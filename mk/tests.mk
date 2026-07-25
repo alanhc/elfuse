@@ -18,7 +18,8 @@
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
-        test-linkat-symlink-fallback perf
+        test-linkat-symlink-fallback test-casefold-host \
+        probe-volume-naming perf
 
 ## Build and run the assembly hello world test
 test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
@@ -81,7 +82,8 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) \
 		$(BUILD_DIR)/test-fork-ipc-protocol-host \
 		$(BUILD_DIR)/test-vcpu-run-hooks-host \
 		$(BUILD_DIR)/test-identity-override-host \
-		$(BUILD_DIR)/test-teardown-live-vcpu-host
+		$(BUILD_DIR)/test-teardown-live-vcpu-host \
+		$(BUILD_DIR)/test-casefold-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v -s '$(SANITIZER_SECTIONS)'
 	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-tlbi-encoder-host
@@ -93,6 +95,8 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) \
 	@$(BUILD_DIR)/test-identity-override-host
 	@printf "\n$(BLUE)━━━ teardown live-worker accounting unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-teardown-live-vcpu-host
+	@printf "\n$(BLUE)━━━ filename codec unit test ━━━$(RESET)\n"
+	@$(BUILD_DIR)/test-casefold-host
 
 ## Run the unit test suite plus busybox applet validation
 check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
@@ -100,7 +104,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 		$(BUILD_DIR)/test-fork-ipc-protocol-host \
 		$(BUILD_DIR)/test-vcpu-run-hooks-host \
 		$(BUILD_DIR)/test-identity-override-host \
-		$(BUILD_DIR)/test-teardown-live-vcpu-host
+		$(BUILD_DIR)/test-teardown-live-vcpu-host \
+		$(BUILD_DIR)/test-casefold-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-tlbi-encoder-host
@@ -112,6 +117,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(BUILD_DIR)/test-identity-override-host
 	@printf "\n$(BLUE)━━━ teardown live-worker accounting unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-teardown-live-vcpu-host
+	@printf "\n$(BLUE)━━━ filename codec unit test ━━━$(RESET)\n"
+	@$(BUILD_DIR)/test-casefold-host
 	@printf "\n$(BLUE)━━━ shebang parser unit test ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-shebang-host
 	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
@@ -859,6 +866,18 @@ test-vcpu-run-hooks-host: $(BUILD_DIR)/test-vcpu-run-hooks-host
 ## Run the deterministic argv-tail overshoot guard test
 test-proctitle-host: $(BUILD_DIR)/test-proctitle-host
 	$(BUILD_DIR)/test-proctitle-host
+
+# Filename codec unit test. The binary takes a directory, so the same test can
+# be pointed at another volume:
+#   build/test-casefold-host /Volumes/case-sensitive-image
+## Run the filename codec unit tests against a scratch directory
+test-casefold-host: $(BUILD_DIR)/test-casefold-host
+	$(BUILD_DIR)/test-casefold-host
+
+# Volume naming probe
+## Report how the filesystem treats filenames (regenerates docs/filenames.md tables)
+probe-volume-naming: $(BUILD_DIR)/probe-volume-naming
+	$(BUILD_DIR)/probe-volume-naming
 
 # Shebang parser unit test
 ## Run shebang parsing unit tests

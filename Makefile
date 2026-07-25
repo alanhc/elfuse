@@ -40,6 +40,7 @@ SRCS := \
     syscall/path.c \
     syscall/fuse.c \
     syscall/sidecar.c \
+    syscall/casefold.c \
     syscall/chown-overlay.c \
     syscall/fs.c \
     syscall/fs-stat.c \
@@ -191,6 +192,21 @@ $(BUILD_DIR)/test-teardown-live-vcpu-host: \
 		$(BUILD_DIR)/runtime/thread.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(HVF_LDFLAGS)
+
+## Build the volume naming probe (native macOS binary)
+# Standalone: it measures the filesystem, so it links nothing from the project.
+$(BUILD_DIR)/probe-volume-naming: $(BUILD_DIR)/probe-volume-naming.o \
+		| $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the filename codec host test (native macOS binary)
+# casefold.o is a leaf translation unit with no syscall-layer dependencies, so
+# the test links exactly the code under test and nothing else.
+$(BUILD_DIR)/test-casefold-host: $(BUILD_DIR)/test-casefold-host.o \
+		$(BUILD_DIR)/syscall/casefold.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 
 # Guest test binaries (cross-compiled, aarch64-linux)
