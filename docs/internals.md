@@ -984,12 +984,14 @@ How it works:
    `AT_EXECFN` (`argv[0]`) in the auxiliary vector.
 4. The entry point becomes `interp_entry + load_base`; the dynamic linker
    takes over from there.
-5. `sys_openat()` redirects guest absolute paths through the sysroot: if
-   `--sysroot` is set, it tries `<sysroot>/<path>` first, and falls back to
-   the literal host path when the sysroot does not hold it. The temp roots
-   (`/tmp`, `/var/tmp`, any `.ccache` directory) and the guest system
-   directories are excluded from that fallback and resolve in the sysroot
-   either way, so lookup and removal cannot disagree about where a path lives.
+5. Guest absolute paths reach the host through `path_translate_at()`
+   (`src/syscall/path.c`), the single forward resolver every path-taking
+   handler uses; with `--sysroot` set it dispatches each path between the
+   sysroot and the host on existence. The temp roots (`/tmp`, `/var/tmp`, any
+   `.ccache` directory) and the guest system directories are exempt from that
+   dispatch and resolve in the sysroot either way, so lookup and removal cannot
+   disagree about where a path lives. [filenames.md](filenames.md) covers how
+   a name is spelled once it lands on the sysroot volume.
 
 The sysroot is inherited by fork children via IPC state transfer.
 `sys_execve` also loads the interpreter for dynamically linked targets, so
@@ -999,7 +1001,9 @@ correctly. `elf_resolve_interp()` in `src/core/elf.c` is shared between
 
 ### Known Limitations
 
-None currently tracked for the aarch64-linux dynamic-linker path.
+None specific to the aarch64-linux dynamic-linker path. Limitations in guest
+path handling are covered by [filenames.md](filenames.md), which records what
+the sysroot volume can and cannot represent.
 
 ## x86_64-via-Apple-Rosetta
 
