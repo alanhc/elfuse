@@ -1,0 +1,465 @@
+/*
+ * Case-exact path resolution
+ *
+ * Copyright 2026 elfuse contributors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Applies the encoding in casefold.h to a whole path, asking the volume about
+ * one component at a time. casefold-walk.h states the contract.
+ */
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <string.h>
+#include <sys/attr.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "utils.h"
+
+#include "syscall/casefold-walk.h"
+#include "syscall/path.h"
+#include "syscall/proc.h"
+
+bool casefold_active(void)
+{
+    return proc_get_sysroot() && proc_sysroot_casefold_enabled();
+}
+
+typedef enum {
+    PROBE_ERROR = -1,
+    PROBE_EXACT = 0,   /* an entry exists spelled exactly as asked */
+    PROBE_FOLDED = 1,  /* an entry exists, but under a different spelling */
+    PROBE_ABSENT = 2,  /* nothing is there */
+    PROBE_UNUSABLE = 3 /* the volume refuses to hold this name at all */
+} probe_result_t;
+
+/* Scan the directory holding @path for an entry spelled exactly @leaf. Only
+ * reached when the volume cannot report a stored spelling through
+ * getattrlistat, which APFS and HFS+ both can; a network mount that folds case
+ * might not. Costs a directory read, which is why it is the fallback and not
+ * the primary.
+ */
+static probe_result_t probe_by_readdir(host_fd_t base_fd,
+                                       const char *path,
+                                       const char *leaf)
+{
+    char parent[LINUX_PATH_MAX];
+    const char *slash = strrchr(path, '/');
+    struct stat st;
+    struct dirent *de;
+    bool found = false;
+    DIR *d;
+    int fd;
+
+    if (!slash) {
+        /* A bare name is measured from @base_fd itself. */
+        str_copy_trunc(parent, ".", sizeof(parent));
+    } else {
+        size_t n = slash == path ? 1 : (size_t) (slash - path);
+
+        if (n >= sizeof(parent)) {
+            errno = ENAMETOOLONG;
+            return PROBE_ERROR;
+        }
+        memcpy(parent, path, n);
+        parent[n] = '\0';
+    }
+
+    fd = openat(base_fd, parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return PROBE_ERROR;
+    d = fdopendir(fd);
+    if (!d) {
+        close(fd);
+        return PROBE_ERROR;
+    }
+    while ((de = readdir(d))) {
+        if (!strcmp(de->d_name, leaf)) {
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    if (found)
+        return PROBE_EXACT;
+
+    /* Missing from the listing is not the same as absent: the volume may hold
+     * the name under a spelling that folded onto it, and a lookup by that name
+     * will find it. Reporting absent here would send a create at the literal
+     * name straight onto the other file.
+     */
+    if (fstatat(base_fd, path, &st, AT_SYMLINK_NOFOLLOW) == 0)
+        return PROBE_FOLDED;
+    return errno == ENOENT || errno == ENOTDIR ? PROBE_ABSENT : PROBE_ERROR;
+}
+
+const char *casefold_attr_stored_name(const void *reply,
+                                      size_t reply_cap,
+                                      size_t ref_off)
+{
+    u_int32_t total;
+    attrreference_t ref;
+
+    if (reply_cap < sizeof(total))
+        return NULL;
+    /* memcpy, not a cast: the reply struct is packed and nothing guarantees
+     * the caller's buffer aligns its fields.
+     */
+    memcpy(&total, reply, sizeof(total));
+
+    size_t usable = total < reply_cap ? total : reply_cap;
+    if (ref_off > usable || usable - ref_off < sizeof(ref))
+        return NULL;
+    memcpy(&ref, (const char *) reply + ref_off, sizeof(ref));
+
+    /* attr_dataoffset is signed (int32_t); a negative one points before the
+     * reference, outside anything the kernel wrote for this attribute.
+     */
+    if (ref.attr_dataoffset <= 0 || ref.attr_length == 0)
+        return NULL;
+    size_t name_off = ref_off + (size_t) ref.attr_dataoffset;
+    if (name_off >= usable || ref.attr_length > usable - name_off)
+        return NULL;
+
+    const char *name = (const char *) reply + name_off;
+    return memchr(name, '\0', ref.attr_length) ? name : NULL;
+}
+
+/* Does an entry spelled exactly @leaf sit at @path?
+ *
+ * A plain stat cannot answer this: the volume resolves names case- and
+ * normalization-blind, so it reports success for a spelling that is not what is
+ * stored, while Linux resolution is byte-exact and must report ENOENT for that.
+ * getattrlistat goes through the same folding lookup but hands back the name as
+ * stored, which is the byte comparison this needs. FSOPT_NOFOLLOW keeps the
+ * question about the entry itself rather than a symlink's target, so a link is
+ * judged by its own name.
+ */
+static probe_result_t probe_exact(host_fd_t base_fd,
+                                  const char *path,
+                                  const char *leaf)
+{
+    struct attrlist al = {
+        .bitmapcount = ATTR_BIT_MAP_COUNT,
+        .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME,
+    };
+    struct {
+        u_int32_t length;
+        attribute_set_t returned;
+        attrreference_t name_ref;
+        char name[CASEFOLD_STORED_NAME_MAX];
+    } __attribute__((aligned(4), packed)) attr_buf;
+
+    if (getattrlistat(base_fd, path, &al, &attr_buf, sizeof(attr_buf),
+                      FSOPT_NOFOLLOW) == 0) {
+        const char *stored = NULL;
+        if (attr_buf.returned.commonattr & ATTR_CMN_NAME)
+            stored = casefold_attr_stored_name(
+                &attr_buf, sizeof(attr_buf),
+                (size_t) ((const char *) &attr_buf.name_ref -
+                          (const char *) &attr_buf));
+        if (stored) {
+            if (!strcmp(stored, leaf))
+                return PROBE_EXACT;
+            /* A mismatch is not yet a fold. For a second hard link to a
+             * symlink the volume reports the primary link's name here rather
+             * than the one just looked up (observed on APFS; a second link to
+             * a regular file reports itself), so an entry spelled exactly as
+             * asked can still come back under another name. Only the listing
+             * tells an aliased name from a genuinely folded one, and only a
+             * mismatch pays for the scan.
+             */
+            return probe_by_readdir(base_fd, path, leaf);
+        }
+        /* The call succeeded but the volume withheld the name or handed back
+         * a reply whose bounds do not hold it, so there is no spelling to
+         * compare. Say so rather than dispatching on an errno no one set,
+         * which would pick a verdict out of whatever ran last.
+         */
+        errno = ENOTSUP;
+    }
+
+    switch (errno) {
+    case ENOENT:
+    case ENOTDIR:
+        return PROBE_ABSENT;
+    case EILSEQ:
+    case EINVAL:
+        /* The volume will not hold this byte sequence as a name, so it can
+         * never be there and can never be created there. Both answers are the
+         * same: the name has to be escaped.
+         *
+         * EINVAL can also mean a malformed request rather than a malformed
+         * name, and the two are indistinguishable here. It does not matter:
+         * the attrlist is a compile-time constant, so a malformed one would
+         * fail every probe in every directory rather than this one, which no
+         * lookup in the suite would survive.
+         */
+        return PROBE_UNUSABLE;
+    case ENOTSUP:
+        return probe_by_readdir(base_fd, path, leaf);
+    default:
+        return PROBE_ERROR;
+    }
+}
+
+/* Append "/@name" to @out, tracking the running length so the walk does not
+ * rescan what it has already built.
+ */
+static int append_component(char *out,
+                            size_t outsz,
+                            size_t *len,
+                            const char *name)
+{
+    size_t name_len = strlen(name);
+    size_t pos = *len;
+
+    /* No separator before the first component: an empty prefix means the walk
+     * is measured from a descriptor, and a leading '/' would make the result
+     * absolute and resolve it against the host root instead.
+     */
+    if (pos != 0 && out[pos - 1] != '/') {
+        if (pos + 1 >= outsz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        out[pos++] = '/';
+    }
+    if (pos + name_len >= outsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out + pos, name, name_len + 1);
+    *len = pos + name_len;
+    return 0;
+}
+
+/* Append a component and record where it landed. Predicting the offset instead
+ * gets it wrong whenever append_component omits the separator: an empty prefix,
+ * or a prefix that already ends in one, as a root sysroot does.
+ */
+static int append_leaf(char *out,
+                       size_t outsz,
+                       size_t *len,
+                       const char *name,
+                       casefold_walk_t *walk)
+{
+    size_t name_len = strlen(name);
+
+    walk->parent_offset = *len;
+    if (append_component(out, outsz, len, name) < 0)
+        return -1;
+    walk->leaf_offset = *len - name_len;
+    return 0;
+}
+
+/* The on-disk name a guest component takes when nothing can be probed for it,
+ * either because it is absent or because its parent is. Escaping depends only
+ * on the name, so this needs no filesystem access.
+ */
+static int name_by_rule(const char *guest, char *out, size_t outsz)
+{
+    if (!casefold_needs_escape(guest)) {
+        if (strlen(guest) + 1 > outsz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(out, guest, strlen(guest) + 1);
+        return 0;
+    }
+    return casefold_escape(guest, out, outsz);
+}
+
+/* Spell one component, given the parent already spelled in @out. Reports
+ * through @present whether the entry is there, and writes the host spelling
+ * into @host.
+ */
+static probe_result_t resolve_component(host_fd_t base_fd,
+                                        const char *out,
+                                        size_t len,
+                                        const char *guest,
+                                        char *host,
+                                        size_t hostsz,
+                                        bool *present)
+{
+    char probe_path[LINUX_PATH_MAX];
+    size_t probe_len = len;
+    probe_result_t verdict;
+
+    *present = false;
+
+    /* An escape-shaped guest name is stored escaped unconditionally, so it can
+     * never be mistaken for the encoding of a different name. Probing its
+     * literal spelling would find some unrelated file.
+     */
+    if (!casefold_is_escaped(guest)) {
+        if (str_copy_trunc(probe_path, out, sizeof(probe_path)) >=
+            sizeof(probe_path)) {
+            errno = ENAMETOOLONG;
+            return PROBE_ERROR;
+        }
+        if (append_component(probe_path, sizeof(probe_path), &probe_len,
+                             guest) < 0)
+            return PROBE_ERROR;
+
+        verdict = probe_exact(base_fd, probe_path, guest);
+        if (verdict == PROBE_ERROR)
+            return PROBE_ERROR;
+        if (verdict == PROBE_EXACT) {
+            if (str_copy_trunc(host, guest, hostsz) >= hostsz) {
+                errno = ENAMETOOLONG;
+                return PROBE_ERROR;
+            }
+            *present = true;
+            return PROBE_EXACT;
+        }
+    } else {
+        /* An escape-shaped guest name can only live at its own escape, so the
+         * literal slot says nothing about it and is left unprobed: whatever
+         * sits there encodes a different name. Absent until the escape probe
+         * below says otherwise.
+         */
+        verdict = PROBE_ABSENT;
+    }
+
+    /* The literal spelling is not what is stored. Whatever the reason (a
+     * differently-spelled sibling in the slot, a name the volume refuses, or
+     * simply nothing there), the escape is the only other place the name can
+     * live, so ask whether it does.
+     */
+    if (casefold_escape(guest, host, hostsz) < 0) {
+        if (errno != ENAMETOOLONG && errno != EINVAL)
+            return PROBE_ERROR;
+        /* Cannot be escaped, so the literal spelling is the only candidate and
+         * the probe already answered for it.
+         */
+        return name_by_rule(guest, host, hostsz) < 0 ? PROBE_ERROR : verdict;
+    }
+
+    probe_len = len;
+    if (str_copy_trunc(probe_path, out, sizeof(probe_path)) >=
+        sizeof(probe_path)) {
+        errno = ENAMETOOLONG;
+        return PROBE_ERROR;
+    }
+    if (append_component(probe_path, sizeof(probe_path), &probe_len, host) < 0)
+        return PROBE_ERROR;
+
+    switch (probe_exact(base_fd, probe_path, host)) {
+    case PROBE_EXACT:
+        *present = true;
+        return PROBE_EXACT;
+    case PROBE_ERROR:
+        return PROBE_ERROR;
+    default:
+        break;
+    }
+
+    /* Neither spelling is there. Which one the name would take is decided by
+     * the name alone, which is what keeps two processes creating colliding
+     * names off the same slot.
+     */
+    if (verdict == PROBE_ABSENT)
+        return name_by_rule(guest, host, hostsz) < 0 ? PROBE_ERROR
+                                                     : PROBE_ABSENT;
+    /* The slot is taken by a different spelling, or refused outright, so the
+     * name belongs at its escape even though nothing is there yet. Reported as
+     * folded rather than absent: the two differ to a caller deciding whether
+     * the sysroot has a claim on this path.
+     *
+     * A refused name converges on the same answer as an occupied slot, which
+     * is why PROBE_UNUSABLE needs no separate verdict of its own. Both mean the
+     * sysroot owns this path and the caller must not look for it on the host.
+     * The difference is why the literal spelling is unavailable, and no caller
+     * asks that. Deliberately fail-closed: the alternative sends a guest asking
+     * for an ill-formed name out to whatever the host happens to hold.
+     */
+    return PROBE_FOLDED;
+}
+
+casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
+                                       const char *base_host_prefix,
+                                       const char *guest_path,
+                                       bool follow_final,
+                                       char *out,
+                                       size_t outsz,
+                                       casefold_walk_t *walk)
+{
+    const char *scan = guest_path;
+    const char *comp;
+    size_t comp_len;
+    size_t len;
+    bool absent = false;
+
+    walk->parent_found = true;
+    walk->parent_offset = 0;
+    walk->leaf_offset = 0;
+    walk->folded = false;
+
+    len = str_copy_trunc(out, base_host_prefix ? base_host_prefix : "", outsz);
+    if (len >= outsz) {
+        errno = ENAMETOOLONG;
+        return CASEFOLD_ERROR;
+    }
+
+    while (path_next_component(&scan, &comp, &comp_len)) {
+        char guest[CASEFOLD_GUEST_NAME_MAX + 1];
+        char host[CASEFOLD_HOST_NAME_MAX + 1];
+        bool present = false;
+
+        if (path_component_copy(guest, sizeof(guest), comp, comp_len) < 0)
+            return CASEFOLD_ERROR;
+
+        /* "." and ".." navigate rather than name an entry, so they are spelled
+         * through untouched. An absolute path has already had them collapsed;
+         * a dirfd-relative one may still carry them.
+         */
+        if (!strcmp(guest, ".") || !strcmp(guest, "..")) {
+            if (append_leaf(out, outsz, &len, guest, walk) < 0)
+                return CASEFOLD_ERROR;
+            continue;
+        }
+
+        if (absent) {
+            /* Below a component that is not there, nothing can be probed, and
+             * nothing needs to be: the spelling follows from the name.
+             */
+            walk->parent_found = false;
+            if (name_by_rule(guest, host, sizeof(host)) < 0)
+                return CASEFOLD_ERROR;
+        } else {
+            probe_result_t verdict = resolve_component(
+                base_fd, out, len, guest, host, sizeof(host), &present);
+
+            if (verdict == PROBE_ERROR)
+                return CASEFOLD_ERROR;
+            /* A fold means the sysroot holds an entry where the guest asked,
+             * under a spelling the guest did not use. Recorded for the caller
+             * because it is the one absent verdict that must not fall through
+             * to the host: something is already there.
+             */
+            if (verdict == PROBE_FOLDED)
+                walk->folded = true;
+            absent = !present;
+        }
+
+        if (append_leaf(out, outsz, &len, host, walk) < 0)
+            return CASEFOLD_ERROR;
+    }
+
+    if (absent)
+        return CASEFOLD_ABSENT;
+
+    /* The probe deliberately stops at a symlink rather than following it, so a
+     * caller that asked about the target has to say so. A link pointing nowhere
+     * is absent for that caller, which is what an access(2) probe would report.
+     */
+    if (follow_final && faccessat(base_fd, out, F_OK, 0) < 0)
+        return CASEFOLD_ABSENT;
+    return CASEFOLD_FOUND;
+}

@@ -54,17 +54,20 @@
 #define CASEFOLD_SYM_BITS 12u
 
 /* Symbols the long tier spends on a guest name of n bytes: one carrying the
- * length, then one per CASEFOLD_SYM_BITS of payload.
+ * length, then one per CASEFOLD_SYM_BITS of payload. Computed in size_t
+ * because the result sizes buffers.
  */
 #define CASEFOLD_SYMBOLS(n) \
-    (1u + (8u * (n) + CASEFOLD_SYM_BITS - 1u) / CASEFOLD_SYM_BITS)
+    ((size_t) 1 +           \
+     ((size_t) 8 * (n) + CASEFOLD_SYM_BITS - 1) / CASEFOLD_SYM_BITS)
 
 /* Longest host spelling any escaped name can take, in bytes. Each symbol is a
  * BMP code point, so three UTF-8 bytes. Buffers holding a host component must
  * be sized by this and not by NAME_MAX, which is a guest-side limit.
  */
 #define CASEFOLD_HOST_NAME_MAX \
-    (CASEFOLD_PREFIX_LEN + 3u * CASEFOLD_SYMBOLS(CASEFOLD_GUEST_NAME_MAX))
+    (CASEFOLD_PREFIX_LEN +     \
+     (size_t) 3 * CASEFOLD_SYMBOLS(CASEFOLD_GUEST_NAME_MAX))
 
 /* Every escape has to fit the volume's per-name limit, and both tiers spend
  * exactly one unit per output character: the hex tier emits ASCII digits, the

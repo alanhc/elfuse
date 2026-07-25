@@ -41,6 +41,7 @@ SRCS := \
     syscall/fuse.c \
     syscall/sidecar.c \
     syscall/casefold.c \
+    syscall/casefold-walk.c \
     syscall/chown-overlay.c \
     syscall/fs.c \
     syscall/fs-stat.c \
@@ -208,6 +209,14 @@ $(BUILD_DIR)/test-casefold-host: $(BUILD_DIR)/test-casefold-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the case-exact path resolution host test (native macOS binary)
+# Links the resolver and the codec; the two process-state symbols the resolver
+# reads are stubbed in the test.
+$(BUILD_DIR)/test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host.o \
+		$(BUILD_DIR)/syscall/casefold-walk.o \
+		$(BUILD_DIR)/syscall/casefold.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.

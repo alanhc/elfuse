@@ -329,25 +329,6 @@ int path_translate_dirent_name(guest_fd_t dirfd,
     return 0;
 }
 
-bool path_next_component(const char **pathp, const char **comp, size_t *len)
-{
-    const char *p = *pathp;
-
-    while (*p == '/')
-        p++;
-    if (*p == '\0') {
-        *pathp = p;
-        return false;
-    }
-
-    *comp = p;
-    while (*p != '\0' && *p != '/')
-        p++;
-    *len = (size_t) (p - *comp);
-    *pathp = p;
-    return true;
-}
-
 static bool path_component_is_dot(const char *comp, size_t len)
 {
     return len == 1 && comp[0] == '.';

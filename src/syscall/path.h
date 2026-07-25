@@ -68,8 +68,30 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen);
  * from repeated slashes. Returns true with the component (not NUL-terminated)
  * reported through comp and len, leaving *pathp at its end; returns false once
  * only slashes or the terminating NUL remain.
+ *
+ * Inline beside path_component_copy, its usual companion, so a leaf module can
+ * walk a path without linking the rest of the translation layer.
  */
-bool path_next_component(const char **pathp, const char **comp, size_t *len);
+static inline bool path_next_component(const char **pathp,
+                                       const char **comp,
+                                       size_t *len)
+{
+    const char *p = *pathp;
+
+    while (*p == '/')
+        p++;
+    if (*p == '\0') {
+        *pathp = p;
+        return false;
+    }
+
+    *comp = p;
+    while (*p != '\0' && *p != '/')
+        p++;
+    *len = (size_t) (p - *comp);
+    *pathp = p;
+    return true;
+}
 
 /* Copy a counted component (not NUL-terminated, as path_next_component reports)
  * into dst and NUL-terminate it. Returns 0, or -1 with errno set to
