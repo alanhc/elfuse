@@ -172,8 +172,9 @@ expected interpreter path (for example `/lib/ld-musl-aarch64.so.1` or
 
 Practical notes:
 
-- The sysroot is consulted only for guest absolute paths; relative paths still
-  resolve from the guest working directory.
+- The sysroot is consulted for guest absolute paths; relative paths resolve
+  from the guest working directory, and inside the sysroot they receive the
+  same byte-exact name semantics as absolute ones.
 - `/tmp`, `/var/tmp`, and any `.ccache` directory are backed by the sysroot
   alone. A guest's temporary files go there so they cannot collide on a
   case-insensitive host `/tmp`, and every operation on those paths, including
@@ -186,11 +187,17 @@ Practical notes:
   the sysroot itself lives in is not reachable from the guest.
 - The sysroot setting is preserved across guest `fork` and `execve`, so spawned
   children see the same view of the filesystem.
-- On case-insensitive macOS volumes, `elfuse` maintains per-directory
-  sidecar token files so case-colliding Linux names remain distinct, and
-  lookups verify the on-disk spelling byte-for-byte: a name that differs
-  from an existing entry only by case (or Unicode normalization form)
-  reports `ENOENT`, matching Linux semantics instead of APFS's folding.
+- On case-insensitive macOS volumes, `elfuse` keeps Linux's byte-exact name
+  semantics: a lookup whose spelling differs from the on-disk entry only by
+  case or Unicode normalization form reports `ENOENT`, and a name the volume
+  cannot store as itself is held under an escaped `.ef=<payload>` spelling the
+  guest never sees. Guest names keep their full 255 bytes either way.
+  [docs/filenames.md](filenames.md) describes the model.
+- A sysroot holding `.ef_<token>` entries plus a `.elfuse_case_index` file
+  per directory was written by a different on-disk encoding and is not
+  readable: those entries decode to nothing and surface under their literal
+  host names. Recreate the sysroot: unpack the rootfs again, with
+  `--create-sysroot` if the volume folds case.
 - Use `--create-sysroot PATH` if the host filesystem is case-insensitive
   (default APFS) and the sysroot is being provisioned for the first
   time; `elfuse` creates a case-sensitive APFS sparsebundle, mounts it

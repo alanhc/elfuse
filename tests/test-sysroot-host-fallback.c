@@ -7,13 +7,13 @@
  * proc_resolve_sysroot_path_flags resolves absolute guest paths inside the
  * sysroot when they exist there and otherwise falls back to the literal host
  * path so guests can reach host resources (mktemp dirs, /etc/resolv.conf). On a
- * case-insensitive sysroot the sidecar walk used to veto that fallback: it
+ * case-insensitive sysroot an earlier walk used to veto that fallback: it
  * anchored every absolute path at the sysroot root and returned ENOENT as soon
  * as a component was missing there, which broke every coreutils invocation
  * against a host mktemp directory (test-matrix "musl dyn" suite).
  *
  * The harness (mk/tests.mk) runs this binary under --sysroot with a
- * case-insensitive sysroot so the sidecar is active, and passes:
+ * case-insensitive sysroot so the case-exact walk is active, and passes:
  *   argv[1]  host directory whose intermediate components do not exist in
  *            the sysroot; contains hello.txt ("host-visible\n")
  *   argv[2]  host file whose parent chain is fully mirrored inside the

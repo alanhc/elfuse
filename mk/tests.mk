@@ -19,7 +19,8 @@
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-linkat-symlink-fallback test-casefold-host \
-        test-casefold-walk-host \
+        test-casefold-walk-host test-sysroot-name-unique \
+        test-sysroot-name-relative \
         probe-volume-naming perf
 
 ## Build and run the assembly hello world test
@@ -101,6 +102,10 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) \
 	@$(BUILD_DIR)/test-casefold-host
 	@printf "\n$(BLUE)━━━ case-exact path resolution unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-casefold-walk-host
+	@printf "\n$(BLUE)━━━ one on-disk name per guest name ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-unique
+	@printf "\n$(BLUE)━━━ relative and dirfd-relative names ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-relative
 
 ## Run the unit test suite plus busybox applet validation
 check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
@@ -126,6 +131,10 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(BUILD_DIR)/test-casefold-host
 	@printf "\n$(BLUE)━━━ case-exact path resolution unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-casefold-walk-host
+	@printf "\n$(BLUE)━━━ one on-disk name per guest name ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-unique
+	@printf "\n$(BLUE)━━━ relative and dirfd-relative names ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-relative
 	@printf "\n$(BLUE)━━━ shebang parser unit test ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-shebang-host
 	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
@@ -316,7 +325,7 @@ test-case-collision-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-case-collision
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-case-collision
 
 ## Host paths outside the sysroot must stay reachable when the sysroot is
-## case-insensitive (sidecar active): the sidecar walk defers to the
+## case-insensitive (case-exact walk active): the walk defers to the
 ## resolver's host-literal fallback instead of vetoing it with ENOENT.
 ## Regression test for the test-matrix "musl dyn" coreutils failures.
 test-sysroot-host-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-host-fallback
@@ -373,10 +382,10 @@ test-sysroot-tmp-remove: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-tmp-remove
 
 ## Wrong-case (and wrong-normalization) lookups must fail with ENOENT:
 ## Linux treats names as byte strings, while APFS resolves them case- and
-## normalization-insensitively. The sidecar walk verifies the on-disk
-## spelling of every unmapped component instead of trusting the folded
+## normalization-insensitively. The case-exact walk verifies the on-disk
+## spelling of every fold-stable component instead of trusting the folded
 ## probe. Stages exact-case fixtures host-side; the guest asserts folded
-## spellings do not resolve. The normalization probes require the sidecar,
+## spellings do not resolve. The normalization probes require the walk,
 ## so the guest skips them when the staging volume is case-sensitive.
 test-sysroot-case-exact: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-case-exact
 	@set -e; \
@@ -393,6 +402,62 @@ test-sysroot-case-exact: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-case-exact
 	    $(BUILD_DIR)/test-sysroot-case-exact "$$mode"; \
 	if [ ! -e "$$sysroot/data/Makefile" ]; then \
 		printf "$(RED)FAIL$(RESET) wrong-case op removed the exact entry\n"; \
+		exit 1; \
+	fi
+
+# A guest name whose spelling the volume cannot hold is stored escaped, so a
+# directory can hold a mixture of literal and escaped entries. Each guest name
+# must stay reachable through exactly one of them, and the on-disk spellings
+# must never surface. The recipe asserts the host-side half afterwards: an
+# escaped entry whose decoded name is also present literally would be a name
+# reachable two ways, and a leftover entry would be one the teardown could not
+# name.
+## Each guest name has exactly one on-disk representation
+test-sysroot-name-unique: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-unique
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-name-unique; \
+	left=$$(ls -A "$$tmpdir/name-unique" 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$left" != 0 ]; then \
+		printf "$(RED)FAIL$(RESET) %s entries survived the teardown\n" "$$left"; \
+		ls -Ab "$$tmpdir/name-unique"; \
+		exit 1; \
+	fi
+
+# A guest names one file two ways: absolutely, and relative to its working
+# directory or a directory descriptor. Both have to reach it, which is not
+# automatic when the name is stored under an escaped spelling: a relative name
+# has no leading component to key the sysroot resolvers on, only the descriptor
+# it is measured against. Tree walkers reach every name this way.
+## Relative and dirfd-relative names resolve to the same file as absolute ones
+test-sysroot-name-relative: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-relative
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	outside="$$tmpdir-outside"; \
+	mkdir -p "$$outside"; \
+	trap 'rm -rf "$$tmpdir" "$$tmpdir-outside"' EXIT; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-name-relative "$$outside"; \
+	stray=$$(ls -A "$$tmpdir/name-relative" \
+	    | grep -v '^\.ef=' | grep -cvE '^(walkdir|slashfile|notdirfile)$$' || true); \
+	if [ "$$stray" != 0 ]; then \
+		printf "$(RED)FAIL$(RESET) %s name(s) stored unescaped\n" "$$stray"; \
+		ls -Ab "$$tmpdir/name-relative"; \
+		exit 1; \
+	fi; \
+	if [ ! -d "$$tmpdir/name-relative/walkdir" ] || \
+	   [ ! -f "$$tmpdir/name-relative/slashfile" ] || \
+	   [ ! -f "$$tmpdir/name-relative/notdirfile" ]; then \
+		printf "$(RED)FAIL$(RESET) a fold-stable fixture was escaped\n"; \
+		ls -Ab "$$tmpdir/name-relative"; \
+		exit 1; \
+	fi; \
+	if [ ! -e "$$outside/Outside.Rel" ] || [ ! -e "$$outside/Outside.Abs" ]; then \
+		printf "$(RED)FAIL$(RESET) a name outside the sysroot was not stored literally\n"; \
+		ls -Ab "$$outside"; \
 		exit 1; \
 	fi
 

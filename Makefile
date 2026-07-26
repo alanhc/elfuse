@@ -39,7 +39,6 @@ SRCS := \
     syscall/mem.c \
     syscall/path.c \
     syscall/fuse.c \
-    syscall/sidecar.c \
     syscall/casefold.c \
     syscall/casefold-walk.c \
     syscall/chown-overlay.c \

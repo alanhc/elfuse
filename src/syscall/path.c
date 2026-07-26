@@ -19,10 +19,10 @@
 
 #include "runtime/procemu.h"
 #include "syscall/abi.h"
+#include "syscall/casefold-walk.h"
 #include "syscall/fuse.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
-#include "syscall/sidecar.h"
 
 #ifndef MAXSYMLINKS
 #define MAXSYMLINKS 40
@@ -147,10 +147,21 @@ int path_check_intercept_access(const struct stat *st, int mode, int flags)
     return -1;
 }
 
+/* True when @path names a directory by ending in one or more separators. "/"
+ * itself does not count: it is the root, not an assertion about a leaf.
+ */
+static bool path_has_trailing_slash(const char *path)
+{
+    size_t len = path ? strlen(path) : 0;
+
+    return len > 1 && path[len - 1] == '/';
+}
+
 /* Forward-declared: defined below dirfd_guest_base_path(), which it needs. */
 static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
                                                    const char *path,
                                                    unsigned int flags,
+                                                   bool *in_sysroot,
                                                    char *host_out,
                                                    size_t host_outsz);
 
@@ -167,8 +178,8 @@ int path_translate_at(guest_fd_t dirfd,
     /* Only the fields read on the no-rewrite fast path need explicit defaults;
      * proc_path / guest_buf / host_buf are read-after-written by their
      * respective resolvers. memset of all three 4 KiB buffers would add ~12 KiB
-     * of zeroing per call, which became visible at ~30 calls per dynamic-linker
-     * startup after the sidecar caches dropped the rest of the openat overhead.
+     * of zeroing per call, which is visible at ~30 calls per dynamic-linker
+     * startup.
      */
     tx->guest_path = path;
     tx->intercept_path = path;
@@ -205,8 +216,8 @@ int path_translate_at(guest_fd_t dirfd,
      * stay on the sysroot path so the synthetic-directory intercepts keep
      * answering for them. The resolver rejects "..", embedded '/', and
      * empty names with EACCES. The early return skips sysroot resolution,
-     * the relative-containment recheck, and the sidecar lookup: the backing
-     * path is absolute, self-contained, and must never be sidecar-mapped.
+     * the relative-containment recheck, and the casefold walk: the backing
+     * path is absolute, self-contained, and must never be escape-mapped.
      * is_dev_shm signals the redirect to callers, which must force nofollow
      * on the host call; see dev_shm_resolve_path() for that invariant.
      */
@@ -220,12 +231,6 @@ int path_translate_at(guest_fd_t dirfd,
     }
 
     errno = 0;
-    if ((flags & PATH_TR_CREATE) && sidecar_active() &&
-        sidecar_path_targets_reserved_name(tx->guest_path)) {
-        errno = ENOENT;
-        return -1;
-    }
-
     if (flags & PATH_TR_CREATE) {
         tx->host_path = path_resolve_sysroot_create_path(
             tx->guest_path, tx->host_buf, sizeof(tx->host_buf),
@@ -252,9 +257,11 @@ int path_translate_at(guest_fd_t dirfd,
      * target, before the prefix check runs.
      */
     bool climbed_root = false;
+    bool relative_in_sysroot = false;
     if (tx->host_path && tx->guest_path[0] != '/' && proc_get_sysroot()) {
         int recheck = path_check_relative_sysroot_containment(
-            dirfd, tx->guest_path, flags, tx->host_buf, sizeof(tx->host_buf));
+            dirfd, tx->guest_path, flags, &relative_in_sysroot, tx->host_buf,
+            sizeof(tx->host_buf));
         if (recheck < 0) {
             tx->host_path = NULL;
             if (errno == 0)
@@ -271,19 +278,40 @@ int path_translate_at(guest_fd_t dirfd,
         }
     }
 
-    /* Sidecar only runs after sysroot resolution succeeds. If the resolver
-     * rejected the path (e.g. nofollow containment violation), sidecar must not
-     * be allowed to walk an alternate index and resurrect the rejected target.
-     * A path that clamped at the guest root skips it too: sidecar walks the
-     * relative spelling from dirfd, which is the walk just replaced.
+    /* A relative name has no leading component for the resolvers above to key
+     * on, so they hand it back untouched, but it still names a file that may
+     * be stored under an escaped spelling. Resolve it the same way, seeded from
+     * the descriptor it is measured against rather than from the sysroot.
+     * Without this the two ways of naming one file disagree: a create through a
+     * relative name lands beside the entry an absolute create already made, and
+     * O_EXCL on a name that exists succeeds.
+     *
+     * Only for a name the sysroot actually claims. Outside it the guest is
+     * looking at the host filesystem, where an absolute path is passed through
+     * untouched and a relative one has to match; escaping here would leave
+     * elfuse's spellings in directories it does not own. The containment check
+     * above already made that call, and now reports it.
+     *
+     * Runs after that check, so a path it rejected is not resolved to a usable
+     * spelling afterwards.
      */
-    if (tx->host_path && !climbed_root && !(flags & PATH_TR_CREATE)) {
-        int sidecar_rc = sidecar_translate_lookup_at(
-            dirfd, tx->guest_path, tx->host_buf, sizeof(tx->host_buf));
-        if (sidecar_rc < 0)
+    if (tx->host_path && relative_in_sysroot && !climbed_root &&
+        casefold_active()) {
+        host_fd_ref_t ref;
+        casefold_walk_t walk;
+        casefold_verdict_t verdict;
+
+        if (host_dirfd_ref_open(dirfd, &ref) < 0) {
+            errno = EBADF;
             return -1;
-        if (sidecar_rc > 0)
-            tx->host_path = tx->host_buf;
+        }
+        verdict =
+            casefold_resolve_at(ref.fd, "", tx->guest_path, false, tx->host_buf,
+                                sizeof(tx->host_buf), &walk);
+        host_fd_ref_close(&ref);
+        if (verdict == CASEFOLD_ERROR)
+            return -1;
+        tx->host_path = tx->host_buf;
     }
 
     if (!tx->host_path) {
@@ -296,10 +324,59 @@ int path_translate_at(guest_fd_t dirfd,
         return -1;
     }
 
+    /* A trailing slash asserts the target is a directory (POSIX 4.13, and
+     * path_resolution(7)), so "file/" owes ENOTDIR. The component walk skips
+     * separators, so the assertion is lost by the time the host path is built.
+     * Put it back rather than re-stat here: Darwin enforces trailing-slash
+     * semantics itself, so the kernel answers on the caller's own syscall,
+     * which is both free and atomic with the operation being performed.
+     */
+    if (path_has_trailing_slash(tx->guest_path) &&
+        !path_has_trailing_slash(tx->host_path)) {
+        size_t len = strlen(tx->host_path);
+
+        if (tx->host_path != tx->host_buf) {
+            if (str_copy_trunc(tx->host_buf, tx->host_path,
+                               sizeof(tx->host_buf)) >= sizeof(tx->host_buf)) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            tx->host_path = tx->host_buf;
+        }
+        if (len + 2 > sizeof(tx->host_buf)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        tx->host_buf[len] = '/';
+        tx->host_buf[len + 1] = '\0';
+    }
+
     return 0;
 }
 
-int path_translate_dirent_name(guest_fd_t dirfd,
+bool path_dirent_dir_holds_escapes(host_fd_t host_dirfd)
+{
+    char sr[LINUX_PATH_MAX], dirpath[LINUX_PATH_MAX];
+
+    if (!casefold_active() || !proc_sysroot_snapshot(sr, sizeof(sr)))
+        return false;
+    if (fcntl(host_dirfd, F_GETPATH, dirpath) < 0)
+        return false;
+    size_t sr_len = strlen(sr);
+    /* "--sysroot /" is the one prefix that is a bare separator: it owns every
+     * host path, but path_prefix_match on it accepts only "/" itself.
+     */
+    if (sr_len == 1)
+        return true;
+    /* proc_set_sysroot stores a realpath()-canonical prefix and F_GETPATH
+     * reports canonical paths, so a byte compare is sound; the residual
+     * folding-volume caveat is the accepted gap the NO_XDEV checker
+     * documents (path.h).
+     */
+    return path_prefix_match(dirpath, sr, sr_len);
+}
+
+int path_translate_dirent_name(bool dir_holds_escapes,
                                const char *host_name,
                                char *guest_name,
                                size_t guest_name_sz)
@@ -309,24 +386,29 @@ int path_translate_dirent_name(guest_fd_t dirfd,
         return -1;
     }
 
-    guest_name[0] = '\0';
-    int sidecar_rc = sidecar_translate_dirent_name(dirfd, host_name, guest_name,
-                                                   guest_name_sz);
-    if (sidecar_rc < 0)
-        return sidecar_rc;
-    if (sidecar_rc > 0)
-        return sidecar_rc;
-    if (guest_name[0] != '\0')
+    /* Only a directory the sysroot owns can hold escaped spellings, and the
+     * process-wide fold switch cannot say which side of that boundary these
+     * entries came from; the caller answers it from the directory's own host
+     * identity. Outside the sysroot the guest is looking at the host
+     * filesystem directly, where a name merely shaped like an escape is an
+     * ordinary file that means itself; decoding it would report a name the
+     * directory does not contain and that no later open could resolve, while
+     * hiding the entry's real name behind it.
+     */
+    if (!dir_holds_escapes) {
+        if (str_copy_trunc(guest_name, host_name, guest_name_sz) >=
+            guest_name_sz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
         return 0;
-
-    size_t len = strlen(host_name);
-    if (len + 1 > guest_name_sz) {
-        errno = ENAMETOOLONG;
-        return -1;
     }
 
-    memcpy(guest_name, host_name, len + 1);
-    return 0;
+    /* Decoding an on-disk name needs nothing beyond the name itself: no
+     * bookkeeping entry to hide, and no failure mode beyond a caller buffer
+     * too small for the result.
+     */
+    return casefold_to_guest(host_name, guest_name, guest_name_sz);
 }
 
 static bool path_component_is_dot(const char *comp, size_t len)
@@ -451,6 +533,44 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
     size_t len;
     int rc = 0;
 
+    /* An absolute path arrived already translated. A relative one is still
+     * spelled the guest's way, and the walk below asks the volume for each
+     * component by name, so inside a sysroot it needs the stored spelling, the
+     * same translation path_translate_at applies. Without it this walker
+     * and that one disagree, and a guest gets two answers for one path: openat
+     * opens the file while openat2 reports it missing.
+     *
+     * Gated on containment for the reason path_translate_at is: outside the
+     * sysroot the names on disk are the guest's own, and escaping one would
+     * look for a file nobody wrote.
+     */
+    if (path[0] != '/' && casefold_active()) {
+        bool in_sysroot = false;
+
+        int recheck = path_check_relative_sysroot_containment(
+            dirfd, path, PATH_TR_NOFOLLOW, &in_sysroot, NULL, 0);
+        if (recheck < 0) {
+            rc = -1;
+            goto out;
+        }
+        /* A climbed path is walked with the depth clamp below; the casefold
+         * walk would hand the volume the unclamped '..' spelling again, the
+         * exact walk the clamp replaces. path_translate_at makes the same
+         * call through its !climbed_root gate.
+         */
+        if (in_sysroot && recheck == 0) {
+            casefold_walk_t walk;
+
+            if (casefold_resolve_at(current_fd, "", path, false, sysroot_buf,
+                                    sizeof(sysroot_buf),
+                                    &walk) == CASEFOLD_ERROR) {
+                rc = -1;
+                goto out;
+            }
+            scan = sysroot_buf;
+        }
+    }
+
     /* No symlink budget here: the loop reports ELOOP at the first link rather
      * than following one, so nothing accumulates against MAXSYMLINKS, and a
      * link-free path has no component limit to enforce (path_resolution(7)).
@@ -468,7 +588,11 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
             }
         }
 
-        char name[NAME_MAX + 1];
+        /* Sized for the stored spelling, not the guest one: both branches
+         * above leave host-spelled components in @scan, and an escape runs
+         * past NAME_MAX for a name Linux still allows.
+         */
+        char name[CASEFOLD_STORED_NAME_MAX];
         if (path_component_copy(name, sizeof(name), comp, len) < 0) {
             rc = -1;
             goto out;
@@ -913,9 +1037,52 @@ static int classify_guest_path_mount(const char *guest_path)
     return PATH_MOUNT_ROOT;
 }
 
-static int host_path_to_guest_path(const char *host_path,
-                                   char *out,
-                                   size_t outsz)
+/* Rewrite each component of an absolute host-relative path into its guest
+ * spelling. A guest-created name whose spelling the volume cannot hold sits on
+ * disk under its escape, so publishing the stripped remainder as-is would show
+ * the guest a name it has never seen and cannot open.
+ */
+static int path_decode_components(const char *host_rel, char *out, size_t outsz)
+{
+    const char *scan = host_rel;
+    const char *comp;
+    size_t comp_len;
+    size_t len = 0;
+
+    while (path_next_component(&scan, &comp, &comp_len)) {
+        /* Both sized for a name the volume can hand back, not for an escape.
+         * CASEFOLD_HOST_NAME_MAX bounds only what elfuse writes; a literal
+         * component the host already holds (a full-length CJK name, say) is
+         * longer than any escape, and decoding leaves such a name unchanged
+         * so the guest side needs the same room.
+         */
+        char host_name[CASEFOLD_STORED_NAME_MAX];
+        char guest_name[CASEFOLD_STORED_NAME_MAX];
+
+        if (path_component_copy(host_name, sizeof(host_name), comp, comp_len) <
+            0)
+            return -1;
+        if (casefold_to_guest(host_name, guest_name, sizeof(guest_name)) < 0)
+            return -1;
+        if (len + 1 + strlen(guest_name) + 1 > outsz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        out[len++] = '/';
+        len += (size_t) snprintf(out + len, outsz - len, "%s", guest_name);
+    }
+    if (len == 0) {
+        if (outsz < 2) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        out[len++] = '/';
+    }
+    out[len] = '\0';
+    return 0;
+}
+
+int path_host_to_guest(const char *host_path, char *out, size_t outsz)
 {
     char sysroot[LINUX_PATH_MAX];
     const char *guest_path = host_path;
@@ -927,6 +1094,13 @@ static int host_path_to_guest_path(const char *host_path,
             guest_path = host_path + sysroot_len;
             if (*guest_path == '\0')
                 guest_path = "/";
+            /* Only a volume that folds case holds escaped names. On a
+             * byte-exact sysroot the stored spelling is already the guest's,
+             * and decoding would rename a host-staged file that merely looks
+             * like an escape.
+             */
+            else if (casefold_active())
+                return path_decode_components(guest_path, out, outsz);
         }
     }
 
@@ -983,7 +1157,7 @@ static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz)
 
     char host_path[LINUX_PATH_MAX];
     if (path_openat2_dirfd_host_path(dirfd, host_path, sizeof(host_path)) == 0)
-        return host_path_to_guest_path(host_path, out, outsz);
+        return path_host_to_guest(host_path, out, outsz);
 
     /* fd_snapshot already proved dirfd is open, so a valid-but-wrong-type fd
      * (pipe, socket, epoll, ...) belongs here, not in the "bad fd" case: Linux
@@ -1024,37 +1198,22 @@ static int dirfd_reconstruct_abs_path(guest_fd_t dirfd,
     return 0;
 }
 
-bool path_relative_climbs_guest_root(guest_fd_t dirfd, const char *path)
-{
-    if (!path || path[0] == '\0' || path[0] == '/')
-        return false;
-    /* A walk that never dips above the descriptor cannot reach the guest
-     * root, whatever the descriptor's depth; skip the reconstruction.
-     */
-    if (path_openat2_stays_beneath(path, false) != 0)
-        return false;
-
-    /* An unjudgeable base reports "does not climb": the caller's own walk
-     * fails on the same bad descriptor with the accurate errno, where
-     * claiming a climb would silently reroute it.
-     */
-    char abs_path[LINUX_PATH_MAX];
-    if (dirfd_reconstruct_abs_path(dirfd, path, abs_path, sizeof(abs_path)) < 0)
-        return false;
-    return path_openat2_stays_beneath(abs_path, false) == 0;
-}
-
 /* Returns 1 when the reconstruction climbed the guest root, with @host_out
  * holding the absolute host path the caller opens instead of walking from
  * dirfd; 0 when the walk stays beneath it, leaving @host_out untouched; or -1
- * with errno set.
+ * with errno set. @in_sysroot reports whether the sysroot claims the
+ * reconstructed path. A caller with no way to substitute a spelling opts out
+ * of the climbed copy with a NULL @host_out.
  */
 static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
                                                    const char *path,
                                                    unsigned int flags,
+                                                   bool *in_sysroot,
                                                    char *host_out,
                                                    size_t host_outsz)
 {
+    *in_sysroot = false;
+
     char abs_path[LINUX_PATH_MAX];
     if (dirfd_reconstruct_abs_path(dirfd, path, abs_path, sizeof(abs_path)) < 0)
         return -1;
@@ -1067,10 +1226,17 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
 
     char host_buf[LINUX_PATH_MAX];
     const char *checked;
-    if (flags & PATH_TR_NOFOLLOW) {
-        checked = path_resolve_sysroot_nofollow_path(abs_path, host_buf,
-                                                     sizeof(host_buf));
-    } else if (flags & PATH_TR_CREATE) {
+    /* CREATE outranks NOFOLLOW, exactly as in path_translate_at's absolute
+     * ladder: a create decides where an absent leaf goes, which the create
+     * resolver anchors in the sysroot, while the lookup resolvers fall
+     * through to the host for an absent path. Testing NOFOLLOW first sends a
+     * renameat destination (translated with both flags) through the
+     * lookup fallback, so an in-sysroot target below an escaped directory
+     * reads as outside and the caller skips the escape walk entirely.
+     * Nofollow semantics are not lost: the create resolver never follows a
+     * final link either.
+     */
+    if (flags & PATH_TR_CREATE) {
         /* A pure containment probe must not mkdir() anything: its result is
          * discarded. A climbed resolution is the path the caller actually
          * opens, so it owes the caller's create-parents semantics, or the
@@ -1079,6 +1245,9 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
         bool create_parents = climbed && (flags & PATH_TR_CREATE_PARENTS) != 0;
         checked = path_resolve_sysroot_create_path(
             abs_path, host_buf, sizeof(host_buf), create_parents);
+    } else if (flags & PATH_TR_NOFOLLOW) {
+        checked = path_resolve_sysroot_nofollow_path(abs_path, host_buf,
+                                                     sizeof(host_buf));
     } else {
         checked =
             path_resolve_sysroot_path(abs_path, host_buf, sizeof(host_buf));
@@ -1086,15 +1255,24 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
 
     if (!checked)
         return -1;
+    /* The resolver returns its own buffer for a path the sysroot claims and the
+     * input pointer for one that falls through to the host, so this comparison
+     * is the sysroot-or-host decision, already taken. Report it rather than
+     * discard it: a relative name is measured from a descriptor and has no
+     * prefix of its own to make that call from.
+     */
+    *in_sysroot = checked != abs_path;
     if (!climbed)
         return 0;
     /* checked is either the sysroot spelling or the reconstructed guest path
      * itself, which the sysroot does not claim; both are absolute, so either
      * one lands where the guest's own resolution would.
      */
-    if (str_copy_trunc(host_out, checked, host_outsz) >= host_outsz) {
-        errno = ENAMETOOLONG;
-        return -1;
+    if (host_out) {
+        if (str_copy_trunc(host_out, checked, host_outsz) >= host_outsz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
     }
     return 1;
 }
@@ -1230,6 +1408,33 @@ static int reset_walk_fd(host_fd_t *current_fd, host_fd_t root_fd)
     return replace_walk_fd(current_fd, next_fd);
 }
 
+/* Spell one component the way the volume stores it, for a probe measured from
+ * @dirfd. A walker that asks the host for a name has to use the stored
+ * spelling; the guest's own would find nothing wherever an escape applies, and
+ * the walker would then report the absence rather than what is actually there.
+ * Outside a sysroot, and for any name needing no escape, this is the name
+ * itself.
+ */
+static int host_component_spelling(host_fd_t dirfd,
+                                   const char *guest,
+                                   char *out,
+                                   size_t outsz)
+{
+    casefold_walk_t walk;
+
+    if (!casefold_active()) {
+        if (str_copy_trunc(out, guest, outsz) >= outsz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return 0;
+    }
+    return casefold_resolve_at(dirfd, "", guest, false, out, outsz, &walk) ==
+                   CASEFOLD_ERROR
+               ? -1
+               : 0;
+}
+
 int path_openat2_crosses_mount(guest_fd_t dirfd,
                                const char *path,
                                bool in_root,
@@ -1313,6 +1518,13 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
         if (len == 1 && comp[0] == '.')
             continue;
 
+        /* The component's stored spelling, resolved once per component: the
+         * symlink probe below and the descent that follows it both address the
+         * same entry through the same descriptor, and each resolution costs a
+         * host probe.
+         */
+        char host_name[CASEFOLD_STORED_NAME_MAX];
+
         if (len == 2 && comp[0] == '.' && comp[1] == '.') {
             size_t before_len = strlen(current);
             guest_path_pop(current, floor_len);
@@ -1333,9 +1545,14 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
                 goto out;
             }
 
+            if (host_walk &&
+                host_component_spelling(current_fd, name, host_name,
+                                        sizeof(host_name)) < 0)
+                goto out;
+
             struct stat st;
             if (host_walk &&
-                fstatat(current_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+                fstatat(current_fd, host_name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
                 if (S_ISLNK(st.st_mode)) {
                     if (guest_path_append(current, sizeof(current), comp, len) <
                         0)
@@ -1353,8 +1570,8 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
                     str_copy_trunc(current, parent, sizeof(current));
 
                     char target[LINUX_PATH_MAX];
-                    ssize_t target_len = readlinkat(current_fd, name, target,
-                                                    sizeof(target) - 1);
+                    ssize_t target_len = readlinkat(current_fd, host_name,
+                                                    target, sizeof(target) - 1);
                     if (target_len < 0)
                         goto out;
                     if (++symlink_count > MAXSYMLINKS) {
@@ -1419,11 +1636,8 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
             rest++;
         if (host_walk && *rest != '\0' &&
             !(len == 2 && comp[0] == '.' && comp[1] == '.')) {
-            char name[NAME_MAX + 1];
-            if (path_component_copy(name, sizeof(name), comp, len) < 0)
-                goto out;
-            host_fd_t next_fd =
-                openat(current_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            host_fd_t next_fd = openat(current_fd, host_name,
+                                       O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (replace_walk_fd(&current_fd, next_fd) < 0)
                 goto out;
         }
@@ -1467,8 +1681,8 @@ int path_openat2_check_fd_xdev(int guest_fd, int start_class)
      * mis-classify as /tmp). Trust the precheck in those cases and only
      * re-derive the class when the resolution started at root: that is
      * precisely the window where a symlink can escape into an intercept class
-     * without the walker seeing it (sidecar shadows hide the link node from
-     * fstatat).
+     * without the walker seeing it (a link stored under an escaped spelling
+     * is invisible to a walker probing the guest spelling).
      *
      * The /proc/self/fd/N magic-link case (where snap.proc_path stamps the
      * resulting fd with a PROC label even though the real mount of the dup
@@ -1495,8 +1709,7 @@ int path_openat2_check_fd_xdev(int guest_fd, int start_class)
         char host_path[LINUX_PATH_MAX];
         if (fcntl(snap.host_fd, F_GETPATH, host_path) < 0)
             return -1;
-        if (host_path_to_guest_path(host_path, guest_path, sizeof(guest_path)) <
-            0)
+        if (path_host_to_guest(host_path, guest_path, sizeof(guest_path)) < 0)
             return -1;
         end_class = classify_guest_path_mount(guest_path);
     } else {

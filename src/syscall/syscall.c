@@ -2071,8 +2071,9 @@ static int64_t sc_openat2(guest_t *g,
         if (opened >= 0 && (resolve & RESOLVE_NO_XDEV) &&
             no_xdev_start_class >= 0) {
             /* The string walker cannot see symlinks that the kernel followed
-             * during the actual open (sysroot case-fold sidecar shadows hide
-             * the link node from the precheck's fstatat walk). Re-classify the
+             * during the actual open (on a case-fold sysroot a link stored
+             * under an escaped spelling is invisible to the precheck's fstatat
+             * walk when the spelling changes underneath it). Re-classify the
              * opened fd's resolved host path; if it landed in a different mount
              * class, drop the fd and return EXDEV. This also tightens the
              * precheck-vs-open TOCTOU window since the post-check sees the

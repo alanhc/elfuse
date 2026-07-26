@@ -102,6 +102,9 @@ What they do:
   - the BusyBox applet smoke suite (auto-resolved from
     `externals/test-fixtures/aarch64-musl/staticbin/bin/busybox` or
     downloaded into `build/busybox` on first run)
+  - the filename codec and case-exact path resolution unit tests
+  - the sysroot filename lanes: one representation per name, non-ASCII
+    and normalization, full-length names, and host-staged escape shapes
   - the sysroot procfs exec, FUSE-on-Alpine, and `timeout=0` regressions
   - the Rosetta CLI gating regressions
   - the hot-syscall guardrail (`tests/test-bench-guardrail.sh`)
@@ -177,6 +180,25 @@ understood divergence from the qemu reference kernel is listed in
 runs in both `elfuse-aarch64` and `qemu-aarch64` modes, so most tests are
 exercised twice per matrix run: once against `build/elfuse`, once against the
 real kernel.
+
+`ELFUSE_SKIP` is the same mechanism pointing the other way: tests that run only
+against the reference kernel. A test belongs there when it needs something the
+elfuse lane cannot provide: most often a writable, byte-exact root, which that
+lane has no sysroot to give and which the macOS root is not. A skip is not a
+pass, so the `elfuse-aarch64` row of `EXPECTED_BASELINES` does not move when a
+test is added to the list.
+
+Both lists match a test by its label, and a label matching nothing fails
+silently while still reading as deliberate policy, so
+`.ci/check-matrix-lists.sh` rejects a label that names no registered test and a
+label present in both lists, which would run under no runner at all.
+
+The filename tests are `ELFUSE_SKIP`'s main occupants. They assert that names
+differing only in case, or only in Unicode normalization, stay distinct,
+exactly what a case-folding host volume is entitled to get wrong. Running them
+against the VM's tmpfs turns those expectations into measurements; their
+elfuse-side coverage is the `make check` sysroot lanes, where a real sysroot
+exists.
 
 The x86_64 mode is narrower: it aggregates the Rosetta-specific acceptance
 scripts and their per-binary summaries into the same matrix runner, including

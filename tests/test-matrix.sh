@@ -363,12 +363,28 @@ QEMU_SKIP="
 #   write -- a genuine behavioral difference worth reviewing on its own,
 #   not just an environment artifact.
 
-is_qemu_skipped()
+# Tests that only run under qemu. A test belongs here when it needs a writable,
+# byte-exact root: the elfuse lane runs without a sysroot, and the macOS root is
+# neither writable nor byte-exact.
+#
+# The filename tests need one for a second reason. They assert that names Linux
+# keeps apart stay apart, which a case-folding volume is entitled to get wrong,
+# so running them without a sysroot would not merely fail to set up, it would
+# measure the host's naming rules instead of Linux's. Their elfuse-side coverage
+# is the make-check sysroot lanes.
+ELFUSE_SKIP="
+    test-sysroot-name-unique
+    test-sysroot-name-relative
+"
+
+# Whitespace-separated membership test, shared by the per-runner skip lists so a
+# third runner does not need a third copy.
+list_has()
 {
-    local label="$1"
-    local skipped
-    for skipped in $QEMU_SKIP; do
-        [ "$skipped" = "$label" ] && return 0
+    local needle="$1"
+    local item
+    for item in $2; do
+        [ "$item" = "$needle" ] && return 0
     done
     return 1
 }
@@ -380,8 +396,13 @@ is_qemu_skipped()
 maybe_qemu_skip()
 {
     local runner="$1" label="$2"
-    if [ "$runner" = "run_qemu" ] && is_qemu_skipped "$label"; then
+    if [ "$runner" = "run_qemu" ] && list_has "$label" "$QEMU_SKIP"; then
         test_report skip "$label" " (qemu)"
+        skip=$((skip + 1))
+        return 0
+    fi
+    if [ "$runner" = "run_elfuse" ] && list_has "$label" "$ELFUSE_SKIP"; then
+        test_report skip "$label" " (elfuse: needs a sysroot lane)"
         skip=$((skip + 1))
         return 0
     fi
@@ -826,6 +847,19 @@ run_unit_tests()
 
     printf "\nX11 raw protocol\n"
     test_check "$runner" "test-x11" "0 failed" "$bindir/test-x11"
+
+    # Filenames, against the reference kernel. These pin what Linux does with
+    # names that collide only under case folding or Unicode normalization, and
+    # with names at the length limit, the expectations the sysroot's on-disk
+    # encoding exists to satisfy. Against a real kernel they are measurements
+    # rather than beliefs, because the VM's / and /tmp are tmpfs: byte-exact and
+    # case-sensitive. Each cleans up after itself, so repeated runs in one boot
+    # are safe.
+    printf "\nFilenames\n"
+    test_check "$runner" "test-sysroot-name-unique" "0 failed" \
+        "$bindir/test-sysroot-name-unique"
+    test_check "$runner" "test-sysroot-name-relative" "0 failed" \
+        "$bindir/test-sysroot-name-relative"
 }
 
 run_coreutils_tests()
@@ -1255,7 +1289,7 @@ run_suite()
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
     "elfuse-aarch64|241|0"
-    "qemu-aarch64|218|0"
+    "qemu-aarch64|220|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

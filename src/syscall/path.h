@@ -120,7 +120,30 @@ int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,
                       path_translation_t *tx);
-int path_translate_dirent_name(guest_fd_t dirfd,
+/* Convert a host path to the guest path naming the same object: strip the
+ * sysroot prefix, and decode any component the volume made elfuse store under
+ * an escape. The result is what the guest must be shown for its own cwd, and it
+ * has to be a path the guest can hand straight back to chdir(2).
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG when @out is too small.
+ */
+int path_host_to_guest(const char *host_path, char *out, size_t outsz);
+
+/* True when the directory behind @host_dirfd is one whose entries elfuse may
+ * have stored escaped: a folding sysroot is configured and the directory's
+ * canonical host path lies under it. One answer per directory read, not per
+ * entry: the answer is a property of the directory, and F_GETPATH is a
+ * syscall. When the fd's path cannot be read the answer is false: decoding is
+ * a claim that elfuse wrote the name, so it needs the directory proven inside
+ * the sysroot, or a foreign escape-shaped entry decodes into a phantom name no
+ * lookup can resolve. The directory-unlinked-while-open failure lists nothing
+ * either way, and the residual cost of failing closed, a live in-sysroot
+ * directory that lost its path showing stored spellings, at least shows names
+ * that open.
+ */
+bool path_dirent_dir_holds_escapes(host_fd_t host_dirfd);
+
+int path_translate_dirent_name(bool dir_holds_escapes,
                                const char *host_name,
                                char *guest_name,
                                size_t guest_name_sz);
@@ -133,13 +156,6 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
                             char *out,
                             size_t outsz);
 int sys_path_has_symlink(guest_fd_t dirfd, const char *path);
-/* Whether resolving the relative @path from @dirfd walks above the guest root,
- * where Linux clamps '..' (path_resolution(7)) but a walk over host
- * descriptors keeps climbing. False for absolute paths and whenever the
- * reconstruction cannot be judged; callers use it to hand such paths to the
- * clamped absolute resolvers instead of walking them from @dirfd.
- */
-bool path_relative_climbs_guest_root(guest_fd_t dirfd, const char *path);
 
 const char *path_resolve_sysroot_path(const char *path,
                                       char *buf,
@@ -173,13 +189,14 @@ int path_openat2_resolved_within_root(guest_fd_t dirfd,
  * on every non-error return so the caller can re-run the check against the
  * actually opened fd via path_openat2_check_fd_xdev. The post-open check is
  * what closes the symlink bypass for callers that do not also set
- * RESOLVE_NO_SYMLINKS: the precheck's fstatat walk cannot see symlinks that
- * live in a sidecar shadow directory (case-fold sysroot), so the kernel may
- * follow a link the walker did not, and only F_GETPATH on the resulting fd
- * reveals the real landing site.
+ * RESOLVE_NO_SYMLINKS: the precheck's fstatat walk probes each component by
+ * its stored spelling, and on a case-fold sysroot that spelling can change
+ * between the precheck and the open, so the kernel may follow a link the
+ * walker did not, and only F_GETPATH on the resulting fd reveals the real
+ * landing site.
  *
  * Known gaps (best-effort by design):
- * - host_path_to_guest_path strips the configured sysroot prefix with
+ * - path_host_to_guest strips the configured sysroot prefix with
  *    a case-sensitive strncmp; on case-insensitive macOS volumes a
  *    differently-cased F_GETPATH could fail to strip and the dirfd is
  *    then classified as the root class. Sysroots that happen to live

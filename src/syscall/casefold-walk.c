@@ -32,10 +32,18 @@ bool casefold_active(void)
 
 typedef enum {
     PROBE_ERROR = -1,
-    PROBE_EXACT = 0,   /* an entry exists spelled exactly as asked */
-    PROBE_FOLDED = 1,  /* an entry exists, but under a different spelling */
-    PROBE_ABSENT = 2,  /* nothing is there */
-    PROBE_UNUSABLE = 3 /* the volume refuses to hold this name at all */
+    PROBE_EXACT = 0,    /* an entry exists spelled exactly as asked */
+    PROBE_FOLDED = 1,   /* an entry exists, but under a different spelling */
+    PROBE_ABSENT = 2,   /* nothing is there */
+    PROBE_UNUSABLE = 3, /* the volume refuses to hold this name at all */
+    /* Nothing is there because a component of the prefix is not a directory.
+     * Kept apart from PROBE_ABSENT because the two answer differently for a
+     * caller deciding whether the sysroot has a claim on the path: resolution
+     * stopped inside the tree (path_resolution(7)), so the path is the
+     * sysroot's to answer for and owes ENOTDIR rather than falling through to
+     * a host file that merely shares the literal spelling.
+     */
+    PROBE_NOTDIR = 4
 } probe_result_t;
 
 /* Scan the directory holding @path for an entry spelled exactly @leaf. Only
@@ -95,7 +103,9 @@ static probe_result_t probe_by_readdir(host_fd_t base_fd,
      */
     if (fstatat(base_fd, path, &st, AT_SYMLINK_NOFOLLOW) == 0)
         return PROBE_FOLDED;
-    return errno == ENOENT || errno == ENOTDIR ? PROBE_ABSENT : PROBE_ERROR;
+    if (errno == ENOTDIR)
+        return PROBE_NOTDIR;
+    return errno == ENOENT ? PROBE_ABSENT : PROBE_ERROR;
 }
 
 const char *casefold_attr_stored_name(const void *reply,
@@ -186,8 +196,9 @@ static probe_result_t probe_exact(host_fd_t base_fd,
 
     switch (errno) {
     case ENOENT:
-    case ENOTDIR:
         return PROBE_ABSENT;
+    case ENOTDIR:
+        return PROBE_NOTDIR;
     case EILSEQ:
     case EINVAL:
         /* The volume will not hold this byte sequence as a name, so it can
@@ -364,9 +375,8 @@ static probe_result_t resolve_component(host_fd_t base_fd,
      * the name alone, which is what keeps two processes creating colliding
      * names off the same slot.
      */
-    if (verdict == PROBE_ABSENT)
-        return name_by_rule(guest, host, hostsz) < 0 ? PROBE_ERROR
-                                                     : PROBE_ABSENT;
+    if (verdict == PROBE_ABSENT || verdict == PROBE_NOTDIR)
+        return name_by_rule(guest, host, hostsz) < 0 ? PROBE_ERROR : verdict;
     /* The slot is taken by a different spelling, or refused outright, so the
      * name belongs at its escape even though nothing is there yet. Reported as
      * folded rather than absent: the two differ to a caller deciding whether
@@ -400,6 +410,7 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
     walk->parent_offset = 0;
     walk->leaf_offset = 0;
     walk->folded = false;
+    walk->notdir = false;
 
     len = str_copy_trunc(out, base_host_prefix ? base_host_prefix : "", outsz);
     if (len >= outsz) {
@@ -445,6 +456,14 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
              */
             if (verdict == PROBE_FOLDED)
                 walk->folded = true;
+            /* Resolution stopped at a component that is not a directory, so
+             * the sysroot has answered and the caller must not look for the
+             * path on the host. Recorded rather than returned immediately so
+             * out still receives the remaining components: a caller reporting
+             * the error issues its own syscall against the whole spelling.
+             */
+            if (verdict == PROBE_NOTDIR)
+                walk->notdir = true;
             absent = !present;
         }
 

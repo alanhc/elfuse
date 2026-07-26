@@ -97,7 +97,8 @@ Key files:
 | `src/syscall/fs.c`, `fs-stat.c`, `fs-xattr.c` | filesystem syscalls |
 | `src/syscall/io.c`, `poll.c`, `fd.c`, `fdtable.c` | I/O, polling, FD lifecycle and table |
 | `src/syscall/path.c` | centralized guest-to-host path resolution |
-| `src/syscall/sidecar.c` | case-fold sidecar tokens for case-insensitive macOS volumes |
+| `src/syscall/casefold.c` | guest/host filename encoding for case-folding volumes (see [filenames.md](filenames.md)) |
+| `src/syscall/casefold-walk.c` | case-exact path resolution against the sysroot |
 | `src/syscall/fuse.c` | guest-internal FUSE transport and minimal VFS |
 | `src/syscall/inotify.c` | inotify via kqueue `EVFILT_VNODE` |
 | `src/syscall/sysvipc.c` | System V shared memory and semaphores |

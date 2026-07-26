@@ -62,6 +62,13 @@ typedef struct {
      * rather than treat the path as unclaimed and look for it on the host.
      */
     bool folded;
+    /* Some component of the path is not a directory, so resolution stopped
+     * there (path_resolution(7)) and everything below it owes ENOTDIR. Absent
+     * for the same reason folded is: the path is not there, but the sysroot
+     * decided that, so a caller must report the error rather than treat the
+     * path as unclaimed and look for it on the host.
+     */
+    bool notdir;
 } casefold_walk_t;
 
 /* Resolve @guest_path, interpreted relative to @base_fd, into its host spelling

@@ -28,6 +28,8 @@ analyze:
 check-format: check-syscall-dispatch
 	@echo "  FMT     src/ tests/ (check)"
 	$(Q)$(CLANG_FORMAT) --dry-run --Werror $(C_FORMAT_FILES)
+	@echo "  MATRIX  skip lists"
+	$(Q)bash .ci/check-matrix-lists.sh
 	@printf "  SHCHK   %d scripts\n" $(words $(SHELL_SCRIPTS))
 	@fail=0; \
 	for f in $(SHELL_SCRIPTS); do \

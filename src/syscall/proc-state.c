@@ -18,6 +18,7 @@
 #include "utils.h"
 
 #include "core/sysroot.h"
+#include "syscall/casefold-walk.h"
 
 #include "runtime/thread.h"
 
@@ -84,20 +85,17 @@ void proc_state_init(void)
 int proc_cwd_refresh(void)
 {
     char cwd[LINUX_PATH_MAX];
-    const char *guest_cwd = cwd;
+    char guest[LINUX_PATH_MAX];
     if (!getcwd(cwd, sizeof(cwd)))
         return -1;
 
-    char sr[LINUX_PATH_MAX];
-    if (proc_sysroot_snapshot(sr, sizeof(sr))) {
-        size_t sr_len = strlen(sr);
-        if (!strncmp(cwd, sr, sr_len) &&
-            (cwd[sr_len] == '\0' || cwd[sr_len] == '/')) {
-            guest_cwd = cwd + sr_len;
-            if (*guest_cwd == '\0')
-                guest_cwd = "/";
-        }
-    }
+    /* One conversion, shared with the rest of the path layer: a private
+     * prefix-strip here would not know a component can be stored escaped, and
+     * would hand the guest a cwd it cannot chdir back into.
+     */
+    if (path_host_to_guest(cwd, guest, sizeof(guest)) < 0)
+        return -1;
+    const char *guest_cwd = guest;
 
     size_t len = strlen(guest_cwd);
     pthread_mutex_lock(&cwd_lock);
@@ -442,6 +440,29 @@ bool proc_sysroot_casefold_enabled(void)
     pthread_mutex_unlock(&sysroot_lock);
     return enabled;
 }
+
+/* True when realpath(3) failed because the path stopped resolving rather than
+ * because it resolves somewhere it should not. A sibling thread or process can
+ * unlink or rename the entry between the resolver's existence probe and this
+ * recheck, and canonicalizing a vanished path dies with ENOENT (or ENOTDIR
+ * when a component was replaced by a file). Nothing can be reached through a
+ * path that no longer resolves, so the caller may keep the sysroot spelling
+ * and let its own syscall report the truth; turning the failure into a veto
+ * manufactures ELOOP for a plain concurrent unlink. Every other realpath
+ * errno stays a veto: a loop really is ELOOP, and denying on EACCES or EIO is
+ * the conservative side of a containment check.
+ *
+ * The reasoning covers the sysroot argument as much as the path under it: a
+ * sysroot renamed out from under a running guest leaves nothing reachable
+ * beneath it either, so the caller's own syscall owes the same ENOENT. There
+ * is no containment question left to answer once the root of the comparison
+ * is gone.
+ */
+static bool realpath_vanished(void)
+{
+    return errno == ENOENT || errno == ENOTDIR;
+}
+
 /* Confirm @resolved_path canonicalizes inside @sysroot. This is a
  * check-then-use sequence: callers issue the actual syscall after this returns,
  * so a symlink swapped in between will not be re-validated. openat2
@@ -456,11 +477,11 @@ static bool sysroot_path_is_contained(const char *resolved_path,
     char real_sysroot[LINUX_PATH_MAX], real_path[LINUX_PATH_MAX];
 
     if (!realpath(sysroot, real_sysroot))
-        return false;
+        return realpath_vanished();
 
     if (follow_final) {
         if (!realpath(resolved_path, real_path))
-            return false;
+            return realpath_vanished();
     } else {
         const char *base = strrchr(resolved_path, '/');
         /* "." and ".." basenames navigate the directory tree and cannot
@@ -471,7 +492,7 @@ static bool sysroot_path_is_contained(const char *resolved_path,
          */
         if (base && (!strcmp(base + 1, "..") || !strcmp(base + 1, "."))) {
             if (!realpath(resolved_path, real_path))
-                return false;
+                return realpath_vanished();
         } else {
             char parent[LINUX_PATH_MAX];
             char *slash;
@@ -489,7 +510,7 @@ static bool sysroot_path_is_contained(const char *resolved_path,
 
             *slash = '\0';
             if (!realpath(parent, real_path))
-                return false;
+                return realpath_vanished();
             size_t parent_len = strlen(real_path);
             if (snprintf(real_path + parent_len, sizeof(real_path) - parent_len,
                          "/%s",
@@ -751,13 +772,92 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     if (seeded <= 0)
         return seeded < 0 ? NULL : path;
 
-    if (sysroot_path_exists(buf, follow_final)) {
+    /* Does this path name something under the sysroot, and if so under what
+     * host spelling? On a volume that folds case those are one question: the
+     * walk decides each component's stored spelling and reports whether the
+     * whole path resolved, so its verdict is the existence answer and its
+     * output is the host path. On a byte-exact volume the guest spelling is
+     * the host spelling, and a concatenation plus one probe answers both.
+     */
+    bool present;
+    bool folded = false;
+    if (casefold_active()) {
+        casefold_walk_t walk;
+        casefold_verdict_t verdict = casefold_resolve_at(
+            AT_FDCWD, sr, clamped, follow_final, buf, bufsz, &walk);
+
+        if (verdict == CASEFOLD_ERROR)
+            return NULL;
+        present = verdict == CASEFOLD_FOUND;
+        folded = walk.folded;
+        /* The walk stopped at a component that is not a directory, which is
+         * the answer the byte-exact branch below reads off ENOTDIR: resolution
+         * fails there (path_resolution(7)) and the host fallback must not run,
+         * or "file/tail" would be reported against an unrelated host path,
+         * ENOENT where Linux owes ENOTDIR. The caller's own syscall against
+         * the sysroot spelling reproduces the right errno. The containment
+         * check is skipped for the reason the folded return below gives:
+         * nothing past the offending component is ever reached.
+         */
+        if (!present && walk.notdir)
+            return buf;
+        /* An all-slash guest path names the root, which always exists, is
+         * trivially contained, and has no parent for the containment check
+         * to split off: with the sysroot at "/" the resolved path is the
+         * one-character prefix itself, and treating that shape as impossible
+         * reports ELOOP for lstat("/").
+         */
+        if (present && walk.leaf_offset == 0)
+            return buf;
+    } else {
+        int n = snprintf(buf, bufsz, "%s%s", sr, clamped);
+        if (n < 0) {
+            if (errno == 0)
+                errno = EINVAL;
+            return NULL;
+        }
+        if ((size_t) n >= bufsz) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+        present = sysroot_path_exists(buf, follow_final);
+        /* A probe that dies with ENOTDIR found a sysroot component that is
+         * not a directory. Linux resolves left to right and fails there with
+         * ENOTDIR (path_resolution(7)), so the sysroot has answered: the
+         * host fallback below must not run, or "file/" and "file/tail" would
+         * be reported against an unrelated host path, ENOENT where Linux
+         * owes ENOTDIR. The caller's own syscall against the sysroot
+         * spelling reproduces the right errno on the host. The containment
+         * check is skipped for the reason the folded return below gives:
+         * resolution never reaches anything past the offending component.
+         */
+        if (!present && errno == ENOTDIR)
+            return buf;
+    }
+
+    if (present) {
         if (!sysroot_path_is_contained(buf, sr, follow_final)) {
             errno = ELOOP;
             return NULL;
         }
         return buf;
     }
+
+    /* The sysroot holds an entry where this path asked, spelled differently,
+     * so the path is absent to a byte-exact reader but the sysroot has a claim
+     * on it, and the answer Linux owes is ENOENT. Falling through would open an
+     * unrelated host file that merely shares the name, which is how a
+     * wrong-case lookup escapes the tree entirely.
+     *
+     * Returning before the containment check above is deliberate: a folded
+     * component's escape does not exist, every component before it resolved
+     * case-exactly without passing through a link, and resolution proceeds
+     * component by component from the left (path_resolution(7)), so the
+     * caller's syscall dies with ENOENT at the folded component before
+     * anything after it could be reached, contained or not.
+     */
+    if (folded)
+        return buf;
 
     /* Prevent escaping guest system paths to macOS host paths, which leads
      * to host contamination and permission failures (e.g. SIP/EPERM).
@@ -811,34 +911,101 @@ const char *proc_resolve_sysroot_create_path(const char *path,
         return buf;
 
     char parent[LINUX_PATH_MAX];
-    str_copy_trunc(parent, buf, sizeof(parent));
-    /* Trailing slashes name the same directory (POSIX); drop them so the final
-     * separator splits off the leaf component rather than matching the trailing
-     * slash itself, which would leave the target as its own parent.
-     */
-    size_t plen = strlen(parent);
-    while (plen > 1 && parent[plen - 1] == '/')
-        parent[--plen] = '\0';
-    char *slash = strrchr(parent, '/');
-    if (!slash || slash == parent)
-        return buf;
+    bool parent_present;
 
-    *slash = '\0';
-    if (access(parent, F_OK) == 0) {
+    /* The target does not exist yet, so what has to be decided is where it
+     * would go: the host spelling of every component leading to it, and
+     * whether that parent is there. On a folding volume a concatenated parent
+     * answers neither: a parent stored escaped reads as absent, and a
+     * wrong-case one folds onto a directory the create would then land in.
+     */
+    if (casefold_active()) {
+        casefold_walk_t walk;
+
+        if (casefold_resolve_at(AT_FDCWD, sr, clamped, false, buf, bufsz,
+                                &walk) == CASEFOLD_ERROR)
+            return NULL;
+        if (str_copy_trunc(parent, buf, sizeof(parent)) >= sizeof(parent)) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+        /* An all-slash guest path names the root, which always exists and has
+         * no parent to check.
+         */
+        if (walk.leaf_offset == 0)
+            return buf;
+        /* The walk records where the parent's spelling ends, so truncating
+         * there needs no correction for the separator: only the walk knows
+         * whether it inserted one, and with the sysroot at "/" it did not:
+         * the parent is the root, not the empty string a leaf_offset - 1
+         * truncation would leave.
+         */
+        parent[walk.parent_offset] = '\0';
+        parent_present = walk.parent_found;
+
+        /* A fold above the leaf means the parent the guest named is not the
+         * entry the volume matched, so that parent does not exist. Both other
+         * answers are wrong: falling through puts the create on the host, and
+         * returning the sysroot spelling puts it inside the folded entry,
+         * which is a directory this sysroot did not create under that name.
+         */
+        if (walk.folded && !parent_present) {
+            errno = ENOENT;
+            return NULL;
+        }
+    } else {
+        int n = snprintf(buf, bufsz, "%s%s", sr, clamped);
+        if (n < 0) {
+            if (errno == 0)
+                errno = EINVAL;
+            return NULL;
+        }
+        if ((size_t) n >= bufsz) {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+
+        /* An all-slash guest path ("/", "///") names the root, which always
+         * exists and has no parent to check; trimming it would walk strrchr
+         * into the sysroot prefix and trip the containment guard.
+         *
+         * Return buf as-is.
+         */
+        if (clamped[strspn(clamped, "/")] == '\0')
+            return buf;
+
+        str_copy_trunc(parent, buf, sizeof(parent));
+        /* Trailing slashes name the same directory (POSIX); drop them so the
+         * final separator splits off the leaf component rather than matching
+         * the trailing slash itself, which would leave the target as its own
+         * parent.
+         */
+        size_t plen = strlen(parent);
+        while (plen > 1 && parent[plen - 1] == '/')
+            parent[--plen] = '\0';
+        char *slash = strrchr(parent, '/');
+        if (!slash || slash == parent)
+            return buf;
+
+        *slash = '\0';
+        parent_present = access(parent, F_OK) == 0;
+        /* access() failed for a reason other than "parent missing" (e.g.
+         * EACCES, ELOOP, ENAMETOOLONG, EIO). Treating those as "parent absent"
+         * would let the redirect logic auto-create or silently fall back to
+         * the host literal, which can bypass sysroot resolution. Surface the
+         * real error.
+         */
+        if (!parent_present && errno != ENOENT && errno != ENOTDIR)
+            return NULL;
+    }
+
+    if (parent_present) {
         if (!sysroot_path_is_contained(parent, sr, true)) {
             errno = ELOOP;
             return NULL;
         }
         return buf;
     }
-
-    /* access() failed for a reason other than "parent missing" (e.g. EACCES,
-     * ELOOP, ENAMETOOLONG, EIO). Treating those as "parent absent" would let
-     * the redirect logic auto-create or silently fall back to the host literal,
-     * which can bypass sysroot resolution. Surface the real error.
-     */
-    if (errno != ENOENT && errno != ENOTDIR)
-        return NULL;
 
     /* Parent doesn't exist in sysroot. Only the temp roots and the guest system
      * directories are forced to resolve there; everything else falls back to

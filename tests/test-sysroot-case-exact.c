@@ -7,22 +7,22 @@
  * Linux path resolution treats names as byte strings: a lookup whose spelling
  * differs from the on-disk entry only by case (or Unicode normalization form)
  * must fail with ENOENT. APFS resolves such lookups case- and
- * normalization-insensitively, so on a case-insensitive sysroot the sidecar
- * walk has to verify the on-disk spelling of every unmapped component instead
- * of trusting the folded openat/fstatat probe. Read-path syscalls (stat, open,
- * access) used to leak the folded match through; mutation syscalls already
- * went through a byte-exact readdir check.
+ * normalization-insensitively, so on a case-insensitive sysroot the case-exact
+ * walk (src/syscall/casefold-walk.c) has to verify the on-disk spelling of
+ * every fold-stable component instead of trusting the folded openat/fstatat
+ * probe. Read-path syscalls (stat, open, access) used to leak the folded match
+ * through; mutation syscalls already went through a byte-exact readdir check.
  *
  * The harness (mk/tests.mk) stages inside the sysroot, host-side:
  *   /data/Makefile   ("exact\n")
  *   /data/sub/f.txt  ("sub\n")
  *   /data/caf\xc3\xa9  NFC spelling ("nfc\n")
- * and passes argv[1] = "ci" when the sysroot volume is case-insensitive
- * (sidecar active) or "cs" when it is case-sensitive. The wrong-case probes
- * hold either way; the normalization probes only hold with the sidecar's
- * byte-exact verification, so they are skipped under "cs" (APFS folds
- * normalization even on case-sensitive volumes -- a documented limitation of
- * running without the sidecar).
+ * and passes argv[1] = "ci" when the sysroot volume is case-insensitive (the
+ * walk active) or "cs" when it is case-sensitive. The wrong-case probes hold
+ * either way; the normalization probes only hold with the walk's byte-exact
+ * verification, so they are skipped under "cs" (APFS folds normalization even
+ * on case-sensitive volumes, a documented limitation of running without the
+ * walk).
  */
 
 #include <errno.h>
