@@ -36,6 +36,13 @@ typedef enum {
     CASEFOLD_ERROR = -1, /* the probe failed; errno is set */
     CASEFOLD_FOUND = 0,  /* every component resolved; out names the object */
     CASEFOLD_ABSENT = 1, /* out is where the object would have to live */
+    /* A component the walk had to pass through is a symlink. out names that
+     * link in host spelling; the caller resolves the target in the guest
+     * namespace and comes back with the spliced path. The walk does not follow
+     * it itself, because where an absolute target lands is a dispatch question
+     * (sysroot or host), and the walk sees only the sysroot side.
+     */
+    CASEFOLD_SYMLINK = 2,
 } casefold_verdict_t;
 
 typedef struct {
@@ -69,6 +76,15 @@ typedef struct {
      * path as unclaimed and look for it on the host.
      */
     bool notdir;
+    /* Set with CASEFOLD_SYMLINK: the byte offset in the guest path at which
+     * the components after the link begin, or the path length when the link
+     * was the final component.
+     */
+    size_t link_rest_offset;
+    /* Offset in the guest path of the link component itself, so the caller can
+     * rebuild the directory a relative target is measured from.
+     */
+    size_t link_guest_offset;
 } casefold_walk_t;
 
 /* Resolve @guest_path, interpreted relative to @base_fd, into its host spelling

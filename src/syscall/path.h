@@ -120,6 +120,29 @@ int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,
                       path_translation_t *tx);
+/* Longest symlink chain a resolution may follow before reporting ELOOP, as
+ * Linux does (include/linux/namei.h). Shared so the path layer and the sysroot
+ * resolvers cannot disagree about when a chain has gone on too long.
+ */
+#ifndef MAXSYMLINKS
+#define MAXSYMLINKS 40
+#endif
+
+/* Splice a symlink target back into a path being resolved: @target followed by
+ * whatever of the original path was left unconsumed. @prefix is prepended for a
+ * relative target only, and names the directory holding the link; pass NULL
+ * when the caller re-anchors another way. One copy, because the concatenation
+ * is where a spliced path could be silently shortened into a different one.
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG.
+ */
+int path_splice_link_target(const char *prefix,
+                            size_t prefix_len,
+                            const char *target,
+                            const char *rest,
+                            char *out,
+                            size_t outsz);
+
 /* Convert a host path to the guest path naming the same object: strip the
  * sysroot prefix, and decode any component the volume made elfuse store under
  * an escape. The result is what the guest must be shown for its own cwd, and it

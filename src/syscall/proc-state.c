@@ -762,6 +762,102 @@ static bool is_sysroot_backed_temp_path(const char *path)
     return false;
 }
 
+/* Resolve @path under @sr, following every symlink the walk has to pass
+ * through, and report the guest path it finally names in @guest_out.
+ *
+ * A link records the bytes the guest wrote, and readlink(2) owes those bytes
+ * back, so a target cannot be rewritten on the way in. Following it therefore
+ * has to happen in the guest's namespace: a relative target is joined to the
+ * directory holding the link, an absolute one replaces the path outright, and
+ * either way the result re-enters resolution as an ordinary guest path. That is
+ * what makes an absolute target behave like the same path typed by the guest
+ * rather than like a host path, which is what the host kernel would make of it.
+ *
+ * Iterative because a chain may be MAXSYMLINKS deep and each step needs a whole
+ * path buffer; recursing would put 40 of them on the stack.
+ */
+static casefold_verdict_t resolve_through_links(const char *sr,
+                                                const char *path,
+                                                bool follow_final,
+                                                char *buf,
+                                                size_t bufsz,
+                                                casefold_walk_t *walk,
+                                                char *guest_out,
+                                                size_t guest_outsz)
+{
+    char splice[LINUX_PATH_MAX];
+    char norm[LINUX_PATH_MAX];
+    const char *cur = path;
+
+    for (int depth = 0;; depth++) {
+        casefold_verdict_t verdict;
+        char target[LINUX_PATH_MAX];
+        const char *rest;
+        ssize_t n;
+
+        verdict = casefold_resolve_at(AT_FDCWD, sr, cur, follow_final, buf,
+                                      bufsz, walk);
+        if (verdict != CASEFOLD_SYMLINK) {
+            if (str_copy_trunc(guest_out, cur, guest_outsz) >= guest_outsz) {
+                errno = ENAMETOOLONG;
+                return CASEFOLD_ERROR;
+            }
+            return verdict;
+        }
+
+        /* @depth counts links actually crossed, so the guard sits with the
+         * readlink it bounds; the terminal iteration resolves without
+         * following anything and consumes no budget. Linux resolves a 40-link
+         * chain and fails following the 41st (path_resolution(7)), the same
+         * accounting path_openat2_crosses_mount uses.
+         */
+        if (depth >= MAXSYMLINKS) {
+            errno = ELOOP;
+            return CASEFOLD_ERROR;
+        }
+
+        /* buf names the link itself, in the spelling the volume stores, so the
+         * host can read it even when the name had to be escaped.
+         */
+        n = readlink(buf, target, sizeof(target) - 1);
+        if (n < 0)
+            return CASEFOLD_ERROR;
+        target[n] = '\0';
+
+        rest = cur + walk->link_rest_offset;
+
+        /* A relative target is measured from the directory holding the link,
+         * which is the guest path up to the link component.
+         */
+        if (path_splice_link_target(cur, walk->link_guest_offset, target, rest,
+                                    splice, sizeof(splice)) < 0)
+            return CASEFOLD_ERROR;
+        /* A target may carry '..' that climbs above the guest root, which
+         * the walk would append literally and follow out of the sysroot. Clamp
+         * it exactly as an entry path is clamped; an interior '..' stays for
+         * the host to resolve against the directory the link named.
+         */
+        if (!clamp_dotdot_at_guest_root(norm, splice, sizeof(norm))) {
+            errno = ENAMETOOLONG;
+            return CASEFOLD_ERROR;
+        }
+        cur = norm;
+    }
+}
+
+/* After a walk that may have followed links, point @path at the guest path it
+ * finally named. Reports whether a link was actually crossed, because the
+ * host-fallback decision downstream is different for a path the guest typed
+ * and one a link handed it; shared by both resolvers so the two cannot drift.
+ */
+static bool rebase_after_link(const char **path, const char *followed)
+{
+    if (!strcmp(*path, followed))
+        return false;
+    *path = followed;
+    return true;
+}
+
 static const char *proc_resolve_sysroot_path_flags(const char *path,
                                                    char *buf,
                                                    size_t bufsz,
@@ -771,6 +867,10 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     int seeded = sysroot_seed_host_path(path, buf, bufsz, sr, clamped);
     if (seeded <= 0)
         return seeded < 0 ? NULL : path;
+    /* Moves to the link's target once one is followed, so everything below
+     * decides from where resolution actually ended up.
+     */
+    const char *lookup = clamped;
 
     /* Does this path name something under the sysroot, and if so under what
      * host spelling? On a volume that folds case those are one question: the
@@ -781,10 +881,13 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
      */
     bool present;
     bool folded = false;
+    bool followed_link = false;
+    char followed[LINUX_PATH_MAX];
     if (casefold_active()) {
         casefold_walk_t walk;
-        casefold_verdict_t verdict = casefold_resolve_at(
-            AT_FDCWD, sr, clamped, follow_final, buf, bufsz, &walk);
+        casefold_verdict_t verdict =
+            resolve_through_links(sr, lookup, follow_final, buf, bufsz, &walk,
+                                  followed, sizeof(followed));
 
         if (verdict == CASEFOLD_ERROR)
             return NULL;
@@ -809,8 +912,15 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
          */
         if (present && walk.leaf_offset == 0)
             return buf;
+        /* Everything below decides between the sysroot and the host, and after
+         * a link that decision belongs to where the link pointed, not to where
+         * the guest started. An absolute target is then treated exactly like
+         * the same absolute path from the guest: the sysroot when it is there,
+         * the host when it is not and the path is not a guest system directory.
+         */
+        followed_link = rebase_after_link(&lookup, followed);
     } else {
-        int n = snprintf(buf, bufsz, "%s%s", sr, clamped);
+        int n = snprintf(buf, bufsz, "%s%s", sr, lookup);
         if (n < 0) {
             if (errno == 0)
                 errno = EINVAL;
@@ -869,11 +979,40 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
      */
     char norm_path[LINUX_PATH_MAX];
     bool has_norm =
-        lexical_normalize_absolute_path(norm_path, clamped, sizeof(norm_path));
-    const char *path_to_check = has_norm ? norm_path : clamped;
+        lexical_normalize_absolute_path(norm_path, lookup, sizeof(norm_path));
+    const char *path_to_check = has_norm ? norm_path : lookup;
     if (is_guest_system_path(path_to_check) ||
         is_sysroot_backed_temp_path(path_to_check))
         return buf;
+
+    /* A path reached by following a symlink never falls through to the host.
+     * An absolute target typed by the guest is one thing: the guest asked for
+     * it, and the host fallback is the documented answer. A target recorded
+     * inside the sysroot is another: honoring it would let anything that can
+     * write a symlink there hand the guest a file from outside the tree, which
+     * is the escape tests/test-sysroot-symlink-escape.c exists to prevent.
+     * Resolution stops at the sysroot spelling, so the caller's own syscall
+     * reports the path as missing, which is what it is in the guest's
+     * namespace.
+     */
+    if (followed_link) {
+        /* The sysroot does not have it. If the host does, the link was a way
+         * to reach a file outside the tree, and refusing is the whole point;
+         * report ELOOP, which is what resolution stopping at a link means and
+         * what callers of this resolver already propagate. If the host has
+         * nothing either the link simply dangles, and buf lets the caller's own
+         * syscall say so.
+         *
+         * The collapsed spelling is what the host is asked about: a target
+         * reaching out of the tree keeps the '..' components that carried it
+         * there, and those name nothing from the host's root.
+         */
+        if (sysroot_path_exists(path_to_check, follow_final)) {
+            errno = ELOOP;
+            return NULL;
+        }
+        return buf;
+    }
 
     return path;
 }
@@ -899,6 +1038,10 @@ const char *proc_resolve_sysroot_create_path(const char *path,
     int seeded = sysroot_seed_host_path(path, buf, bufsz, sr, clamped);
     if (seeded <= 0)
         return seeded < 0 ? NULL : path;
+    /* Moves to the link's target once one is followed, so everything below
+     * decides from where resolution actually ended up.
+     */
+    const char *lookup = clamped;
 
     /* An all-slash guest path ("/", "///", and anything clamping to them)
      * names the root, which always exists and has no parent to check; trimming
@@ -907,7 +1050,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      *
      * Return buf as-is.
      */
-    if (clamped[strspn(clamped, "/")] == '\0')
+    if (lookup[strspn(lookup, "/")] == '\0')
         return buf;
 
     char parent[LINUX_PATH_MAX];
@@ -919,12 +1062,20 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      * answers neither: a parent stored escaped reads as absent, and a
      * wrong-case one folds onto a directory the create would then land in.
      */
+    bool followed_link = false;
+    char followed[LINUX_PATH_MAX];
     if (casefold_active()) {
         casefold_walk_t walk;
 
-        if (casefold_resolve_at(AT_FDCWD, sr, clamped, false, buf, bufsz,
-                                &walk) == CASEFOLD_ERROR)
+        /* Intermediate links have to be followed here as well. Lookup and
+         * create are separate resolvers, and a follow rule taught to only one
+         * of them lets a create below a link land beside the link instead of
+         * inside the directory the link names.
+         */
+        if (resolve_through_links(sr, lookup, false, buf, bufsz, &walk,
+                                  followed, sizeof(followed)) == CASEFOLD_ERROR)
             return NULL;
+        followed_link = rebase_after_link(&lookup, followed);
         if (str_copy_trunc(parent, buf, sizeof(parent)) >= sizeof(parent)) {
             errno = ENAMETOOLONG;
             return NULL;
@@ -954,7 +1105,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
             return NULL;
         }
     } else {
-        int n = snprintf(buf, bufsz, "%s%s", sr, clamped);
+        int n = snprintf(buf, bufsz, "%s%s", sr, lookup);
         if (n < 0) {
             if (errno == 0)
                 errno = EINVAL;
@@ -971,7 +1122,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
          *
          * Return buf as-is.
          */
-        if (clamped[strspn(clamped, "/")] == '\0')
+        if (lookup[strspn(lookup, "/")] == '\0')
             return buf;
 
         str_copy_trunc(parent, buf, sizeof(parent));
@@ -1013,12 +1164,21 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      */
     char norm_path[LINUX_PATH_MAX];
     bool has_norm =
-        lexical_normalize_absolute_path(norm_path, clamped, sizeof(norm_path));
-    const char *path_to_check = has_norm ? norm_path : clamped;
+        lexical_normalize_absolute_path(norm_path, lookup, sizeof(norm_path));
+    const char *path_to_check = has_norm ? norm_path : lookup;
 
     if (!is_sysroot_backed_temp_path(path_to_check) &&
-        !is_guest_system_path(path_to_check))
+        !is_guest_system_path(path_to_check)) {
+        /* As in the lookup resolver: a path reached by following a link may not
+         * fall through to the host, and after a link the guest path lives in a
+         * local buffer, so the input pointer is no longer the input.
+         */
+        if (followed_link) {
+            errno = ELOOP;
+            return NULL;
+        }
         return path;
+    }
 
     if (!create_parents) {
         if (sysroot_validate_dir_prefix(parent) < 0)

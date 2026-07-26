@@ -318,28 +318,58 @@ arrival order and is not part of the contract.
 
 ## Symlink targets
 
-A symlink stores the bytes the guest gave it, and nothing rewrites them. That is
-required: `readlink` has to return what was written, so a target cannot be
-translated on the way in.
+A relative target stores the bytes the guest gave it, and nothing rewrites
+them: `readlink` returns what was written. An absolute target cannot be stored
+verbatim, because anything following the link natively resolves it from the
+host root rather than the sysroot. Creation therefore rewrites it to a target
+relative to the link's own directory, which names the same object inside the
+sysroot and survives the tree being moved; `readlink` reports that rewritten
+spelling, the one visible divergence, since nothing on disk tells a rewritten
+target from a relative one the guest wrote.
 
-The consequence is that a target naming something stored escaped cannot be
-followed by the host. `symlink("/d/Foo", "/d/link")` records `/d/Foo`, while the
-directory holds `.ef=466f6f`, so when the host kernel resolves the link it looks
-for a name that is not there. Following the link fails with `ENOENT` even though
-both files exist and `readlink` reports the target correctly.
+That leaves the stored bytes naming a *guest* path while the disk holds host
+spellings, so following a link is done in the guest's namespace rather than by
+handing the target to the host kernel. When the walk reaches a link it has to
+pass through, it stops and says so; the resolver reads the target, joins a
+relative one to the directory holding the link or lets an absolute one replace
+the path outright, appends whatever was left, and resolves the result as an
+ordinary guest path. Chains are followed the same way, bounded at
+`MAXSYMLINKS` hops, `ELOOP` past that.
 
-Two cases are unaffected, and between them cover most real trees:
+Knowing a component is a link is free: the probe already asks the volume for
+each component's stored name, and `ATTR_CMN_OBJTYPE` rides along on that same
+request.
 
-- a target whose every component is fold-stable, which is stored under its own
-  spelling and so resolves normally
-- any operation that does not follow the link: `lstat`, `readlink`, `unlink`,
-  `rename`, and `linkat` without `AT_SYMLINK_FOLLOW`
+Following is not atomic, and nothing here claims otherwise. The walk resolves by
+path rather than by holding descriptors, so a component can be replaced between
+being resolved and being used; adding link following lengthens that window
+without changing its nature. The guarantee is over the operation, not the
+resolution: the create, rename or unlink a caller finally issues is one kernel
+call, so a name is never left half-moved.
 
-An absolute target is the worst case, because the host resolves it from the host
-root rather than from the sysroot, so it misses on two counts at once.
+Which components are followed is POSIX's rule, not a choice: every intermediate
+component is, and only the last one honors a caller's request not to. So
+`lstat("/a/link/b")` follows `link` and reports on `b`.
 
-Closing this means resolving link targets through the same walk that resolves
-guest paths, and doing it for every following operation rather than one of them.
+### A link may not leave the sysroot
+
+An absolute target resolves against the sysroot, exactly as the same path typed
+by the guest would, which is what a chroot-like tree owes. It does not,
+however, inherit the host fallback that a typed path gets. A path the guest
+names itself may fall through to the host when the sysroot does not have it; a
+path arrived at by following a link may not, because anything able to write a
+symlink into the tree could otherwise hand the guest a file from outside it.
+
+A link whose target the sysroot does not hold therefore ends one of two ways:
+
+- the host has nothing there either, so the link simply dangles and the guest
+  gets `ENOENT`
+- the host does have something there, which is the escape the rule exists to
+  stop, and the guest gets `ELOOP`
+
+Operations that do not follow are untouched throughout: `lstat`, `readlink`,
+`unlink`, `rename`, and `linkat` without `AT_SYMLINK_FOLLOW` all keep seeing the
+link itself, including when its target does not resolve.
 
 ## Name length
 

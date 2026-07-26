@@ -460,16 +460,19 @@ int main(void)
      * that holds for an absolute target too: nothing has to resolve the
      * target to copy the link.
      *
-     * The followed target is relative on purpose. An absolute target is
-     * stored verbatim, because the guest has to read back the bytes it wrote,
-     * so when the host kernel follows the link it resolves those bytes
-     * against the host root rather than the sysroot and the target is not
-     * there. Following a relative target stays inside the translated parent
-     * and works. Using an absolute one here would test that gap instead of
-     * linkat.
+     * The followed target is spelled relative in one case and absolute in the
+     * other: a symlink stores the bytes the guest wrote, so the two spellings
+     * reach the target through different resolution paths (the relative one
+     * against the translated parent, the absolute one through the
+     * guest-namespace splice), and only running both shows linkat follows
+     * each.
      */
     TEST("linkat AT_SYMLINK_FOLLOW links the target, not the symlink");
     check_linkat(base, "real-target", "real-link", "REAL-HARD", false,
+                 AT_SYMLINK_FOLLOW, false);
+
+    TEST("linkat AT_SYMLINK_FOLLOW follows an absolute target too");
+    check_linkat(base, "Abs.Target", "abs-follow-link", "ABS-FOLLOW-HARD", true,
                  AT_SYMLINK_FOLLOW, false);
 
     TEST("linkat without AT_SYMLINK_FOLLOW links the symlink itself");

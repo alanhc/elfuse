@@ -24,10 +24,6 @@
 #include "syscall/path.h"
 #include "syscall/proc.h"
 
-#ifndef MAXSYMLINKS
-#define MAXSYMLINKS 40
-#endif
-
 #define PROC_PATH_COMPONENTS_MAX (LINUX_PATH_MAX / 2)
 
 bool path_prefix_match(const char *path, const char *prefix, size_t plen)
@@ -147,6 +143,42 @@ int path_check_intercept_access(const struct stat *st, int mode, int flags)
     return -1;
 }
 
+/* Splice a symlink target back into a path being resolved: @target, then
+ * whatever of the original path was left unconsumed. @prefix is prepended only
+ * for a relative target, and names the directory the link sits in; a caller
+ * that re-anchors some other way (by resetting a descriptor, say) passes NULL.
+ *
+ * Shared because two walkers follow links and the concatenation is where the
+ * truncation checks live. A second copy of it would be a second place for a
+ * spliced path to be silently shortened into one naming a different file.
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG.
+ */
+int path_splice_link_target(const char *prefix,
+                            size_t prefix_len,
+                            const char *target,
+                            const char *rest,
+                            char *out,
+                            size_t outsz)
+{
+    int n;
+
+    while (*rest == '/')
+        rest++;
+
+    if (target[0] == '/' || !prefix)
+        n = snprintf(out, outsz, "%s%s%s", target, *rest ? "/" : "", rest);
+    else
+        n = snprintf(out, outsz, "%.*s%s%s%s", (int) prefix_len, prefix, target,
+                     *rest ? "/" : "", rest);
+
+    if (n < 0 || (size_t) n >= outsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
 /* True when @path names a directory by ending in one or more separators. "/"
  * itself does not count: it is the root, not an assertion about a leaf.
  */
@@ -162,6 +194,8 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
                                                    const char *path,
                                                    unsigned int flags,
                                                    bool *in_sysroot,
+                                                   char *abs_out,
+                                                   size_t abs_outsz,
                                                    char *host_out,
                                                    size_t host_outsz);
 
@@ -258,10 +292,12 @@ int path_translate_at(guest_fd_t dirfd,
      */
     bool climbed_root = false;
     bool relative_in_sysroot = false;
+    char relative_abs[LINUX_PATH_MAX];
+    char relative_host[LINUX_PATH_MAX];
     if (tx->host_path && tx->guest_path[0] != '/' && proc_get_sysroot()) {
         int recheck = path_check_relative_sysroot_containment(
-            dirfd, tx->guest_path, flags, &relative_in_sysroot, tx->host_buf,
-            sizeof(tx->host_buf));
+            dirfd, tx->guest_path, flags, &relative_in_sysroot, relative_abs,
+            sizeof(relative_abs), relative_host, sizeof(relative_host));
         if (recheck < 0) {
             tx->host_path = NULL;
             if (errno == 0)
@@ -273,6 +309,7 @@ int path_translate_at(guest_fd_t dirfd,
              * absolute host path the recheck already resolved; POSIX has the
              * kernel ignore dirfd for an absolute path, so the two agree.
              */
+            str_copy_trunc(tx->host_buf, relative_host, sizeof(tx->host_buf));
             tx->host_path = tx->host_buf;
             climbed_root = true;
         }
@@ -297,6 +334,14 @@ int path_translate_at(guest_fd_t dirfd,
      */
     if (tx->host_path && relative_in_sysroot && !climbed_root &&
         casefold_active()) {
+        /* The caller's follow decision applies to the final component here
+         * exactly as it does in the absolute resolvers: a create names the
+         * link, not the target (proc-state.c passes the same false), and
+         * everything else follows unless it asked not to. Stopping short
+         * unconditionally would hand the link's stored target bytes to the
+         * host kernel, which cannot spell them.
+         */
+        bool follow_final = !(flags & (PATH_TR_NOFOLLOW | PATH_TR_CREATE));
         host_fd_ref_t ref;
         casefold_walk_t walk;
         casefold_verdict_t verdict;
@@ -306,11 +351,27 @@ int path_translate_at(guest_fd_t dirfd,
             return -1;
         }
         verdict =
-            casefold_resolve_at(ref.fd, "", tx->guest_path, false, tx->host_buf,
-                                sizeof(tx->host_buf), &walk);
+            casefold_resolve_at(ref.fd, "", tx->guest_path, follow_final,
+                                tx->host_buf, sizeof(tx->host_buf), &walk);
         host_fd_ref_close(&ref);
         if (verdict == CASEFOLD_ERROR)
             return -1;
+        /* A link on the way needs the target resolved in the guest namespace,
+         * and a target may be absolute, which a descriptor-relative walk has
+         * no anchor for. The containment check already resolved the
+         * reconstructed absolute path with the caller's own flag mapping and
+         * handed the host spelling back; using it keeps one mapping for both
+         * legs instead of a second copy that can drift. Only paths that
+         * actually cross a link take this arm; everything else keeps the
+         * descriptor-relative walk, whose descriptor is the anchor openat(2)
+         * semantics are measured from.
+         */
+        if (verdict == CASEFOLD_SYMLINK &&
+            str_copy_trunc(tx->host_buf, relative_host, sizeof(tx->host_buf)) >=
+                sizeof(tx->host_buf)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
         tx->host_path = tx->host_buf;
     }
 
@@ -483,6 +544,30 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
     size_t depth = 0;
 
     if (path[0] == '/') {
+        /* The resolver splices an intermediate link into its target, so its
+         * output cannot reveal the link to the component walk below. Ask the
+         * case-exact walk first: it stops at exactly the link this precheck
+         * exists to refuse. An absent or folded path keeps the resolver's
+         * answer: no in-sysroot component of those is ever spliced, so the
+         * walk below still sees whatever the host side holds.
+         */
+        if (casefold_active()) {
+            char sr[LINUX_PATH_MAX];
+
+            if (proc_sysroot_snapshot(sr, sizeof(sr))) {
+                casefold_walk_t walk;
+                casefold_verdict_t verdict =
+                    casefold_resolve_at(AT_FDCWD, sr, path, false, sysroot_buf,
+                                        sizeof(sysroot_buf), &walk);
+
+                if (verdict == CASEFOLD_ERROR)
+                    return -1;
+                if (verdict == CASEFOLD_SYMLINK) {
+                    errno = ELOOP;
+                    return -1;
+                }
+            }
+        }
         const char *host_path = path_resolve_sysroot_nofollow_path(
             path, sysroot_buf, sizeof(sysroot_buf));
         if (!host_path) {
@@ -548,7 +633,7 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
         bool in_sysroot = false;
 
         int recheck = path_check_relative_sysroot_containment(
-            dirfd, path, PATH_TR_NOFOLLOW, &in_sysroot, NULL, 0);
+            dirfd, path, PATH_TR_NOFOLLOW, &in_sysroot, NULL, 0, NULL, 0);
         if (recheck < 0) {
             rc = -1;
             goto out;
@@ -560,10 +645,20 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
          */
         if (in_sysroot && recheck == 0) {
             casefold_walk_t walk;
+            casefold_verdict_t verdict =
+                casefold_resolve_at(current_fd, "", path, false, sysroot_buf,
+                                    sizeof(sysroot_buf), &walk);
 
-            if (casefold_resolve_at(current_fd, "", path, false, sysroot_buf,
-                                    sizeof(sysroot_buf),
-                                    &walk) == CASEFOLD_ERROR) {
+            if (verdict == CASEFOLD_ERROR) {
+                rc = -1;
+                goto out;
+            }
+            /* The walk stopping at a link is the answer this function exists
+             * to give: RESOLVE_NO_SYMLINKS refuses a path that passes through
+             * one, so there is nothing further to spell out.
+             */
+            if (verdict == CASEFOLD_SYMLINK) {
+                errno = ELOOP;
                 rc = -1;
                 goto out;
             }
@@ -1198,17 +1293,20 @@ static int dirfd_reconstruct_abs_path(guest_fd_t dirfd,
     return 0;
 }
 
-/* Returns 1 when the reconstruction climbed the guest root, with @host_out
- * holding the absolute host path the caller opens instead of walking from
- * dirfd; 0 when the walk stays beneath it, leaving @host_out untouched; or -1
- * with errno set. @in_sysroot reports whether the sysroot claims the
- * reconstructed path. A caller with no way to substitute a spelling opts out
- * of the climbed copy with a NULL @host_out.
+/* Returns 1 when the reconstruction climbed the guest root, so the caller
+ * opens the resolved absolute host path instead of walking from dirfd; 0 when
+ * the walk stays beneath it; or -1 with errno set. @in_sysroot reports whether
+ * the sysroot claims the reconstructed path. @abs_out (the reconstructed
+ * absolute guest path) and @host_out (the resolved host spelling, filled for a
+ * climbed or in-sysroot path) hand the work back to callers that need it; a
+ * NULL pointer opts out of either.
  */
 static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
                                                    const char *path,
                                                    unsigned int flags,
                                                    bool *in_sysroot,
+                                                   char *abs_out,
+                                                   size_t abs_outsz,
                                                    char *host_out,
                                                    size_t host_outsz)
 {
@@ -1262,19 +1360,27 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
      * prefix of its own to make that call from.
      */
     *in_sysroot = checked != abs_path;
-    if (!climbed)
-        return 0;
-    /* checked is either the sysroot spelling or the reconstructed guest path
-     * itself, which the sysroot does not claim; both are absolute, so either
-     * one lands where the guest's own resolution would.
+    /* The reconstruction is not free, and a caller that has to follow a symlink
+     * needs the same absolute path to do it, so hand it back rather than make
+     * it build one of its own that could differ.
      */
-    if (host_out) {
-        if (str_copy_trunc(host_out, checked, host_outsz) >= host_outsz) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
+    if (abs_out && str_copy_trunc(abs_out, abs_path, abs_outsz) >= abs_outsz) {
+        errno = ENAMETOOLONG;
+        return -1;
     }
-    return 1;
+    /* The resolution itself is not free either. A caller whose own walk stops
+     * at a link needs exactly this host path (resolved with the same flag
+     * mapping), and re-deriving it invites the two mappings to drift. A path
+     * that clamped at the guest root needs it whichever way it resolved: both
+     * spellings are absolute, so either lands where the guest's own resolution
+     * would, and the descriptor drops out of the walk.
+     */
+    if (host_out && (*in_sysroot || climbed) &&
+        str_copy_trunc(host_out, checked, host_outsz) >= host_outsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return climbed ? 1 : 0;
 }
 
 static bool normalized_proc_self_fd_anchor(const char *path)
@@ -1580,21 +1686,13 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
                     }
                     target[target_len] = '\0';
 
-                    char rest_buf[LINUX_PATH_MAX];
-                    const char *rest = walk;
-                    while (*rest == '/')
-                        rest++;
-                    if (str_copy_trunc(rest_buf, rest, sizeof(rest_buf)) >=
-                        sizeof(rest_buf)) {
-                        errno = ENAMETOOLONG;
+                    /* No prefix: an absolute target re-anchors the walk fd
+                     * below, and a relative one continues from current_fd,
+                     * which already names the link's directory.
+                     */
+                    if (path_splice_link_target(NULL, 0, target, walk, pending,
+                                                sizeof(pending)) < 0)
                         goto out;
-                    }
-                    if (snprintf(pending, sizeof(pending), "%s%s%s", target,
-                                 rest_buf[0] ? "/" : "",
-                                 rest_buf) >= (int) sizeof(pending)) {
-                        errno = ENAMETOOLONG;
-                        goto out;
-                    }
                     walk = pending;
 
                     if (target[0] == '/') {

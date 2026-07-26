@@ -23,6 +23,7 @@
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root \
+        test-sysroot-symlink-target \
         test-sysroot-name-i18n test-sysroot-name-length \
         test-sysroot-name-staged test-sysroot-name-race \
         test-sysroot-pathmax test-sysroot-corpus \
@@ -183,6 +184,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-openat2-walk
 	@printf "\n$(BLUE)━━━ sysroot '..' resolution ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-dotdot
+	@printf "\n$(BLUE)━━━ escaped symlink-target resolution ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-symlink-target
 	@printf "\n$(BLUE)━━━ sysroot mounted at / ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-root
 	@printf "\n$(BLUE)━━━ literal names without a sysroot ━━━$(RESET)\n"
@@ -492,6 +495,24 @@ test-sysroot-name-relative: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-relativ
 	if [ ! -e "$$outside/Outside.Rel" ] || [ ! -e "$$outside/Outside.Abs" ]; then \
 		printf "$(RED)FAIL$(RESET) a name outside the sysroot was not stored literally\n"; \
 		ls -Ab "$$outside"; \
+		exit 1; \
+	fi
+
+## Symlink targets are resolved in the guest namespace, not the host's
+test-sysroot-symlink-target: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-target
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	had_target=0; [ -e "/symlink-target" ] && had_target=1; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-symlink-target; \
+	if [ "$$had_target" = 0 ] && [ -e "/symlink-target" ]; then \
+		printf "$(RED)FAIL$(RESET) a create through a link escaped to the host root\n"; \
+		exit 1; \
+	fi; \
+	if [ -z "$$(find "$$tmpdir" -maxdepth 2 -name '.ef=*' -print -quit)" ]; then \
+		printf "$(RED)FAIL$(RESET) no escaped entries in the sysroot\n"; \
+		ls -Rb "$$tmpdir"; \
 		exit 1; \
 	fi
 

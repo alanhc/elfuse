@@ -255,17 +255,37 @@ static void section_symlink(void)
     char out[LINUX_PATH_MAX];
     casefold_walk_t walk;
 
-    /* The probe stops at a link rather than following it, so a link is judged
-     * by its own name and an intermediate link is traversed by the kernel when
-     * the next prefix is probed.
+    /* A link the walk does not have to pass through is judged by its own name,
+     * which is what nofollow on the final component means.
      */
     check("symlink resolved by its own name", "/link.to.lowdir", CASEFOLD_FOUND,
           "link.to.lowdir");
-    check("through a symlinked intermediate", "/link.to.lowdir/inner.txt",
-          CASEFOLD_FOUND, "link.to.lowdir/inner.txt");
 
-    /* A dangling link exists as a link but not as a target, so the answer
-     * depends on which the caller asked about.
+    /* A link the walk does have to pass through stops it, and the walk says so
+     * rather than letting the host follow the stored bytes: those name a
+     * guest path, whose components may be escaped and whose absolute form
+     * starts at the sysroot, so the host would look somewhere else. The caller
+     * resolves the target in the guest namespace and comes back.
+     *
+     * link_rest_offset points at what is left to resolve, and
+     * link_guest_offset at the link itself, so a relative target can be joined
+     * to the directory holding it.
+     */
+    if (casefold_resolve_at(AT_FDCWD, root, "/link.to.lowdir/inner.txt", false,
+                            out, sizeof(out), &walk) == CASEFOLD_SYMLINK &&
+        !strcmp(out + strlen(root), "/link.to.lowdir") &&
+        !strcmp("/link.to.lowdir/inner.txt" + walk.link_rest_offset,
+                "inner.txt") &&
+        !strcmp("/link.to.lowdir/inner.txt" + walk.link_guest_offset,
+                "link.to.lowdir/inner.txt"))
+        ok();
+    else
+        fail("an intermediate link stops the walk",
+             "expected CASEFOLD_SYMLINK");
+
+    /* A dangling link exists as a link. Asking about its target stops the walk
+     * at the link too: whether the target is there is a question about a guest
+     * path the caller has not resolved yet.
      */
     if (casefold_resolve_at(AT_FDCWD, root, "/dangling", false, out,
                             sizeof(out), &walk) == CASEFOLD_FOUND)
@@ -273,10 +293,12 @@ static void section_symlink(void)
     else
         fail("dangling link exists without following", "expected found");
     if (casefold_resolve_at(AT_FDCWD, root, "/dangling", true, out, sizeof(out),
-                            &walk) == CASEFOLD_ABSENT)
+                            &walk) == CASEFOLD_SYMLINK &&
+        walk.link_rest_offset == strlen("/dangling"))
         ok();
     else
-        fail("dangling link is absent when followed", "expected absent");
+        fail("following a dangling link stops at the link",
+             "expected CASEFOLD_SYMLINK with nothing left to resolve");
 
     /* A second hard link to a symlink is that same link under another name,
      * and it resolves by the name the caller used. The volume reports the

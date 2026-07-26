@@ -17,6 +17,8 @@
 #include <string.h>
 #include <sys/attr.h>
 #include <sys/stat.h>
+/* fsobj_type_t and VLNK, for the ATTR_CMN_OBJTYPE the probe requests. */
+#include <sys/vnode.h>
 #include <unistd.h>
 
 #include "utils.h"
@@ -152,18 +154,37 @@ const char *casefold_attr_stored_name(const void *reply,
  */
 static probe_result_t probe_exact(host_fd_t base_fd,
                                   const char *path,
-                                  const char *leaf)
+                                  const char *leaf,
+                                  bool *is_link)
 {
+    /* ATTR_CMN_OBJTYPE rides along on a request already being made, so knowing
+     * whether the entry is a symlink costs nothing beyond the byte comparison
+     * this call exists for. FSOPT_NOFOLLOW below already asks about the entry
+     * rather than its target, so the answer is about the link itself.
+     */
     struct attrlist al = {
         .bitmapcount = ATTR_BIT_MAP_COUNT,
-        .commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME,
+        .commonattr =
+            ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_OBJTYPE | ATTR_CMN_NAME,
     };
+    /* Fixed-size attributes come back in ascending bit order, so ATTR_CMN_NAME
+     * (0x1) precedes ATTR_CMN_OBJTYPE (0x8) and the variable-length name data
+     * follows both. Ordering these fields any other way silently misreads every
+     * field after the first. Only attributes the volume actually returned are
+     * packed, so an absent one shifts every later field down by its width,
+     * which is why obj_type is read under the ATTR_CMN_NAME test below rather
+     * than beside it.
+     */
     struct {
         u_int32_t length;
         attribute_set_t returned;
         attrreference_t name_ref;
+        fsobj_type_t obj_type;
         char name[CASEFOLD_STORED_NAME_MAX];
     } __attribute__((aligned(4), packed)) attr_buf;
+
+    if (is_link)
+        *is_link = false;
 
     if (getattrlistat(base_fd, path, &al, &attr_buf, sizeof(attr_buf),
                       FSOPT_NOFOLLOW) == 0) {
@@ -174,6 +195,22 @@ static probe_result_t probe_exact(host_fd_t base_fd,
                 (size_t) ((const char *) &attr_buf.name_ref -
                           (const char *) &attr_buf));
         if (stored) {
+            /* Read here, not before the test: obj_type only sits at this
+             * offset because name_ref precedes it, and it does so only when
+             * the name was returned inside the reply's own bounds. With the
+             * name withheld or the reply malformed the field would be read
+             * past where the volume wrote it, and a garbage VLNK sends the
+             * walk chasing a link that is not there.
+             */
+            size_t usable = attr_buf.length < sizeof(attr_buf)
+                                ? attr_buf.length
+                                : sizeof(attr_buf);
+            size_t obj_end = (size_t) ((const char *) &attr_buf.obj_type -
+                                       (const char *) &attr_buf) +
+                             sizeof(attr_buf.obj_type);
+            if (is_link && (attr_buf.returned.commonattr & ATTR_CMN_OBJTYPE) &&
+                obj_end <= usable)
+                *is_link = attr_buf.obj_type == VLNK;
             if (!strcmp(stored, leaf))
                 return PROBE_EXACT;
             /* A mismatch is not yet a fold. For a second hard link to a
@@ -296,7 +333,8 @@ static probe_result_t resolve_component(host_fd_t base_fd,
                                         const char *guest,
                                         char *host,
                                         size_t hostsz,
-                                        bool *present)
+                                        bool *present,
+                                        bool *is_link)
 {
     char probe_path[LINUX_PATH_MAX];
     size_t probe_len = len;
@@ -318,7 +356,7 @@ static probe_result_t resolve_component(host_fd_t base_fd,
                              guest) < 0)
             return PROBE_ERROR;
 
-        verdict = probe_exact(base_fd, probe_path, guest);
+        verdict = probe_exact(base_fd, probe_path, guest, is_link);
         if (verdict == PROBE_ERROR)
             return PROBE_ERROR;
         if (verdict == PROBE_EXACT) {
@@ -361,7 +399,7 @@ static probe_result_t resolve_component(host_fd_t base_fd,
     if (append_component(probe_path, sizeof(probe_path), &probe_len, host) < 0)
         return PROBE_ERROR;
 
-    switch (probe_exact(base_fd, probe_path, host)) {
+    switch (probe_exact(base_fd, probe_path, host, is_link)) {
     case PROBE_EXACT:
         *present = true;
         return PROBE_EXACT;
@@ -408,6 +446,8 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
 
     walk->parent_found = true;
     walk->parent_offset = 0;
+    walk->link_rest_offset = 0;
+    walk->link_guest_offset = 0;
     walk->leaf_offset = 0;
     walk->folded = false;
     walk->notdir = false;
@@ -427,8 +467,10 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
             return CASEFOLD_ERROR;
 
         /* "." and ".." navigate rather than name an entry, so they are spelled
-         * through untouched. An absolute path has already had them collapsed;
-         * a dirfd-relative one may still carry them.
+         * through untouched. An absolute path arrives collapsed by
+         * construction: the resolvers normalize at entry and after every
+         * spliced link target. A dirfd-relative one may still carry them, and
+         * the host kernel resolves those against the real descriptor.
          */
         if (!strcmp(guest, ".") || !strcmp(guest, "..")) {
             if (append_leaf(out, outsz, &len, guest, walk) < 0)
@@ -444,11 +486,38 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
             if (name_by_rule(guest, host, sizeof(host)) < 0)
                 return CASEFOLD_ERROR;
         } else {
-            probe_result_t verdict = resolve_component(
-                base_fd, out, len, guest, host, sizeof(host), &present);
+            bool is_link = false;
+            probe_result_t verdict =
+                resolve_component(base_fd, out, len, guest, host, sizeof(host),
+                                  &present, &is_link);
 
             if (verdict == PROBE_ERROR)
                 return CASEFOLD_ERROR;
+
+            /* A link the walk has to pass through stops it. That is every
+             * intermediate component, and the final one only when the caller
+             * asked to follow: path_resolution(7) applies nofollow to the last
+             * component alone.
+             *
+             * The host cannot be asked to follow it instead. A link records the
+             * bytes the guest wrote, and those name a guest path: a component
+             * of it may be stored escaped, and an absolute one starts at the
+             * sysroot rather than at the host root. Handing them to the kernel
+             * looks somewhere else entirely.
+             */
+            if (present && is_link) {
+                const char *rest = scan;
+
+                while (*rest == '/')
+                    rest++;
+                if (*rest != '\0' || follow_final) {
+                    if (append_leaf(out, outsz, &len, host, walk) < 0)
+                        return CASEFOLD_ERROR;
+                    walk->link_guest_offset = (size_t) (comp - guest_path);
+                    walk->link_rest_offset = (size_t) (rest - guest_path);
+                    return CASEFOLD_SYMLINK;
+                }
+            }
             /* A fold means the sysroot holds an entry where the guest asked,
              * under a spelling the guest did not use. Recorded for the caller
              * because it is the one absent verdict that must not fall through
