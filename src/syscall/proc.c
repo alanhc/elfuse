@@ -2962,12 +2962,13 @@ static const hv_sys_reg_t hvc4_sysregs[] = {
  * Both modes check proc_exit_group_requested so the main thread also reacts to
  * exit_group called by a worker.
  */
-int vcpu_run_loop(hv_vcpu_t vcpu,
-                  hv_vcpu_exit_t *vexit,
-                  guest_t *g,
-                  bool verbose,
-                  int timeout_sec,
-                  int *wait_status_out)
+int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
+                             hv_vcpu_exit_t *vexit,
+                             guest_t *g,
+                             bool verbose,
+                             int timeout_sec,
+                             int *wait_status_out,
+                             const vcpu_run_hooks_t *hooks)
 {
     int exit_code = 0;
     (void) signal_take_termination_wait_status();
@@ -2997,6 +2998,17 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
         if (proc_exit_group_requested()) {
             exit_code = proc_exit_group_code();
             break;
+        }
+        if (hooks && hooks->tick) {
+            int tick_ret = hooks->tick(g, hooks->opaque);
+            if (tick_ret != 0) {
+                exit_code = tick_ret;
+                break;
+            }
+            if (proc_exit_group_requested()) {
+                exit_code = proc_exit_group_code();
+                break;
+            }
         }
 
         if (verbose) {
@@ -4117,4 +4129,15 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
             signal_status != 0 ? signal_status : (exit_code & 0xff) << 8;
     }
     return exit_code;
+}
+
+int vcpu_run_loop(hv_vcpu_t vcpu,
+                  hv_vcpu_exit_t *vexit,
+                  guest_t *g,
+                  bool verbose,
+                  int timeout_sec,
+                  int *wait_status_out)
+{
+    return vcpu_run_loop_with_hooks(vcpu, vexit, g, verbose, timeout_sec,
+                                    wait_status_out, NULL);
 }

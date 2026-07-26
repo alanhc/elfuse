@@ -153,6 +153,12 @@ $(BUILD_DIR)/test-fork-ipc-protocol-host: \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the vCPU run-loop hook API compile test (native macOS binary).
+$(BUILD_DIR)/test-vcpu-run-hooks-host: \
+		$(BUILD_DIR)/test-vcpu-run-hooks-host.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the identity override host test (native macOS binary)
 $(BUILD_DIR)/test-identity-override-host: \
 		$(BUILD_DIR)/test-identity-override-host.o \

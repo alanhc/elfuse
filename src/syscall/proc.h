@@ -498,6 +498,34 @@ int proc_exit_group_requested(void);
  */
 void proc_request_hvc6_yield(void);
 
+/* Optional embedder hook. Called on the vCPU owner thread at host boundaries
+ * (before each hv_vcpu_run() entry or re-entry).
+ *
+ * Stop semantics:
+ * Return nonzero to stop the loop. A nonzero tick return is propagated
+ * and returned as the run loop's exit code.
+ *
+ * Cooperative-only timing:
+ * The tick is only checked at host boundaries, not during guest execution.
+ * A guest spinning entirely in EL0 without VM-exiting will never trigger
+ * the tick, meaning a tick-initiated hook cannot interrupt a runaway guest.
+ * To force interruption of a runaway guest, use hv_vcpus_exit().
+ *
+ * Concurrency and lifetime:
+ * When a single vcpu_run_hooks_t and its opaque data are shared across
+ * multiple vCPUs, the tick function will be invoked concurrently from
+ * multiple host threads and must be thread-safe. The run loop does not keep
+ * a copy of the hooks structure and dereferences it every iteration; the
+ * caller must ensure the hooks structure and opaque lifetime extend until
+ * all run loops return.
+ */
+typedef int (*vcpu_run_loop_tick_fn)(guest_t *g, void *opaque);
+
+typedef struct vcpu_run_hooks {
+    vcpu_run_loop_tick_fn tick;
+    void *opaque;
+} vcpu_run_hooks_t;
+
 /* Run the vCPU execution loop.
  *
  * Returns the exit code.
@@ -513,3 +541,10 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                   bool verbose,
                   int timeout_sec,
                   int *wait_status_out);
+int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
+                             hv_vcpu_exit_t *vexit,
+                             guest_t *g,
+                             bool verbose,
+                             int timeout_sec,
+                             int *wait_status_out,
+                             const vcpu_run_hooks_t *hooks);
