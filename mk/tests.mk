@@ -12,7 +12,8 @@
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
         test-sysroot-host-fallback test-sysroot-case-exact \
-        test-sysroot-create-paths test-fork-ipc-protocol-host test-identity-override-host \
+        test-sysroot-create-paths test-fork-ipc-protocol-host \
+        test-vcpu-run-hooks-host test-identity-override-host \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
@@ -77,12 +78,15 @@ SANITIZER_SECTIONS := Threading|Stress|Signal.*thread|Fork edge|CoW fork|Guard p
 check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) \
 		$(BUILD_DIR)/test-tlbi-encoder-host \
 		$(BUILD_DIR)/test-fork-ipc-protocol-host \
+		$(BUILD_DIR)/test-vcpu-run-hooks-host \
 		$(BUILD_DIR)/test-identity-override-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v -s '$(SANITIZER_SECTIONS)'
 	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-tlbi-encoder-host
 	@printf "\n$(BLUE)━━━ fork IPC protocol identity unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-fork-ipc-protocol-host
+	@printf "\n$(BLUE)━━━ vCPU run-loop hook API unit test ━━━$(RESET)\n"
+	@$(BUILD_DIR)/test-vcpu-run-hooks-host
 	@printf "\n$(BLUE)━━━ identity override unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-identity-override-host
 
@@ -90,12 +94,15 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) \
 check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 		$(BUILD_DIR)/test-tlbi-encoder-host \
 		$(BUILD_DIR)/test-fork-ipc-protocol-host \
+		$(BUILD_DIR)/test-vcpu-run-hooks-host \
 		$(BUILD_DIR)/test-identity-override-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-tlbi-encoder-host
 	@printf "\n$(BLUE)━━━ fork IPC protocol identity unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-fork-ipc-protocol-host
+	@printf "\n$(BLUE)━━━ vCPU run-loop hook API unit test ━━━$(RESET)\n"
+	@$(BUILD_DIR)/test-vcpu-run-hooks-host
 	@printf "\n$(BLUE)━━━ identity override unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-identity-override-host
 	@printf "\n$(BLUE)━━━ shebang parser unit test ━━━$(RESET)\n"
@@ -751,6 +758,11 @@ test-rwx: $(BUILD_DIR)/test-rwx
 ## Run the fork IPC protocol identity unit test
 test-fork-ipc-protocol-host: $(BUILD_DIR)/test-fork-ipc-protocol-host
 	$(BUILD_DIR)/test-fork-ipc-protocol-host
+
+# vCPU run-loop hook API regression
+## Run the vCPU run-loop hook API unit test
+test-vcpu-run-hooks-host: $(BUILD_DIR)/test-vcpu-run-hooks-host
+	$(BUILD_DIR)/test-vcpu-run-hooks-host
 
 # Proctitle argv-tail regression
 ## Run the deterministic argv-tail overshoot guard test
