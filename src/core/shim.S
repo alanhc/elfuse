@@ -63,6 +63,13 @@
  * save and restore ALL 31 GPRs.
  */
 
+/* RVAE1IS is part of FEAT_TLBIRANGE (the tlb-rmi architectural extension).
+ * Apple as defaults to the host CPU's baseline feature set and otherwise
+ * rejects this mnemonic even though the shim executes only on Apple Silicon
+ * CPUs that provide the instruction.  Declare the extension locally so the
+ * assembler accepts the architectural instruction encoding. */
+.arch_extension tlb-rmi
+
 .text
 
 /* SAVE_GPRS: push all 31 GPRs onto a 256-byte EL1 stack frame.
