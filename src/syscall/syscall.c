@@ -2177,10 +2177,29 @@ static int64_t sc_execveat(guest_t *g,
         char pathname[LINUX_PATH_MAX];
         if (guest_read_str(g, x1, pathname, sizeof(pathname)) < 0)
             return -LINUX_EFAULT;
+        /* Translate like every other *at handler: under a casefold sysroot a
+         * guest-created entry exists on disk only under its escaped spelling,
+         * so handing the raw guest bytes to the host cannot resolve it (and
+         * could resolve a case-colliding host-literal file instead). The
+         * translated name stays dirfd-relative, so openat + F_GETPATH turn it
+         * into the absolute host path sys_execve needs.
+         */
+        path_translation_t tx;
+        if (path_translate_at(dirfd, pathname, PATH_TR_NONE, &tx) < 0)
+            return linux_errno();
+        if (tx.fuse_path || tx.proc_resolved != 0)
+            return -LINUX_ENOSYS;
         host_fd_ref_t dir_ref;
-        if (host_fd_ref_open(dirfd, &dir_ref) < 0)
+        if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
             return -LINUX_EBADF;
-        int tmp_fd = openat(dir_ref.fd, pathname, O_RDONLY);
+        /* O_CLOEXEC: the descriptor is closed a few lines below, but a
+         * concurrent execve on another vCPU thread inside that window would
+         * otherwise leak it into the new image. A shm redirect leaf forces
+         * nofollow; see dev_shm_resolve_path().
+         */
+        int tmp_fd =
+            openat(path_translation_dirfd(&tx, &dir_ref), tx.host_path,
+                   O_RDONLY | O_CLOEXEC | (tx.is_dev_shm ? O_NOFOLLOW : 0));
         if (tmp_fd < 0) {
             host_fd_ref_close(&dir_ref);
             return linux_errno();

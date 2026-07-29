@@ -18,7 +18,7 @@
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
-        test-sysroot-inotify-names \
+        test-sysroot-inotify-names test-sysroot-exec-names \
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-sysroot-name-unique \
         test-sysroot-name-relative \
@@ -189,6 +189,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-symlink-target
 	@printf "\n$(BLUE)━━━ inotify names across the escape boundary ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-inotify-names
+	@printf "\n$(BLUE)━━━ exec identity across the escape boundary ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-exec-names
 	@printf "\n$(BLUE)━━━ sysroot mounted at / ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-root
 	@printf "\n$(BLUE)━━━ literal names without a sysroot ━━━$(RESET)\n"
@@ -516,6 +518,25 @@ test-sysroot-symlink-target: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-tar
 	if [ -z "$$(find "$$tmpdir" -maxdepth 2 -name '.ef=*' -print -quit)" ]; then \
 		printf "$(RED)FAIL$(RESET) no escaped entries in the sysroot\n"; \
 		ls -Rb "$$tmpdir"; \
+		exit 1; \
+	fi
+
+# Exec crosses the escape boundary twice: the path being executed resolves
+# like every other guest path, and the identity the kernel reports back
+# (/proc/self/exe, /proc/self/fd/N) carries guest bytes. The recipe asserts
+# the host-side half: the staged binary sits on disk only under its escape,
+# so the passing exec lanes prove the resolution actually crossed it.
+## exec paths and the reported exec identity stay in the guest namespace
+test-sysroot-exec-names: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-exec-names
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-exec-names; \
+	if [ -e "$$tmpdir/Apps" ] && \
+	   [ -z "$$(find "$$tmpdir" -maxdepth 1 -name '.ef=*' -print -quit)" ]; then \
+		printf "$(RED)FAIL$(RESET) Apps was stored literally\n"; \
+		ls -Ab "$$tmpdir"; \
 		exit 1; \
 	fi
 

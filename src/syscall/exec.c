@@ -461,17 +461,16 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                    bool verbose,
                    const char *host_path)
 {
-    /* Copy guest execve inputs before any state-reset point of no return. If
-     * host_path is provided (from execveat resolution), use it directly instead
-     * of reading from guest memory. This avoids writing host-resolved paths
-     * into guest address space.
+    /* Copy guest execve inputs before any state-reset point of no return. A
+     * provided host_path (from execveat resolution) is used directly for the
+     * exec open, but the guest-visible identity in path must carry the guest
+     * spelling: strip the sysroot and decode escaped components so
+     * /proc/self/exe never reports the private host namespace.
      */
     char path[LINUX_PATH_MAX];
     if (host_path) {
-        size_t len = strlen(host_path);
-        if (len >= LINUX_PATH_MAX)
+        if (path_host_to_guest(host_path, path, sizeof(path)) < 0)
             return -LINUX_ENAMETOOLONG;
-        memcpy(path, host_path, len + 1);
     } else if (guest_read_str(g, path_gva, path, sizeof(path)) < 0) {
         return -LINUX_EFAULT;
     }
@@ -479,7 +478,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     log_debug("execve(\"%s\")", path);
 
     char path_host_buf[LINUX_PATH_MAX];
-    const char *path_host = path;
+    const char *path_host = host_path ? host_path : path;
     bool path_host_temp = false;
     /* Whether path_host is a shm redirect leaf (drives O_NOFOLLOW on the exec
      * open). Re-evaluated whenever path_host is repointed to an interpreter.
