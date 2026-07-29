@@ -198,6 +198,11 @@ make probe-volume-naming                        # against a temp directory
 build/probe-volume-naming /Volumes/cs-image     # against any other volume
 ```
 
+`make test-sysroot-name-race` exercises the claim in "Why nothing is locked"
+directly: several processes sharing one sysroot, each creating a different
+member of a case-colliding set. It is a scheduling test and is repeated, so a
+pass does not prove there is no race; only a failure proves there is one.
+
 The probe reports what a volume does, including behavior elfuse is immune to.
 The facts the design actually depends on are asserted separately by
 `make test-casefold-host`, which fails the build if a future macOS release

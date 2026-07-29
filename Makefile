@@ -238,6 +238,11 @@ $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
+# test-sysroot-name-soak churns from worker threads plus forked children
+$(BUILD_DIR)/test-sysroot-name-soak: tests/test-sysroot-name-soak.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
 # test-process-lifecycle creates a worker to verify that process PIDs and
 # thread TIDs share one namespace-wide allocator across fork children.
 $(BUILD_DIR)/test-process-lifecycle: tests/test-process-lifecycle.c src/utils.h | $(BUILD_DIR)

@@ -21,6 +21,12 @@
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-sysroot-name-unique \
         test-sysroot-name-relative \
+        test-nosysroot-literal-names test-sysroot-outside-names \
+        test-sysroot-root \
+        test-sysroot-name-i18n test-sysroot-name-length \
+        test-sysroot-name-staged test-sysroot-name-race \
+        test-sysroot-pathmax test-sysroot-corpus \
+        test-sysroot-name-soak check-soak \
         probe-volume-naming perf
 
 ## Build and run the assembly hello world test
@@ -106,6 +112,12 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) \
 	@$(MAKE) --no-print-directory test-sysroot-name-unique
 	@printf "\n$(BLUE)━━━ relative and dirfd-relative names ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-name-relative
+	@printf "\n$(BLUE)━━━ non-ASCII guest filenames ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-i18n
+	@printf "\n$(BLUE)━━━ guest filenames at full length ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-length
+	@printf "\n$(BLUE)━━━ host-staged escape-shaped names ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-staged
 
 ## Run the unit test suite plus busybox applet validation
 check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
@@ -135,6 +147,18 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-name-unique
 	@printf "\n$(BLUE)━━━ relative and dirfd-relative names ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-name-relative
+	@printf "\n$(BLUE)━━━ non-ASCII guest filenames ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-i18n
+	@printf "\n$(BLUE)━━━ guest filenames at full length ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-length
+	@printf "\n$(BLUE)━━━ host-staged escape-shaped names ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-staged
+	@printf "\n$(BLUE)━━━ concurrent creation of colliding names ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-name-race
+	@printf "\n$(BLUE)━━━ guest paths at the host path ceiling ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-pathmax
+	@printf "\n$(BLUE)━━━ frozen on-disk spelling corpus ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-corpus
 	@printf "\n$(BLUE)━━━ shebang parser unit test ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-shebang-host
 	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
@@ -159,6 +183,16 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-openat2-walk
 	@printf "\n$(BLUE)━━━ sysroot '..' resolution ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-dotdot
+	@printf "\n$(BLUE)━━━ sysroot mounted at / ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-root
+	@printf "\n$(BLUE)━━━ literal names without a sysroot ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-nosysroot-literal-names
+	@printf "\n$(BLUE)━━━ literal names outside the sysroot ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-outside-names
+	@printf "\n$(BLUE)━━━ guest-visible working directory ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-chdir
+	@printf "\n$(BLUE)━━━ case collisions on a folding sysroot ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-case-collision-fallback
 	@printf "\n$(BLUE)━━━ Alpine sysroot FUSE validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-fuse-alpine
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
@@ -460,6 +494,193 @@ test-sysroot-name-relative: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-relativ
 		ls -Ab "$$outside"; \
 		exit 1; \
 	fi
+
+## The degenerate sysroot: a one-character host prefix
+test-sysroot-root: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-root
+	$(ELFUSE_BIN) --sysroot / $(BUILD_DIR)/test-sysroot-root
+
+## Escape-shaped host names must mean themselves when there is no sysroot
+test-nosysroot-literal-names: $(ELFUSE_BIN) $(BUILD_DIR)/test-nosysroot-literal-names
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	printf 'literal\n' > "$$tmpdir/.ef=464f4f"; \
+	printf 'other\n'   > "$$tmpdir/plain"; \
+	$(ELFUSE_BIN) $(BUILD_DIR)/test-nosysroot-literal-names "$$tmpdir"
+
+## Escape-shaped host names must mean themselves outside the sysroot
+test-sysroot-outside-names: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-outside-names
+	@set -e; \
+	srdir=$$(mktemp -d); \
+	outdir=$$(mktemp -d); \
+	trap 'rm -rf "$$srdir" "$$outdir"' EXIT; \
+	printf 'literal\n' > "$$outdir/.ef=464f4f"; \
+	$(ELFUSE_BIN) --sysroot "$$srdir" \
+	    $(BUILD_DIR)/test-sysroot-outside-names "$$outdir"; \
+	if [ -z "$$(find "$$srdir" -maxdepth 1 -name '.ef=*' -print -quit)" ]; then \
+		printf "$(RED)FAIL$(RESET) the control name was not escaped, so the volume did not fold\n"; \
+		ls -Ab "$$srdir"; \
+		exit 1; \
+	fi
+
+# A Linux filename is a byte string and a guest may use any of them, but the
+# volume underneath decides which two byte strings are the same name, and it
+# folds in ways no simple rule predicts. Every pair here is one it considers
+# equal and the guest must see as two files.
+## Non-ASCII, normalization and case-folding guest filenames
+test-sysroot-name-i18n: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-i18n
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	printf 'staged\n' > "$$tmpdir/$$(printf '\346\226\207\346\241\243')-host.txt"; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-name-i18n; \
+	if [ ! -e "$$tmpdir/$$(printf '\346\226\207\346\241\243')-host.txt" ]; then \
+		printf "$(RED)FAIL$(RESET) a host-staged non-ASCII name was disturbed\n"; \
+		exit 1; \
+	fi
+
+# Linux allows a 255-byte component and a guest is entitled to all of them,
+# including for a name stored escaped, which is longer on disk than the name it
+# stands for. Nothing below the Linux maximum may be refused.
+## Guest filenames at their full length, both stored forms
+test-sysroot-name-length: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-length
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-name-length
+
+# Component length is a guest budget; whole-path length is a host one, and the
+# host's is smaller (macOS PATH_MAX 1024 against Linux's 4096). A guest path
+# past the host ceiling reports ENAMETOOLONG and is never truncated; see
+# docs/filenames.md, "Whole paths". Not in the qemu matrix: a real Linux
+# kernel has no 1024-byte ceiling, so the boundary this pins does not exist
+# there.
+## Guest paths that cross the host path ceiling report ENAMETOOLONG
+test-sysroot-pathmax: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-pathmax
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	printf 'probe\n' > "$$tmpdir/pathmax-probe"; \
+	mode=exact; \
+	if [ -e "$$tmpdir/PATHMAX-PROBE" ]; then mode=fold; fi; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-pathmax "$$mode"
+
+# Names the guest cannot create for itself, because elfuse would store them
+# under a different spelling. A well-formed escape means the name it decodes
+# to whoever wrote it; anything that merely resembles one means itself.
+#
+# No two fixtures here may differ only by case: the staging happens on the host
+# with no translation, so a folding volume would merge them and the guest would
+# see one file where the recipe meant two. That is why the uppercase-hex case
+# uses a payload whose lowercase form is not also staged.
+## Host-staged escape-shaped names in a sysroot
+test-sysroot-name-staged: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-staged
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	d="$$tmpdir/staged"; \
+	mkdir -p "$$d"; \
+	printf 'plain\n'          > "$$d/Plain.Host"; \
+	printf 'escaped-foo\n'    > "$$d/.ef=464f4f"; \
+	printf 'literal-upper\n'  > "$$d/.ef=5A5A"; \
+	printf 'literal-odd\n'    > "$$d/.ef=464f4"; \
+	printf 'literal-nonhex\n' > "$$d/.ef=zzzz"; \
+	printf 'literal-slash\n'  > "$$d/.ef=2f"; \
+	printf 'literal-dotdot\n' > "$$d/.ef=2e2e"; \
+	printf 'literal-bare\n'   > "$$d/.ef="; \
+	printf 'literal-legacy\n' > "$$d/.ef_464f4f"; \
+	printf 'literal-bar\n'    > "$$d/Bar"; \
+	printf 'shadowed\n'       > "$$d/.ef=426172"; \
+	nm="r2probe-$$$$"; \
+	Nm="R2Probe-$$$$"; \
+	mkdir -p "$$tmpdir/tmp/$$Nm"; \
+	mkdir -p "/tmp/$$nm"; \
+	printf 'HOST-LEAK\n' > "/tmp/$$nm/planted"; \
+	esc="/private/tmp/elfuse-staged-$$$$"; \
+	mkdir -p "$$esc/folded" "$$tmpdir$$esc/Folded"; \
+	printf 'HOST-LEAK\n' > "$$esc/folded/planted"; \
+	trap 'rm -rf "$$tmpdir" "/tmp/'"$$nm"'" "'"$$esc"'"' EXIT; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-name-staged \
+	    "/tmp/$$nm" "$$esc/folded"; \
+	if [ -e "/tmp/$$nm/created" ] || [ -e "$$esc/folded/created" ] || \
+	   [ -n "$$(find "$$tmpdir" -name created)" ]; then \
+		printf "$(RED)FAIL$(RESET) a create landed under a folded component\n"; \
+		exit 1; \
+	fi
+
+# A sysroot written by an older elfuse holds the spellings that build froze,
+# and the current build must keep reading them. The literals staged here are
+# copies of rows in tests/casefold-vectors.h. Keep them in step; the guest
+# opens strictly by guest name, so a literal that drifts from the header
+# fails at runtime rather than silently testing nothing. Staging happens on
+# the host so nothing here derives from the codec under test. Escapes mean
+# their guest names only where the escape is active, so a case-sensitive
+# scratch volume is a SKIP, not a pass.
+## Read a corpus of frozen on-disk spellings staged host-side
+test-sysroot-corpus: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-corpus
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	printf 'p\n' > "$$tmpdir/CaseProbe"; \
+	if [ ! -e "$$tmpdir/caseprobe" ]; then \
+		printf "$(YELLOW)SKIP$(RESET) test-sysroot-corpus (scratch volume is case-sensitive)\n"; \
+		exit 0; \
+	fi; \
+	rm -f "$$tmpdir/CaseProbe"; \
+	c="$$tmpdir/corpus"; \
+	mkdir -p "$$c"; \
+	printf 'Foo\n' > "$$c/.ef=466f6f"; \
+	printf 'README\n' > "$$c/.ef=524541444d45"; \
+	printf 'caf\303\251\n' > "$$c/.ef=636166c3a9"; \
+	mkdir -p "$$c/.ef=4775657374446972"; \
+	printf 'New.File\n' > "$$c/.ef=4775657374446972/.ef=4e65772e46696c65"; \
+	long=".ef=$$(printf '\344\271\276')"; \
+	i=0; \
+	while [ $$i -lt 42 ]; do \
+		long="$$long$$(printf '\345\216\205\345\231\230')"; \
+		i=$$((i + 1)); \
+	done; \
+	awk 'BEGIN { for (i = 0; i < 126; i++) printf "X"; printf "\n" }' \
+	    > "$$c/$$long"; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-corpus
+
+# The volume counterpart of test-sysroot-name-race: minutes of threaded and
+# forked churn over one colliding set instead of ten processes aimed at one
+# window. Excluded from check for its runtime, so the guest runs with
+# --timeout 0; a pass is only the absence of a reproducer today. The header
+# of tests/test-sysroot-name-soak.c states the invariants.
+## Soak colliding-name churn for SECS seconds (default 120)
+test-sysroot-name-soak: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-soak
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	$(ELFUSE_BIN) --timeout 0 --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-name-soak $(or $(SECS),120)
+
+## Alias for test-sysroot-name-soak
+check-soak: test-sysroot-name-soak
+
+# Nothing serializes name creation in a sysroot, because the on-disk spelling of
+# a guest name is a function of that name alone. fork(2) under elfuse spawns a
+# separate host process, so the children really are separate processes sharing
+# one sysroot. Repeated, because a single round can miss a narrow window; a pass
+# does not prove there is no race, only a failure proves there is one.
+## Concurrent creation of case-colliding names, repeated
+test-sysroot-name-race: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-race
+	@set -e; \
+	i=0; \
+	tmpdir=""; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	while [ $$i -lt 10 ]; do \
+		tmpdir=$$(mktemp -d); \
+		$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+		    $(BUILD_DIR)/test-sysroot-name-race > "$$tmpdir/.out" 2>&1 || { \
+			cat "$$tmpdir/.out"; rm -rf "$$tmpdir"; exit 1; }; \
+		rm -rf "$$tmpdir"; \
+		i=$$((i + 1)); \
+	done; \
+	printf "test-sysroot-name-race: 10 rounds - PASS\n"
 
 # Build APFS-side dirents whose UTF-8 byte length exceeds Linux
 # NAME_MAX (255). 89 copies of U+3042 (3-byte UTF-8) plus a 1-byte

@@ -375,6 +375,9 @@ QEMU_SKIP="
 ELFUSE_SKIP="
     test-sysroot-name-unique
     test-sysroot-name-relative
+    test-sysroot-name-i18n
+    test-sysroot-name-length
+    test-sysroot-name-race
 "
 
 # Whitespace-separated membership test, shared by the per-runner skip lists so a
@@ -855,11 +858,22 @@ run_unit_tests()
     # rather than beliefs, because the VM's / and /tmp are tmpfs: byte-exact and
     # case-sensitive. Each cleans up after itself, so repeated runs in one boot
     # are safe.
+    #
+    # test-sysroot-name-staged is deliberately absent: it stages the on-disk
+    # spellings elfuse produces on a folding volume, which is not a concept a
+    # Linux kernel has, and it fails 10 of its 11 assertions here for exactly
+    # that reason.
     printf "\nFilenames\n"
     test_check "$runner" "test-sysroot-name-unique" "0 failed" \
         "$bindir/test-sysroot-name-unique"
     test_check "$runner" "test-sysroot-name-relative" "0 failed" \
         "$bindir/test-sysroot-name-relative"
+    test_check "$runner" "test-sysroot-name-i18n" "0 failed" \
+        "$bindir/test-sysroot-name-i18n"
+    test_check "$runner" "test-sysroot-name-length" "0 failed" \
+        "$bindir/test-sysroot-name-length"
+    test_check "$runner" "test-sysroot-name-race" "0 failed" \
+        "$bindir/test-sysroot-name-race"
 }
 
 run_coreutils_tests()
@@ -1289,7 +1303,7 @@ run_suite()
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
     "elfuse-aarch64|241|0"
-    "qemu-aarch64|220|0"
+    "qemu-aarch64|223|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

@@ -3,9 +3,23 @@
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * The guest's working directory is tracked as a guest path, not a host one, so
+ * getcwd(3) and /proc/self/cwd must report where the guest thinks it is rather
+ * than where the file actually sits. Two things can break that: the sysroot
+ * prefix leaking out, and (on a folding volume) a component whose on-disk
+ * spelling is escaped being reported as stored.
+ *
+ * Code under test: proc_cwd_refresh in src/syscall/proc-state.c and the
+ * host-to-guest conversion in src/syscall/path.c. A regression shows up as a
+ * cwd the guest cannot chdir back into, because the path it was handed names
+ * nothing in its own namespace.
+ *
+ * Run under --sysroot.
  */
 
 #include <errno.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -63,6 +77,52 @@ int main(void)
             FAIL("chdir unexpectedly succeeded via sysroot lib fallback");
         } else if (errno != ENOENT) {
             FAIL("chdir failed with wrong errno");
+        } else {
+            PASS();
+        }
+    }
+
+    /* A directory whose name the volume cannot hold as itself is stored under
+     * an escape. The cwd is reported to the guest, so it has to be reported in
+     * the guest's spelling; handing back the escape names a directory the guest
+     * never created and cannot chdir into.
+     */
+    TEST("getcwd reports the guest spelling of an escaped directory");
+    {
+        ssize_t len;
+
+        if (mkdir("/Cwd.Dir", 0755) < 0 && errno != EEXIST) {
+            FAIL("mkdir failed");
+        } else if (chdir("/Cwd.Dir") < 0) {
+            FAIL("chdir failed");
+        } else if (!getcwd(cwd, sizeof(cwd))) {
+            FAIL("getcwd failed");
+        } else if (strcmp(cwd, "/Cwd.Dir")) {
+            FAIL("getcwd leaked the on-disk spelling");
+        } else if ((len = readlink("/proc/self/cwd", proc_cwd,
+                                   sizeof(proc_cwd) - 1)) < 0) {
+            FAIL("readlink /proc/self/cwd failed");
+        } else {
+            proc_cwd[len] = '\0';
+            if (strcmp(proc_cwd, "/Cwd.Dir"))
+                FAIL("/proc/self/cwd leaked the on-disk spelling");
+            else
+                PASS();
+        }
+    }
+
+    /* The cwd must be usable, not merely printable: a guest that reads it and
+     * chdirs back has to arrive where it started.
+     */
+    TEST("the reported cwd can be returned to");
+    {
+        if (chdir("/") < 0) {
+            FAIL("chdir / failed");
+        } else if (chdir(cwd) < 0) {
+            FAIL("the reported cwd does not resolve");
+        } else if (!getcwd(proc_cwd, sizeof(proc_cwd)) ||
+                   strcmp(proc_cwd, "/Cwd.Dir")) {
+            FAIL("round trip landed somewhere else");
         } else {
             PASS();
         }
