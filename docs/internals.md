@@ -648,9 +648,9 @@ In `src/runtime/forkipc.c`:
 
 ### `execve`
 
-`sys_execve` in `src/syscall/exec.c` reloads the ELF, loads the dynamic
-interpreter for dynamically-linked targets via the shared
-`elf_resolve_interp()` helper (also used at startup), rebuilds page tables,
+`sys_execve` in `src/syscall/exec.c` reloads the ELF, resolves the dynamic
+interpreter for dynamically-linked targets through `path_translate_at()`
+like any other guest path, rebuilds page tables,
 and restarts the vCPU. Signal handlers are reset to `SIG_DFL` per POSIX:
 `SIG_IGN` stays `SIG_IGN`, and pending and blocked masks are preserved.
 This happens in `signal_reset_for_exec()` after `guest_reset`.
@@ -996,8 +996,14 @@ How it works:
 The sysroot is inherited by fork children via IPC state transfer.
 `sys_execve` also loads the interpreter for dynamically linked targets, so
 tools that `execve` dynamic children (`env`, `nice`, `nohup`) work
-correctly. `elf_resolve_interp()` in `src/core/elf.c` is shared between
-`src/main.c` and `src/syscall/exec.c`.
+correctly. The two loaders resolve `PT_INTERP` in different orders.
+Guest-issued execs route it through `path_translate_at()` like any other
+guest path. The initial process is loaded by the core bootstrap
+(`load_interpreter()` in `src/core/bootstrap.c`), which probes
+`elf_resolve_interp()` (`src/core/elf.c`) first, a literal sysroot
+concatenation plus a `/lib/<basename>` fallback, and only when both
+probes miss does it fall through to `path_translate_at()`, materializing
+a FUSE interpreter and refusing one in `/dev/shm`.
 
 ### Known Limitations
 

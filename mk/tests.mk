@@ -19,6 +19,7 @@
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-sysroot-inotify-names test-sysroot-exec-names \
+        test-sysroot-interp-fallback test-sysroot-interp-cased \
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-sysroot-name-unique \
         test-sysroot-name-relative \
@@ -191,6 +192,10 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-inotify-names
 	@printf "\n$(BLUE)━━━ exec identity across the escape boundary ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-exec-names
+	@printf "\n$(BLUE)━━━ PT_INTERP /lib fallback ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-interp-fallback
+	@printf "\n$(BLUE)━━━ PT_INTERP through an escaped path ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-interp-cased
 	@printf "\n$(BLUE)━━━ sysroot mounted at / ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-root
 	@printf "\n$(BLUE)━━━ literal names without a sysroot ━━━$(RESET)\n"
@@ -518,6 +523,68 @@ test-sysroot-symlink-target: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-tar
 	if [ -z "$$(find "$$tmpdir" -maxdepth 2 -name '.ef=*' -print -quit)" ]; then \
 		printf "$(RED)FAIL$(RESET) no escaped entries in the sysroot\n"; \
 		ls -Rb "$$tmpdir"; \
+		exit 1; \
+	fi
+
+# PT_INTERP names the loader by the guest's spelling, and a rootfs may ship
+# it somewhere other than where the binary asks (store-style paths). The
+# interp resolver falls back to /lib/<basename> when the asked-for path does
+# not resolve; this pins the fallback with an absent /nix-style prefix.
+## PT_INTERP falls back to /lib/<basename> for an absent store path
+test-sysroot-interp-fallback: $(ELFUSE_BIN)
+	@if [ -z "$(SYSROOT_DIR)" ] || \
+	    [ ! -f "$(SYSROOT_DIR)/lib/ld-musl-aarch64.so.1" ] || \
+	    [ ! -f "$(DYNAMIC_COREUTILS_BIN)/echo" ]; then \
+		printf "$(YELLOW)SKIP$(RESET) test-sysroot-interp-fallback (musl fixtures missing)\n"; \
+		exit 0; \
+	fi; \
+	set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	cp "$(DYNAMIC_COREUTILS_BIN)/echo" "$$tmpdir/echo"; \
+	off=$$(grep -abo '/lib/ld-musl-aarch64.so.1' "$$tmpdir/echo" | head -1 | cut -d: -f1); \
+	[ -n "$$off" ]; \
+	printf '/nix' | dd of="$$tmpdir/echo" bs=1 seek="$$off" conv=notrunc 2>/dev/null; \
+	out=$$($(ELFUSE_BIN) --sysroot $(SYSROOT_DIR) "$$tmpdir/echo" interp-fallback-ok); \
+	[ "$$out" = "interp-fallback-ok" ]
+
+# The loader itself may live under a case-protected path: the guest stages a
+# copy of the musl loader below /NiX (stored escaped), and the patched binary
+# asks for it by that spelling with a basename /lib does not carry, so only
+# a resolution that walks the escape can launch it, and the /lib fallback
+# cannot mask a regression. The exec goes through a guest trampoline because
+# the initial process is loaded by the core bootstrap, which resolves
+# PT_INTERP by literal concatenation plus the /lib fallback only.
+## PT_INTERP resolves through an escaped path
+test-sysroot-interp-cased: $(ELFUSE_BIN) $(BUILD_DIR)/mkdir-arg \
+		$(BUILD_DIR)/copy-arg $(BUILD_DIR)/exec-arg
+	@if [ -z "$(SYSROOT_DIR)" ] || \
+	    [ ! -f "$(SYSROOT_DIR)/lib/ld-musl-aarch64.so.1" ] || \
+	    [ ! -f "$(DYNAMIC_COREUTILS_BIN)/echo" ]; then \
+		printf "$(YELLOW)SKIP$(RESET) test-sysroot-interp-cased (musl fixtures missing)\n"; \
+		exit 0; \
+	fi; \
+	set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	sysroot="$$tmpdir/sysroot"; \
+	cp -R "$(SYSROOT_DIR)" "$$sysroot"; \
+	mkdir -p "$$sysroot/bin"; \
+	cp $(BUILD_DIR)/mkdir-arg "$$sysroot/bin/mkdir-arg"; \
+	cp $(BUILD_DIR)/copy-arg "$$sysroot/bin/copy-arg"; \
+	cp $(BUILD_DIR)/exec-arg "$$sysroot/bin/exec-arg"; \
+	$(ELFUSE_BIN) --sysroot "$$sysroot" "$$sysroot/bin/mkdir-arg" /NiX; \
+	$(ELFUSE_BIN) --sysroot "$$sysroot" "$$sysroot/bin/copy-arg" \
+	    /lib/ld-musl-aarch64.so.1 /NiX/xd-musl-aarch64.so.1; \
+	cp "$(DYNAMIC_COREUTILS_BIN)/echo" "$$sysroot/echo-cased"; \
+	off=$$(grep -abo '/lib/ld-musl-aarch64.so.1' "$$sysroot/echo-cased" | head -1 | cut -d: -f1); \
+	[ -n "$$off" ]; \
+	printf '/NiX/xd-musl' | dd of="$$sysroot/echo-cased" bs=1 seek="$$off" conv=notrunc 2>/dev/null; \
+	out=$$($(ELFUSE_BIN) --sysroot "$$sysroot" "$$sysroot/bin/exec-arg" \
+	    /echo-cased echo interp-cased-ok); \
+	[ "$$out" = "interp-cased-ok" ]; \
+	if [ -e "$$sysroot/NiX" ]; then \
+		printf "$(RED)FAIL$(RESET) NiX was stored literally\n"; \
 		exit 1; \
 	fi
 
