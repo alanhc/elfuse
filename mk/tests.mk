@@ -18,6 +18,7 @@
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
+        test-sysroot-inotify-names \
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-sysroot-name-unique \
         test-sysroot-name-relative \
@@ -186,6 +187,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-dotdot
 	@printf "\n$(BLUE)━━━ escaped symlink-target resolution ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-symlink-target
+	@printf "\n$(BLUE)━━━ inotify names across the escape boundary ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-inotify-names
 	@printf "\n$(BLUE)━━━ sysroot mounted at / ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-root
 	@printf "\n$(BLUE)━━━ literal names without a sysroot ━━━$(RESET)\n"
@@ -513,6 +516,26 @@ test-sysroot-symlink-target: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-tar
 	if [ -z "$$(find "$$tmpdir" -maxdepth 2 -name '.ef=*' -print -quit)" ]; then \
 		printf "$(RED)FAIL$(RESET) no escaped entries in the sysroot\n"; \
 		ls -Rb "$$tmpdir"; \
+		exit 1; \
+	fi
+
+# Watches resolve their path like every other guest path, and event names are
+# decoded back to guest bytes. The recipe asserts the host-side half: the
+# fixture the guest leaves behind must sit on disk only under its escape, so a
+# passing guest lane proves the events were decoded rather than the names
+# having been stored literally.
+## inotify watches and event names cross the escape boundary intact
+test-sysroot-inotify-names: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-inotify-names
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	outdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir" "$$outdir"' EXIT; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-inotify-names "$$outdir"; \
+	if [ -e "$$tmpdir/watch/CaseDir" ] && \
+	   [ -z "$$(find "$$tmpdir/watch" -maxdepth 1 -name '.ef=*' -print -quit)" ]; then \
+		printf "$(RED)FAIL$(RESET) CaseDir was stored literally\n"; \
+		ls -Ab "$$tmpdir/watch"; \
 		exit 1; \
 	fi
 

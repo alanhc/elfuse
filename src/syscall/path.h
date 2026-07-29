@@ -166,6 +166,13 @@ int path_host_to_guest(const char *host_path, char *out, size_t outsz);
  */
 bool path_dirent_dir_holds_escapes(host_fd_t host_dirfd);
 
+/* Decode one on-disk entry name to the guest-visible spelling.
+ * @dir_holds_escapes is the caller's per-directory answer from
+ * path_dirent_dir_holds_escapes(); when false every name means itself.
+ * Returns 0, or -1 with errno set: ENAMETOOLONG for a host name no guest
+ * dirent or event buffer could carry, which is the one failure a caller with
+ * real arguments sees; a missing argument is EINVAL.
+ */
 int path_translate_dirent_name(bool dir_holds_escapes,
                                const char *host_name,
                                char *guest_name,
