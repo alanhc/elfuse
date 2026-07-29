@@ -32,6 +32,7 @@
         test-sysroot-name-staged test-sysroot-name-race \
         test-sysroot-pathmax test-sysroot-corpus \
         test-sysroot-name-soak check-soak \
+        check-name-caseexact test-sysroot-path-matrix \
         probe-volume-naming perf
 
 ## Build and run the assembly hello world test
@@ -170,6 +171,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-pathmax
 	@printf "\n$(BLUE)━━━ frozen on-disk spelling corpus ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-corpus
+	@printf "\n$(BLUE)━━━ addressing modes agree across the path matrix ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-path-matrix
 	@printf "\n$(BLUE)━━━ shebang parser unit test ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-shebang-host
 	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
@@ -891,6 +894,94 @@ test-sysroot-name-race: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-race
 		i=$$((i + 1)); \
 	done; \
 	printf "test-sysroot-name-race: 10 rounds - PASS\n"
+
+# The byte-exact lane is the oracle for the name suite. A case-sensitive
+# volume stores every name as itself and matches byte-exactly (the same
+# contract the tests assert), so an expectation that fails here disagrees
+# with a real Linux filesystem, whatever the folding lane says of it.
+# test-sysroot-name-staged stays out: it stages the spellings a folding
+# volume forces, and those do not exist here. One image hosts every run,
+# with a per-test subdirectory keeping the sysroots apart; the find at the
+# end enforces for all tests at once that elfuse stored nothing escaped,
+# which is the inversion of the folding lane's stray checks. It prunes the
+# path-matrix subtree, because an escape-shaped literal is one of that
+# test's name classes: the guest asks for that name and a byte-exact volume
+# owes it back unchanged, so an entry there is a guest creation and says
+# nothing about what elfuse wrote. A positive check keeps the subtree
+# covered instead, since every other lane creates no such name.
+# The cross-product matrix asserts mode agreement, an invariant that must
+# hold identically whether the volume folds or not; the recipe provisions a
+# folding tmpdir, and check-name-caseexact re-runs the same binary on the
+# case-sensitive volume.
+## Addressing modes agree over operation x shape x name class
+test-sysroot-path-matrix: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-path-matrix
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-path-matrix
+
+## Re-run the name suite on a case-sensitive volume as ground truth
+check-name-caseexact: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-name-unique \
+		$(BUILD_DIR)/test-sysroot-name-relative \
+		$(BUILD_DIR)/test-sysroot-name-i18n \
+		$(BUILD_DIR)/test-sysroot-name-length \
+		$(BUILD_DIR)/test-sysroot-name-race \
+		$(BUILD_DIR)/test-sysroot-path-matrix
+	@dmg=$$(mktemp -u).dmg; mnt=""; \
+	trap '[ -n "$$mnt" ] && hdiutil detach "$$mnt" -force -quiet >/dev/null 2>&1; rm -f "$$dmg"' EXIT; \
+	if ! hdiutil create -size 64m -fs "Case-sensitive APFS" \
+	        -volname elfusenamecs -quiet "$$dmg" >/dev/null 2>&1; then \
+		printf "$(YELLOW)SKIP$(RESET) check-name-caseexact (hdiutil create failed)\n"; \
+		exit 0; \
+	fi; \
+	mnt=$$(hdiutil attach "$$dmg" -nobrowse | awk '/\/Volumes\//{print $$NF}'); \
+	if [ -z "$$mnt" ]; then \
+		printf "$(YELLOW)SKIP$(RESET) check-name-caseexact (hdiutil attach failed)\n"; \
+		exit 0; \
+	fi; \
+	set -e; \
+	for t in name-unique name-i18n name-length; do \
+		mkdir -p "$$mnt/$$t"; \
+	done; \
+	printf 'staged\n' > "$$mnt/name-i18n/$$(printf '\346\226\207\346\241\243')-host.txt"; \
+	$(ELFUSE_BIN) --sysroot "$$mnt/name-unique" \
+	    $(BUILD_DIR)/test-sysroot-name-unique; \
+	mkdir -p "$$mnt/name-relative" "$$mnt/name-relative-outside"; \
+	$(ELFUSE_BIN) --sysroot "$$mnt/name-relative" \
+	    $(BUILD_DIR)/test-sysroot-name-relative "$$mnt/name-relative-outside"; \
+	$(ELFUSE_BIN) --sysroot "$$mnt/name-i18n" \
+	    $(BUILD_DIR)/test-sysroot-name-i18n csapfs; \
+	mkdir -p "$$mnt/path-matrix"; \
+	$(ELFUSE_BIN) --sysroot "$$mnt/path-matrix" \
+	    $(BUILD_DIR)/test-sysroot-path-matrix; \
+	if [ ! -e "$$mnt/name-i18n/$$(printf '\346\226\207\346\241\243')-host.txt" ]; then \
+		printf "$(RED)FAIL$(RESET) a host-staged non-ASCII name was disturbed\n"; \
+		exit 1; \
+	fi; \
+	$(ELFUSE_BIN) --sysroot "$$mnt/name-length" \
+	    $(BUILD_DIR)/test-sysroot-name-length; \
+	i=0; \
+	while [ $$i -lt 3 ]; do \
+		mkdir -p "$$mnt/name-race-$$i"; \
+		$(ELFUSE_BIN) --sysroot "$$mnt/name-race-$$i" \
+		    $(BUILD_DIR)/test-sysroot-name-race > "$$mnt/name-race-$$i/.out" 2>&1 || { \
+			cat "$$mnt/name-race-$$i/.out"; exit 1; }; \
+		i=$$((i + 1)); \
+	done; \
+	printf "test-sysroot-name-race: 3 byte-exact rounds - PASS\n"; \
+	escaped=$$(find "$$mnt" -path "$$mnt/path-matrix" -prune -o \
+	    -name '.ef=*' -print | wc -l | tr -d ' '); \
+	if [ "$$escaped" != 0 ]; then \
+		printf "$(RED)FAIL$(RESET) %s name(s) escaped on a byte-exact volume\n" "$$escaped"; \
+		find "$$mnt" -path "$$mnt/path-matrix" -prune -o -name '.ef=*' -print; \
+		exit 1; \
+	fi; \
+	if [ -z "$$(find "$$mnt/path-matrix" -name 'Mixed.Name' -print -quit)" ]; then \
+		printf "$(RED)FAIL$(RESET) path-matrix stored no literal Mixed.Name\n"; \
+		find "$$mnt/path-matrix" | head -40; \
+		exit 1; \
+	fi
 
 # Build APFS-side dirents whose UTF-8 byte length exceeds Linux
 # NAME_MAX (255). 89 copies of U+3042 (3-byte UTF-8) plus a 1-byte

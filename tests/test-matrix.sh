@@ -373,6 +373,7 @@ QEMU_SKIP="
 # measure the host's naming rules instead of Linux's. Their elfuse-side coverage
 # is the make-check sysroot lanes.
 ELFUSE_SKIP="
+    test-sysroot-path-matrix
     test-sysroot-name-unique
     test-sysroot-name-relative
     test-sysroot-name-i18n
@@ -863,6 +864,15 @@ run_unit_tests()
     # spellings elfuse produces on a folding volume, which is not a concept a
     # Linux kernel has, and it fails 10 of its 11 assertions here for exactly
     # that reason.
+    #
+    # test-sysroot-pathmax is deliberately absent for the mirror-image reason:
+    # it pins ENAMETOOLONG at the macOS 1024-byte PATH_MAX ceiling, and a real
+    # Linux kernel, with no such ceiling, correctly builds every path the test
+    # expects to be refused.
+    #
+    # test-sysroot-corpus is deliberately absent like test-sysroot-name-staged:
+    # its fixtures are the on-disk spellings elfuse freezes for a folding
+    # volume, which mean nothing to a Linux kernel.
     printf "\nFilenames\n"
     test_check "$runner" "test-sysroot-name-unique" "0 failed" \
         "$bindir/test-sysroot-name-unique"
@@ -874,6 +884,8 @@ run_unit_tests()
         "$bindir/test-sysroot-name-length"
     test_check "$runner" "test-sysroot-name-race" "0 failed" \
         "$bindir/test-sysroot-name-race"
+    test_check "$runner" "test-sysroot-path-matrix" "0 failed" \
+        "$bindir/test-sysroot-path-matrix"
 }
 
 run_coreutils_tests()
@@ -1303,7 +1315,7 @@ run_suite()
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
     "elfuse-aarch64|241|0"
-    "qemu-aarch64|223|0"
+    "qemu-aarch64|224|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

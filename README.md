@@ -56,7 +56,7 @@ boot-time overhead those tools impose.
 - GNU `objcopy` or `llvm-objcopy`
 - Hypervisor entitlement: `com.apple.security.hypervisor`
 
-To build only (`make elfuse`) without running tests, just the 
+To build only (`make elfuse`) without running tests, just the
 Xcode Command Line Tools and `objcopy` (`brew install binutils`) suffice.
 
 For guest test binaries, the project also expects an AArch64 Linux cross
@@ -65,7 +65,7 @@ used by the repository test harness, but `CROSS_COMPILE` and
 `BAREMETAL_CROSS` are overridable.
 
 See
-[docs/testing.md](docs/testing.md#build-requirements) for toolchain setup guide. 
+[docs/testing.md](docs/testing.md#build-requirements) for toolchain setup guide.
 
 ## Quick Start
 

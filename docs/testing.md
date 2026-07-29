@@ -32,7 +32,7 @@ Guest test builds additionally require:
 - An AArch64 Linux cross-compiler for C test programs
 - An AArch64 bare-metal toolchain for the assembly smoke test
 
-The toolchain defaults are defined in `mk/toolchain.mk`. 
+The toolchain defaults are defined in `mk/toolchain.mk`.
 These variables are intended to be overridden when needed:
 
 - `CROSS_COMPILE`
@@ -46,7 +46,7 @@ the full `make test-matrix` (including the `qemu-aarch64` reference run). Run it
 once on an Apple Silicon macOS host:
 
 ```sh
-# GNU coreutils (gtimeout) — required by the test harness timeout wrapper
+# GNU coreutils (gtimeout): required by the test harness timeout wrapper
 brew install coreutils
 
 # GNU objcopy
@@ -60,12 +60,14 @@ brew tap messense/macos-cross-toolchains
 brew trust --formula messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
 brew install aarch64-unknown-linux-gnu
 
-# QEMU — boots the Alpine minirootfs for the qemu-aarch64 reference run
+# QEMU: boots the Alpine minirootfs for the qemu-aarch64 reference run
 brew install qemu
 ```
 
-Depending on your setup, you might need to add the following to your PATH
-```
+Depending on the setup, the bare-metal toolchain may also need adding to
+`PATH`:
+
+```sh
 export PATH="/opt/homebrew/opt/aarch64-elf-gcc/bin:$PATH"
 ```
 
@@ -103,8 +105,27 @@ What they do:
     `externals/test-fixtures/aarch64-musl/staticbin/bin/busybox` or
     downloaded into `build/busybox` on first run)
   - the filename codec and case-exact path resolution unit tests
-  - the sysroot filename lanes: one representation per name, non-ASCII
-    and normalization, full-length names, and host-staged escape shapes
+  - the sysroot lanes, each a recipe in `mk/tests.mk` that provisions
+    its own sysroot and asserts the on-disk shape host-side after the
+    guest exits: the filename family (one representation per name,
+    relative and dirfd-relative names, non-ASCII, full length,
+    host-staged escape shapes, concurrent colliding creates), the
+    edge shapes (sysroot at `/`, no sysroot, the guest-visible cwd),
+    byte-exact lookup, host fallback, symlink escapes and targets,
+    case collisions, the decode boundary (inotify names, exec
+    identity, `PT_INTERP`, pathname `AF_UNIX` sockets), the host
+    path ceiling (`ENAMETOOLONG` where macOS's 1024-byte `PATH_MAX`
+    undercuts the guest's 4096, a macOS-only boundary, which is why
+    the lane is absent from the qemu matrix), and the frozen-spelling
+    corpus (on-disk escapes staged byte-for-byte from
+    `tests/casefold-vectors.h` and read back through a live sysroot)
+  - the byte-exact oracle lane (`check-name-caseexact`): the name
+    suite re-run against a case-sensitive APFS sparsebundle. The
+    volume itself enforces the byte-exact matching the tests assert,
+    so a failure there means a test's expectation (not the volume)
+    is wrong, whatever the folding lane says of it. The i18n lane
+    runs in its `csapfs` mode, pinning the two divergences that
+    configuration accepts (see `docs/filenames.md`)
   - the sysroot procfs exec, FUSE-on-Alpine, and `timeout=0` regressions
   - the Rosetta CLI gating regressions
   - the hot-syscall guardrail (`tests/test-bench-guardrail.sh`)
@@ -114,6 +135,10 @@ What they do:
   (`test-rosetta-cli`, `test-rosetta-failure-modes`,
   `test-rosetta-statics`, `test-rosetta-alpine`,
   `test-rosetta-audit`, `test-rosetta-jit`, `test-rosetta-glibc`)
+- `make test-sysroot-name-soak`: minutes of threaded and forked churn over
+  one case-colliding name set (`SECS=N` overrides the default 120). Excluded
+  from `check` for its runtime; a pass is only the absence of a reproducer,
+  and the invariants are stated in `tests/test-sysroot-name-soak.c`
 - `make test-busybox`: just the BusyBox suite, useful when iterating on a
   single applet failure without rerunning the unit suite
 - `make test-fuse-alpine`: validate guest `/dev/fuse` + `mount("fuse")`
@@ -380,6 +405,7 @@ Suggested minimum validation:
 | Change area | Recommended validation |
 |-------------|------------------------|
 | CLI, logging, docs-only build rules | `make elfuse` |
+| Filename codec, case-exact walk, sysroot resolvers | `make check` (runs the codec unit tests, name lanes, and byte-exact oracle lane), plus `make test-sysroot-name-soak` for resolver concurrency. A red golden vector in `test-casefold-host` means the on-disk format moved: see `docs/filenames.md` before touching `tests/casefold-vectors.h` |
 | General syscall or runtime logic | `make elfuse && make check && make test-matrix-elfuse-aarch64` |
 | `/proc`, `/dev`, path, or BusyBox-sensitive behavior | `make elfuse && make check && make test-matrix-elfuse-aarch64` |
 | Rosetta hosting, x86_64 dispatch, VZ ioctls, AOT cache | `make elfuse && make test-rosetta-all` |
