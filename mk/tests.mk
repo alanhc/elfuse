@@ -20,8 +20,10 @@
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-sysroot-inotify-names test-sysroot-exec-names \
         test-sysroot-interp-fallback test-sysroot-interp-cased \
+        test-sysroot-absock-names test-absock-cleanup \
         test-linkat-symlink-fallback test-casefold-host \
-        test-casefold-walk-host test-sysroot-name-unique \
+        test-casefold-walk-host test-absock-names-host \
+        test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root \
@@ -95,7 +97,8 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) \
 		$(BUILD_DIR)/test-identity-override-host \
 		$(BUILD_DIR)/test-teardown-live-vcpu-host \
 		$(BUILD_DIR)/test-casefold-host \
-		$(BUILD_DIR)/test-casefold-walk-host
+		$(BUILD_DIR)/test-casefold-walk-host \
+		$(BUILD_DIR)/test-absock-names-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v -s '$(SANITIZER_SECTIONS)'
 	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-tlbi-encoder-host
@@ -111,6 +114,8 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) \
 	@$(BUILD_DIR)/test-casefold-host
 	@printf "\n$(BLUE)━━━ case-exact path resolution unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-casefold-walk-host
+	@printf "\n$(BLUE)━━━ absock derived-name unit test ━━━$(RESET)\n"
+	@$(BUILD_DIR)/test-absock-names-host
 	@printf "\n$(BLUE)━━━ one on-disk name per guest name ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-name-unique
 	@printf "\n$(BLUE)━━━ relative and dirfd-relative names ━━━$(RESET)\n"
@@ -130,7 +135,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 		$(BUILD_DIR)/test-identity-override-host \
 		$(BUILD_DIR)/test-teardown-live-vcpu-host \
 		$(BUILD_DIR)/test-casefold-host \
-		$(BUILD_DIR)/test-casefold-walk-host
+		$(BUILD_DIR)/test-casefold-walk-host \
+		$(BUILD_DIR)/test-absock-names-host
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	@printf "\n$(BLUE)━━━ TLBI RVAE1IS encoder unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-tlbi-encoder-host
@@ -146,6 +152,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(BUILD_DIR)/test-casefold-host
 	@printf "\n$(BLUE)━━━ case-exact path resolution unit test ━━━$(RESET)\n"
 	@$(BUILD_DIR)/test-casefold-walk-host
+	@printf "\n$(BLUE)━━━ absock derived-name unit test ━━━$(RESET)\n"
+	@$(BUILD_DIR)/test-absock-names-host
 	@printf "\n$(BLUE)━━━ one on-disk name per guest name ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-name-unique
 	@printf "\n$(BLUE)━━━ relative and dirfd-relative names ━━━$(RESET)\n"
@@ -196,6 +204,10 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-interp-fallback
 	@printf "\n$(BLUE)━━━ PT_INTERP through an escaped path ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-interp-cased
+	@printf "\n$(BLUE)━━━ pathname sockets across the escape boundary ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-absock-names
+	@printf "\n$(BLUE)━━━ absock namespace lifecycle ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-absock-cleanup
 	@printf "\n$(BLUE)━━━ sysroot mounted at / ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-root
 	@printf "\n$(BLUE)━━━ literal names without a sysroot ━━━$(RESET)\n"
@@ -523,6 +535,72 @@ test-sysroot-symlink-target: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-tar
 	if [ -z "$$(find "$$tmpdir" -maxdepth 2 -name '.ef=*' -print -quit)" ]; then \
 		printf "$(RED)FAIL$(RESET) no escaped entries in the sysroot\n"; \
 		ls -Rb "$$tmpdir"; \
+		exit 1; \
+	fi
+
+# A pathname socket's address is a filesystem path and resolves like one.
+# The recipe asserts the host-side half: the socket the guest leaves bound
+# sits inside the sysroot only under its escape, nothing landed at the
+# host-literal spelling, and the private shortening-link dir is swept on
+# exit.
+## pathname AF_UNIX socket addresses resolve through the sysroot
+test-sysroot-absock-names: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-absock-names
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	before=$$(ls -d /tmp/elfuse-absock-* 2>/dev/null | wc -l | tr -d ' '); \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-sysroot-absock-names; \
+	for leaf in My.Sock Recv.Sock Sender.Sock sock Sock; do \
+		if [ -e "/sockdir/$$leaf" ]; then \
+			printf "$(RED)FAIL$(RESET) socket path /sockdir/%s escaped to the host root\n" "$$leaf"; \
+			exit 1; \
+		fi; \
+	done; \
+	if ls -A "$$tmpdir/sockdir" | grep -qx 'Sock'; then \
+		printf "$(RED)FAIL$(RESET) Sock was stored literally\n"; \
+		ls -Ab "$$tmpdir/sockdir"; \
+		exit 1; \
+	fi; \
+	after=$$(ls -d /tmp/elfuse-absock-* 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$after" -gt "$$before" ]; then \
+		printf "$(RED)FAIL$(RESET) absock namespace dir leaked ($$before -> $$after)\n"; \
+		exit 1; \
+	fi
+
+# The absock namespace dir is shared across a forked guest tree, so neither
+# exit order may destroy state the other side still needs; the recipe also
+# asserts the dir itself does not leak.
+## absock namespace lifecycle across fork and exit order
+test-absock-cleanup: $(ELFUSE_BIN) $(BUILD_DIR)/test-absock-cleanup
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	before=$$(ls -d /tmp/elfuse-absock-* 2>/dev/null | wc -l | tr -d ' '); \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-absock-cleanup; \
+	printf "  %-30s " "owner sweep spares live child"; \
+	out=$$($(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-absock-cleanup owner-sweep 2>/dev/null); \
+	verdict=$$(printf '%s\n' "$$out" | sed -n 's/^OWNER_SWEEP=//p'); \
+	if [ "$$verdict" = ok ]; then \
+		printf "OK\n"; \
+	else \
+		printf "FAIL: child socket %s\n" "$${verdict:-unreported}"; \
+		exit 1; \
+	fi; \
+	printf "  %-30s " "child mints after owner exit"; \
+	out=$$($(ELFUSE_BIN) --sysroot "$$tmpdir" \
+	    $(BUILD_DIR)/test-absock-cleanup child-after-owner 2>/dev/null); \
+	verdict=$$(printf '%s\n' "$$out" | sed -n 's/^CHILD_AFTER=//p'); \
+	if [ "$$verdict" = ok ]; then \
+		printf "OK\n"; \
+	else \
+		printf "FAIL: late bind %s\n" "$${verdict:-unreported}"; \
+		exit 1; \
+	fi; \
+	after=$$(ls -d /tmp/elfuse-absock-* 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$after" -gt "$$before" ]; then \
+		printf "$(RED)FAIL$(RESET) absock namespace dir leaked ($$before -> $$after)\n"; \
 		exit 1; \
 	fi
 
@@ -1303,6 +1381,10 @@ test-casefold-host: $(BUILD_DIR)/test-casefold-host
 ## Run the case-exact path resolution unit tests
 test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host
 	$(BUILD_DIR)/test-casefold-walk-host
+
+## Run the absock derived-name unit test natively on the host
+test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
+	$(BUILD_DIR)/test-absock-names-host
 
 # Volume naming probe
 ## Report how the filesystem treats filenames (regenerates docs/filenames.md tables)

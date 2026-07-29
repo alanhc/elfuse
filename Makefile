@@ -217,6 +217,11 @@ $(BUILD_DIR)/test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+$(BUILD_DIR)/test-absock-names-host: $(BUILD_DIR)/test-absock-names-host.o \
+		$(BUILD_DIR)/syscall/net-absock.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
 

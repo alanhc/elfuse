@@ -291,6 +291,22 @@ arrange, since elfuse writes one or the other), a lookup takes the literal one.
 The escaped entry is then unreachable under any guest name, though a listing
 still reports the name twice.
 
+## The escape never reaches the guest
+
+Everything the kernel reports back to the guest decodes stored spellings to
+guest bytes first. Directory listings (`getdents64`) and inotify event names
+decode each entry as it is read, but only for directories the sysroot holds:
+a host directory reached through the fallback reports its entries as stored,
+because those names are the host's and an escape-shaped literal there means
+itself. `getcwd`, `/proc/self/cwd`,
+`/proc/self/exe`, `/proc/self/fd/N`, and the addresses returned for pathname
+AF_UNIX sockets (`getsockname`, `getpeername`, `accept`, `recvfrom`) map a
+whole host path back through the sysroot strip and the same per-component
+decode. The forward direction is symmetric: watches, exec targets,
+`PT_INTERP` interpreters, and socket addresses resolve through the ordinary
+path translation, so a name spelled by the guest and a name reported to the
+guest always mean the same file.
+
 ## Why nothing is locked
 
 Which spelling a guest name takes is decided by the name, so a create is one
