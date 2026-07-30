@@ -68,6 +68,7 @@ static _Atomic uint64_t sysreg_write_count =
  * check and surfaces an install hint regardless.
  */
 static _Atomic bool rosetta_enabled = true;
+
 /* Runtime indicator: distinct from rosetta_enabled (user opt-in). Set when the
  * active guest_t is actually running under rosetta, so callers without direct
  * guest_t access (proc_intercept_readlink, log paths) can branch on runtime
@@ -223,6 +224,7 @@ static void proc_init_child_entry(proc_entry_t *entry,
     entry->reserved = false;
     entry->host_pid = host_pid;
     entry->guest_pid = guest_pid_val;
+
     /* Seed with the group the child inherited at fork. The caller passes the
      * exact value sent in the fork IPC header so the parent's view and the
      * child's own pgid cannot disagree even if a sibling thread changes the
@@ -404,8 +406,8 @@ out:
 int proc_reserve_child(int64_t guest_pid_val, int64_t pgid)
 {
     /* Explicit SIG_IGN/SA_NOCLDWAIT children are not guest-waitable. Reclaim
-     * any that have already terminated before consuming another table slot,
-     * so a workload that intentionally never calls wait does not retain stale
+     * any that have already terminated before consuming another table slot, so
+     * a workload that intentionally never calls wait does not retain stale
      * bookkeeping entries indefinitely.
      */
     if (signal_sigchld_autoreap())
@@ -546,10 +548,10 @@ static bool process_registry_path(char *out, size_t out_size)
 }
 
 /* The process-group registry above intentionally contains only live host
- * members. Linux lifecycle state has different retention rules: an exited
- * child must remain discoverable until a guest wait consumes it, including
- * after its original host parent exits. Keep that state in a separate binary
- * registry protected by flock so unrelated signal/group readers stay simple.
+ * members. Linux lifecycle state has different retention rules: an exited child
+ * must remain discoverable until a guest wait consumes it, including after its
+ * original host parent exits. Keep that state in a separate binary registry
+ * protected by flock so unrelated signal/group readers stay simple.
  */
 #define LIFECYCLE_MAGIC 0x454C464CU /* "ELFL" */
 #define LIFECYCLE_VERSION 5
@@ -780,8 +782,10 @@ static int lifecycle_publish_child(pid_t host_pid,
         lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
         if (entry) {
             entry->host_pid = host_pid;
+
             /* The reservation owns the parent/group fields, while an exit or
-             * reparent transaction that won this race owns terminal state. */
+             * reparent transaction that won this race owns terminal state.
+             */
             if (!entry->exited && !entry->reparent_pending) {
                 entry->ppid = ppid;
                 entry->pgid = pgid;
@@ -805,10 +809,11 @@ static void lifecycle_publish_self(void)
         lifecycle_entry_t *entry = lifecycle_upsert(&registry, proc_get_pid());
         if (entry) {
             entry->host_pid = getpid();
-            /* A parent-exit transaction writes the authoritative adopter
-             * before notifying this process. Do not let an unrelated publish
-             * from the child overwrite that value with its stale local PPID
-             * while the reparent control record is still pending.
+
+            /* A parent-exit transaction writes the authoritative adopter before
+             * notifying this process. Do not let an unrelated publish from the
+             * child overwrite that value with its stale local PPID while the
+             * reparent control record is still pending.
              */
             if (!entry->reparent_pending)
                 entry->ppid = proc_get_ppid();
@@ -932,6 +937,7 @@ static bool lifecycle_reparent_complete(int64_t guest_pid, int64_t ppid)
     lifecycle_registry_t *registry = lifecycle_load_locked(fd);
     if (registry) {
         lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
+
         /* A missing/consumed child or one that has already exited no longer
          * needs its live shim PPID cache updated.
          */
@@ -980,6 +986,7 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
         pthread_mutex_unlock(&pid_lock);
         return;
     }
+
     /* A direct child is visible in the lifecycle registry before its local
      * admission transaction commits. The registry's host PID may already have
      * been published while the local slot is still reserved, so checking only
@@ -1035,6 +1042,7 @@ static void lifecycle_import_children(void)
         int64_t self = proc_get_pid();
         for (uint32_t i = 0; i < registry->count; i++) {
             lifecycle_entry_t *entry = &registry->entries[i];
+
             /* host_pid==0 is a pre-spawn reservation, not a live or waitable
              * child. The local reserved-slot check in
              * proc_register_adopted_local() also closes the later window after
@@ -1157,13 +1165,13 @@ typedef struct {
     bool found;
 } registry_find_ctx_t;
 
-/* Locate @target's guest pid without registry_parse_cb's per-record
- * kill(2) liveness probe: that check exists to build a filtered live-
- * membership list for group-signal delivery, but a host_pid ->guest_pid
- * lookup is only ever done for a pid the caller just observed to be alive
- * (e.g. it holds a conflicting file lock right now), so it is redundant
- * here. proc_host_to_guest_pid still verifies the match via proc_pidpath
- * to guard against the pid having been recycled.
+/* Locate @target's guest pid without registry_parse_cb's per-record kill(2)
+ * liveness probe: that check exists to build a filtered live- membership list
+ * for group-signal delivery, but a host_pid ->guest_pid lookup is only ever
+ * done for a pid the caller just observed to be alive (e.g. it holds a
+ * conflicting file lock right now), so it is redundant here.
+ * proc_host_to_guest_pid still verifies the match via proc_pidpath to guard
+ * against the pid having been recycled.
  */
 static void registry_find_by_host_cb(char *rec, void *vctx)
 {
@@ -1232,6 +1240,7 @@ static void proc_registry_publish(pid_t host_pid,
         }
     if (idx < 0) {
         if (n == REGISTRY_MAX_ENTRIES)
+
             /* No slot for a new live member: group signals (kill(-1),
              * kill(-pgid), kill(0)) reaching this pid via the registry will
              * miss it. Warn rather than drop silently.
@@ -1293,6 +1302,7 @@ void proc_registry_sync_self_pgid(guest_t *g)
     pid_t self = getpid();
     int64_t self_guest = proc_get_pid();
     for (int i = 0; i < n; i++)
+
         /* Match host pid AND guest pid: a stale same-host-pid record left by a
          * recycled pid must not overwrite this process's group.
          */
@@ -1384,6 +1394,7 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
         close(fd);
         return -1;
     }
+
     /* The line is durably appended under the lock, so ring the doorbell even if
      * close() reports an error; suppressing the kill would leave the queued
      * line waiting for some later unrelated signal.
@@ -1489,9 +1500,10 @@ void proc_process_exit(int wait_status)
 
     for (uint32_t i = 0; i < nreparented; i++) {
         if (reparented[i].exited) {
-            /* The exiting process is not necessarily a child of the adopter,
-             * so its own SIGCHLD goes elsewhere. Notify the adopter explicitly
-             * for every already-terminal child that became waitable there. */
+            /* The exiting process is not necessarily a child of the adopter, so
+             * its own SIGCHLD goes elsewhere. Notify the adopter explicitly for
+             * every already-terminal child that became waitable there.
+             */
             if (adopter_host_pid > 0)
                 (void) proc_send_guest_signal(adopter_host_pid, adopter_pid,
                                               LINUX_SIGCHLD);
@@ -1561,8 +1573,8 @@ static void proc_notify_reparent(pid_t host_pid,
     /* SIGUSR2 is a standard signal, so multiple doorbells can coalesce. The
      * file record remains durable, but a process exiting immediately after one
      * successful kill must not assume the receiver already updated its shim
-     * identity cache. Retry until the child acknowledges the registry's
-     * pending transaction, with a bounded 50ms exit-path delay.
+     * identity cache. Retry until the child acknowledges the registry's pending
+     * transaction, with a bounded 50ms exit-path delay.
      */
     for (int attempt = 0; attempt < 20; attempt++) {
         if (lifecycle_reparent_complete(target_guest_pid, new_ppid))
@@ -1691,8 +1703,8 @@ int64_t proc_host_to_guest_pid(pid_t host_pid)
     if (!ctx.found)
         return -1;
 
-    /* Guard against host pid reuse: only trust the hit if the pid still
-     * runs this elfuse binary, same check as proc_get_namespace_targets.
+    /* Guard against host pid reuse: only trust the hit if the pid still runs
+     * this elfuse binary, same check as proc_get_namespace_targets.
      */
     char our_path[PROC_PIDPATHINFO_MAXSIZE];
     int our_len = proc_pidpath(getpid(), our_path, sizeof(our_path));
@@ -1793,10 +1805,11 @@ int64_t sys_ptrace(guest_t *g,
          * the tracee out of hv_vcpu_run; the tracee will then enter ptrace-stop
          * in its HV_EXIT_REASON_CANCELED handler.
          *
-         * Read the vCPU handle under thread_lock: thread_find drops the lock
-         * before returning, so touching target->vcpu afterwards would race a
-         * concurrent teardown/recycle. Snapshot the handle while locked, then
-         * call HVF outside the lock (framework calls must not run under it).
+         * Kick the tracee under thread_lock, not after releasing it: the tracee
+         * destroys its own vCPU under the same lock on exit, so snapshotting
+         * the handle and calling hv_vcpus_exit outside the lock could hand HVF
+         * a freed vCPU. Holding the lock across the kick serializes it against
+         * destruction; the kick does not block, so this is safe.
          */
         pthread_mutex_t *tlock = thread_get_lock();
         pthread_mutex_lock(tlock);
@@ -1809,22 +1822,19 @@ int64_t sys_ptrace(guest_t *g,
             pthread_mutex_unlock(tlock);
             return 0; /* Already stopped */
         }
-        hv_vcpu_t vcpu = target->vcpu;
-        bool vcpu_valid = target->vcpu_valid;
+
         /* If the tracee is still in vCPU bring-up (handle not yet published),
          * hv_vcpus_exit cannot reach it, and dropping the interrupt would lose
-         * it silently. Record it under thread_lock: the worker checks this flag
-         * at publish and self-kicks so the interrupt is delivered before it
-         * runs any guest code. This serializes against the worker's publish
-         * (also under thread_lock), so exactly one of the two paths delivers
-         * it.
+         * it silently. Record it instead: the worker checks this flag at
+         * publish and self-kicks so the interrupt is delivered before it runs
+         * any guest code. This serializes against the worker's publish (also
+         * under thread_lock), so exactly one of the two paths delivers it.
          */
-        if (!vcpu_valid)
+        if (target->vcpu_valid)
+            hv_vcpus_exit(&target->vcpu, 1);
+        else
             target->ptrace_interrupt_pending = true;
         pthread_mutex_unlock(tlock);
-
-        if (vcpu_valid)
-            hv_vcpus_exit(&vcpu, 1);
         return 0;
     }
 
@@ -2152,6 +2162,7 @@ int64_t sys_wait4(guest_t *g,
             }
             return ptrace_tid;
         }
+
         /* ptrace_tid == 0: no matching children or WNOHANG; fall through to the
          * process table for regular fork children.
          */
@@ -2229,11 +2240,12 @@ int64_t sys_wait4(guest_t *g,
                 if (ret > 0) {
                     if (WIFEXITED(status) || WIFSIGNALED(status))
                         status = lifecycle_guest_terminal_status(gpid, status);
+
                     /* Credit CPU only on a terminal report. mac_options may
-                     * carry WUNTRACED/WCONTINUED, and a stop/continue report
-                     * is a snapshot of a still-running child: crediting it
-                     * here would double- or triple-count the same child
-                     * across its stop, continue, and final exit reports.
+                     * carry WUNTRACED/WCONTINUED, and a stop/continue report is
+                     * a snapshot of a still-running child: crediting it here
+                     * would double- or triple-count the same child across its
+                     * stop, continue, and final exit reports.
                      */
                     if (WIFEXITED(status) || WIFSIGNALED(status))
                         proc_children_cpu_add(&ru);
@@ -2351,14 +2363,14 @@ int64_t sys_wait4(guest_t *g,
             if (mac_options & WNOHANG) {
                 ret = wait4(host_pid, &status, mac_options, &ru);
             } else {
-                /* A bare blocking wait4 has no re-check point: a worker
-                 * parked here past exit_group is invisible to
-                 * thread_join_workers' poll cap and touches guest memory
-                 * (status/rusage writes below) on an eventual delayed
-                 * return, well after guest_destroy may have unmapped it.
-                 * Poll with WNOHANG under a bounded retry instead, mirroring
-                 * the pid==-1 loop above; proc_mark_child_exited broadcasts
-                 * pid_cond on every host child exit.
+                /* A bare blocking wait4 has no re-check point: a worker parked
+                 * here past exit_group is invisible to thread_join_workers'
+                 * poll cap and touches guest memory (status/rusage writes
+                 * below) on an eventual delayed return, well after
+                 * guest_destroy may have unmapped it. Poll with WNOHANG under a
+                 * bounded retry instead, mirroring the pid==-1 loop above;
+                 * proc_mark_child_exited broadcasts pid_cond on every host
+                 * child exit.
                  */
                 for (;;) {
                     ret = wait4(host_pid, &status, mac_options | WNOHANG, &ru);
@@ -2552,10 +2564,11 @@ int64_t sys_waitid(guest_t *g,
                 }
                 status = lifecycle_guest_terminal_status(entry_gpid, status);
                 pthread_mutex_lock(&pid_lock);
-                /* Host wait4 necessarily consumes the host zombie. Preserve
-                 * the status/rusage in the guest process table so Linux
-                 * WNOWAIT remains repeatable and a later consuming wait can
-                 * account and remove it exactly once.
+
+                /* Host wait4 necessarily consumes the host zombie. Preserve the
+                 * status/rusage in the guest process table so Linux WNOWAIT
+                 * remains repeatable and a later consuming wait can account and
+                 * remove it exactly once.
                  */
                 if (proc_table[i].active &&
                     proc_table[i].host_pid == host_pid) {
@@ -2640,6 +2653,7 @@ int64_t sys_waitid(guest_t *g,
 
         if (mac_options & WNOHANG) {
             pthread_mutex_unlock(&pid_lock);
+
             /* Per POSIX/Linux: zero siginfo when WNOHANG returns with no
              * waitable children, so callers can distinguish via si_pid.
              */
@@ -2798,6 +2812,7 @@ int proc_preempt_init(void)
     sigemptyset(&block);
     sigaddset(&block, SIGUSR2);
     sigaddset(&block, SIGALRM);
+
     /* pthread_sigmask returns the error code directly. If the block fails, vCPU
      * threads would inherit an unblocked mask and a signal landing mid-run
      * could still produce HV_EXIT_REASON_UNKNOWN, so fail bring-up rather than
@@ -2875,6 +2890,7 @@ static void sig_drain_cb(char *rec, void *vctx)
         return;
     p = end;
     long signum = strtol(p, &end, 10);
+
     /* Reject any trailing garbage so a forged record like "<ns> <pid> 9junk"
      * from a same-user temp-dir writer cannot be accepted as a bare signal.
      */
@@ -2897,6 +2913,7 @@ static void drain_external_guest_signal(void)
     char path[PATH_MAX];
     if (!signal_transport_path(path, sizeof(path), getpid()))
         return;
+
     /* O_RDWR (not O_RDONLY) so the drain can truncate under the lock. No
      * O_CREAT: if no sender has written since the last drain, there is nothing
      * to consume.
@@ -3081,6 +3098,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                     int ret = syscall_dispatch(vcpu, g, &exit_code, verbose);
                     if (ret == 1)
                         running = false;
+
                     /* execve replaced the process image; sys_execve already
                      * installed the new X0/syscall-return state.
                      */
@@ -3230,6 +3248,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                         value = 0x00000111ff000000ULL;
                         have_vz_override = true;
                     }
+
                     /* ID_AA64MMFR1_EL1 (3,0,0,7,1): VZ returns 0. Raw hardware
                      * (e.g., 0x11212000) exposes HPDS, PAN, LO, XNX etc. that
                      * VZ does not virtualize.
@@ -3413,14 +3432,15 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                             "%s: W^X toggle FAILED "
                             "(split=%d update=%d) far=0x%llx",
                             prefix, sr, ur, (unsigned long long) far);
+
                     /* TLB flush is done by the shim (tlbi_restore_eret) for the
                      * single faulting page. Clear this thread's pending request
                      * so the next syscall epilogue does not re-flush the W^X
                      * page. cpu_tlbi_req is per-vCPU, so this only touches our
                      * own slot -- concurrent vCPUs are unaffected.
                      *
-                     * The HVC #9 shim now consumes X8 as a post-HVC marker:
-                     * 0 means W^X succeeded and the shim should run the TLBI
+                     * The HVC #9 shim now consumes X8 as a post-HVC marker: 0
+                     * means W^X succeeded and the shim should run the TLBI
                      * retry epilogue; 2 means signal_deliver_fault installed a
                      * handler frame and the shim must drop its saved frame.
                      * Clear X8 here so a guest's pre-fault X8 value cannot be
@@ -3549,6 +3569,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                         signal_set_fault_info(LINUX_ILL_ILLOPC, elr_addr, esr);
                         int sig_ret = signal_deliver_fault(
                             vcpu, g, LINUX_SIGILL, &exit_code);
+
                         /* HVC #11 consumes X8 as the post-fault TLBI opcode.
                          * signal_deliver() may leave it unchanged when no
                          * handler is materialized, or set the syscall-path
@@ -3624,6 +3645,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                      * a later legitimate retry.
                      */
                     enum { STALE_TLB_RETRY_MAX = 16 };
+
                     /* Only translation (fsc_type 0x01) and permission (0x03)
                      * faults are stale-TLB plausible. Alignment,
                      * external-abort, and access-flag classes cannot be cleared
@@ -3690,6 +3712,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                             tlbi_request_emit_to_vcpu(vcpu);
                             break;
                         }
+
                         /* Retry budget exhausted: the entry is not actually
                          * stale. Reset the slot and fall through to SIGSEGV.
                          */
@@ -3727,6 +3750,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                     signal_set_fault_info(si_code, far_addr, esr);
                     int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGSEGV,
                                                        &exit_code);
+
                     /* HVC #11 consumes X8 as the post-fault TLBI opcode.
                      * signal_deliver() may leave it unchanged when no handler
                      * is materialized, or set the syscall-path frame-drop
@@ -3758,6 +3782,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                     uint64_t esr;
                     hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
                     uint32_t iss = (uint32_t) (esr & 0x1FFFFFF);
+
                     /* Decode ISS for system instruction:
                      *   Op0[21:20] Op2[19:17] Op1[16:14]
                      *   CRn[13:10] Rt[9:5] CRm[4:1] Dir[0]
@@ -3917,6 +3942,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                     int reason =
                         (ec == 0x30) ? GDB_STOP_BREAKPOINT : GDB_STOP_STEP;
                     uint64_t stop_pc = vcpu_get_reg(vcpu, HV_REG_PC);
+
                     /* TDE routes debug exceptions EL0->EL2, bypassing EL1.
                      * ELR_EL1 and SPSR_EL1 are NOT updated; sync them from
                      * HV_REG_PC/HV_REG_CPSR so the GDB register snapshot reads
@@ -4084,6 +4110,7 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                 int sig_ret = signal_deliver(vcpu, g, &exit_code);
                 if (sig_ret < 0)
                     running = false;
+
                 /* sig_ret >= 0: signal delivered or nothing pending, loop back
                  * and resume vCPU execution
                  */

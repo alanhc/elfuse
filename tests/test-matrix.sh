@@ -752,6 +752,12 @@ run_unit_tests()
     test_rc "$runner" "test-exit-group-teardown-fork" 42 \
         "$bindir/test-exit-group-teardown" fork
 
+    printf "\nTeardown vs live/bring-up worker vCPUs\n"
+    test_rc "$runner" "test-teardown-live-vcpu-spin" 42 \
+        "$bindir/test-teardown-live-vcpu" spin
+    test_rc "$runner" "test-teardown-live-vcpu-bringup" 42 \
+        "$bindir/test-teardown-live-vcpu" bringup
+
     printf "\nSysV shared memory\n"
     test_rc "$runner" "test-sysv-shm" 0 "$bindir/test-sysv-shm"
 

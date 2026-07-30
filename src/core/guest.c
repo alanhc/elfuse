@@ -218,9 +218,9 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa)
  * gva_translate_perm() walks L0->L3 lock-free on every guest-pointer
  * translation, from every vCPU thread, while the runtime mutators
  * (guest_update_perms, guest_invalidate_ptes, split_l2_block, ...) rewrite
- * descriptors under the caller's mmap lock. The lock serializes mutator
- * against mutator only -- it provides no happens-before edge to the lock-free
- * walker, so the descriptor accesses themselves must carry the ordering:
+ * descriptors under the caller's mmap lock. The lock serializes mutator against
+ * mutator only -- it provides no happens-before edge to the lock-free walker,
+ * so the descriptor accesses themselves must carry the ordering:
  *
  *   - pte_store_release publishes a descriptor so that everything written
  *     before it -- most critically the 512 L3 fills of split_l2_block and the
@@ -233,14 +233,14 @@ static uint64_t *pt_at(const guest_t *g, uint64_t gpa)
  *     from that one value, never re-read per field, so a concurrent rewrite
  *     cannot make the walker mix two generations of the same entry.
  *
- * Table pages come from a bump allocator (pt_alloc_page) that is only reset
- * on execve while all vCPU threads are quiesced, so a not-yet-published table
- * can never be reached through a stale pointer; filling it with plain stores
- * before the release-flip is sound. Boot-time construction also keeps plain
- * stores -- guest_build_page_tables, guest_init_kbuf, and the rosetta kbuf
- * user-alias install (guest_install_kbuf_user_alias /
- * populate_kbuf_l2_blocks) all run single-threaded before any vCPU thread
- * exists, and pthread_create provides the happens-before edge.
+ * Table pages come from a bump allocator (pt_alloc_page) that is only reset on
+ * execve while all vCPU threads are quiesced, so a not-yet-published table can
+ * never be reached through a stale pointer; filling it with plain stores before
+ * the release-flip is sound. Boot-time construction also keeps plain stores --
+ * guest_build_page_tables, guest_init_kbuf, and the rosetta kbuf user-alias
+ * install (guest_install_kbuf_user_alias / populate_kbuf_l2_blocks) all run
+ * single-threaded before any vCPU thread exists, and pthread_create provides
+ * the happens-before edge.
  */
 static inline uint64_t pte_load_acquire(const uint64_t *entry)
 {
@@ -385,6 +385,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
             continue;
 
         uint64_t try_size = 1ULL << bits;
+
         /* Respect a caller-supplied size cap (size > 0 means "no larger than
          * this"). Skip slab attempts that exceed the cap.
          */
@@ -655,8 +656,8 @@ void guest_destroy(guest_t *g)
      * off the shared pipe, and thread_wake_exit_waiters broadcasts the internal
      * condvars (fork barrier, ptrace stop/wait). Without them, host-blocked
      * workers miss the hv_vcpus_exit kick (which only affects threads inside
-     * hv_vcpu_run) and the 100ms join cap in thread_join_workers detaches
-     * them, leaving live pthreads to crash on the imminent munmap.
+     * hv_vcpu_run) and the 100ms join cap in thread_join_workers detaches them,
+     * leaving live pthreads to crash on the imminent munmap.
      */
     if (!proc_exit_group_requested())
         proc_request_exit_group(0);
@@ -665,15 +666,43 @@ void guest_destroy(guest_t *g)
     thread_interrupt_all();
     thread_wake_exit_waiters();
     thread_join_workers();
-    /* Destroy all remaining worker vCPUs (thread table) before tearing down the
-     * VM. This prevents hv_vm_destroy from racing with active vCPUs that may
-     * still be running if thread join timed out during exit_group.
+
+    /* Destroy the main vCPU (owned by this thread) before tearing down the VM.
+     * Worker vCPUs are never destroyed cross-thread here; if thread join timed
+     * out and one is still live, thread_destroy_all_vcpus reports it via
+     * live_workers so teardown is deferred to process exit.
      */
-    bool main_vcpu_destroyed = thread_destroy_all_vcpus(g->vcpu, g->vcpu_valid);
+    bool live_workers = false;
+    bool main_vcpu_destroyed =
+        thread_destroy_all_vcpus(g->vcpu, g->vcpu_valid, &live_workers);
+    if (live_workers) {
+        /* A worker did not stop within the join cap and is still live on its
+         * own thread. HVF vCPUs are thread-affine, so neither a cross-thread
+         * hv_vcpu_destroy nor hv_vm_destroy / munmap of the slab may run while
+         * that worker holds a live vCPU without corrupting kernel state and
+         * panicking the host. guest_destroy is always terminal -- main() and
+         * the fork-child return straight into process exit after it -- so leave
+         * the VM, its vCPUs, and the slab in place and let process teardown
+         * reclaim them atomically, the one operation that safely stops a
+         * foreign vCPU. The leaked fds and heap are reclaimed the same way.
+         */
+        log_warn(
+            "guest_destroy: worker vCPU still live past join cap; "
+            "deferring HVF teardown to process exit");
+
+        /* thread_destroy_all_vcpus already destroyed the main vCPU (owned by
+         * this thread); clear the handle so no stale g->vcpu_valid survives the
+         * early return even though the rest of teardown is deferred.
+         */
+        g->vcpu_valid = false;
+        g->vcpu = 0;
+        return;
+    }
     if (g->vcpu_valid && !main_vcpu_destroyed)
         hv_vcpu_destroy(g->vcpu);
     g->vcpu_valid = false;
     g->vcpu = 0;
+
     /* Unmap each HVF segment. hv_vm_destroy releases all stage-2 state
      * regardless, but unmapping explicitly keeps invariants clean for
      * downstream tools (Instruments, leak detectors).
@@ -728,6 +757,7 @@ static bool guest_mapping_overlaps(const guest_t *g, uint64_t gpa, size_t size)
         if (gpa < m->gpa + m->size && m->gpa < end)
             return true;
     }
+
     /* Overflow segments occupy IPA ranges stacked above guest_size on a
      * first-come basis. An explicit mapping added later must not silently land
      * on top of an already-allocated overflow segment; HVF would accept the
@@ -752,6 +782,7 @@ int guest_add_mapping(guest_t *g,
         return -1;
     if ((gpa & (PAGE_SIZE - 1)) || (size & (PAGE_SIZE - 1)))
         return -1;
+
     /* If the caller supplied a host VA, it must be page-aligned. NULL means
      * callee-allocate-and-own; non-NULL means caller-owned, mapped as-is into
      * Stage-2 without taking ownership.
@@ -913,6 +944,7 @@ uint64_t guest_overflow_alloc(guest_t *g)
                   (unsigned long long) seg_ipa);
         return UINT64_MAX;
     }
+
     /* Skip past every extra mapping that overlaps the candidate placement. Each
      * skip moves seg_ipa forward, so the scan must restart to catch any mapping
      * the new position now overlaps. The loop is bounded by n_mappings -- each
@@ -989,6 +1021,7 @@ int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa)
 {
     if (!g)
         return -1;
+
     /* Scrub kbuf state up-front so partial failure leaves the guest in a
      * fully-zeroed state rather than a stale half-initialized one. The caller
      * must treat a -1 return as "kbuf is unconfigured" and must not read
@@ -1033,6 +1066,7 @@ int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa)
         /* Up-front scrub already cleared kbuf_base / kbuf_gpa / ttbr1. */
         return -1;
     }
+
     /* From this point the kbuf is real; publish the host pointer + GPA so
      * subsequent code can look them up. ttbr1 is published last, after the
      * L0/L1/L2 tree is fully populated below.
@@ -1263,8 +1297,8 @@ static int gva_translate_perm(const guest_t *g,
     uint64_t base = g->ipa_base;
 
     /* Lock-free walk: load each level's descriptor exactly once with acquire
-     * (see pte_load_acquire) and decode that snapshot. Concurrent mutators
-     * hold the mmap lock against each other but not against this walker.
+     * (see pte_load_acquire) and decode that snapshot. Concurrent mutators hold
+     * the mmap lock against each other but not against this walker.
      */
     const uint64_t *l0 = pt_at(g, g->ttbr0 - base);
     unsigned l0_idx = (unsigned) (gva / (512ULL * BLOCK_1GIB));
@@ -1304,6 +1338,7 @@ static int gva_translate_perm(const guest_t *g,
             return -1;
 
         int perms = desc_to_perms(l3e);
+
         /* EL1-only pages (shim_data) are inaccessible to guest EL0 in the page
          * tables; the host accessors that act on a guest-supplied GVA must
          * refuse them too, otherwise a guest could pass a shim_data GVA as a
@@ -1320,6 +1355,7 @@ static int gva_translate_perm(const guest_t *g,
         if (page_ipa < base)
             return -1;
         uint64_t gpa = (page_ipa - base) + (gva & (PAGE_SIZE - 1));
+
         /* Accept GPAs inside the primary buffer or covered by an extra IPA
          * mapping (rosetta segments, kbuf, etc.). Anything else is a dangling
          * page-table entry pointing at unmapped Stage-2 IPA.
@@ -1343,6 +1379,7 @@ static int gva_translate_perm(const guest_t *g,
 
     /* L2 block descriptor: 2MiB granularity. */
     int perms = desc_to_perms(l2e);
+
     /* See the L3 page-descriptor branch above: EL1-only blocks are inaccessible
      * to host-on-behalf-of-guest accesses for the same reason. shim_data is
      * mapped as a 2MiB EL1-only block at boot.
@@ -1388,6 +1425,7 @@ static uint64_t gva_contiguous_avail(const guest_t *g,
 
     for (;;) {
         uint64_t chunk = cur.chunk;
+
         /* Clamp to the remaining bytes in whichever backing region cur.gpa
          * lives in: the primary buffer, or an extra IPA mapping. The original
          * primary-buffer clamp underflowed harmlessly for high GPAs, but the
@@ -2401,6 +2439,7 @@ static uint64_t make_block_desc(uint64_t gpa, int perms)
      */
     if (perms & MEM_PERM_EL1_ONLY) {
         desc |= PT_AP_RW_EL1;
+
         /* EL1-only data: never EL0-executable (already set above if MEM_PERM_X
          * is unset, but assert defensively).
          */
@@ -2532,6 +2571,7 @@ static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
                 uint64_t apply_start = (s_start > b) ? s_start : b;
                 uint64_t apply_end =
                     (s_end < b + BLOCK_2MIB) ? s_end : b + BLOCK_2MIB;
+
                 /* Page-align to 4KiB so partially covered pages are recreated
                  * with the union of all overlapping segment permissions.
                  */
@@ -2588,6 +2628,7 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
         uint64_t gpa_start = ALIGN_2MIB_DOWN(regions[r].gpa_start);
         uint64_t gpa_end = ALIGN_2MIB_UP(regions[r].gpa_end);
         int perms = regions[r].perms;
+
         /* Non-identity regions (rosetta segments) supply a va_base so the
          * page-table entry is indexed by VA, but the block descriptor still
          * carries the GPA where the data physically lives. va_offset is the
@@ -2713,6 +2754,7 @@ int guest_extend_page_tables(guest_t *g,
             (unsigned long long) start, (unsigned long long) end);
         return -1;
     }
+
     /* Defensive: end is bounded by guest_size above, so the ALIGN_2MIB_UP below
      * cannot wrap on any reachable input. The explicit guard documents the
      * contract and matches the wrap guards in guest_invalidate_ptes /
@@ -2980,8 +3022,8 @@ static int split_l2_block(guest_t *g, uint64_t *l2_entry)
      * permissions. Extract the output IPA from bits [47:21] of the existing
      * descriptor (not from the caller's address). Plain stores are fine here:
      * the table is unreachable until the release-flip below publishes it, and
-     * the release orders the fills before the new L2 value for any walker
-     * that acquires it (see pte_store_release).
+     * the release orders the fills before the new L2 value for any walker that
+     * acquires it (see pte_store_release).
      */
     uint64_t block_ipa = *l2_entry & L2_BLOCK_ADDR_MASK;
     for (int i = 0; i < 512; i++)
@@ -3201,6 +3243,7 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx =
                 (unsigned) (((base + pa) % BLOCK_2MIB) / PAGE_SIZE);
+
             /* Extract the existing output IPA from the L3 entry. For
              * non-identity mapped regions, pa is a VA not a GPA, so the builder
              * must use the IPA already stored in the descriptor (set by
@@ -3254,6 +3297,7 @@ int guest_install_va_pages(guest_t *g,
         return -1;
     if ((va | length | gpa) & (PAGE_SIZE - 1))
         return -1;
+
     /* Reject wrap on both the VA side and the GPA side. Without the gpa guard,
      * a caller could pass a near-UINT64_MAX gpa with a non-zero length and the
      * loop would wrap p back to a low GPA, silently installing descriptors

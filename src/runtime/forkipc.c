@@ -237,6 +237,7 @@ int fork_child_main(int ipc_fd,
     g.ttbr0 = hdr.ttbr0;
     g.mmap_rx_next = hdr.mmap_rx_next;
     g.mmap_rx_end = hdr.mmap_rx_end;
+
     /* Restore rosetta placement so the non-identity page-table entries that
      * came across in the memory transfer continue to resolve. ttbr1 points at
      * the L0 page the parent's PT pool emitted; that page sits inside the
@@ -274,9 +275,9 @@ int fork_child_main(int ipc_fd,
         return 1;
     }
 
-    /* Linux preserves already-open descriptors above a newly lowered soft
-     * limit across fork. Install the inherited table under the default table
-     * limit first, then restore the parent's guest-visible limit.
+    /* Linux preserves already-open descriptors above a newly lowered soft limit
+     * across fork. Install the inherited table under the default table limit
+     * first, then restore the parent's guest-visible limit.
      */
     if (sys_nofile_restore(hdr.nofile_cur, hdr.nofile_max) < 0) {
         log_error("fork-child: failed to restore RLIMIT_NOFILE");
@@ -308,8 +309,8 @@ int fork_child_main(int ipc_fd,
 
     /* Do not enter guest code until the parent has committed both the local
      * process-table slot and the shared lifecycle entry. EOF here means fork
-     * admission failed, so this helper exits without exposing a child whose
-     * PID the parent cannot later wait for.
+     * admission failed, so this helper exits without exposing a child whose PID
+     * the parent cannot later wait for.
      */
     uint8_t admission_ready = 0;
     if (fork_ipc_read_all(ipc_fd, &admission_ready, sizeof(admission_ready)) <
@@ -441,6 +442,7 @@ int fork_child_main(int ipc_fd,
     shim_globals_set_trace_enabled(&g, verbose);
     shim_globals_publish_pid(&g, hdr.child_pid, hdr.parent_pid);
     shim_globals_publish_creds(&g, hdr.uid, hdr.euid, hdr.gid, hdr.egid);
+
     /* proc_set_session above committed hdr.pgid/sid into proc-identity; mirror
      * into the shim cache so the child's getpgid(0)/getsid(0) fast paths see
      * the inherited session state from the first syscall. Publish via
@@ -448,22 +450,26 @@ int fork_child_main(int ipc_fd,
      * even though no sibling vCPU exists at this point.
      */
     proc_publish_pgsid_snapshot(&g);
+
     /* Fresh entropy for the child. Linux's vDSO getrandom epoch-bumps across
      * fork; this path re-fills the ring from arc4random_buf which seeds from
      * the host kernel's RNG, so parent and child do not share future urandom
      * output.
      */
     shim_globals_refill_urandom_ring(&g);
+
     /* Register the singleton for the child's signal.c so its attention setters
      * know which guest to update.
      */
     signal_set_shim_globals_guest(&g);
+
     /* The parent may exit after publishing this child but before bootstrap
      * reaches the guest loop. Pull any reparent transaction that arrived in
      * that window after the shim cache is live, so the fork header's original
      * PPID cannot overwrite the adopter selected by the lifecycle registry.
      */
     proc_lifecycle_sync_self(&g);
+
     /* Same for the fd-table hooks. Must precede any fd_alloc the child performs
      * (the fd-table-restore step has already run above, but those slots are
      * populated via direct memcpy of the parent's entries; subsequent
@@ -471,6 +477,7 @@ int fork_child_main(int ipc_fd,
      * in sync).
      */
     shim_globals_set_singleton(&g);
+
     /* shim_globals_init above zeroed the urandom bitmap. Walk the inherited fd
      * table and re-mark every readable FD_URANDOM slot so the shim's read fast
      * path sees the correct state from the first syscall onward.
@@ -686,6 +693,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         log_error("clone_thread: thread table full");
         return -LINUX_EAGAIN;
     }
+
     /* Captured now, while the slot is guaranteed still ours (thread_alloc just
      * marked it active, so no concurrent thread_alloc reuse-scan will touch it
      * until our own worker deactivates it). Passed to thread_set_host_thread
@@ -736,11 +744,10 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         return -LINUX_EFAULT;
     }
 
-    /* Create the host pthread (joinable; the main thread joins all live
-     * workers via thread_join_workers before guest teardown, and a worker
-     * that exits on its own is joined when its table slot is reused by
-     * thread_alloc). Threads clean up their TID address via
-     * CLONE_CHILD_CLEARTID + futex wake.
+    /* Create the host pthread (joinable; the main thread joins all live workers
+     * via thread_join_workers before guest teardown, and a worker that exits on
+     * its own is joined when its table slot is reused by thread_alloc). Threads
+     * clean up their TID address via CLONE_CHILD_CLEARTID + futex wake.
      */
     pthread_t host_thread;
     pthread_attr_t attr;
@@ -755,6 +762,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         thread_deactivate(t);
         pthread_cond_destroy(&startup.cond);
         pthread_mutex_destroy(&startup.lock);
+
         /* Roll back any SETTID writes done before pthread_create. Same
          * rationale as the post-handshake failure path: clone(2) does not leave
          * live-looking TIDs behind for a thread that never started.
@@ -815,6 +823,22 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
     return child_tid;
 }
 
+/* Destroy this thread's own vCPU and clear the published handle, in that order,
+ * with thread_lock held by the caller. HVF vCPUs are thread-affine, so only the
+ * owning thread runs this. Destroying before clearing vcpu_valid keeps a
+ * concurrent thread_destroy_all_vcpus scan from ever observing this slot as
+ * active-and-valid-but-live: it sees either a live handle (and defers) or a
+ * fully torn-down slot. The vcpu_valid guard covers the bring-up-failure
+ * caller, where hv_vcpu_create failed before any handle was published.
+ */
+static void thread_destroy_own_vcpu_locked(thread_entry_t *t)
+{
+    if (t->vcpu_valid)
+        hv_vcpu_destroy(t->vcpu);
+    t->vcpu_valid = false;
+    t->vcpu = 0;
+}
+
 /* Worker pthread entry: creates the HVF vCPU on this thread (required by Apple
  * HVF, since the vCPU is bound to the creating thread), configures all
  * registers from parent state, then enters the run loop. On exit, performs
@@ -850,15 +874,18 @@ static void *thread_create_and_run(void *arg)
      * concurrently; they read t->vcpu under thread_lock, so an unlocked store
      * here is a data race (flagged by ThreadSanitizer). Until this store the
      * scanners observe vcpu_valid=false and skip the slot; the startup_failed
-     * path below deactivates before destroying, so a scan that does observe a
-     * valid handle only ever hands HVF a live vCPU. The separate flag is
-     * required because handle value zero is valid for the first vCPU.
+     * path below destroys the handle and clears vcpu_valid in one locked
+     * section before deactivating, so a scan either observes a live handle (and
+     * defers) or a fully torn-down slot, never an inactive-yet-undestroyed
+     * vCPU. The separate flag is required because handle value zero is valid
+     * for the first vCPU.
      */
     pthread_mutex_t *tlock = thread_get_lock();
     pthread_mutex_lock(tlock);
     t->vcpu = vcpu;
     t->vcpu_valid = true;
     t->vexit = vexit;
+
     /* A PTRACE_INTERRUPT that raced this bring-up (arrived before the handle
      * was published) recorded a pending request it could not deliver via
      * hv_vcpus_exit. Consume it under the same lock and self-kick below so the
@@ -963,18 +990,19 @@ static void *thread_create_and_run(void *arg)
     goto startup_ok;
 
 startup_failed:
-    /* HVF sysreg/GPR setup failed after vCPU creation. Drop the thread slot
-     * before tearing the vCPU down: the vCPU handle was already published under
-     * thread_lock, so a concurrent thread_interrupt_all /
-     * thread_destroy_all_vcpus / exit_group could otherwise observe it.
-     * Deactivating first removes the slot from THREAD_FOR_EACH_ACTIVE iteration
-     * so subsequent scans skip it before the handle is destroyed. Then destroy
-     * the vCPU on its owning thread (the only thread allowed to do so), free
-     * args, and finally signal the parent so it observes a fully torn-down
-     * state.
+    /* HVF sysreg/GPR setup failed after vCPU creation. The vCPU handle was
+     * already published under thread_lock, so destroy it on its owning thread
+     * (the only thread allowed to do so) and clear vcpu_valid in the same
+     * critical section, then deactivate. Destroying before clearing the flag
+     * keeps a concurrent thread_destroy_all_vcpus scan from ever observing an
+     * active-and-valid-but-live handle or an inactive-yet-undestroyed one: it
+     * either sees the live handle and defers, or sees the slot fully torn down.
+     * Finally signal the parent so it observes a fully torn-down state.
      */
+    pthread_mutex_lock(tlock);
+    thread_destroy_own_vcpu_locked(t);
+    pthread_mutex_unlock(tlock);
     thread_deactivate(t);
-    hv_vcpu_destroy(vcpu);
     free(tca);
     pthread_mutex_lock(&startup->lock);
     startup->startup_rc = -LINUX_EIO;
@@ -983,8 +1011,7 @@ startup_failed:
     pthread_mutex_unlock(&startup->lock);
     return NULL;
 
-startup_ok:;
-
+startup_ok:
     /* If a sibling armed a fork snapshot while this worker was still in
      * bring-up, thread_quiesce_siblings could not kick a not-yet-published
      * vCPU, but it still counted this slot in fork_target_count. Check the
@@ -1034,11 +1061,15 @@ startup_ok:;
 
     log_debug("thread tid=%lld exiting", (long long) t->guest_tid);
 
+    /* Destroy the vCPU on its owning thread while still holding the lock, and
+     * only then clear vcpu_valid. thread_destroy_all_vcpus scans under the same
+     * lock; keeping the handle valid until it is actually gone means a teardown
+     * scan can never observe this slot as active-with-a-live-but-invalid vCPU
+     * and tear down the VM/slab out from under an undestroyed vCPU.
+     */
     pthread_mutex_lock(tlock);
-    t->vcpu_valid = false;
-    t->vcpu = 0;
+    thread_destroy_own_vcpu_locked(t);
     pthread_mutex_unlock(tlock);
-    hv_vcpu_destroy(vcpu);
     thread_deactivate(t);
 
     /* When all CLONE_THREAD workers have exited and only the main thread
@@ -1149,6 +1180,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         log_error("clone_vm: pthread_create failed: %s", strerror(err));
         free(tca);
         thread_deactivate(t);
+
         /* Roll back the SETTID writes clone_apply_tid_flags made: no child
          * thread was created, so clone(2) must not leave live-looking TIDs.
          */
@@ -1177,21 +1209,19 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
 /* Report a vm-clone worker that failed HVF bring-up as an exited child so the
  * parent's wait4 can reap it. sys_clone_vm already returned the child tid, so
  * dropping the slot with thread_deactivate (which clears active) would make
- * wait4 skip it and leave the parent unable to collect a status. Publish the
- * exit status and invalidate t->vcpu under the thread lock, so
- * thread_interrupt_all and thread_destroy_all_vcpus cannot hand the
- * torn-down vCPU to HVF, then destroy the handle outside the lock. Keep the
- * slot active for wait4. Reports SIGKILL because the child never ran a guest
- * instruction. Does not trigger exit_group: only the child failed.
+ * wait4 skip it and leave the parent unable to collect a status. Destroy the
+ * vCPU and publish the exit status in one critical section, destroy first: the
+ * slot only becomes reapable (vm_exited) once the handle is gone, so a parent
+ * wait4 that reaps and deactivates it cannot leave a teardown scan racing an
+ * undestroyed vCPU. Keep the slot active for wait4. Reports SIGKILL because the
+ * child never ran a guest instruction. Does not trigger exit_group: only the
+ * child failed. Runs on the child's own thread, so the destroy is owner-local.
  */
 static void vm_clone_report_bringup_failure(thread_entry_t *t)
 {
     pthread_mutex_t *lock = thread_get_lock();
     pthread_mutex_lock(lock);
-    hv_vcpu_t dying = t->vcpu;
-    bool dying_valid = t->vcpu_valid;
-    t->vcpu_valid = false;
-    t->vcpu = 0;
+    thread_destroy_own_vcpu_locked(t);
     t->vm_exited = true;
     t->vm_exit_status = LINUX_SIGKILL; /* WIFSIGNALED, WTERMSIG == SIGKILL */
     /* The slot stays active for wait4 rather than deactivating, so the fork
@@ -1202,8 +1232,6 @@ static void vm_clone_report_bringup_failure(thread_entry_t *t)
     thread_fork_release_counted_locked(t);
     pthread_cond_broadcast(&t->ptrace_cond);
     pthread_mutex_unlock(lock);
-    if (dying_valid)
-        hv_vcpu_destroy(dying);
 }
 
 /* Worker entry for vm-clone children. Sets up vCPU, runs guest code, then marks
@@ -1236,6 +1264,7 @@ static void *vm_clone_thread_run(void *arg)
     t->vcpu = vcpu;
     t->vcpu_valid = true;
     t->vexit = vexit;
+
     /* Deliver a PTRACE_INTERRUPT that raced bring-up; see
      * thread_create_and_run. vm-clone children are the usual ptrace targets.
      */
@@ -1317,52 +1346,47 @@ static void *vm_clone_thread_run(void *arg)
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 
-    /* Mark exit status for parent's wait4 to collect. vm_exit_status uses
-     * wait-format: (exit_code << 8) for normal exit.
+    log_debug("vm_clone tid=%lld exiting (code=%d)", (long long) t->guest_tid,
+              exit_code);
+
+    /* Destroy the vCPU and publish exit status in one critical section, destroy
+     * first. The slot only becomes reapable (vm_exited) once the handle is
+     * gone, so a parent wait4 that reaps and deactivates the slot can never
+     * leave a later teardown scan racing an undestroyed vCPU. thread_lock also
+     * serializes this against thread_destroy_all_vcpus. Destroying this vCPU
+     * ahead of thread_interrupt_all below is fine: the current vCPU already
+     * left hv_vcpu_run, and thread_interrupt_all only needs the OTHER vCPUs'
+     * handles. vm_exit_status is wait-format: (exit_code << 8) for a normal
+     * exit.
      */
     pthread_mutex_t *lock = thread_get_lock();
     pthread_mutex_lock(lock);
+    thread_destroy_own_vcpu_locked(t);
     t->vm_exited = true;
     t->vm_exit_status = wait_status;
     pthread_cond_broadcast(&t->ptrace_cond);
     pthread_mutex_unlock(lock);
 
-    log_debug("vm_clone tid=%lld exiting (code=%d)", (long long) t->guest_tid,
-              exit_code);
+    /* Slot stays active until the parent collects status with wait4;
+     * thread_ptrace_wait frees it when it reads vm_exited.
+     */
 
-    /* Check if this was the last VM-clone child BEFORE destroying the vCPU,
-     * because thread_interrupt_all needs valid vCPU handles. In real Linux,
-     * child exit delivers exit_signal (SIGCHLD) which interrupts the parent's
-     * futex_wait with -EINTR. The emulator simulates this by requesting
-     * exit_group and interrupting all vCPUs.
+    /* Last VM-clone child triggers exit_group so the main thread's futex_wait /
+     * run loop unblocks (mirrors SIGCHLD on child exit). vm_exited is already
+     * set, so this slot excludes itself from the active-clone count.
      */
     int last_clone = (thread_count_active_vm_clones() == 0);
-
     if (last_clone) {
         log_debug("last vm_clone exited, triggering exit_group");
         proc_request_exit_group(exit_code);
-        /* Interrupt all vCPUs while the current one is still valid. The main
-         * thread's vCPU may be blocked in hv_vcpu_run; this forces it out so it
-         * can check proc_exit_group_requested. The current vCPU is not in
-         * hv_vcpu_run (loop already exited) so the exit call on it is a
-         * harmless no-op.
+
+        /* thread_interrupt_all only reaches threads inside hv_vcpu_run; peers
+         * parked on fork_cond or another slot's ptrace_cond/resume_cond need
+         * the separate broadcast.
          */
         thread_interrupt_all();
-        /* thread_interrupt_all only reaches threads inside hv_vcpu_run.
-         * Peers parked on fork_cond or another slot's ptrace_cond/resume_cond
-         * see neither the vCPU kick nor this exit, so broadcast separately.
-         */
         thread_wake_exit_waiters();
     }
-
-    pthread_mutex_lock(lock);
-    t->vcpu_valid = false;
-    t->vcpu = 0;
-    pthread_mutex_unlock(lock);
-    hv_vcpu_destroy(vcpu);
-    /* Keep the slot active until the parent collects status with wait4. The
-     * slot is freed when thread_ptrace_wait reads vm_exited.
-     */
 
     return NULL;
 }
@@ -1400,6 +1424,7 @@ static int fork_snapshot_shm_via_clonefile(int src_fd)
     }
     int clone_fd = open(clone_path, O_RDWR | O_CLOEXEC);
     int saved_errno = errno;
+
     /* Best-effort cleanup: the clone fd alone keeps the inode alive, so any
      * unlink/rmdir failure here is a directory-leak nuisance, not a correctness
      * issue. Caller still gets the open fd.
@@ -1509,6 +1534,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     child_argv[ci++] = self_path;
     if (verbose)
         child_argv[ci++] = "--verbose";
+
     /* Rosetta is on by default; only propagate the opt-out flag when the parent
      * explicitly disabled it. The child re-reads ELFUSE_NO_ROSETTA from the
      * environment too, so an env-based opt-out is preserved across fork without
@@ -1625,6 +1651,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
     guest_region_t *regions_snapshot = NULL;
     guest_region_t preannounced_snapshot[GUEST_MAX_PREANNOUNCED];
+
     /* APFS clone fd for the CoW snapshot sent to the child. Declared up front
      * so early goto fail_snapshot exits do not read an uninitialized local.
      */
@@ -1700,6 +1727,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                 len -= (uint64_t) nw;
             }
         }
+
         /* Attempt the APFS clone snapshot for every guest, not just Rosetta:
          * the clone gives POSIX-style isolation at O(metadata) cost and avoids
          * torn-snapshot reads in guests that snapshot their own state across
@@ -1882,6 +1910,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         log_error("clone: failed to release admitted child");
         goto fail_snapshot;
     }
+
     /* The process-state payload includes the SCM_RIGHTS handoff for region
      * backing fds. Keep siblings quiesced until that send completes so a
      * concurrent munmap/remap cannot close or recycle the captured fd numbers.
@@ -1938,6 +1967,7 @@ fail_snapshot:
     free(regions_snapshot);
     if (snapshot_shm_fd >= 0)
         close(snapshot_shm_fd);
+
     /* Roll back the in-place anon-shared overlay conversion while siblings are
      * still parked. A partial rollback failure (e.g., region drift past the
      * quiesce timeout) leaves the parent in a mixed state: the originating
@@ -1957,6 +1987,7 @@ fail_snapshot:
         close(vfork_notify_fds[0]);
     if (vfork_notify_fds[1] >= 0)
         close(vfork_notify_fds[1]);
+
     /* posix_spawn at the top of sys_clone always succeeds before any goto
      * fail_snapshot fires, so child_host_pid is a live process here. The IPC
      * socket just closed; the child reads EOF on fork_ipc_read_all and returns

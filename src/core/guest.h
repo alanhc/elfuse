@@ -149,6 +149,7 @@
 #define MEM_PERM_R (1 << 0)
 #define MEM_PERM_W (1 << 1)
 #define MEM_PERM_X (1 << 2)
+
 /* AP[2:1]=00: privileged-only (no EL0 read/write). Combine with MEM_PERM_R/W.
  * Used for shim_data so the guest cannot directly read or store to the identity
  * cache, urandom bitmap, ring, or attention flag. The EL1 shim still has full
@@ -276,7 +277,8 @@ typedef enum {
     TLBI_RANGE_LARGE = 3, /* FEAT_TLBIRANGE single-shot TLBI RVAE1IS for
                            * ranges that exceed TLBI_SELECTIVE_MAX_PAGES but
                            * stay within TLBI_RVAE_MAX_PAGES; encoded as
-                           * X8 = 4 on the wire. */
+                           * X8 = 4 on the wire.
+                           */
 } tlbi_kind_t;
 
 /* Cap selective per-page TLBI VAE1IS at this many 4 KiB pages. Beyond this, use
@@ -345,10 +347,12 @@ typedef struct {
     uint8_t icache_flush; /* 1 = the change introduced executable content
                            *     visible to EL0, so the shim must IC IALLU
                            *     after the TLBI sequence. 0 = data-only
-                           *     change, skip the I-cache invalidation. */
+                           *     change, skip the I-cache invalidation.
+                           */
     uint16_t pages;       /* Page count when kind == TLBI_RANGE (1..MAX) */
     uint64_t start;       /* Page-aligned VA when kind == TLBI_RANGE */
 } tlbi_request_t;
+
 /* Layout contract: 16 bytes (1+1+2+4 padding+8). Documents the padding and pins
  * the TLS slot size so future field additions surface as a build break rather
  * than silently growing the per-vCPU footprint.
@@ -675,6 +679,7 @@ static inline void tlbi_request_range(uint64_t start, uint64_t end)
         return;
     if (end <= start)
         return;
+
     /* Page-align: TLBI VAE1IS operates on 4 KiB granules. ALIGN_UP can overflow
      * if end is within PAGE_SIZE-1 of UINT64_MAX; saturate to broadcast in that
      * pathological case rather than wrap to 0.
@@ -687,6 +692,7 @@ static inline void tlbi_request_range(uint64_t start, uint64_t end)
     uint64_t s = start & ~mask;
     uint64_t e = (end + mask) & ~mask;
     uint64_t n = (e - s) >> 12;
+
     /* Two thresholds. (a) <= TLBI_SELECTIVE_MAX_PAGES uses the per-page VAE1IS
      * loop, which preserves the most TLB entries. (b) <= TLBI_RVAE_MAX_PAGES
      * uses a single TLBI RVAE1IS via FEAT_TLBIRANGE, which still preserves
@@ -707,12 +713,14 @@ static inline void tlbi_request_range(uint64_t start, uint64_t end)
         cpu_tlbi_req.pages = (uint16_t) n;
         return;
     }
+
     /* Coalesce by union. Disjoint ranges still produce a single bounding
      * interval; if it stays within the active cap, the range TLBI still wins
      * over a full flush by preserving unrelated TLB entries.
      */
     uint64_t es = cpu_tlbi_req.start;
     uint64_t pe = (uint64_t) cpu_tlbi_req.pages * 4096ULL;
+
     /* The accumulator only ever holds page counts <= large_cap (enforced by the
      * cap check above), so es + pe never overflows on real callers, but be
      * explicit.
@@ -731,6 +739,7 @@ static inline void tlbi_request_range(uint64_t start, uint64_t end)
     }
     cpu_tlbi_req.start = us;
     cpu_tlbi_req.pages = (uint16_t) un;
+
     /* Promote kind if the coalesced range now exceeds the per-page cap. The
      * inverse direction (LARGE -> RANGE) is impossible because un >= pe / 4096
      * after coalescing.
@@ -799,7 +808,15 @@ int guest_init_from_shm(guest_t *g,
                         uint32_t ipa_bits,
                         bool retain_shared);
 
-/* Tear down VM and free guest memory. */
+/* Tear down VM and free guest memory. Must be terminal: the caller has to
+ * proceed straight to process exit afterwards. If a worker vCPU is still live
+ * past the join cap, HVF teardown cannot run safely, so guest_destroy leaks the
+ * VM and slab for process exit to reclaim -- and macOS allows only one VM per
+ * process, so a non-terminal caller would both leak and fail to bring up a
+ * second VM. All current callers (main() cleanup, the fork-child run loop)
+ * satisfy this. Remaining host-side cleanup (mounts, heap) is still safe to run
+ * after a deferred teardown: it never touches HVF or guest memory.
+ */
 void guest_destroy(guest_t *g);
 
 /* Install a Stage-2 mapping for a high IPA range that the primary buffer does
@@ -1157,6 +1174,7 @@ int guest_region_add_ex_gpa(guest_t *g,
                             uint64_t offset,
                             const char *name,
                             int backing_fd);
+
 /* Like guest_region_add_ex, but consumes owned_backing_fd on success or
  * failure.
  */

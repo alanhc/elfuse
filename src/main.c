@@ -117,6 +117,13 @@ static void cleanup_main_resources(guest_t *g,
                                    char *elf_path,
                                    char *sysroot_path)
 {
+    /* guest_destroy may defer HVF teardown to process exit when a worker vCPU
+     * is still live, but the remaining cleanup below touches only host state
+     * (mounts, cwd, heap) -- never HVF or guest memory -- so it is safe to run
+     * regardless and must run so a deferred teardown does not orphan the
+     * sysroot mount or the FUSE-materialized temp ELF, which process exit will
+     * not reclaim.
+     */
     if (guest_initialized)
         guest_destroy(g);
     rosettad_clear_binary_path();
@@ -160,10 +167,10 @@ _Static_assert((INFRA_PT_POOL_OFF & 0xFFF) == 0 &&
 
 /* Host descriptors used outside the guest FD table. Blocking I/O may hold two
  * duplicated descriptors per guest thread (for example, copy_file_range()),
- * requiring up to 2 * MAX_THREADS descriptors. Keep another 128 descriptors
- * for runtime pipes, fork IPC, debugger sockets, sysroot/FUSE plumbing, and
- * similar bounded overhead. Operations whose descriptor use grows with their
- * input set, such as ppoll(), require separate accounting.
+ * requiring up to 2 * MAX_THREADS descriptors. Keep another 128 descriptors for
+ * runtime pipes, fork IPC, debugger sockets, sysroot/FUSE plumbing, and similar
+ * bounded overhead. Operations whose descriptor use grows with their input set,
+ * such as ppoll(), require separate accounting.
  */
 #define HOST_FD_RESERVE 256
 
@@ -234,12 +241,14 @@ static int host_dc_zva_assert(void)
 int main(int argc, char **argv)
 {
     log_init();
+
     /* Resolve ELFUSE_STARTUP_TRACE before any guest syscall can fire so the
      * histogram captures the very first dynamic-linker openat.
      */
     syscall_hist_init();
 
     bool verbose = false;
+
     /* x86_64-via-Rosetta is on by default; --no-rosetta or ELFUSE_NO_ROSETTA=1
      * disables it. Architecture is auto-detected from the ELF header in
      * guest_bootstrap_prepare; the access() probe in rosetta_prepare surfaces
@@ -408,8 +417,8 @@ int main(int argc, char **argv)
     }
     proc_set_fakeroot_enabled(fakeroot);
 
-    /* Top-level processes establish the capacity; fork helpers normally
-     * inherit it, but recheck before receiving the parent's FD table. Guest
+    /* Top-level processes establish the capacity; fork helpers normally inherit
+     * it, but recheck before receiving the parent's FD table. Guest
      * RLIMIT_NOFILE state is virtualized separately and cannot lower this
      * internal host reserve.
      */
@@ -660,24 +669,25 @@ int main(int argc, char **argv)
 
     /* Tear down debugger state before joining workers: a worker parked in
      * gdb_stub_handle_stop() stays active (not deactivated) until this
-     * broadcasts resume_cond, so joining first would just time out and
-     * detach it while it is still paused. */
+     * broadcasts resume_cond, so joining first would just time out and detach
+     * it while it is still paused.
+     */
     gdb_stub_shutdown();
 
     /* Wait for worker vCPU threads to stop before tearing down guest memory.
-     * The main thread leaves the run loop as soon as it observes the
-     * exit_group flag, but sibling vCPU threads may still be mid-iteration in
-     * their own run loops (e.g. touching shim_globals). cleanup_main_resources
-     * unmaps the guest slab via guest_destroy, so a still-running worker would
-     * fault on freed guest memory and crash the host with SIGSEGV, masking the
-     * real exit code. thread_join_workers() is a no-op once the workers have
-     * already wound down (the common single-threaded case).
+     * The main thread leaves the run loop as soon as it observes the exit_group
+     * flag, but sibling vCPU threads may still be mid-iteration in their own
+     * run loops (e.g. touching shim_globals). cleanup_main_resources unmaps the
+     * guest slab via guest_destroy, so a still-running worker would fault on
+     * freed guest memory and crash the host with SIGSEGV, masking the real exit
+     * code. thread_join_workers() is a no-op once the workers have already
+     * wound down (the common single-threaded case).
      *
      * vcpu_run_loop can also return here without anyone having requested
      * exit_group or kicked the siblings out of hv_vcpu_run: the alarm timeout
      * (exit_code 124), a fatal default-disposition signal, or ELR_EL1==0 all
-     * bail out with a bare break. On those paths siblings are still spinning
-     * in the guest, so mirror guest_destroy's request-interrupt prefix before
+     * bail out with a bare break. On those paths siblings are still spinning in
+     * the guest, so mirror guest_destroy's request-interrupt prefix before
      * joining -- otherwise this call burns its full poll cap, detaches every
      * worker, and guest_destroy's own request-interrupt-join (which honors
      * join_abandoned) skips them, leaving live pthreads to fault on the
@@ -688,8 +698,9 @@ int main(int argc, char **argv)
     futex_interrupt_request();
     wakeup_pipe_signal();
     thread_interrupt_all();
-    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait)
-     * see neither the pipe nor the vCPU kick; broadcast so they re-check the
+
+    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait) see
+     * neither the pipe nor the vCPU kick; broadcast so they re-check the
      * exit-group flag and terminate before the join below gives up on them.
      */
     thread_wake_exit_waiters();
