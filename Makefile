@@ -181,6 +181,17 @@ $(BUILD_DIR)/test-shebang-host: $(BUILD_DIR)/test-shebang-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the teardown live-worker accounting host unit test (native macOS binary)
+# Links the in-tree thread.o so the real thread_destroy_all_vcpus logic runs.
+# It drives only the worker branches (main vCPU passed as not-valid), so no
+# hv_vcpu_destroy is ever called and no HVF entitlement is needed; the framework
+# is linked only to resolve thread.o's hv_* references.
+$(BUILD_DIR)/test-teardown-live-vcpu-host: \
+		$(BUILD_DIR)/test-teardown-live-vcpu-host.o \
+		$(BUILD_DIR)/runtime/thread.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(HVF_LDFLAGS)
+
 
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.

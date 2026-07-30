@@ -132,6 +132,7 @@ void thread_register_main(hv_vcpu_t vcpu,
     t->altstack_flags = LINUX_SS_DISABLE;
     t->on_altstack = false;
     thread_ptrace_init(t);
+
     /* Release-store so a lock-free scanner that acquire-loads active == 1 sees
      * this slot's initialized fields (see thread_pending_union,
      * thread_tid_alive).
@@ -159,11 +160,13 @@ rescan:
     THREAD_FOR_EACH (t) {
         if (__atomic_load_n(&t->active, __ATOMIC_RELAXED))
             continue;
+
         /* Skip slots where a tracer is still inside pthread_cond_wait on
          * ptrace_cond. Memset+reinit while a waiter holds a reference is UB.
          */
         if (t->ptrace_conds_inited && t->ptrace_waiters > 0)
             continue;
+
         /* Reap the previous occupant's pthread before reusing the slot. Workers
          * that exit on their own are joinable but never joined
          * (thread_join_workers snapshots active entries only), so dropping the
@@ -187,6 +190,7 @@ rescan:
             pthread_cond_destroy(&t->ptrace_cond);
             pthread_cond_destroy(&t->resume_cond);
         }
+
         /* Bump generation across the memset so a caller still holding this
          * slot's pointer from before reuse (e.g. a clone parent racing its own
          * worker's startup-failure path) can detect the recycle via
@@ -204,6 +208,7 @@ rescan:
         }
         t->altstack_flags = LINUX_SS_DISABLE;
         thread_ptrace_init(t);
+
         /* Release-store last so a lock-free scanner that observes active == 1
          * also sees the zeroed tpending / guest_tid set above.
          */
@@ -313,9 +318,9 @@ void thread_deactivate(thread_entry_t *t)
 
     /* Release store: everything this thread did -- including its last guest
      * memory access -- must happen-before thread_join_workers' acquire load
-     * observing 0, or the joiner could green-light guest_destroy's unmap
-     * while stores are still in flight. The joiner polls lock-free, so the
-     * mutex held here provides no edge to it.
+     * observing 0, or the joiner could green-light guest_destroy's unmap while
+     * stores are still in flight. The joiner polls lock-free, so the mutex held
+     * here provides no edge to it.
      */
     __atomic_store_n(&t->active, 0, __ATOMIC_RELEASE);
     atomic_fetch_sub(&active_thread_count, 1);
@@ -426,6 +431,7 @@ uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t)
         log_error("thread: SP_EL1 slots exhausted");
     } else {
         int slot = bit_ctz64(free_mask);
+
         /* Main thread's SP_EL1 sits at the top of the shim data block. Each
          * subsequent thread is 4KiB below.
          */
@@ -476,16 +482,18 @@ void thread_join_workers(void)
     THREAD_FOR_EACH (t) {
         if (t == current_thread || t->join_abandoned)
             continue;
+
         /* Never wait for the main thread (slot 0): its entry only deactivates
          * inside guest_destroy, which runs on the main thread AFTER its own
-         * thread_join_workers. A worker waiting here (exit_group called from
-         * a worker) would burn the full cap on it, and the resulting mutual
-         * wait (worker polling main while main polls the worker) ends in
-         * pthread_detach on both sides, leaving the loser to touch guest
-         * memory after guest_destroy unmaps it.
+         * thread_join_workers. A worker waiting here (exit_group called from a
+         * worker) would burn the full cap on it, and the resulting mutual wait
+         * (worker polling main while main polls the worker) ends in
+         * pthread_detach on both sides, leaving the loser to touch guest memory
+         * after guest_destroy unmaps it.
          */
         if (t == &thread_table[0])
             continue;
+
         /* Inactive slots are included when they still hold an unjoined handle:
          * a worker that exited on its own shortly before teardown and whose
          * slot was never reused. Its pthread has terminated (or is in final
@@ -513,10 +521,10 @@ void thread_join_workers(void)
      * re-checks every 200ms (io.c wait helper) and the futex paths every 100ms
      * (FUTEX_OS_SYNC_POLL_CAP_NS quanta), so 500ms covers the slowest bound
      * with margin. One shared deadline keeps worst-case shutdown at the cap
-     * even with many stuck workers, rather than multiplying a per-worker cap
-     * by nworkers. A worker still alive past the cap is detached and, if this
-     * pass claimed its handle, marked join_abandoned so a later pass does not
-     * touch it again. The vCPU is NOT destroyed here because HVF vCPUs are
+     * even with many stuck workers, rather than multiplying a per-worker cap by
+     * nworkers. A worker still alive past the cap is detached and, if this pass
+     * claimed its handle, marked join_abandoned so a later pass does not touch
+     * it again. The vCPU is NOT destroyed here because HVF vCPUs are
      * thread-affine, so cross-thread hv_vcpu_destroy while the owning thread
      * may still be inside hv_vcpu_run is unsafe.
      */
@@ -527,13 +535,14 @@ void thread_join_workers(void)
                 continue;
             if (!__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE))
                 continue;
+
             /* The slot may have been reused for a new logical thread while we
              * polled: thread_alloc only recycles a slot once its previous
              * occupant is inactive, so a generation bump here proves our
              * snapshotted worker already deactivated even though the slot now
-             * reads active == 1 again for the replacement thread. Stop
-             * tracking this worker's active bit for the rest of the loop
-             * rather than following the wrong thread.
+             * reads active == 1 again for the replacement thread. Stop tracking
+             * this worker's active bit for the rest of the loop rather than
+             * following the wrong thread.
              */
             if (workers[w].t->generation != workers[w].generation) {
                 workers[w].recycled = true;
@@ -549,6 +558,7 @@ void thread_join_workers(void)
     for (int w = 0; w < nworkers; w++) {
         if (!workers[w].claimed)
             continue;
+
         /* recycled short-circuits before the active re-check: once recycled,
          * that bit belongs to the replacement thread and must not influence the
          * join-vs-detach decision for our (already-terminated) handle.
@@ -565,34 +575,91 @@ void thread_join_workers(void)
     }
 }
 
-bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu, bool main_vcpu_valid)
+bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu,
+                              bool main_vcpu_valid,
+                              bool *live_workers_left)
 {
     bool main_destroyed = false;
+    bool live_workers = false;
     pthread_mutex_lock(&thread_lock);
     THREAD_FOR_EACH_ACTIVE (t) {
-        if (!t->vcpu_valid)
-            continue;
-        if (main_vcpu_valid && t->vcpu == main_vcpu)
-            main_destroyed = true;
-        hv_vcpu_destroy(t->vcpu);
-        t->vcpu_valid = false;
-        t->vcpu = 0;
-        thread_free_sp_el1_locked(t);
-        __atomic_store_n(&t->active, 0, __ATOMIC_RELEASE);
-        /* Do NOT destroy condvars. Same race as thread_deactivate: a waiter
-         * woken by an earlier broadcast may still reference the condvar.
-         * Process is exiting, so the leak is harmless.
+        /* The main vCPU is the only handle owned by the thread running
+         * guest_destroy, so it is the only one this thread may destroy. The
+         * vcpu_valid term guards a not-yet-published worker whose t->vcpu still
+         * reads 0 from colliding with a main_vcpu handle of 0 (a valid value
+         * for the first vCPU).
          */
+        if (main_vcpu_valid && t->vcpu_valid && t->vcpu == main_vcpu) {
+            hv_vcpu_destroy(t->vcpu);
+            t->vcpu_valid = false;
+            t->vcpu = 0;
+            thread_free_sp_el1_locked(t);
+            __atomic_store_n(&t->active, 0, __ATOMIC_RELEASE);
+
+            /* Keep the count accurate rather than zeroing the whole table: any
+             * leaked live worker stays active and counted until process exit
+             * reclaims it.
+             */
+            atomic_fetch_sub(&active_thread_count, 1);
+            main_destroyed = true;
+
+            /* Do NOT destroy condvars. Same race as thread_deactivate: a waiter
+             * woken by an earlier broadcast may still reference the condvar.
+             * Process is exiting, so the leak is harmless.
+             */
+            continue;
+        }
+
+        /* A slot that has already published vm_exited destroyed its own vCPU on
+         * its owning thread (under thread_lock, before setting vm_exited) and
+         * that thread has terminated; a vm-clone child stays active past that
+         * only so a later wait4 can reap it. It holds no live vCPU, so it does
+         * not block teardown -- treating it as live would wrongly defer the
+         * explicit HVF teardown/unmaps for an already-dead slot.
+         *
+         * Gate on !vcpu_valid too, not vm_exited alone: this is the guard that
+         * keeps hv_vm_destroy/munmap from running under a live foreign vCPU and
+         * panicking the host, so it checks the direct fact (no live handle
+         * here) rather than trusting that vm_exited always implies the handle
+         * is gone. The two are published together under thread_lock, so this
+         * term is currently always true; keeping it fails closed (defer to
+         * process exit) if that ordering ever regresses.
+         */
+        if (t->vm_exited && !t->vcpu_valid)
+            continue;
+
+        /* Every other active non-main slot is a live worker: running a vCPU, or
+         * mid-bring-up (active, vcpu_valid not yet set) about to create and
+         * enter one on its own thread. HVF vCPUs are thread-affine, so this
+         * thread can neither destroy such a handle nor let hv_vm_destroy /
+         * munmap run while the worker is live without corrupting kernel state
+         * and panicking the host. vcpu_valid alone is not a sufficient proxy --
+         * a bring-up worker is active with vcpu_valid still false. Report it so
+         * guest_destroy defers teardown to process exit, the only safe way to
+         * stop a foreign vCPU.
+         */
+        live_workers = true;
     }
-    atomic_store(&active_thread_count, 0);
+
     pthread_mutex_unlock(&thread_lock);
+    if (live_workers_left)
+        *live_workers_left = live_workers;
     return main_destroyed;
 }
 
 void thread_interrupt_all(void)
 {
-    /* Collect active vCPUs under the lock, then call hv_vcpus_exit outside the
-     * lock to avoid holding it during a framework call.
+    /* Collect active vCPUs and kick them out of hv_vcpu_run() in one critical
+     * section. hv_vcpus_exit must run under thread_lock, not after releasing
+     * it: a worker destroys its own vCPU under the same lock on exit, so a
+     * handle collected here and used after the lock is dropped could be handed
+     * to HVF after it was freed, faulting the host on the released vCPU object.
+     * Holding the lock across the kick serializes it against destruction --
+     * every handle passed is still live, or the worker already cleared
+     * vcpu_valid and was skipped. hv_vcpus_exit only signals the target vCPUs
+     * to leave hv_vcpu_run and returns without waiting, so it does not block
+     * under the lock (the signal-preemption path already kicks under
+     * thread_lock the same way).
      */
     hv_vcpu_t vcpus[MAX_THREADS];
     int count = 0;
@@ -601,13 +668,13 @@ void thread_interrupt_all(void)
     THREAD_FOR_EACH_ACTIVE (t)
         if (t->vcpu_valid) /* skip bring-up/torn-down slots */
             vcpus[count++] = t->vcpu;
-    pthread_mutex_unlock(&thread_lock);
 
-    /* Force all active vCPUs out of hv_vcpu_run(). Each vCPU will see
-     * HV_EXIT_REASON_CANCELED and check for pending signals.
+    /* Each kicked vCPU sees HV_EXIT_REASON_CANCELED and checks pending signals
+     * / teardown.
      */
     if (count > 0)
         hv_vcpus_exit(vcpus, (uint32_t) count);
+    pthread_mutex_unlock(&thread_lock);
 }
 
 int thread_signal_deliverable(uint64_t sigbit)
@@ -663,11 +730,15 @@ void thread_quiesce_siblings(void)
     fork_quiesced_count = 0;
     fork_target_count = targets;
 
-    pthread_mutex_unlock(&thread_lock);
-
-    /* Force siblings out of hv_vcpu_run */
+    /* Force siblings out of hv_vcpu_run under the lock, before releasing it: a
+     * sibling destroys its own vCPU under thread_lock on exit, so kicking a
+     * collected handle after the lock is dropped could hand HVF a freed vCPU.
+     * The kick does not block, so holding the lock across it is safe.
+     */
     if (count > 0)
         hv_vcpus_exit(vcpus, (uint32_t) count);
+
+    pthread_mutex_unlock(&thread_lock);
 
     /* Wait until all siblings have blocked on the barrier. Use a bounded wait:
      * siblings in long-running host syscalls (poll, read, accept) may not reach
@@ -695,6 +766,7 @@ void thread_resume_siblings(void)
     fork_quiesce_active = false;
     fork_quiesced_count = 0;
     fork_target_count = 0;
+
     /* Clear any fork_counted still set on siblings that never reached the
      * barrier (blocked in a host syscall and released by the timeout) so the
      * next barrier generation starts from a clean slate.
@@ -727,10 +799,10 @@ int thread_fork_barrier_check(void)
     }
 
     /* Block until fork is complete. Bail out on exit_group: the resume
-     * broadcast comes from the forking thread, whose progress the teardown
-     * path does not control, so waiting for it would leave this park outside
-     * the bounded-wake guarantee. thread_wake_exit_waiters broadcasts
-     * fork_cond after the flag is set; the caller's run loop re-checks
+     * broadcast comes from the forking thread, whose progress the teardown path
+     * does not control, so waiting for it would leave this park outside the
+     * bounded-wake guarantee. thread_wake_exit_waiters broadcasts fork_cond
+     * after the flag is set; the caller's run loop re-checks
      * proc_exit_group_requested and exits.
      */
     while (fork_quiesce_active && !proc_exit_group_requested())
@@ -750,11 +822,11 @@ void thread_wake_exit_waiters(void)
     pthread_cond_broadcast(&fork_cond);
 
     /* Ptrace parks: tracers blocked in thread_ptrace_wait (ptrace_cond) and
-     * tracees blocked in thread_ptrace_stop (resume_cond). Scan every slot
-     * with live condvars, not just active ones: a tracer may still be parked
-     * on a slot whose thread was deactivated. ptrace_conds_inited only
-     * transitions under thread_lock with ptrace_waiters == 0, so broadcasting
-     * here never touches a destroyed condvar.
+     * tracees blocked in thread_ptrace_stop (resume_cond). Scan every slot with
+     * live condvars, not just active ones: a tracer may still be parked on a
+     * slot whose thread was deactivated. ptrace_conds_inited only transitions
+     * under thread_lock with ptrace_waiters == 0, so broadcasting here never
+     * touches a destroyed condvar.
      */
     THREAD_FOR_EACH (t) {
         if (!t->ptrace_conds_inited)
@@ -827,6 +899,7 @@ retry:
         }
         nranges++;
     }
+
     /* Pass 2: commit. Both passes iterate the table in the same order under the
      * same lock, so the active set seen here matches pass 1.
      */
@@ -1087,10 +1160,10 @@ int thread_ptrace_stop(thread_entry_t *t, int sig)
     pthread_cond_broadcast(&t->ptrace_cond);
 
     /* Block until tracer calls PTRACE_CONT. Bail out on exit_group: only the
-     * tracer signals resume_cond, and a tracer that exits (or calls
-     * exit_group itself) will never CONT this stop. thread_wake_exit_waiters
-     * broadcasts resume_cond; returning 0 sends the caller back to its run
-     * loop, which re-checks proc_exit_group_requested.
+     * tracer signals resume_cond, and a tracer that exits (or calls exit_group
+     * itself) will never CONT this stop. thread_wake_exit_waiters broadcasts
+     * resume_cond; returning 0 sends the caller back to its run loop, which
+     * re-checks proc_exit_group_requested.
      */
     while (t->ptrace_stopped && !proc_exit_group_requested())
         pthread_cond_wait(&t->resume_cond, &thread_lock);
@@ -1148,8 +1221,9 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
 
     for (;;) {
         /* exit_group teardown: the stop/exit notifications that would signal
-         * ptrace_cond stop arriving once workers are being torn down. Return 0
-         * ("no matching children") so the caller falls through and its
+         * ptrace_cond stop arriving once workers are being torn down.
+         *
+         * Return 0 ("no matching children") so the caller falls through and its
          * blocking paths re-check proc_exit_group_requested.
          */
         if (proc_exit_group_requested()) {
@@ -1179,6 +1253,7 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
                 int64_t tid = t->guest_tid;
                 if (out_status)
                     *out_status = t->vm_exit_status;
+
                 /* Destroy condvars after the last waiter returns from
                  * pthread_cond_wait().
                  */
@@ -1188,6 +1263,7 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
                 t->ptrace_cleanup_pending = true;
                 thread_ptrace_cleanup_locked(t);
                 pthread_mutex_unlock(&thread_lock);
+
                 /* Slot is now inactive; drop any unconsumed thread-directed
                  * pending bits from the global hint (same rationale as
                  * thread_deactivate). Outside thread_lock to honor sig_lock (4)

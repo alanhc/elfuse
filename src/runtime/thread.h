@@ -39,7 +39,8 @@ typedef struct thread_entry {
     hv_vcpu_t vcpu;              /* HVF vCPU handle for this thread */
     bool vcpu_valid;             /* Handle has been published and not destroyed.
                                   * hv_vcpu_t value 0 is valid, so the handle
-                                  * itself cannot be used as a sentinel. */
+                                  * itself cannot be used as a sentinel.
+                                  */
     hv_vcpu_exit_t *vexit;       /* vCPU exit info pointer */
     pthread_t host_thread;       /* macOS host thread running this vCPU */
     bool host_thread_needs_join; /* host_thread was created joinable and nobody
@@ -304,20 +305,32 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
  */
 int thread_count_active_vm_clones(void);
 
-/* Join worker threads (all active threads except the caller, minus any
- * already join_abandoned by a prior pass). Collects thread handles under the
- * lock, then polls OUTSIDE the lock under one shared 500ms deadline so
- * workers can call thread_deactivate() to set active=0. Workers still alive
- * past the deadline are detached and marked join_abandoned so a later pass
- * (e.g. guest_destroy's internal join after main()'s) does not touch the same
- * handle twice.
+/* Join worker threads (all active threads except the caller, minus any already
+ * join_abandoned by a prior pass). Collects thread handles under the lock, then
+ * polls OUTSIDE the lock under one shared 500ms deadline so workers can call
+ * thread_deactivate() to set active=0. Workers still alive past the deadline
+ * are detached and marked join_abandoned so a later pass (e.g. guest_destroy's
+ * internal join after main()'s) does not touch the same handle twice.
  */
 void thread_join_workers(void);
 
-/* Destroy all active worker vCPUs. Called during guest_destroy to ensure no
- * vCPUs remain active before hv_vm_destroy().
+/* Destroy the main vCPU (owned by the calling thread) during guest_destroy. HVF
+ * vCPUs are thread-affine, so worker vCPUs are never destroyed here: an active
+ * worker slot that has not published vm_exited is one whose owning thread is
+ * still live -- running a vCPU or mid-bring-up about to enter one -- and a
+ * cross-thread hv_vcpu_destroy on such a handle, or hv_vm_destroy while it
+ * holds one, corrupts the kernel vCPU object and panics the host. Such a worker
+ * is left for process-exit reclamation and reported via live_workers_left (may
+ * be NULL) so the caller defers the rest of HVF teardown. A slot that has
+ * already published vm_exited (a vm-clone child that self-destroyed its vCPU
+ * and stays active only for wait4) holds no live vCPU and does not force the
+ * deferral.
+ *
+ * Returns whether the main vCPU was destroyed.
  */
-bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu, bool main_vcpu_valid);
+bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu,
+                              bool main_vcpu_valid,
+                              bool *live_workers_left);
 
 /* Interrupt all active vCPUs by calling hv_vcpus_exit(). Used for signal
  * preemption: when a signal is queued while a vCPU is running in a tight loop
@@ -326,14 +339,14 @@ bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu, bool main_vcpu_valid);
  */
 void thread_interrupt_all(void);
 
-/* Wake workers parked on internal condvars (fork barrier, ptrace stop/wait)
- * so exit_group teardown reaches them within a bounded time. hv_vcpus_exit
- * only interrupts threads inside hv_vcpu_run, and the wakeup pipe / futex
- * interrupt only cover guest syscall waits; a thread parked on fork_cond,
- * ptrace_cond, or resume_cond would otherwise sleep past the join cap in
- * thread_join_workers and still be live when guest memory is unmapped.
- * Callers must set the exit-group flag (proc_request_exit_group) BEFORE
- * calling this so woken waiters observe it when they re-check.
+/* Wake workers parked on internal condvars (fork barrier, ptrace stop/wait) so
+ * exit_group teardown reaches them within a bounded time. hv_vcpus_exit only
+ * interrupts threads inside hv_vcpu_run, and the wakeup pipe / futex interrupt
+ * only cover guest syscall waits; a thread parked on fork_cond, ptrace_cond, or
+ * resume_cond would otherwise sleep past the join cap in thread_join_workers
+ * and still be live when guest memory is unmapped. Callers must set the
+ * exit-group flag (proc_request_exit_group) BEFORE calling this so woken
+ * waiters observe it when they re-check.
  */
 void thread_wake_exit_waiters(void);
 
@@ -434,6 +447,7 @@ int thread_prepare_deferred_stack_unmaps_for_cleanup(thread_entry_t *t,
                                                      uint64_t *starts,
                                                      uint64_t *ends,
                                                      int max_ranges);
+
 /* Snapshot the deferred unmap entries without modifying the thread record.
  * Returns the number of entries copied (capped at max_ranges).
  */
