@@ -2209,6 +2209,113 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva, int mode, int dev)
     return -LINUX_ENOSYS;
 }
 
+typedef enum {
+    SYMLINK_TARGET_VERBATIM,  /* store the guest's target unchanged */
+    SYMLINK_TARGET_REWRITTEN, /* store the composed relative path */
+    SYMLINK_TARGET_FAILED,    /* must rewrite but cannot; errno is set */
+} symlink_target_rewrite_t;
+
+/* Absolute host path of the new symlink itself.
+ *
+ * path_translate_at() only rewrites absolute guest paths; a relative linkpath
+ * is handed back untouched because the resolvers have no dirfd context (see
+ * the comment in path_translate_at). Measuring depth against that bare name
+ * would silently skip the rewrite and leave an escaping absolute target on
+ * disk, so rebuild the location from the dirfd first.
+ */
+static bool symlink_host_location(int dirfd,
+                                  const host_fd_ref_t *dir_ref,
+                                  const char *host_path,
+                                  char *out,
+                                  size_t outsz)
+{
+    if (host_path[0] == '/') {
+        if (str_copy_trunc(out, host_path, outsz) >= outsz) {
+            errno = ENAMETOOLONG;
+            return false;
+        }
+        return true;
+    }
+
+    char base[LINUX_PATH_MAX];
+    if (dirfd == LINUX_AT_FDCWD) {
+        if (!getcwd(base, sizeof(base)))
+            return false;
+    } else if (dir_ref->fd < 0 || fcntl(dir_ref->fd, F_GETPATH, base) < 0) {
+        return false;
+    }
+
+    int n = snprintf(out, outsz, "%s/%s", base, host_path);
+    if (n < 0 || (size_t) n >= outsz) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    return true;
+}
+
+/* Express absolute guest path @target as a path relative to the directory that
+ * holds the new symlink, so a native follow stays inside the sysroot. ".." is
+ * normalized away first, clamped at "/" the way a chroot resolves it, so the
+ * result can never climb above the sysroot.
+ *
+ * VERBATIM covers the cases where no rewrite is owed: a relative target, no
+ * sysroot configured, or a symlink created outside the sysroot, where the
+ * guest is deliberately working against host paths. Anything that must be
+ * rewritten but cannot is FAILED rather than VERBATIM -- falling back to the
+ * literal target there would hand back the very escape this closes.
+ */
+static symlink_target_rewrite_t symlink_rewrite_target(const char *target,
+                                                       int dirfd,
+                                                       const host_fd_ref_t *ref,
+                                                       const char *host_path,
+                                                       char *out,
+                                                       size_t outsz)
+{
+    char sr[LINUX_PATH_MAX], norm[LINUX_PATH_MAX], link_host[LINUX_PATH_MAX];
+    if (target[0] != '/' || !proc_sysroot_snapshot(sr, sizeof(sr)))
+        return SYMLINK_TARGET_VERBATIM;
+
+    if (!symlink_host_location(dirfd, ref, host_path, link_host,
+                               sizeof(link_host)))
+        return SYMLINK_TARGET_FAILED;
+
+    size_t sr_len = strlen(sr);
+    if (strncmp(link_host, sr, sr_len) != 0 || link_host[sr_len] != '/')
+        return SYMLINK_TARGET_VERBATIM;
+
+    if (path_openat2_normalize_in_root(target, norm, sizeof(norm)) != 0)
+        return SYMLINK_TARGET_FAILED;
+
+    /* One ".." per directory between the sysroot and the symlink itself.
+     * Counting components rather than separators keeps repeated or trailing
+     * slashes ("/a//b/link") from inflating the depth and walking out above
+     * the sysroot -- host_path is a plain concatenation with no normalization.
+     */
+    size_t components = 0;
+    for (const char *p = link_host + sr_len; *p;) {
+        while (*p == '/')
+            p++;
+        if (!*p)
+            break;
+        components++;
+        while (*p && *p != '/')
+            p++;
+    }
+    size_t depth = components ? components - 1 : 0;
+
+    size_t norm_len = strlen(norm);
+    if (depth * 3 + norm_len + 1 > outsz) {
+        errno = ENAMETOOLONG;
+        return SYMLINK_TARGET_FAILED;
+    }
+
+    char *w = out;
+    for (size_t i = 0; i < depth; i++, w += 3)
+        memcpy(w, "../", 3);
+    memcpy(w, norm, norm_len + 1);
+    return SYMLINK_TARGET_REWRITTEN;
+}
+
 int64_t sys_symlinkat(guest_t *g,
                       uint64_t target_gva,
                       int dirfd,
@@ -2231,9 +2338,36 @@ int64_t sys_symlinkat(guest_t *g,
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
+    /* An absolute target is stored verbatim, but the host kernel resolves it
+     * against the real host root -- not --sysroot -- whenever anything follows
+     * the symlink natively, so the follow escapes the guest tree. Store it
+     * relative to the symlink's own directory instead: it stays inside the
+     * sysroot and survives the tree being moved, where "<sysroot><target>"
+     * would strand every such link.
+     *
+     * Two divergences the guest can see: readlink() reports the rewritten
+     * form, since nothing on disk tells a rewritten target from a relative one
+     * the guest wrote; and an absolute target loses the host fallback a direct
+     * open() would get, the choice being made once at creation rather than at
+     * follow time.
+     */
+    const char *host_target = target;
+    char rel_target[LINUX_PATH_MAX];
+    switch (symlink_rewrite_target(target, dirfd, &dir_ref, tx.host_path,
+                                   rel_target, sizeof(rel_target))) {
+    case SYMLINK_TARGET_REWRITTEN:
+        host_target = rel_target;
+        break;
+    case SYMLINK_TARGET_FAILED:
+        host_fd_ref_close(&dir_ref);
+        return linux_errno();
+    case SYMLINK_TARGET_VERBATIM:
+        break;
+    }
+
     /* Resolve linkpath (the new symlink location) through sysroot */
-    if (symlinkat(target, path_translation_dirfd(&tx, &dir_ref), tx.host_path) <
-        0) {
+    if (symlinkat(host_target, path_translation_dirfd(&tx, &dir_ref),
+                  tx.host_path) < 0) {
         host_fd_ref_close(&dir_ref);
         return linux_errno();
     }
