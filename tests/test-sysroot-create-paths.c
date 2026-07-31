@@ -330,7 +330,7 @@ int main(int argc, char **argv)
             _exit(0);
         }
 
-        int hit_eloop = 0;
+        bool hit_eloop = false;
         int iterations = 0;
         while (iterations < 10000) {
             iterations++;
@@ -339,7 +339,7 @@ int main(int argc, char **argv)
                 close(fd);
                 unlink("/tmp/race_dir/file.txt");
             } else if (errno == ELOOP) {
-                hit_eloop = 1;
+                hit_eloop = true;
                 break;
             }
         }
@@ -361,15 +361,13 @@ int main(int argc, char **argv)
         unlink(host_race_file);
         rmdir(host_race_dir);
 
-        /* Assert that no artifact exists outside mounted_sysroot_root on the
-         * host */
-        struct stat host_st;
-        if (stat("/tmp/race_dir", &host_st) == 0)
-            FAIL("TOCTOU race created directory outside of sysroot");
-        else if (hit_eloop)
-            FAIL("TOCTOU race returned ELOOP");
-        else
-            PASS();
+        /* The host-escape half of this assertion lives in the harness
+         * (mk/tests.mk). Guest /tmp is sysroot-backed for lookups as well as
+         * creates, so a stat of /tmp/race_dir from in here reports on the
+         * sysroot copy the lines above just deleted and can never observe a
+         * host artifact, whether or not the race produced one.
+         */
+        EXPECT_TRUE(!hit_eloop, "TOCTOU race returned ELOOP");
     }
 
     SUMMARY("test-sysroot-create-paths");

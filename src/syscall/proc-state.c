@@ -518,8 +518,11 @@ static bool sysroot_path_exists(const char *resolved_path, bool follow_final)
 /* Resolve an absolute guest path against --sysroot. This keeps absolute guest
  * filesystem syscalls inside the sysroot when the target exists there, and
  * otherwise falls back to the literal host path so apps can still reach host
- * resources such as /tmp or /etc/resolv.conf. Containment via realpath() is
- * enforced only when the path actually resolves under sysroot, to prevent
+ * resources such as /etc/resolv.conf. The temp roots
+ * (is_sysroot_backed_temp_path) and the guest system directories
+ * (is_guest_system_path) are excluded from that fallback and stay on the
+ * sysroot spelling whether or not they exist there. Containment via realpath()
+ * is enforced only when the path actually resolves under sysroot, to prevent
  * symlink escape from a tree the caller intended to stay inside.
  */
 static bool lexical_normalize_absolute_path(char *dest,
@@ -609,6 +612,37 @@ static bool is_guest_system_path(const char *path)
     return false;
 }
 
+/* The temp roots are sysroot-backed for every operation, lookup as much as
+ * create. Creates redirect so a guest's temp files cannot collide on the host's
+ * case-insensitive /tmp; a lookup falling back to the host would then surface
+ * entries that no create-resolved unlink or rename could touch, leaving them
+ * readable but not removable. The roots match as directories too, not only as
+ * prefixes of their children, so a listing cannot enumerate host entries whose
+ * children resolve into the sysroot.
+ *
+ * /var/tmp also lands in is_guest_system_path(), which claims all of /var for
+ * macOS SIP reasons; it belongs here on its own terms as a temp root, so the
+ * two rules stay independent. ccache matches by component because HOME may be a
+ * macOS home directory (/Users/<user>/.ccache) that no other rule covers; the
+ * component test is deliberately generous, matching a final leaf or a regular
+ * file too, an over-match that only widens what resolves into the sysroot.
+ */
+static bool is_sysroot_backed_temp_path(const char *path)
+{
+    if (path_prefix_match(path, "/tmp", 4) ||
+        path_prefix_match(path, "/var/tmp", 8))
+        return true;
+
+    static const char ccache_dir[] = ".ccache";
+    const char *scan = path;
+    const char *comp;
+    size_t len;
+    while (path_next_component(&scan, &comp, &len))
+        if (len == sizeof(ccache_dir) - 1 && !memcmp(comp, ccache_dir, len))
+            return true;
+    return false;
+}
+
 static const char *proc_resolve_sysroot_path_flags(const char *path,
                                                    char *buf,
                                                    size_t bufsz,
@@ -648,7 +682,13 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     char norm_path[LINUX_PATH_MAX];
     bool has_norm =
         lexical_normalize_absolute_path(norm_path, path, sizeof(norm_path));
-    if (is_guest_system_path(has_norm ? norm_path : path))
+    /* Resolution stops at the sysroot spelling for both classes. The caller's
+     * own syscall reports the path absent when the sysroot does not hold it,
+     * which is what it is in the guest's namespace.
+     */
+    const char *path_to_check = has_norm ? norm_path : path;
+    if (is_guest_system_path(path_to_check) ||
+        is_sysroot_backed_temp_path(path_to_check))
         return buf;
 
     return path;
@@ -729,19 +769,16 @@ const char *proc_resolve_sysroot_create_path(const char *path,
     if (errno != ENOENT && errno != ENOTDIR)
         return NULL;
 
-    /* Parent doesn't exist in sysroot. Only /tmp, /var/tmp, and ccache get
-     * forcefully redirected to the sysroot to avoid host case-collisions;
-     * everything else falls back to the host literal.
-     * Guest system directories must also be forced to resolve to the sysroot.
+    /* Parent doesn't exist in sysroot. Only the temp roots and the guest system
+     * directories are forced to resolve there; everything else falls back to
+     * the host literal.
      */
     char norm_path[LINUX_PATH_MAX];
     bool has_norm =
         lexical_normalize_absolute_path(norm_path, path, sizeof(norm_path));
     const char *path_to_check = has_norm ? norm_path : path;
 
-    if (strncmp(path_to_check, "/tmp/", 5) &&
-        strncmp(path_to_check, "/var/tmp/", 9) &&
-        !strstr(path_to_check, "/.ccache/") &&
+    if (!is_sysroot_backed_temp_path(path_to_check) &&
         !is_guest_system_path(path_to_check))
         return path;
 

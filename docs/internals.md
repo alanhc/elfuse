@@ -802,6 +802,10 @@ Resolving in `path_translate_at` instead means `chmod`, `chown`, `truncate`,
 `statfs`, and the xattr calls all inherit the backing path from one place, so an
 `open` followed by any of them on the same name stays consistent.
 
+The early return also takes shm objects out of sysroot resolution entirely, so
+the `/tmp/elfuse-shm-<uid>` backing directory is reached as a host path and is
+unaffected by the sysroot's redirect of guest `/tmp`.
+
 Only a non-empty flat leaf is redirected. Bare `/dev/shm` and `/dev/shm/` stay
 on the sysroot path so the synthetic-directory intercepts keep answering for
 them, and `statfs` on a shm leaf or on `/dev/shm` reports `TMPFS_MAGIC`
@@ -866,7 +870,11 @@ How it works:
 4. The entry point becomes `interp_entry + load_base`; the dynamic linker
    takes over from there.
 5. `sys_openat()` redirects guest absolute paths through the sysroot: if
-   `--sysroot` is set, it tries `<sysroot>/<path>` first.
+   `--sysroot` is set, it tries `<sysroot>/<path>` first, and falls back to
+   the literal host path when the sysroot does not hold it. The temp roots
+   (`/tmp`, `/var/tmp`, any `.ccache` directory) and the guest system
+   directories are excluded from that fallback and resolve in the sysroot
+   either way, so lookup and removal cannot disagree about where a path lives.
 
 The sysroot is inherited by fork children via IPC state transfer.
 `sys_execve` also loads the interpreter for dynamically linked targets, so
