@@ -14,6 +14,7 @@
         test-sysroot-tmp-remove test-sysroot-host-fallback test-sysroot-case-exact \
         test-sysroot-create-paths test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
+        test-dynamic-array-host test-string-builder-host \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
@@ -143,7 +144,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-teardown-live-vcpu-host test-casefold-host \
-        test-casefold-walk-host test-absock-names-host)
+        test-casefold-walk-host test-absock-names-host \
+        test-dynamic-array-host test-string-builder-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -158,6 +160,8 @@ $(call run-host-unit,test-teardown-live-vcpu-host,teardown live-worker accountin
 $(call run-host-unit,test-casefold-host,filename codec unit test)
 $(call run-host-unit,test-casefold-walk-host,case-exact path resolution unit test)
 $(call run-host-unit,test-absock-names-host,absock derived-name unit test)
+$(call run-host-unit,test-dynamic-array-host,dynamic array unit test)
+$(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)
@@ -1395,6 +1399,16 @@ test-rwx: $(BUILD_DIR)/test-rwx
 ## Run the fork IPC protocol identity unit test
 test-fork-ipc-protocol-host: $(BUILD_DIR)/test-fork-ipc-protocol-host
 	$(BUILD_DIR)/test-fork-ipc-protocol-host
+
+# String builder unit test
+## Run the growable string builder host unit test
+test-string-builder-host: $(BUILD_DIR)/test-string-builder-host
+	$(BUILD_DIR)/test-string-builder-host
+
+# Generic dynamic array unit test
+## Run the raw/typed dynamic array host unit test
+test-dynamic-array-host: $(BUILD_DIR)/test-dynamic-array-host
+	$(BUILD_DIR)/test-dynamic-array-host
 
 # vCPU run-loop hook API regression
 ## Run the vCPU run-loop hook API unit test
