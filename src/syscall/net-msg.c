@@ -462,8 +462,17 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 
         ssize_t ret = recvmsg(host_ref.fd, &msg, mac_flags);
         if (ret < 0) {
-            host_fd_ref_close(&host_ref);
-            return linux_errno();
+            int64_t r = recv_eof_or_errno(host_ref.fd, fd);
+            if (r != 0) {
+                host_fd_ref_close(&host_ref);
+                return r;
+            }
+
+            /* SEQPACKET-over-DGRAM EOF: fall through with an empty result so
+             * the guest sees msg_controllen 0 and msg_flags 0 like a real EOF.
+             */
+            ret = 0;
+            msg.msg_flags = 0;
         }
         uint64_t zero64 = 0;
         int32_t mflags = mac_to_linux_msg_flags(msg.msg_flags);
@@ -545,10 +554,33 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 
     ssize_t ret = recvmsg(host_ref.fd, &msg, mac_flags);
     if (ret < 0) {
+        int64_t r = recv_eof_or_errno(host_ref.fd, fd);
         free(mac_ctrl_heap);
         host_iov_free(&host_iov);
+        if (r == 0) {
+            /* SEQPACKET-over-DGRAM EOF: report an empty control buffer and
+             * flags, matching a real 0-length recvmsg. Do not fall through --
+             * recvmsg left msg unmodified, so the control loop would walk the
+             * stale (uninitialized) mac_ctrl buffer. Surface EFAULT on an
+             * unwritable msghdr like the success path.
+             */
+            uint64_t zero64 = 0;
+            uint32_t zero32 = 0;
+            int32_t zflags = 0;
+            if ((lmsg.msg_name &&
+                 guest_write_small(
+                     g, msg_gva + offsetof(linux_msghdr_t, msg_namelen),
+                     &zero32, sizeof(zero32)) < 0) ||
+                guest_write_small(
+                    g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
+                    &zero64, sizeof(zero64)) < 0 ||
+                guest_write_small(g,
+                                  msg_gva + offsetof(linux_msghdr_t, msg_flags),
+                                  &zflags, sizeof(zflags)) < 0)
+                r = -LINUX_EFAULT;
+        }
         host_fd_ref_close(&host_ref);
-        return linux_errno();
+        return r;
     }
 
     if (lmsg.msg_name) {
@@ -960,8 +992,17 @@ int64_t sys_recvmmsg(guest_t *g,
             }
             ssize_t ret = recvmsg(host_ref.fd, &host_msg, mac_flags);
             if (ret < 0) {
-                host_fd_ref_close(&host_ref);
-                return linux_errno();
+                int64_t r = recv_eof_or_errno(host_ref.fd, fd);
+                if (r != 0) {
+                    host_fd_ref_close(&host_ref);
+                    return r;
+                }
+
+                /* SEQPACKET-over-DGRAM EOF: record one empty message, matching
+                 * how the general loop path counts a 0-length recvmsg.
+                 */
+                ret = 0;
+                host_msg.msg_flags = 0;
             }
             uint32_t msg_len = (uint32_t) ret;
             int32_t out_flags =
@@ -1024,6 +1065,15 @@ int64_t sys_recvmmsg(guest_t *g,
         if (write_linux_mmsghdr_len(g, hdr_gva, msg_len) < 0)
             return received > 0 ? (int64_t) received : -LINUX_EFAULT;
         received++;
+        /* A zero-length message ends the batch. On a connection-oriented
+         * socket it is EOF; the macOS SEQPACKET-over-DGRAM substitute reports
+         * that EOF only once (then EAGAIN), so a further blocking iteration
+         * would hang waiting for a persistent EOF that never arrives. Stop
+         * here, matching the vlen==1 fast path -- recvmmsg may return fewer
+         * than vlen messages and callers loop for more.
+         */
+        if (ret == 0)
+            break;
     }
     return (int64_t) received;
 }
