@@ -983,7 +983,24 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
     pthread_mutex_lock(&pid_lock);
     proc_entry_t *entry = proc_find_guest_entry(source->guest_pid);
     if (entry && entry->host_waitable) {
+        /* proc_process_exit() publishes the status and raises SIGCHLD while
+         * the host process is still tearing down, so wait4 reports "running"
+         * for a moment after the guest was told the child is gone -- a skew
+         * Linux never has. Copy the status across so a WNOHANG poll from the
+         * handler cannot miss it; proc_deferred_reap_poll() does the host
+         * reap later so nothing blocks here.
+         */
+        if (source->exited && !entry->exited) {
+            entry->exited = true;
+            entry->exit_status = source->exit_status;
+            entry->rusage = source->rusage;
+            entry->rusage_valid = source->rusage_valid;
+            entry->host_reap_pending = true;
+            pthread_cond_broadcast(&pid_cond);
+        }
         pthread_mutex_unlock(&pid_lock);
+        if (source->exited)
+            proc_pidfd_notify_exit(source->guest_pid);
         return;
     }
 
@@ -2137,12 +2154,43 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
 
 /* sys_wait4. */
 
+/* Reap host children whose terminal status the guest already consumed from the
+ * lifecycle registry. Their exit was published before the host process finished
+ * tearing down, so wait4() had nothing to collect at the time; collecting it
+ * later keeps a zombie from being stranded without making any wait path block.
+ */
+static void proc_deferred_reap_poll(void)
+{
+    pthread_mutex_lock(&pid_lock);
+    for (size_t i = 0; i < proc_table_capacity; i++) {
+        if (!proc_table[i].host_reap_pending)
+            continue;
+        pid_t host_pid = proc_table[i].host_pid;
+        if (host_pid <= 0) {
+            proc_table[i].host_reap_pending = false;
+            continue;
+        }
+        pthread_mutex_unlock(&pid_lock);
+        int st;
+        pid_t r = wait4(host_pid, &st, WNOHANG, NULL);
+        pthread_mutex_lock(&pid_lock);
+        /* Only clear the flag once the zombie is gone (r > 0) or the child is
+         * no longer ours to reap (r < 0, typically ECHILD).
+         */
+        if (r != 0 && i < proc_table_capacity &&
+            proc_table[i].host_pid == host_pid)
+            proc_table[i].host_reap_pending = false;
+    }
+    pthread_mutex_unlock(&pid_lock);
+}
+
 int64_t sys_wait4(guest_t *g,
                   int pid,
                   uint64_t status_gva,
                   int options,
                   uint64_t rusage_gva)
 {
+    proc_deferred_reap_poll();
     lifecycle_import_children();
     if (signal_sigchld_autoreap())
         return proc_wait_autoreap_children(pid, options);

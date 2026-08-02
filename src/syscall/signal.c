@@ -1297,10 +1297,76 @@ int64_t signal_rt_sigprocmask(guest_t *g,
     return 0;
 }
 
+/* True when any signal in @candidates would actually reach the guest, and so
+ * should end a wait: one with a handler installed, or a SIG_DFL disposition
+ * that terminates or dumps core. SIG_IGN, and the SIG_DFL dispositions that
+ * ignore/stop/continue, are discarded by signal_deliver() without the guest
+ * ever observing them, so they must not wake a sleeper. An out-of-range bit
+ * counts as a wake so a malformed set can never pin a thread asleep forever.
+ * Caller holds sig_lock.
+ */
+static int signal_first_waking_locked(uint64_t candidates)
+{
+    uint64_t bits = candidates;
+    while (bits) {
+        int idx = bit_ctz64(bits);
+        bits &= bits - 1;
+        if (!RANGE_CHECK(idx, 0, LINUX_NSIG))
+            return idx + 1;
+        linux_sigaction_t *act = &sig_state.actions[idx];
+        if (act->sa_handler == LINUX_SIG_IGN)
+            continue;
+        if (act->sa_handler == LINUX_SIG_DFL) {
+            sig_disposition_t disp = signal_default_disposition(idx + 1);
+            if (disp == SIG_DISP_IGN || disp == SIG_DISP_CONT ||
+                disp == SIG_DISP_STOP)
+                continue;
+        }
+        return idx + 1;
+    }
+    return 0;
+}
+
+static bool signal_set_would_wake_locked(uint64_t candidates)
+{
+    return signal_first_waking_locked(candidates) != 0;
+}
+
+/* Bind a process-directed signal to this thread by moving it from the shared
+ * set into the caller's private set, siginfo included.
+ *
+ * signal_deliver() drains the shared set on whichever thread reaches it first,
+ * so a waiter that woke on a shared signal can lose it to another vCPU and
+ * return with no handler to run -- and, for sigsuspend, with its temporary mask
+ * still installed and nothing left to restore it. Claiming the signal while
+ * still holding sig_lock makes this thread's delivery the one that happens.
+ * Caller holds sig_lock.
+ */
+static void signal_claim_shared_locked(signal_pending_t *tp, int signum)
+{
+    /* Seed the descriptor before dequeuing, the same way signal_deliver() does:
+     * signal_rt_dequeue_locked() leaves it untouched when the RT queue holds no
+     * saved siginfo, so the fields it does not write must already be valid.
+     */
+    signal_rt_info_t info = signal_default_info(signum);
+    if (signum >= LINUX_SIGRTMIN) {
+        if (!signal_rt_dequeue_locked(&sig_state.shared, signum, &info))
+            return;
+    } else {
+        info = signal_standard_peek_locked(&sig_state.shared, signum);
+        sig_state.shared.std_info_valid[signum - 1] = false;
+        sig_state.shared.pending &= ~sig_bit(signum);
+    }
+    signal_enqueue_locked(tp, signum, &info);
+    refresh_pending_hint_locked();
+}
+
 /* rt_sigsuspend. */
 
 int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
 {
+#define SIGSUSPEND_CHUNK_NS 1000000LL /* 1ms chunks */
+
     if (sigsetsize != 8)
         return -LINUX_EINVAL;
 
@@ -1311,41 +1377,101 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
 
         pthread_mutex_lock(&sig_lock);
         uint64_t *blocked = thread_blocked_ptr();
-        uint64_t *saved_ptr = thread_saved_blocked_ptr();
-        bool *valid_ptr = thread_saved_valid_ptr();
 
         /* Save original blocked mask for restoration after signal delivery */
         uint64_t saved_blocked = *blocked;
 
         /* Temporarily set blocked mask (never block SIGKILL/SIGSTOP) */
         uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
-        *blocked = mask & ~unmaskable;
+        __atomic_store_n(blocked, mask & ~unmaskable, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&sig_lock);
 
-        /* If no signal is pending with the new mask, restore immediately. In a
-         * real kernel, sigsuspend blocks until a signal arrives. Signal
-         * emulation check if any signal became deliverable with the new mask.
-         * If yes, the vCPU loop will deliver it. If no, restore the mask; the
-         * caller will loop (musl retries on -EINTR).
+        /* Suspend until a signal that will actually reach the guest becomes
+         * deliverable under the temporary mask.
+         *
+         * Returning -EINTR immediately and leaving the caller to retry looks
+         * equivalent, because the guest does loop -- but sigsuspend() carries
+         * no timeout and has nothing to interleave between retries, so that
+         * loop degenerates into a spin that pins a core. glibc waits for
+         * SIGCHLD this way, so a program doing nothing but waiting burns a
+         * whole CPU and never makes progress.
+         *
+         * Delivery itself still belongs to the vCPU loop: this only waits for
+         * the signal to become deliverable, then returns -EINTR so the handler
+         * runs on the way back out.
          */
-        if (!(self_pending_locked() & ~*blocked)) {
-            *blocked = saved_blocked;
-        }
-        /* If a signal IS pending, the mask stays temporarily modified.
-         * signal_deliver() will execute the handler, and rt_sigreturn will
-         * restore uc_sigmask. But signal delivery needs to set uc_sigmask to
-         * the ORIGINAL mask (saved_blocked), not the sigsuspend mask. Store it
-         * for signal_deliver to use.
-         */
-        else {
-            *saved_ptr = saved_blocked;
-            *valid_ptr = true;
+        bool woke = false;
+        while (!proc_exit_group_requested()) {
+            /* Drain any expired guest itimer so its SIGALRM / SIGVTALRM /
+             * SIGPROF queues into the pending set. Nothing else advances the
+             * timers while this thread is parked here, and sigsuspend() waiting
+             * on alarm() is a common enough shape that skipping this poke turns
+             * the wait into a permanent sleep.
+             */
+            signal_check_timer();
+
+            pthread_mutex_lock(&sig_lock);
+            uint64_t now_blocked =
+                __atomic_load_n(thread_blocked_ptr(), __ATOMIC_ACQUIRE);
+            signal_pending_t *tp =
+                current_thread ? &current_thread->tpending : NULL;
+            /* Private set first, matching signal_deliver()'s dequeue order: a
+             * thread-directed signal is already bound here and needs no claim.
+             */
+            int wake_sig =
+                signal_first_waking_locked(tp ? tp->pending & ~now_blocked : 0);
+            if (!wake_sig) {
+                int shared_sig = signal_first_waking_locked(
+                    sig_state.shared.pending & ~now_blocked);
+                if (shared_sig) {
+                    wake_sig = shared_sig;
+                    /* Without a thread to bind it to there is only one vCPU to
+                     * race with, so leave the signal shared.
+                     */
+                    if (tp)
+                        signal_claim_shared_locked(tp, shared_sig);
+                }
+            }
+            woke = wake_sig != 0;
+            pthread_mutex_unlock(&sig_lock);
+            if (woke)
+                break;
+
+            struct timespec req = {
+                .tv_sec = 0,
+                .tv_nsec = SIGSUSPEND_CHUNK_NS,
+            };
+            /* A host EINTR just means recheck sooner; the loop condition
+             * above is the only thing that decides when to stop.
+             */
+            nanosleep(&req, NULL);
         }
 
+        pthread_mutex_lock(&sig_lock);
+        if (woke) {
+            /* Leave the temporary mask installed so the handler runs under it,
+             * but hand signal_deliver() the pre-suspend mask to stamp into
+             * uc_sigmask, so rt_sigreturn restores what the guest had before
+             * the suspend rather than the sigsuspend mask.
+             */
+            *thread_saved_blocked_ptr() = saved_blocked;
+            *thread_saved_valid_ptr() = true;
+        } else {
+            /* Left the loop without a signal (exit_group). No handler will
+             * run, so nothing would restore the mask: put it back here.
+             * signal_pending() and thread_signal_deliverable() read this field
+             * lock-free, so store it the same way rt_sigprocmask does.
+             */
+            __atomic_store_n(thread_blocked_ptr(), saved_blocked,
+                             __ATOMIC_RELEASE);
+        }
         pthread_mutex_unlock(&sig_lock);
     }
 
     /* Always return -EINTR. */
     return -LINUX_EINTR;
+
+#undef SIGSUSPEND_CHUNK_NS
 }
 
 /* rt_sigpending. */
@@ -1493,27 +1619,7 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
         pthread_mutex_lock(&sig_lock);
         uint64_t *blocked = thread_blocked_ptr();
         uint64_t candidates = self_pending_locked() & ~*blocked & ~mask;
-        bool interrupt = false;
-        uint64_t bits = candidates;
-        while (bits) {
-            int idx = bit_ctz64(bits);
-            bits &= bits - 1;
-            if (!RANGE_CHECK(idx, 0, LINUX_NSIG)) {
-                interrupt = true;
-                break;
-            }
-            linux_sigaction_t *act = &sig_state.actions[idx];
-            if (act->sa_handler == LINUX_SIG_IGN)
-                continue;
-            if (act->sa_handler == LINUX_SIG_DFL) {
-                sig_disposition_t disp = signal_default_disposition(idx + 1);
-                if (disp == SIG_DISP_IGN || disp == SIG_DISP_CONT ||
-                    disp == SIG_DISP_STOP)
-                    continue;
-            }
-            interrupt = true;
-            break;
-        }
+        bool interrupt = signal_set_would_wake_locked(candidates);
         pthread_mutex_unlock(&sig_lock);
         if (interrupt)
             return -LINUX_EINTR;
@@ -1975,7 +2081,41 @@ int signal_take_termination_wait_status(void)
     return status;
 }
 
+/* signal_deliver_one() consumed a signal the guest never observes, so the
+ * caller should look at the next one. Distinct from the documented 0/1/-1
+ * contract of deliver_signal_locked() and never escapes signal_deliver().
+ */
+#define SIGNAL_DELIVER_DISCARDED 2
+
+static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code);
+
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
+{
+    /* Callers invoke this once per syscall epilogue, so stopping at the first
+     * signal that turns out to be discarded (SIG_IGN, or a SIG_DFL disposition
+     * of ignore/stop/continue) would let a lower-numbered ignored signal mask a
+     * higher-numbered one the guest can actually see. Waiters decide whether to
+     * wake using the same disposition filter -- see
+     * signal_pending_interruption() and signal_first_waking_locked() -- so a
+     * mismatch here strands them: rt_sigsuspend in particular returns expecting
+     * a handler to run and restore its temporary mask, and nothing else does.
+     *
+     * Keep going past discarded signals to the first one that reaches the
+     * guest. Each pass dequeues its signal, so the pending set shrinks and the
+     * loop terminates.
+     */
+    for (;;) {
+        int result = signal_deliver_one(vcpu, g, exit_code);
+        if (result != SIGNAL_DELIVER_DISCARDED)
+            return result;
+    }
+}
+
+/* Select, dequeue, and act on one pending signal. Returns
+ * SIGNAL_DELIVER_DISCARDED when the signal was consumed without the guest
+ * observing it, so the caller can move on to the next one.
+ */
+static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 {
     pthread_mutex_lock(&sig_lock);
     uint64_t *blocked = thread_blocked_ptr();
@@ -2024,9 +2164,12 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
     refresh_pending_hint_locked();
 
     int result = deliver_signal_locked(vcpu, g, signum, rt_info, exit_code);
-    if (result < 0)
+    if (result < 0) {
         signal_record_termination(signum);
-    return result;
+        return result;
+    }
+    /* 0 means the signal was dequeued but never reached the guest. */
+    return result == 0 ? SIGNAL_DELIVER_DISCARDED : result;
 }
 
 int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)

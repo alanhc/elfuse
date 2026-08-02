@@ -314,6 +314,11 @@ typedef struct {
     bool rusage_valid;
     bool rusage_accounted;
     bool host_waitable; /* false for a child adopted from another host parent */
+    /* Terminal status was taken from the lifecycle registry before wait4()
+     * could observe the zombie, so the host process still needs reaping. Set
+     * only for host_waitable children; see proc_deferred_reap_poll().
+     */
+    bool host_reap_pending;
     struct rusage rusage;
 } proc_entry_t;
 

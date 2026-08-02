@@ -89,6 +89,7 @@ test-mprotect-mt               # diff=skip
 
 [section] Signal + thread tests
 test-signal-thread
+test-sigsuspend
 test-fault-signal-mt           # diff=skip
 test-exit-group-worker
 

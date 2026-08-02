@@ -613,6 +613,7 @@ run_unit_tests()
     printf "\nSignal tests\n"
     test_check "$runner" "test-signal" "PASS|0 failed" "$bindir/test-signal"
     test_check "$runner" "test-signal-thread" "PASS|0 failed" "$bindir/test-signal-thread"
+    test_check "$runner" "test-sigsuspend" "PASS|0 failed" "$bindir/test-sigsuspend"
     test_check "$runner" "test-tgkill-directed" "0 failed" "$bindir/test-tgkill-directed"
     test_check "$runner" "test-sigill" "0 failed" "$bindir/test-sigill"
     test_check "$runner" "test-kill-broadcast" "0 failed" \

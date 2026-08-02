@@ -220,6 +220,11 @@ $(BUILD_DIR)/test-process-lifecycle: tests/test-process-lifecycle.c src/utils.h 
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -Isrc -o $@ $< -lpthread
 
+# test-sigsuspend parks two threads on one process-directed signal.
+$(BUILD_DIR)/test-sigsuspend: tests/test-sigsuspend.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -Itests -o $@ $< -lpthread
+
 # test-thread-churn creates >64 threads to force thread-table slot reuse.
 $(BUILD_DIR)/test-thread-churn: tests/test-thread-churn.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
