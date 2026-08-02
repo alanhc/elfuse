@@ -46,6 +46,7 @@
 #include "syscall/io.h"
 #include "syscall/net.h"
 #include "syscall/net-identity.h"
+#include "syscall/net-sockopt.h"
 #include "syscall/poll.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
@@ -468,6 +469,7 @@ static int64_t rosetta_vz_ioctl(guest_t *g, uint64_t request, uint64_t arg)
         static const char fake_sock_path[] = ROSETTAD_SOCKET_PATH;
         memcpy(&caps[ROSETTA_CAPS_SOCKET_PATH], fake_sock_path,
                sizeof(fake_sock_path));
+
         /* Snapshot the caps binary path under the rosetta path lock so a
          * concurrent execve cannot tear the string between length probe and
          * copy. Inline buffer matches the cap exactly; the snapshot helper
@@ -615,6 +617,7 @@ static uint32_t mac_oflag_to_linux(tcflag_t mf)
 #define LINUX_PARODD 0x0200
 #define LINUX_HUPCL 0x0400
 #define LINUX_CLOCAL 0x0800
+
 /* LINUX_CBAUD 0x0000100f and LINUX_CBAUDEX 0x00001000 encode baud in c_cflag;
  * macOS uses dedicated speed fields, so termios translation ignores CBAUD on
  * translation. TCGETS2/TCSETS2 use BOTHER to signal numeric c_ispeed/c_ospeed.
@@ -650,6 +653,7 @@ static speed_t linux_cbaud_to_speed(uint32_t cbaud)
 static tcflag_t linux_cflag_to_mac(uint32_t lf)
 {
     tcflag_t mf = 0;
+
     /* CSIZE: Linux CS5=0x00, CS6=0x10, CS7=0x20, CS8=0x30
      *        macOS CS5=0x00, CS6=0x100, CS7=0x200, CS8=0x300
      */
@@ -1088,8 +1092,9 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     }
 
     ssize_t ret = read(host_ref.fd, buf, count);
+    int64_t result = ret < 0 ? recv_eof_or_errno(host_ref.fd, fd) : ret;
     host_fd_ref_close(&host_ref);
-    return ret < 0 ? linux_errno() : ret;
+    return result;
 }
 
 int64_t sys_pread64(guest_t *g,
@@ -1212,6 +1217,7 @@ static int64_t build_host_iov(guest_t *g,
             free(heap);
             return -LINUX_EFAULT;
         }
+
         /* Cap to contiguous permitted bytes. When the guest iov entry spans a
          * non-contiguous boundary (different mapping or permission), zero every
          * subsequent host iov length so the host readv/writev returns a
@@ -1386,6 +1392,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
             return err;
         int64_t ret = urandom_fill_iov(fd, host_iov.iov, iovcnt);
         host_iov_free(&host_iov);
+
         /* Mirror sys_read's slow-path refill so a readv consumer that drains
          * the shim ring leaves it ready for the next call, instead of forcing
          * every subsequent EL1 fast-path attempt back through HVC until some
@@ -1398,6 +1405,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         type == FD_INOTIFY) {
         if (iovcnt <= 0)
             return -LINUX_EINVAL;
+
         /* Use guest_read for the iov array since guest_ptr alone is unsafe if
          * the array spans a 2MiB block boundary.
          */
@@ -1444,7 +1452,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
     }
 
     ssize_t ret = readv(host_ref.fd, host_iov.iov, iovcnt);
-    int64_t result = ret < 0 ? linux_errno() : ret;
+    int64_t result = ret < 0 ? recv_eof_or_errno(host_ref.fd, fd) : ret;
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
     return result;
@@ -2127,6 +2135,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         t.c_cflag = linux_cflag_to_mac(lt2.c_cflag);
         t.c_lflag = linux_lflag_to_mac(lt2.c_lflag);
         termios_copy_cc_to_mac(t.c_cc, lt2.c_cc);
+
         /* Resolve baud rate: BOTHER means use numeric c_ispeed/c_ospeed;
          * otherwise decode the standard CBAUD index to a numeric rate.
          */
@@ -2283,6 +2292,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             close(host_slave_fd);
             return -LINUX_EMFILE;
         }
+
         /* Track CLOEXEC + accmode in the guest table so exec honors them; the
          * host fd's own FD_CLOEXEC is per-descriptor and would be lost on the
          * dup that host_fd_ref hands multi-threaded callers.
@@ -2359,6 +2369,7 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
             host_fd_ref_close(&host_ref);
             return 0;
         }
+
         /* EINVAL: misaligned, sub-block, or non-regular file. pwrite zeros only
          * through the current EOF so KEEP_SIZE remains guest-visible. Any other
          * host errno propagates verbatim.

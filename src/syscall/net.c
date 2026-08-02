@@ -72,8 +72,8 @@ int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags)
  * the macOS host call does. (read() is the exception: sock_read_iter returns 0
  * for a zero count, so sys_read stays untouched.) Gate the host call on
  * readability: an interruptible wait for blocking callers, a zero-timeout
- * readiness probe for nonblocking ones. EOF counts as readable in both, and
- * the host call then returns 0 like Linux.
+ * readiness probe for nonblocking ones. EOF counts as readable in both, and the
+ * host call then returns 0 like Linux.
  *
  * Returns 0 to proceed or a negative Linux errno (EINTR/EAGAIN).
  */
@@ -831,6 +831,7 @@ int64_t sys_sendto(guest_t *g,
         len = avail;
 
     int mac_flags = translate_msg_flags(linux_flags);
+
     /* MSG_NOSIGNAL (0x4000): suppress SIGPIPE on EPIPE. macOS has no
      * MSG_NOSIGNAL; elfuse handles it by not queuing SIGPIPE.
      */
@@ -911,9 +912,9 @@ int64_t sys_recvfrom(guest_t *g,
     int mac_flags = translate_msg_flags(flags);
 
     /* A single interruptible wait (not a MSG_DONTWAIT probe loop) preserves
-     * MSG_WAITALL semantics; the tiny ready-then-stolen window can still
-     * block, matching sys_read. A zero-length recv takes the readiness gate
-     * instead: unlike read(), Linux blocks it on an empty socket.
+     * MSG_WAITALL semantics; the tiny ready-then-stolen window can still block,
+     * matching sys_read. A zero-length recv takes the readiness gate instead:
+     * unlike read(), Linux blocks it on an empty socket.
      */
     int64_t waited = len > 0
                          ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
@@ -934,8 +935,13 @@ int64_t sys_recvfrom(guest_t *g,
         ret = recv(host_ref.fd, buf, len, mac_flags);
     }
     if (ret < 0) {
-        host_fd_ref_close(&host_ref);
-        return linux_errno();
+        int64_t result = recv_eof_or_errno(host_ref.fd, fd);
+        if (result < 0) {
+            host_fd_ref_close(&host_ref);
+            return result;
+        }
+        ret = 0;
+        mac_len = 0;
     }
 
     /* Write back source address if requested. */
@@ -954,8 +960,8 @@ int64_t sys_recvfrom(guest_t *g,
         int out_len =
             mac_to_linux_sockaddr((struct sockaddr *) &mac_sa, mac_len,
                                   linux_sa, (uint32_t) sizeof(linux_sa));
-        if (out_len > 0) {
-            uint32_t actual_len = (uint32_t) out_len;
+        if (out_len > 0 || mac_len == 0) {
+            uint32_t actual_len = out_len > 0 ? (uint32_t) out_len : 0;
             uint32_t write_len = actual_len;
             if (write_len > guest_addrlen)
                 write_len = guest_addrlen;
@@ -963,6 +969,7 @@ int64_t sys_recvfrom(guest_t *g,
                 host_fd_ref_close(&host_ref);
                 return -LINUX_EFAULT;
             }
+
             /* Write back actual length (Linux returns full size even if the
              * address was truncated to fit the buffer).
              */

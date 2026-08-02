@@ -56,6 +56,7 @@
 #include "syscall/io.h"
 #include "syscall/mem.h"
 #include "syscall/net.h"
+#include "syscall/net-sockopt.h"
 #include "syscall/poll.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
@@ -92,6 +93,7 @@ void syscall_init(void)
 {
     fdtable_init();
     signal_init();
+
     /* Mirror signal_init's attention_guest reset for the fd/urandom bitmap
      * singleton in shim-globals. Defends against a stale parent-process pointer
      * surviving across posix_spawn re-init.
@@ -226,6 +228,7 @@ SC_FORWARD(sc_pwrite64,  sys_pwrite64(g, (int) x0, x1, x2, (int64_t) x3))
 SC_FORWARD(sc_ioctl,     sys_ioctl(g, (int) x0, x1, x2))
 SC_FORWARD(sc_preadv,    sys_preadv(g, (int) x0, x1, (int) x2, (int64_t) x3))
 SC_FORWARD(sc_pwritev,   sys_pwritev(g, (int) x0, x1, (int) x2, (int64_t) x3))
+
 /* aarch64 LP64 raw ABI: x3=pos_l (full 64-bit offset), x4=pos_h (0), x5=flags
  */
 SC_FORWARD(sc_preadv2,   sys_preadv2(g, (int) x0, x1, (int) x2, (int64_t) x3, (int) x5))
@@ -265,6 +268,7 @@ SC_FORWARD(sc_fchmodat2,   sys_fchmodat(g, (int) x0, x1, (uint32_t) x2, (int) x3
 SC_FORWARD(sc_fchownat,    sys_fchownat(g, (int) x0, x1, (uint32_t) x2, (uint32_t) x3, (int) x4))
 SC_FORWARD(sc_fchown,      sys_fchown((int) x0, (uint32_t) x1, (uint32_t) x2))
 SC_FORWARD(sc_utimensat,   sys_utimensat(g, (int) x0, x1, x2, (int) x3))
+
 /* Linux faccessat (SYS 48) is 3-arg: dirfd, path, mode. The flags parameter was
  * added in faccessat2 (SYS 439). x3 contains garbage from the caller's register
  * state.
@@ -383,6 +387,7 @@ SC_FORWARD(sc_sched_rr_get_interval,  sys_sched_rr_get_interval(g, (int) x0, x1)
 SC_FORWARD(sc_exit,    SC_EXIT_SENTINEL | ((int) x0 & 0xFF))
 SC_FORWARD(sc_getpid,  proc_get_pid())
 SC_FORWARD(sc_getppid, proc_get_ppid())
+
 /* getpgid(0) is served inline by the shim's pgid cache and never reaches here,
  * so a registry sync in this path would be dead for the common form; the group
  * signal path in sc_kill does the sync where it can actually run. getpgid may
@@ -410,6 +415,7 @@ static int64_t sc_setsid(guest_t *g,
     (void) x5;
     (void) verbose;
     proc_registry_sync_self_pgid(g);
+
     /* setsid moves the caller into a new group; refresh the registry so the
      * group signal path sees the new pgid without a per-query republish.
      */
@@ -609,10 +615,12 @@ static int64_t sc_setpgid(guest_t *g,
     (void) x4;
     (void) x5;
     (void) verbose;
+
     /* setpgid takes pid_t (32-bit) args; cast as int like sc_kill so a negative
      * pid/pgid is seen as negative, not a large positive.
      */
     int pid = (int) x0, pgid = (int) x1;
+
     /* Kernel order: default pid/pgid before validation, so setpgid(-9, 0) turns
      * the pgid negative and fails EINVAL, not ESRCH.
      */
@@ -623,6 +631,7 @@ static int64_t sc_setpgid(guest_t *g,
         return -LINUX_EINVAL;
     if (rpid < 0)
         return -LINUX_ESRCH;
+
     /* setpgid on a direct child records the group so kill(0) and kill(-pgid)
      * reach it. Kept in the syscall layer so proc-identity stays free of the
      * process-table dependency. Only POSIX-plausible targets are recorded: the
@@ -635,6 +644,7 @@ static int64_t sc_setpgid(guest_t *g,
      */
     if (rpid != self) {
         proc_signal_target_t peer;
+
         /* The registry is the single source of truth for group membership:
          * every child publishes on fork, setpgid, and setsid. The old
          * process-table enumerator was redundant and could report a phantom
@@ -796,6 +806,7 @@ static int64_t sc_sched_setaffinity(guest_t *g,
         return -LINUX_ESRCH;
     if (cpusetsize == 0)
         return -LINUX_EINVAL;
+
     /* Linux accepts short masks as long as at least one supplied bit is set.
      * elfuse only supports CPU 0, so require bit 0 in the first byte.
      */
@@ -817,6 +828,7 @@ static void thread_force_exit_cb(thread_entry_t *t, void *ctx)
     (void) ctx;
     if (t == current_thread)
         return;
+
     /* Skip a slot that is active but has not yet published its vCPU (a sibling
      * still in thread_create_and_run bring-up): it is not in hv_vcpu_run, and
      * handing hv_vcpus_exit a zero handle is invalid. Runs under thread_lock
@@ -904,21 +916,23 @@ static int64_t sc_exit_group(guest_t *g,
     (void) x4;
     (void) x5;
     (void) verbose;
+
     /* Request + interrupt only; do NOT join here. This handler runs on
      * whichever thread issued exit_group, so a join from here would snapshot
-     * the main thread (slot 0, never deactivates) and detach it after the
-     * poll cap, and would race the main thread's own join over the same
-     * siblings (double pthread_join is undefined). The kicked workers wind
-     * down on their own; the single authoritative join is in main() after
-     * vcpu_run_loop returns, before guest teardown.
+     * the main thread (slot 0, never deactivates) and detach it after the poll
+     * cap, and would race the main thread's own join over the same siblings
+     * (double pthread_join is undefined). The kicked workers wind down on their
+     * own; the single authoritative join is in main() after vcpu_run_loop
+     * returns, before guest teardown.
      */
     proc_request_exit_group((int) x0);
     wakeup_pipe_signal();
     thread_for_each(thread_force_exit_cb, NULL);
-    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait)
-     * see neither the pipe nor the vCPU kick; broadcast so they re-check the
-     * exit-group flag and terminate before the authoritative join in main()
-     * (or guest_destroy, for the forked-child path) gives up on them.
+
+    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait) see
+     * neither the pipe nor the vCPU kick; broadcast so they re-check the
+     * exit-group flag and terminate before the authoritative join in main() (or
+     * guest_destroy, for the forked-child path) gives up on them.
      */
     thread_wake_exit_waiters();
     return SC_EXIT_SENTINEL | ((int) x0 & 0xFF);
@@ -1037,6 +1051,7 @@ static int64_t sc_kill(guest_t *g,
                        ? 0
                        : -LINUX_ESRCH;
         }
+
         /* Process-group probe: the caller always exists in its own group;
          * pid<-1 needs the caller or a tracked child in group -pid.
          */
@@ -1081,6 +1096,7 @@ static int64_t sc_kill(guest_t *g,
             return 0;
         if (count == 0)
             return -LINUX_ESRCH;
+
         /* Targets existed but every send failed: report the first transport
          * error rather than a misleading ESRCH.
          */
@@ -1173,17 +1189,20 @@ static int64_t sc_tgkill(guest_t *g,
         return -LINUX_EINVAL;
     if (tgid <= 0 || tid <= 0)
         return -LINUX_EINVAL;
+
     /* All guest threads share the single guest tgid; a mismatch names a thread
      * that is not in this group (or a foreign process elfuse cannot reach),
      * which Linux reports as -ESRCH.
      */
     if (tgid != (int) proc_get_pid())
         return -LINUX_ESRCH;
+
     /* sig == 0 is the existence/permission probe: report whether the thread is
      * live without queueing anything.
      */
     if (sig == 0)
         return thread_tid_alive((int64_t) tid) ? 0 : -LINUX_ESRCH;
+
     /* Thread-directed: only the target thread consumes it (Linux
      * task->pending). The enqueue resolves and validates the tid atomically.
      */
@@ -1206,6 +1225,7 @@ static int64_t rt_sigqueueinfo_impl(guest_t *g,
         return -LINUX_EINVAL;
     if (!thread_tid_alive((int64_t) tid))
         return -LINUX_ESRCH;
+
     /* sig == 0 is the existence/permission probe: the target is live, queue
      * nothing.
      */
@@ -1234,6 +1254,7 @@ static int64_t rt_sigqueueinfo_impl(guest_t *g,
             log_debug("rt_sigqueueinfo(tid=%d, sig=%d, si_code=%d)", tid, sig,
                       info.si_code);
     }
+
     /* Queued signals carry sigval in si_value for both standard and RT signals;
      * standard signals still coalesce to one pending instance.
      */
@@ -1249,11 +1270,13 @@ static int64_t rt_sigqueueinfo_impl(guest_t *g,
                                 (int64_t) tid, sig, info.si_code, info.si_pid,
                                 (uint32_t) info.si_uid, si_int, si_ptr)
                           : signal_queue_thread((int64_t) tid, sig);
+
         /* The target may have exited between the liveness check and the
          * enqueue; report -ESRCH as Linux would for a vanished thread.
          */
         return queued ? 0 : -LINUX_ESRCH;
     }
+
     /* Process-directed: queue into the shared set. Existence was checked
      * lock-free above; if the named tid was a worker that exits in the gap, the
      * signal still lands in the surviving thread group and this returns 0 where
@@ -2434,6 +2457,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             if (tp != FD_REGULAR && tp != FD_STDIO && tp != FD_PIPE &&
                 tp != FD_SOCKET)
                 goto slow_path;
+
             /* Same racy-but-benign read as tp above, and no worse than the
              * shipped tp-based divert: a concurrent close+reopen (only possible
              * with a live sibling thread; a single active thread has no
@@ -2490,6 +2514,7 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             if (can_block) {
                 short ev = (nr == SYS_read) ? POLLIN : POLLOUT;
                 struct pollfd pfd = {.fd = host_ref.fd, .events = ev};
+
                 /* Divert on not-ready (0) or probe error (< 0, e.g. EINTR): a
                  * blocking call here cannot be preempted, so let the
                  * interruptible slow path handle both.
@@ -2502,13 +2527,26 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
 
             ssize_t ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)
                                            : write(host_ref.fd, buf, count);
-            host_fd_ref_close(&host_ref);
             if (ret >= 0) {
+                host_fd_ref_close(&host_ref);
                 result = ret;
                 goto fast_done;
             }
-            if (nr == SYS_write && errno == EPIPE)
+
+            /* SEQPACKET-over-DGRAM peer close is ECONNRESET on the host
+             * datagram socket; Linux reports a clean EOF. recv_eof_or_errno
+             * probes the pinned host fd, so keep it open until after the check.
+             */
+            if (nr == SYS_read) {
+                result = recv_eof_or_errno(host_ref.fd, fd);
+                host_fd_ref_close(&host_ref);
+                goto fast_done;
+            }
+            int fast_errno = errno;
+            host_fd_ref_close(&host_ref);
+            if (fast_errno == EPIPE)
                 signal_queue(LINUX_SIGPIPE);
+            errno = fast_errno;
             result = linux_errno();
             goto fast_done;
         }

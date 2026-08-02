@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <sys/socket.h>
@@ -157,6 +158,58 @@ int net_socket_cached_int_get(int guest_fd, int level, int optname, int *value)
     if (idx < 0)
         return 0;
     return net_sock_cache_get(guest_fd, idx, value);
+}
+
+/* True when the host fd is an AF_UNIX datagram socket. Used together with the
+ * guest's cached SEQPACKET type to pin down the sys_socketpair substitute.
+ */
+static bool host_fd_is_unix_dgram(int host_fd)
+{
+    int st = 0;
+    socklen_t sl = sizeof(st);
+    if (getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &st, &sl) < 0 ||
+        st != SOCK_DGRAM)
+        return false;
+    struct sockaddr_storage ss;
+    socklen_t al = sizeof(ss);
+    return getsockname(host_fd, (struct sockaddr *) &ss, &al) == 0 &&
+           ss.ss_family == AF_UNIX;
+}
+
+/* Fold a failed host recv/read into Linux semantics: the SEQPACKET-over-DGRAM
+ * substitute reports ECONNRESET on peer close where Linux SEQPACKET returns a
+ * clean EOF, so report EOF (0) for exactly that case and the translated
+ * negative errno otherwise.
+ *
+ * The fold fires only when the guest asked for SOCK_SEQPACKET (cached SO_TYPE)
+ * and the host fd is an AF_UNIX datagram socket -- the two facts that together
+ * identify the socketpair substitute. Deliberately left alone:
+ *   - genuine AF_UNIX SOCK_DGRAM sockets (cached type DGRAM): Linux never
+ *     returns EOF there; after draining it blocks or reports EAGAIN, so a
+ *     macOS peer-close ECONNRESET must stay an error, not a fake end-of-stream;
+ *   - the AF_UNIX SOCK_STREAM substitute used for socket()/accept SEQPACKET
+ *     (host type STREAM): a genuine peer abort there is a real reset;
+ *   - INET UDP (host type DGRAM but not AF_UNIX): recv can report a real
+ *     network error, which must stay an error.
+ *
+ * Call only when the host call returned < 0, with the pinned host fd still
+ * open. Probing host_fd is race-free against guest fd reuse; the cached-type
+ * read keys on guest_fd, but a stale hit is bounded by the AF_UNIX-datagram
+ * host check and can only mis-map a peer close between two AF_UNIX sockets --
+ * the same racy-but-benign window the read fast path documents. Both probes run
+ * only on the rare ECONNRESET tail, off the hot path. errno is preserved.
+ */
+int64_t recv_eof_or_errno(int host_fd, int guest_fd)
+{
+    int e = errno;
+    int cached_type = 0;
+    bool fold = e == ECONNRESET &&
+                net_socket_cached_int_get(guest_fd, LINUX_SOL_SOCKET,
+                                          LINUX_SO_TYPE, &cached_type) &&
+                cached_type == LINUX_SOCK_SEQPACKET &&
+                host_fd_is_unix_dgram(host_fd);
+    errno = e; /* undo the getsockopt/getsockname clobber on both paths */
+    return fold ? 0 : linux_errno();
 }
 
 int net_socket_cached_int_get_if_generation(int guest_fd,

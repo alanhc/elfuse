@@ -26,6 +26,9 @@
  *     nonblocking and empty, blocks when empty, 0 without consuming when
  *     data is pending)
  * 15. invalid recvmsg iov returns EFAULT immediately
+ * 16. SEQPACKET peer close reads as EOF (0), not ECONNRESET (Rust spawn)
+ * 17. genuine AF_UNIX datagram peer close is not folded to EOF
+ * 18. recvmmsg(vlen>1) on a peer-closed SEQPACKET substitute does not hang
  */
 
 #include <signal.h>
@@ -245,6 +248,7 @@ int main(void)
             } else {
                 n = recvfrom(dsv[1], recv_buf, sizeof(recv_buf), 0,
                              (struct sockaddr *) &sa, &salen);
+
                 /* Linux returns salen=0 for unnamed AF_UNIX socketpair
                  * endpoints (no source address). Accept both salen==0 and salen
                  * with AF_UNIX family filled in.
@@ -398,11 +402,11 @@ int main(void)
     }
 
     /* Test 14: zero-length recvmsg follows receive-readiness semantics. Linux
-     * clamps the receive low-water target to one byte (sock_rcvlowat returns
-     * v ?: 1), so a zero-length recvmsg behaves like a one-byte receive for
+     * clamps the receive low-water target to one byte (sock_rcvlowat returns v
+     * ?: 1), so a zero-length recvmsg behaves like a one-byte receive for
      * readiness: EAGAIN on an empty nonblocking socket, blocks on an empty
-     * blocking socket (observed here as EINTR via alarm), and returns 0
-     * without consuming anything once data is pending.
+     * blocking socket (observed here as EINTR via alarm), and returns 0 without
+     * consuming anything once data is pending.
      */
     printf("test-socket: 14. zero-length recvmsg readiness semantics... ");
     {
@@ -429,8 +433,8 @@ int main(void)
 
             /* Empty socket, blocking: parks until the timer interrupts. A
              * repeating interval (not a one-shot alarm) closes the race where
-             * the first SIGALRM lands before recvmsg enters the kernel and
-             * the call then blocks with no interrupt left.
+             * the first SIGALRM lands before recvmsg enters the kernel and the
+             * call then blocks with no interrupt left.
              */
             struct sigaction zsa, old_zsa;
             memset(&zsa, 0, sizeof(zsa));
@@ -578,6 +582,164 @@ int main(void)
             failures++;
         }
         close(seq_fd);
+    }
+
+    /* Test 16: SEQPACKET peer close reads as EOF, not ECONNRESET. Rust's
+     * process spawn uses an AF_UNIX SOCK_SEQPACKET socketpair as its CLOEXEC
+     * status channel and treats a recv error there as unreachable (it aborts).
+     * macOS has no AF_UNIX SEQPACKET, so elfuse substitutes SOCK_DGRAM, whose
+     * recv reports ECONNRESET on peer close where Linux SEQPACKET returns EOF.
+     * Verify the clean-EOF contract holds.
+     */
+    printf("test-socket: 16. SEQPACKET peer close -> EOF... ");
+    {
+        /* Every receive syscall must report the peer close as EOF (0), not
+         * ECONNRESET, on the SEQPACKET-over-DGRAM substitute. recv covers
+         * Rust's spawn channel; read, readv, recvmsg, and recvmmsg are the
+         * sibling paths that forward the same host error.
+         */
+        int ok = 1;
+        for (int which = 0; which < 6 && ok; which++) {
+            int eof_sv[2];
+            if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, eof_sv) < 0) {
+                printf("FAIL (socketpair: %m)\n");
+                ok = 0;
+                break;
+            }
+            close(eof_sv[0]); /* drop the peer, as an exec'd child would */
+            char eof_buf[8];
+            char eof_buf2[8];
+            ssize_t eof_n;
+            const char *op;
+            int meta_ok = 1;
+            if (which == 0) {
+                op = "recv";
+                eof_n = recv(eof_sv[1], eof_buf, sizeof(eof_buf), 0);
+            } else if (which == 1) {
+                op = "read";
+                eof_n = read(eof_sv[1], eof_buf, sizeof(eof_buf));
+            } else if (which == 2) {
+                /* Two iovecs forces sys_readv's multi-iovec host readv(). */
+                op = "readv";
+                struct iovec iov[2] = {
+                    {.iov_base = eof_buf, .iov_len = sizeof(eof_buf)},
+                    {.iov_base = eof_buf2, .iov_len = sizeof(eof_buf2)}};
+                eof_n = readv(eof_sv[1], iov, 2);
+            } else if (which == 3) {
+                op = "recvfrom";
+                struct sockaddr_storage ss;
+                socklen_t slen = sizeof(ss);
+                eof_n = recvfrom(eof_sv[1], eof_buf, sizeof(eof_buf), 0,
+                                 (struct sockaddr *) &ss, &slen);
+                meta_ok = slen == 0;
+            } else if (which == 4) {
+                op = "recvmsg";
+                struct iovec iov = {.iov_base = eof_buf,
+                                    .iov_len = sizeof(eof_buf)};
+                struct sockaddr_storage ss;
+                struct msghdr mh = {.msg_name = &ss,
+                                    .msg_namelen = sizeof(ss),
+                                    .msg_iov = &iov,
+                                    .msg_iovlen = 1};
+                eof_n = recvmsg(eof_sv[1], &mh, 0);
+                meta_ok = mh.msg_namelen == 0;
+            } else {
+                /* recvmmsg with vlen==1 records one empty message on EOF. */
+                op = "recvmmsg";
+                struct iovec iov = {.iov_base = eof_buf,
+                                    .iov_len = sizeof(eof_buf)};
+                struct mmsghdr mm = {0};
+                mm.msg_hdr.msg_iov = &iov;
+                mm.msg_hdr.msg_iovlen = 1;
+                int r = recvmmsg(eof_sv[1], &mm, 1, 0, NULL);
+                /* Expect 1 message received, of length 0. */
+                eof_n = (r == 1 && mm.msg_len == 0) ? 0 : (r < 0 ? -1 : 1);
+            }
+            if (eof_n != 0 || !meta_ok) {
+                printf("FAIL (%s=%zd errno=%d %s)\n", op, eof_n,
+                       eof_n < 0 ? errno : 0,
+                       eof_n < 0 ? strerror(errno)
+                                 : (meta_ok ? "data" : "stale address"));
+                ok = 0;
+            }
+            close(eof_sv[1]);
+        }
+        if (ok)
+            printf("PASS\n");
+        else
+            failures++;
+    }
+
+    /* Test 17: a genuine AF_UNIX datagram socket must NOT fold a peer-close
+     * ECONNRESET into EOF -- only the SEQPACKET-over-DGRAM substitute does.
+     * Linux never reports EOF on a datagram receive (it blocks, or returns
+     * EAGAIN when nonblocking), so a clean 0 here would misreport a live peer
+     * as end-of-stream. Use a nonblocking receiver so the check cannot hang on
+     * a real Linux host where the datagram recv would otherwise block.
+     */
+    printf("test-socket: 17. datagram peer close is not EOF... ");
+    {
+        int dsv[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dsv) < 0) {
+            printf("FAIL (socketpair: %m)\n");
+            failures++;
+        } else {
+            fcntl(dsv[1], F_SETFL, O_NONBLOCK);
+            close(dsv[0]);
+            char b[8];
+            ssize_t dn = recv(dsv[1], b, sizeof(b), 0);
+            /* Any error is acceptable (ECONNRESET on macOS/elfuse, EAGAIN on
+             * Linux); a clean EOF(0) is the regression this guards.
+             */
+            if (dn != 0) {
+                printf("PASS (recv=%zd errno=%d)\n", dn, dn < 0 ? errno : 0);
+            } else {
+                printf("FAIL (datagram peer close reported EOF)\n");
+                failures++;
+            }
+            close(dsv[1]);
+        }
+    }
+
+    /* Test 18: a blocking recvmmsg(vlen>1) on a peer-closed SEQPACKET
+     * substitute must terminate the batch at the folded EOF, not hang. The
+     * macOS datagram substitute reports the peer close only once (then EAGAIN),
+     * so a naive loop would block forever on the second iteration's readiness
+     * gate. Expect at least one zero-length message and a prompt return; the
+     * test-runner timeout catches a regression to the hang.
+     */
+    printf("test-socket: 18. recvmmsg(vlen>1) EOF does not hang... ");
+    {
+        int msv[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, msv) < 0) {
+            printf("FAIL (socketpair: %m)\n");
+            failures++;
+        } else {
+            close(msv[0]);
+            char mb[4][8];
+            struct mmsghdr mm[4];
+            struct iovec miov[4];
+            memset(mm, 0, sizeof(mm));
+            for (int i = 0; i < 4; i++) {
+                miov[i].iov_base = mb[i];
+                miov[i].iov_len = sizeof(mb[i]);
+                mm[i].msg_hdr.msg_iov = &miov[i];
+                mm[i].msg_hdr.msg_iovlen = 1;
+            }
+            /* Blocking (no MSG_DONTWAIT): this is the path that would hang. */
+            int mr = recvmmsg(msv[1], mm, 4, 0, NULL);
+            /* elfuse stops at the first EOF (mr==1); Linux keeps reading the
+             * persistent EOF and returns 4. Accept any mr>=1 with the first
+             * message empty; the point is that it returned at all.
+             */
+            if (mr >= 1 && mm[0].msg_len == 0) {
+                printf("PASS (mr=%d)\n", mr);
+            } else {
+                printf("FAIL (mr=%d len0=%u)\n", mr, mm[0].msg_len);
+                failures++;
+            }
+            close(msv[1]);
+        }
     }
 
     if (failures == 0) {
