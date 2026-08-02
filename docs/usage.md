@@ -17,7 +17,7 @@ Supported user-facing options:
 | `-V`, `--version` | Print the build version and exit |
 | `-v`, `--verbose` | Enable syscall-level and loader diagnostics |
 | `-t`, `--timeout N` | Per-iteration vCPU watchdog, in seconds (default `10`, `0` disables) |
-| `--sysroot PATH` | Resolve guest absolute paths under `PATH` first |
+| `--sysroot PATH` | Resolve guest absolute paths under `PATH`, falling back to the host for paths it does not hold |
 | `--create-sysroot PATH` | Provision a case-sensitive APFS sparsebundle mounted at `PATH`, then use it as the sysroot |
 | `--no-rosetta` | Disable the x86_64-via-Rosetta translator (also `ELFUSE_NO_ROSETTA=1`) |
 | `--gdb PORT` | Listen for a GDB RSP client on `PORT` (aarch64 guests only) |
@@ -56,7 +56,9 @@ anything else that inspects `$?`.
 ### Worked Examples
 
 The guest reads and writes the host filesystem directly (no overlay,
-no volume mount), so file arguments are just file arguments.
+no volume mount), so file arguments are just file arguments. Under
+`--sysroot` the temporary directories are the exception; see
+[Dynamic Linking And Sysroots](#dynamic-linking-and-sysroots).
 
 Run a Linux static `jq` against a host JSON file:
 
@@ -138,8 +140,8 @@ the SHA-256-keyed translations.
 
 Dynamic Linux guests need a sysroot that contains the expected interpreter and
 shared libraries. `elfuse` reads `PT_INTERP`, loads the requested interpreter
-from the supplied sysroot, and redirects guest absolute-path opens to that tree
-before falling back to the host filesystem.
+from the supplied sysroot, and redirects guest absolute-path opens to that tree,
+falling back to the host filesystem for paths the sysroot does not hold.
 
 Example:
 
@@ -155,6 +157,13 @@ Practical notes:
 
 - The sysroot is consulted only for guest absolute paths; relative paths still
   resolve from the guest working directory.
+- `/tmp`, `/var/tmp`, and any `.ccache` directory are backed by the sysroot
+  alone. A guest's temporary files go there so they cannot collide on a
+  case-insensitive host `/tmp`, and every operation on those paths, including
+  `stat`, `open`, and directory listings, addresses the same place. Host files
+  under those directories are therefore invisible to the guest, and a guest
+  program or interpreter stored there cannot be loaded; pass one from anywhere
+  else.
 - The sysroot setting is preserved across guest `fork` and `execve`, so spawned
   children see the same view of the filesystem.
 - On case-insensitive macOS volumes, `elfuse` maintains per-directory

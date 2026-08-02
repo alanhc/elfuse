@@ -263,9 +263,11 @@ bool proc_sysroot_casefold_enabled(void);
 
 /* Resolve an absolute guest path through the stored sysroot.
  *
- * Returns path unchanged when no sysroot applies or when the sysroot-backed
- * path does not exist, buf when a sysroot-backed file exists, or NULL if
- * sysroot path construction would truncate or escape containment checks.
+ * Returns buf when a sysroot-backed file exists, and also when the path names a
+ * temp root or a guest system directory, both of which resolve there whether or
+ * not they exist. Returns path unchanged when no sysroot applies or when any
+ * other sysroot-backed path does not exist, or NULL if sysroot path
+ * construction would truncate or escape containment checks.
  */
 const char *proc_resolve_sysroot_path(const char *path,
                                       char *buf,

@@ -11,7 +11,7 @@
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
-        test-sysroot-host-fallback test-sysroot-case-exact \
+        test-sysroot-tmp-remove test-sysroot-host-fallback test-sysroot-case-exact \
         test-sysroot-create-paths test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-proctitle-host test-proctitle-low-stack \
@@ -125,6 +125,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-getdents64-overlong
 	@printf "\n$(BLUE)━━━ sysroot host-fallback validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-host-fallback
+	@printf "\n$(BLUE)━━━ sysroot /tmp remove/rename consistency ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-tmp-remove
 	@printf "\n$(BLUE)━━━ sysroot byte-exact lookup validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-case-exact
 	@printf "\n$(BLUE)━━━ sysroot relative-dirfd symlink escape validation ━━━$(RESET)\n"
@@ -276,6 +278,37 @@ test-sysroot-host-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-host-fallbac
 	    $(BUILD_DIR)/test-sysroot-host-fallback \
 	    "$$hostdir" "$$mirror/final.txt" "$$mirror/both.txt"
 
+## Stages a directory under the runner's own /tmp, the one prefix the guest
+## addresses through the redirect rather than through the host-literal fallback,
+## so a guest that still reached the host would see entries it cannot remove.
+## The sysroot itself comes from TMPDIR (/var/folders on macOS), which is not
+## redirected, so the harness can inspect where the guest's own writes landed.
+## Placement is asserted without spelling any name under the sysroot: on a
+## case-insensitive volume the name codec may store any component under an
+## escaped spelling, so the harness checks only that the redirect populated the
+## sysroot's /tmp at all. The guest side proves the file itself by reading it
+## back.
+## Verify guest /tmp resolves through the sysroot for lookups as well as creates
+test-sysroot-tmp-remove: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-tmp-remove
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	hostdir=$$(mktemp -d /tmp/elfuse-tmp-remove.XXXXXX); \
+	trap 'rm -rf "$$tmpdir" "$$hostdir"' EXIT; \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot" "$$hostdir/d"; \
+	printf 'x' > "$$hostdir/f"; \
+	printf 'x' > "$$hostdir/r"; \
+	$(ELFUSE_BIN) --sysroot "$$sysroot" \
+	    $(BUILD_DIR)/test-sysroot-tmp-remove "$$hostdir"; \
+	if [ "$$(ls -A "$$hostdir" | sort | tr '\n' ' ')" != "d f r " ]; then \
+		printf "$(RED)FAIL$(RESET) guest reached the host /tmp staging dir\n"; \
+		exit 1; \
+	fi; \
+	if [ ! -d "$$sysroot/tmp" ] || [ -z "$$(ls -A "$$sysroot/tmp")" ]; then \
+		printf "$(RED)FAIL$(RESET) guest /tmp write did not land in the sysroot\n"; \
+		exit 1; \
+	fi
+
 ## Wrong-case (and wrong-normalization) lookups must fail with ENOENT:
 ## Linux treats names as byte strings, while APFS resolves them case- and
 ## normalization-insensitively. The sidecar walk verifies the on-disk
@@ -328,12 +361,16 @@ test-sysroot-create-paths: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-create-paths
 	mounted_tmp="$$tmpdir/case-sysroot/tmp/elfuse-sysroot-create-paths/file.txt"; \
 	host_out_dir="$$tmpdir/host-out"; \
 	host_out="$$host_out_dir/result.txt"; \
-	trap 'rm -rf "$$tmpdir"; rm -rf /tmp/elfuse-sysroot-create-paths' EXIT; \
-	rm -rf /tmp/elfuse-sysroot-create-paths; \
+	trap 'rm -rf "$$tmpdir"; rm -rf /tmp/elfuse-sysroot-create-paths /tmp/race_dir' EXIT; \
+	rm -rf /tmp/elfuse-sysroot-create-paths /tmp/race_dir; \
 	mkdir -p "$$host_out_dir"; \
 	$(ELFUSE_BIN) --create-sysroot "$$tmpdir/case-sysroot" $(BUILD_DIR)/test-sysroot-create-paths "$$guest_tmp" "$$mounted_tmp" "$$host_out" "$$tmpdir/case-sysroot"; \
 	if [ -e "$$guest_tmp" ]; then \
 		printf "$(RED)FAIL$(RESET) guest /tmp escaped to host /tmp\n"; \
+		exit 1; \
+	fi; \
+	if [ -e /tmp/race_dir ]; then \
+		printf "$(RED)FAIL$(RESET) TOCTOU race created a directory outside the sysroot\n"; \
 		exit 1; \
 	fi; \
 	if [ ! -f "$$host_out" ]; then \

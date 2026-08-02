@@ -57,6 +57,13 @@ static inline int path_translation_at_flags(const path_translation_t *tx,
     return tx->is_dev_shm ? (at_flags | AT_SYMLINK_NOFOLLOW) : at_flags;
 }
 
+/* True when path equals prefix exactly, or extends it with '/'. Avoids the
+ * surprise where "/sys/devices/system/cpufoo" would match a bare strncmp on
+ * "/sys/devices/system/cpu" and pull an unrelated path through the intercept
+ * layer.
+ */
+bool path_prefix_match(const char *path, const char *prefix, size_t plen);
+
 /* Advance *pathp to the next '/'-separated component, skipping empty segments
  * from repeated slashes. Returns true with the component (not NUL-terminated)
  * reported through comp and len, leaving *pathp at its end; returns false once

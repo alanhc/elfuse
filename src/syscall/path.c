@@ -30,12 +30,7 @@
 
 #define PROC_PATH_COMPONENTS_MAX (LINUX_PATH_MAX / 2)
 
-/* True when path equals prefix exactly, or extends it with '/'. Avoids the
- * surprise where "/sys/devices/system/cpufoo" would match a bare strncmp on
- * "/sys/devices/system/cpu" and pull an unrelated path through the intercept
- * layer.
- */
-static bool path_prefix_match(const char *path, const char *prefix, size_t plen)
+bool path_prefix_match(const char *path, const char *prefix, size_t plen)
 {
     if (strncmp(path, prefix, plen) != 0)
         return false;
