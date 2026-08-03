@@ -401,14 +401,12 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
     const char *comp;
     size_t len;
     int rc = 0;
-    int walk_count = 0;
 
+    /* No symlink budget here: the loop reports ELOOP at the first link rather
+     * than following one, so nothing accumulates against MAXSYMLINKS, and a
+     * link-free path has no component limit to enforce (path_resolution(7)).
+     */
     while (path_next_component(&scan, &comp, &len)) {
-        if (++walk_count > MAXSYMLINKS) {
-            errno = ELOOP;
-            rc = -1;
-            goto out;
-        }
         if (path_component_is_dot(comp, len))
             continue;
 

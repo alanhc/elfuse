@@ -771,6 +771,51 @@ under `/proc`, `/dev`, and a few Linux-expected compatibility files:
 Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
 `src/syscall/fs.c`, `src/syscall/proc-state.c`.
 
+## Path Resolution
+
+A guest names files the way Linux does, from a namespace rooted at the guest's
+`/`. The host has its own root, and with `--sysroot` the guest's tree is a
+subdirectory of it. Every path-taking syscall therefore asks two questions
+before it can act, and `path_translate_at()` in `src/syscall/path.c` answers
+both in one place so no two syscalls can answer them differently for the same
+name:
+
+1. Does the sysroot claim this path? A path it holds resolves there; one it
+   does not falls back to the host filesystem, except for the guest system
+   directories and the temp roots, which resolve in the sysroot whether or not
+   it holds them.
+2. What host spelling does it get? That is the sysroot prefix plus the guest
+   path, adjusted so the host kernel's own resolution lands where Linux's
+   would.
+
+Three resolvers in `src/syscall/proc-state.c` do the work:
+`proc_resolve_sysroot_path()` for a following lookup, its
+`_nofollow_` sibling, and `proc_resolve_sysroot_create_path()` for a path whose
+final component may not exist yet. `path_translate_at()` picks one by flags;
+`sys_path_has_symlink()` calls the nofollow form directly for the
+`openat2(RESOLVE_NO_SYMLINKS)` precheck described below.
+
+### Why The No-Symlinks Precheck Has No Component Budget
+
+`openat2(RESOLVE_NO_SYMLINKS)` must fail with `ELOOP` if any component of the
+path is a symlink. macOS has no equivalent flag, so `sys_path_has_symlink()`
+walks the path itself, one component at a time, and reports `ELOOP` at the
+first `S_ISLNK`.
+
+That walk deliberately carries no `MAXSYMLINKS` counter. It never follows a
+link, so nothing can accumulate against a link budget; the only thing a
+per-component counter could reject is a link-free path deeper than the limit,
+which Linux resolves without complaint, since `path_resolution(7)` caps links
+followed rather than components walked. The counter that does matter lives in
+`path_openat2_crosses_mount()`, which follows links to answer
+`RESOLVE_NO_XDEV` and charges `MAXSYMLINKS` once per link actually crossed.
+
+Related implementation: `src/syscall/path.c` (`path_translate_at`,
+`sys_path_has_symlink`, `path_openat2_crosses_mount`),
+`src/syscall/proc-state.c` (the three resolvers). Validation: the
+`openat2` cases in `tests/test-syscall-fidelity.c`, run by
+`make test-matrix` against both `elfuse` and a reference kernel.
+
 ## POSIX Shared Memory (`/dev/shm`)
 
 Linux exposes POSIX shared memory through `/dev/shm`, a tmpfs the C library

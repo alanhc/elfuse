@@ -17,6 +17,7 @@
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
+        test-sysroot-openat2-walk \
         test-linkat-symlink-fallback perf
 
 ## Build and run the assembly hello world test
@@ -131,6 +132,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-case-exact
 	@printf "\n$(BLUE)━━━ sysroot relative-dirfd symlink escape validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-symlink-escape
+	@printf "\n$(BLUE)━━━ no-symlinks path walking ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-openat2-walk
 	@printf "\n$(BLUE)━━━ Alpine sysroot FUSE validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-fuse-alpine
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
@@ -189,6 +192,28 @@ test-sysroot-chdir: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-chdir
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	mkdir -p "$$tmpdir/bin" "$$tmpdir/lib" "$$tmpdir/lib/elfuse-sysroot-shadow"; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-sysroot-chdir
+
+## openat2(RESOLVE_NO_SYMLINKS) is answered by a manual walk over the host
+## spelling, so a link-free path must resolve however deep it runs and however
+## many directories the sysroot itself adds in front of it. The chains are
+## staged host-side so their names reach the disk literally. mktemp places the
+## sysroot several directories down, which is what makes the shallow chain
+## cross the link budget once the prefix is counted.
+test-sysroot-openat2-walk: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-openat2-walk
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	sysroot="$$tmpdir/sysroot"; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	for spec in "deep 44" "shallow 38"; do \
+		set -- $$spec; \
+		chain="$$sysroot/$$1"; \
+		i=0; \
+		while [ "$$i" -lt "$$2" ]; do chain="$$chain/d"; i=$$((i + 1)); done; \
+		mkdir -p "$$chain"; \
+	done; \
+	mkdir -p "$$sysroot/real/leaf"; \
+	ln -sf real "$$sysroot/link"; \
+	$(ELFUSE_BIN) --sysroot "$$sysroot" $(BUILD_DIR)/test-sysroot-openat2-walk
 
 ## A symlink reachable through a sysroot-contained dirfd must not escape via
 ## openat(dirfd, name): stages both an absolute-target and a deep-".."
