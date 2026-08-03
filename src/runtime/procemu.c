@@ -748,12 +748,8 @@ int proc_dev_shm_resolve(const char *guest_suffix,
 
 static ino_t proc_synth_ino(const char *path)
 {
-    /* 64-bit FNV-1a with Linux-looking nonzero output. */
-    uint64_t h = 1469598103934665603ULL;
-    for (const unsigned char *p = (const unsigned char *) path; *p; ++p) {
-        h ^= (uint64_t) *p;
-        h *= 1099511628211ULL;
-    }
+    /* Masked to a Linux-looking nonzero positive inode. */
+    uint64_t h = fnv1a64(path, strlen(path));
     h &= 0x7fffffffffffffffULL;
     if (h == 0)
         h = 1;
