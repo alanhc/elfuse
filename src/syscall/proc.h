@@ -108,6 +108,38 @@ bool proc_rosetta_active(void);
 void proc_set_fakeroot_enabled(bool enabled);
 bool proc_fakeroot_enabled(void);
 
+/* Opt-in escape hatch letting a guest-initiated exec enter fakeroot mode.
+ * Without it fakeroot can only be turned on before the first image runs
+ * (--fakeroot / ELFUSE_FAKEROOT), so a guest shell has no way to raise
+ * privilege for a single command the way sudo does on Linux.
+ *
+ * path names the one executable allowed to make that transition, as an absolute
+ * path resolved the way the guest resolves paths: under --sysroot the sysroot
+ * spelling and the host spelling of one file both name that file, because the
+ * match is on file identity rather than on the string (see
+ * proc_fakeroot_exec_path). Returns false without arming anything for NULL, an
+ * empty string, a relative path, or one that does not fit.
+ *
+ * Startup only. The stored path is read without a lock by every vCPU thread
+ * that reaches execve, so this must be called before any of them exists;
+ * calling it later is a data race.
+ */
+bool proc_set_fakeroot_exec_path(const char *path);
+
+/* The configured fakeroot exec path, or NULL when none was armed.
+ *
+ * The caller resolves and stats it to compare against the file it actually
+ * opened, so any spelling that reaches that file elevates and a spelling that
+ * reaches a different file does not. What elevates is therefore an inode, not a
+ * name: replacing the file at the configured path replaces what elevates, and
+ * moving the marked executable away disarms the hatch.
+ *
+ * The elevation this feeds is not per-command. Nothing ever clears the fakeroot
+ * gate, so the marked image, everything it execs afterwards, and everything it
+ * forks all stay root -- the same shape as a sudo child, not a one-shot.
+ */
+const char *proc_fakeroot_exec_path(void);
+
 /* Store the guest command line for /proc/self/cmdline emulation. argv is a
  * NULL-terminated array of strings.
  */

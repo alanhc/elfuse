@@ -276,6 +276,7 @@ QEMU_SKIP="
     test-msync
     test-credentials
     test-credentials-fakeroot
+    test-fakeroot-exec
     test-sched-policy
     test-rseq
     test-tier-a
@@ -327,6 +328,9 @@ QEMU_SKIP="
 # test-credentials: pins elfuse's restricted "fakeroot" setuid/capset/
 #   getgroups model (deliberately narrower than real root); the qemu
 #   reference lane runs as genuine root, which has unrestricted privilege.
+# test-fakeroot-exec: ELFUSE_FAKEROOT_EXEC is an elfuse-only escape hatch --
+#   a real kernel has no notion of an executable that turns on fakeroot, so
+#   the marked exec simply stays unprivileged there.
 # test-sched-policy: exercises elfuse's explicitly-a-stub scheduler policy
 #   layer (see the file's own header) -- RT class changes are always
 #   -EPERM'd regardless of privilege, whereas real root can set them.
@@ -765,6 +769,12 @@ run_unit_tests()
     printf "\nCredential/identity emulation\n"
     test_rc "$runner" "test-credentials" 0 "$bindir/test-credentials"
     test_rc "$runner" "test-credentials-fakeroot" 0 --fakeroot "$bindir/test-credentials"
+    # Arm the opt-in transition on the test binary itself: it re-execs its own
+    # path to cross into fakeroot, and a copy of itself to prove the negative.
+    # The assignment prefix scopes the variable to this one call, so an
+    # interrupted run cannot leave it set for anything that follows.
+    ELFUSE_FAKEROOT_EXEC="$bindir/test-fakeroot-exec" \
+        test_rc "$runner" "test-fakeroot-exec" 0 "$bindir/test-fakeroot-exec"
 
     printf "\nScheduler policy stub\n"
     test_rc "$runner" "test-sched-policy" 0 "$bindir/test-sched-policy"
@@ -1232,7 +1242,7 @@ run_suite()
 # observed counts diverge. apple-unknown is the fallback row for SoC strings the
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|238|0"
+    "elfuse-aarch64|239|0"
     "qemu-aarch64|218|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"

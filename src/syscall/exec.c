@@ -334,6 +334,41 @@ static int read_string_array(guest_t *g,
     return count;
 }
 
+/* True when st -- the fstat of the image execve actually opened -- is the file
+ * ELFUSE_FAKEROOT_EXEC names.
+ *
+ * Matching on (st_dev, st_ino) rather than on the pathname is what makes the
+ * hatch safe to hand a guest-supplied string. A name compare would decide on
+ * one path and execute another: the guest spelling and the host spelling of a
+ * sysroot file differ, translation collapses symlinks and ".." on the way to
+ * the file, and a writable parent directory lets the guest swap the leaf
+ * between the compare and the open. Identity answers "is this that file" about
+ * the descriptor already open, so every spelling that reaches the marked
+ * executable elevates and nothing else does.
+ *
+ * Resolved per call rather than cached at startup so that replacing the marked
+ * executable takes effect, and because --sysroot is not established yet when
+ * the environment is parsed. Fails closed on anything unresolvable, including a
+ * fuse-materialized image, whose private temp copy has an identity of its own.
+ */
+static bool exec_matches_fakeroot_target(const struct stat *st)
+{
+    const char *marked = proc_fakeroot_exec_path();
+    if (!marked || !st)
+        return false;
+
+    path_translation_t tx;
+    if (path_translate_at(LINUX_AT_FDCWD, marked, PATH_TR_NONE, &tx) < 0)
+        return false;
+    if (tx.fuse_path)
+        return false;
+
+    struct stat marked_st;
+    if (stat(tx.host_path, &marked_st) != 0)
+        return false;
+    return marked_st.st_dev == st->st_dev && marked_st.st_ino == st->st_ino;
+}
+
 static int check_exec_permission(const struct stat *st)
 {
     uint32_t uid = proc_get_euid();
@@ -455,12 +490,14 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * /proc filesystem.
      */
     if (!strcmp(path, "/proc/self/exe")) {
-        const char *exe = proc_get_elf_path();
-        if (!exe) {
+        /* Snapshot rather than proc_get_elf_path(): that pointer is shared
+         * mutable state, and a sibling execve republishing it would tear the
+         * string this copy -- and the fakeroot decision below -- reads.
+         */
+        if (!proc_elf_path_snapshot(path, sizeof(path))) {
             err = -LINUX_ENOENT;
             goto fail;
         }
-        str_copy_trunc(path, exe, sizeof(path));
         log_debug("execve resolved to \"%s\"", path);
     }
 
@@ -517,6 +554,19 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     if (err < 0) {
         goto fail;
     }
+
+    /* Decide the fakeroot transition from the directly-executed file, before
+     * the shebang loop repoints path_host at an interpreter: a marked wrapper
+     * script has to elevate on its own identity, not on /bin/sh's.
+     *
+     * Unlike the setuid rule below, a script is not excluded. That rule exists
+     * because any file on the system can carry a setuid bit, so the kernel
+     * cannot trust the interpreter line of one it never vetted. Here the
+     * embedder named exactly one file out of band; its shebang line is as much
+     * the embedder's choice as its ELF contents would be, and a marked dynamic
+     * binary would trust guest-reachable shared libraries just the same.
+     */
+    bool enter_fakeroot = exec_matches_fakeroot_target(&exec_st);
 
     while (true) {
         char interp_start[256];
@@ -820,9 +870,42 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      */
     /* Commit credentials right before the Point of No Return.
      * Saved UID/GID are refreshed from the final effective IDs.
+     *
+     * The fakeroot transition lands here, past every failure path, so an exec
+     * that never happens leaves the current image unprivileged. It mirrors what
+     * --fakeroot gives a process at startup (proc_identity_init): root IDs plus
+     * the process-wide gate, and it reaches fork children through the
+     * --fakeroot argv forkipc already derives from that gate. Nothing clears
+     * the gate afterwards, so this elevates the whole process tree from here
+     * on, not just the image being loaded.
+     *
+     * elfuse never tears sibling guest threads down at exec, so a sibling that
+     * outlives this call keeps the credentials committed here for the rest of
+     * the process lifetime -- a multithreaded guest that execs the marked
+     * binary from one thread hands root to every thread that was already
+     * running. The gate is published after the IDs because no permission check
+     * grants on the gate alone: proc-identity.c pairs it with "emu_euid == 0 ||
+     * fakeroot", and sys_getgroups and capget require both. Publishing it last
+     * can therefore only narrow the window, never open one.
+     *
+     * The ATTN_BIT_CRED bracket is the same protocol the setuid family uses in
+     * syscall.c: without it the shim's EL1 identity cache keeps answering
+     * sibling getuid fast paths with pre-exec IDs until
+     * exec_republish_shim_globals_or_die runs, well past guest_reset.
      */
-    proc_set_ids(proc_get_uid(), new_euid, new_euid, proc_get_gid(), new_egid,
-                 new_egid);
+    uint32_t new_uid = proc_get_uid();
+    uint32_t new_gid = proc_get_gid();
+    if (enter_fakeroot) {
+        new_uid = new_euid = 0;
+        new_gid = new_egid = 0;
+    }
+    shim_globals_attn_or(g, ATTN_BIT_CRED);
+    proc_set_ids(new_uid, new_euid, new_euid, new_gid, new_egid, new_egid);
+    if (enter_fakeroot)
+        proc_set_fakeroot_enabled(true);
+    shim_globals_publish_creds(g, proc_get_uid(), proc_get_euid(),
+                               proc_get_gid(), proc_get_egid());
+    shim_globals_attn_and(g, ~ATTN_BIT_CRED);
 
     if (0) {
     fail:

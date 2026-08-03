@@ -20,9 +20,26 @@ Supported user-facing options:
 | `--sysroot PATH` | Resolve guest absolute paths under `PATH`, falling back to the host for paths it does not hold |
 | `--create-sysroot PATH` | Provision a case-sensitive APFS sparsebundle mounted at `PATH`, then use it as the sysroot |
 | `--no-rosetta` | Disable the x86_64-via-Rosetta translator (also `ELFUSE_NO_ROSETTA=1`) |
+| `--fakeroot` | Start the guest as uid/gid 0 with full emulated capabilities (also `ELFUSE_FAKEROOT=1`) |
 | `--gdb PORT` | Listen for a GDB RSP client on `PORT` (aarch64 guests only) |
 | `--gdb-stop-on-entry` | Stop before the first guest instruction |
 | `--` | End `elfuse` option parsing; remaining tokens are guest argv |
+
+`ELFUSE_FAKEROOT_EXEC` has no flag form. It names one executable, by absolute
+path, whose `execve` enters fakeroot mode, so a guest can run unprivileged and
+raise privilege the way `sudo` does rather than paying for root over the whole
+session. Two properties are worth knowing before using it:
+
+- The match is on file identity, not on the pathname. Any spelling that reaches
+  the marked executable elevates -- guest path or host path under `--sysroot`,
+  through symlinks, relative or not -- and a spelling that reaches some other
+  file does not. Replacing the file at that path replaces what elevates.
+- Elevation is never dropped. The marked image, everything it `exec`s
+  afterwards, and everything it forks all stay root. It is a `sudo`-shaped
+  transition for a process tree, not a per-command one.
+
+Unset, which is the default, no exec ever elevates. A value that is not an
+absolute path is rejected at startup rather than ignored.
 
 `--timeout` is a run-loop watchdog. It does not cap total process runtime. It
 only bounds a single `hv_vcpu_run()` iteration before the host regains control,
