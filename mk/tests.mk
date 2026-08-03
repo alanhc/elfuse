@@ -17,7 +17,7 @@
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
-        test-sysroot-openat2-walk \
+        test-sysroot-dotdot test-sysroot-openat2-walk \
         test-linkat-symlink-fallback perf
 
 ## Build and run the assembly hello world test
@@ -134,6 +134,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-symlink-escape
 	@printf "\n$(BLUE)━━━ no-symlinks path walking ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-openat2-walk
+	@printf "\n$(BLUE)━━━ sysroot '..' resolution ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-dotdot
 	@printf "\n$(BLUE)━━━ Alpine sysroot FUSE validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-fuse-alpine
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
@@ -212,8 +214,29 @@ test-sysroot-openat2-walk: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-openat2-walk
 		mkdir -p "$$chain"; \
 	done; \
 	mkdir -p "$$sysroot/real/leaf"; \
+	mkdir -p "$$sysroot/tmp/leaf"; \
 	ln -sf real "$$sysroot/link"; \
 	$(ELFUSE_BIN) --sysroot "$$sysroot" $(BUILD_DIR)/test-sysroot-openat2-walk
+
+## Linux clamps '..' at the root a process resolves from, so the directory
+## holding the sysroot is not reachable from inside it. beside.txt is staged
+## there as a real escape target, and the post-run checks confirm the guest's
+## own creates landed in the sysroot rather than beside it.
+test-sysroot-dotdot: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-dotdot
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	sysroot="$$tmpdir/sysroot"; \
+	beside="$$tmpdir/beside.txt"; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$sysroot/tmp"; \
+	printf 'guest-probe\n' > "$$sysroot/probe.txt"; \
+	printf 'HOST-SIDE-FILE\n' > "$$beside"; \
+	$(ELFUSE_BIN) --sysroot "$$sysroot" $(BUILD_DIR)/test-sysroot-dotdot; \
+	if [ -e "$$tmpdir/made-here.txt" ] || [ -e "$$tmpdir/made-dir" ] || \
+			[ -e "$$tmpdir/var" ]; then \
+		printf "$(RED)FAIL$(RESET) a create through /.. escaped the sysroot\n"; \
+		exit 1; \
+	fi
 
 ## A symlink reachable through a sysroot-contained dirfd must not escape via
 ## openat(dirfd, name): stages both an absolute-target and a deep-".."

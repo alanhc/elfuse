@@ -111,6 +111,13 @@ int resolve_proc_dirfd_path(guest_fd_t dirfd,
                             char *out,
                             size_t outsz);
 int sys_path_has_symlink(guest_fd_t dirfd, const char *path);
+/* Whether resolving the relative @path from @dirfd walks above the guest root,
+ * where Linux clamps '..' (path_resolution(7)) but a walk over host
+ * descriptors keeps climbing. False for absolute paths and whenever the
+ * reconstruction cannot be judged; callers use it to hand such paths to the
+ * clamped absolute resolvers instead of walking them from @dirfd.
+ */
+bool path_relative_climbs_guest_root(guest_fd_t dirfd, const char *path);
 
 const char *path_resolve_sysroot_path(const char *path,
                                       char *buf,

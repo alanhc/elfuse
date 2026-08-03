@@ -181,6 +181,9 @@ Practical notes:
   under those directories are therefore invisible to the guest, and a guest
   program or interpreter stored there cannot be loaded; pass one from anywhere
   else.
+- `..` stops at the guest's root as it does on Linux, so `/..` and
+  `/../etc/hosts` name `/` and `/etc/hosts` inside the sysroot. The directory
+  the sysroot itself lives in is not reachable from the guest.
 - The sysroot setting is preserved across guest `fork` and `execve`, so spawned
   children see the same view of the filesystem.
 - On case-insensitive macOS volumes, `elfuse` maintains per-directory

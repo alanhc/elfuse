@@ -580,6 +580,104 @@ static bool lexical_normalize_absolute_path(char *dest,
     return true;
 }
 
+/* Rewrite the '..' components that would climb above the guest root, and only
+ * those. Linux clamps '..' at the root a process resolves from
+ * (path_resolution(7)), but the sysroot is a directory on the host, so the
+ * host kernel would happily walk out of it.
+ *
+ * Everything else is copied byte for byte, including interior '..', '.', and
+ * runs of slashes. Collapsing those would hand the host a path whose popped
+ * components it never resolves, and their existence and type are part of the
+ * answer: "/absent/../b" owes ENOENT and "/file/../b" owes ENOTDIR, both of
+ * which only the host walk can report.
+ *
+ * @dest is never longer than @src, since components are only dropped, and the
+ * one byte written back for a fully consumed path replaces at least the three
+ * that "/.." occupied.
+ */
+static bool clamp_dotdot_at_guest_root(char *dest,
+                                       const char *src,
+                                       size_t dest_sz)
+{
+    if (!src || src[0] != '/' || dest_sz == 0)
+        return false;
+
+    const char *scan = src;
+    const char *comp;
+    /* The separators before the component about to be read, which travel with
+     * it: a dropped component must not leave its slashes behind. Once the walk
+     * ends this is the trailing run, which states that the path names a
+     * directory and must survive for the host to answer ENOTDIR when it does
+     * not.
+     */
+    const char *sep = scan;
+    size_t len;
+    size_t out = 0;
+    size_t depth = 0;
+
+    while (path_next_component(&scan, &comp, &len)) {
+        size_t sep_len = (size_t) (comp - sep);
+        bool dotdot = len == 2 && comp[0] == '.' && comp[1] == '.';
+
+        if (dotdot && depth == 0) {
+            sep = scan;
+            continue;
+        }
+        if (dotdot)
+            depth--;
+        else if (len != 1 || comp[0] != '.')
+            depth++;
+
+        if (out + sep_len + len >= dest_sz)
+            return false;
+        memcpy(dest + out, sep, sep_len + len);
+        out += sep_len + len;
+        sep = scan;
+    }
+
+    size_t tail = strlen(sep);
+    if (out + tail >= dest_sz)
+        return false;
+    memcpy(dest + out, sep, tail);
+    out += tail;
+
+    if (out == 0)
+        dest[out++] = '/';
+    dest[out] = '\0';
+    return true;
+}
+
+/* Snapshot the sysroot, clamp @path, and spell the host path it names.
+ * Returns 1 with @buf, @sr, and @clamped filled, 0 when sysroot resolution
+ * does not apply and the caller owes its input back, or -1 with errno set.
+ */
+static int sysroot_seed_host_path(const char *path,
+                                  char *buf,
+                                  size_t bufsz,
+                                  char sr[LINUX_PATH_MAX],
+                                  char clamped[LINUX_PATH_MAX])
+{
+    if (!proc_sysroot_snapshot(sr, LINUX_PATH_MAX) || !path || path[0] != '/')
+        return 0;
+    if (bufsz == 0 ||
+        !clamp_dotdot_at_guest_root(clamped, path, LINUX_PATH_MAX)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    int n = snprintf(buf, bufsz, "%s%s", sr, clamped);
+    if (n < 0) {
+        if (errno == 0)
+            errno = EINVAL;
+        return -1;
+    }
+    if ((size_t) n >= bufsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 1;
+}
+
 static bool is_guest_system_path(const char *path)
 {
     if (!path || path[0] != '/')
@@ -648,22 +746,12 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
                                                    size_t bufsz,
                                                    bool follow_final)
 {
-    char sr[LINUX_PATH_MAX];
-    if (!proc_sysroot_snapshot(sr, sizeof(sr)) || !path || path[0] != '/')
-        return path;
-    if (bufsz == 0) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
+    char sr[LINUX_PATH_MAX], clamped[LINUX_PATH_MAX];
+    int seeded = sysroot_seed_host_path(path, buf, bufsz, sr, clamped);
+    if (seeded <= 0)
+        return seeded < 0 ? NULL : path;
 
-    int n = snprintf(buf, bufsz, "%s%s", sr, path);
-    if (n < 0) {
-        if (errno == 0)
-            errno = EINVAL;
-        return NULL;
-    }
-    bool full_path_truncated = (size_t) n >= bufsz;
-    if (!full_path_truncated && sysroot_path_exists(buf, follow_final)) {
+    if (sysroot_path_exists(buf, follow_final)) {
         if (!sysroot_path_is_contained(buf, sr, follow_final)) {
             errno = ELOOP;
             return NULL;
@@ -671,22 +759,18 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
         return buf;
     }
 
-    if (full_path_truncated) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-
     /* Prevent escaping guest system paths to macOS host paths, which leads
      * to host contamination and permission failures (e.g. SIP/EPERM).
-     */
-    char norm_path[LINUX_PATH_MAX];
-    bool has_norm =
-        lexical_normalize_absolute_path(norm_path, path, sizeof(norm_path));
-    /* Resolution stops at the sysroot spelling for both classes. The caller's
+     * Classification reads the fully collapsed spelling, so "/usr/../home/x"
+     * is judged as "/home/x" rather than prefix-matching "/usr".
+     * Resolution stops at the sysroot spelling for both classes. The caller's
      * own syscall reports the path absent when the sysroot does not hold it,
      * which is what it is in the guest's namespace.
      */
-    const char *path_to_check = has_norm ? norm_path : path;
+    char norm_path[LINUX_PATH_MAX];
+    bool has_norm =
+        lexical_normalize_absolute_path(norm_path, clamped, sizeof(norm_path));
+    const char *path_to_check = has_norm ? norm_path : clamped;
     if (is_guest_system_path(path_to_check) ||
         is_sysroot_backed_temp_path(path_to_check))
         return buf;
@@ -711,32 +795,19 @@ const char *proc_resolve_sysroot_create_path(const char *path,
                                              size_t bufsz,
                                              bool create_parents)
 {
-    char sr[LINUX_PATH_MAX];
-    if (!proc_sysroot_snapshot(sr, sizeof(sr)) || !path || path[0] != '/')
-        return path;
-    if (bufsz == 0) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
+    char sr[LINUX_PATH_MAX], clamped[LINUX_PATH_MAX];
+    int seeded = sysroot_seed_host_path(path, buf, bufsz, sr, clamped);
+    if (seeded <= 0)
+        return seeded < 0 ? NULL : path;
 
-    int n = snprintf(buf, bufsz, "%s%s", sr, path);
-    if (n < 0) {
-        if (errno == 0)
-            errno = EINVAL;
-        return NULL;
-    }
-    if ((size_t) n >= bufsz) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-
-    /* An all-slash guest path ("/", "///") names the root, which always exists
-     * and has no parent to check; trimming it would walk strrchr into the
-     * sysroot prefix and trip the containment guard.
+    /* An all-slash guest path ("/", "///", and anything clamping to them)
+     * names the root, which always exists and has no parent to check; trimming
+     * it would walk strrchr into the sysroot prefix and trip the containment
+     * guard.
      *
      * Return buf as-is.
      */
-    if (path[strspn(path, "/")] == '\0')
+    if (clamped[strspn(clamped, "/")] == '\0')
         return buf;
 
     char parent[LINUX_PATH_MAX];
@@ -775,8 +846,8 @@ const char *proc_resolve_sysroot_create_path(const char *path,
      */
     char norm_path[LINUX_PATH_MAX];
     bool has_norm =
-        lexical_normalize_absolute_path(norm_path, path, sizeof(norm_path));
-    const char *path_to_check = has_norm ? norm_path : path;
+        lexical_normalize_absolute_path(norm_path, clamped, sizeof(norm_path));
+    const char *path_to_check = has_norm ? norm_path : clamped;
 
     if (!is_sysroot_backed_temp_path(path_to_check) &&
         !is_guest_system_path(path_to_check))

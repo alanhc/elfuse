@@ -1296,6 +1296,14 @@ static int sidecar_walk_parent_at(guest_fd_t dirfd,
         str_copy_trunc(work, normalized, sizeof(work));
         parent->absolute = true;
     } else {
+        /* A relative path that climbs above the guest root belongs to the
+         * clamped absolute resolvers: the sidecar's own walk from dirfd has
+         * no clamp and would create beside the sysroot or fail where the
+         * guest's spelling resolves. Declining mirrors the lookup-side skip
+         * in path_translate_at().
+         */
+        if (path_relative_climbs_guest_root(dirfd, path))
+            return 1;
         str_copy_trunc(work, path, sizeof(work));
     }
 

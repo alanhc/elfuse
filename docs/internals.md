@@ -792,8 +792,68 @@ Three resolvers in `src/syscall/proc-state.c` do the work:
 `proc_resolve_sysroot_path()` for a following lookup, its
 `_nofollow_` sibling, and `proc_resolve_sysroot_create_path()` for a path whose
 final component may not exist yet. `path_translate_at()` picks one by flags;
-`sys_path_has_symlink()` calls the nofollow form directly for the
-`openat2(RESOLVE_NO_SYMLINKS)` precheck described below.
+`sys_path_has_symlink()` calls the nofollow form directly for absolute paths
+in the `openat2(RESOLVE_NO_SYMLINKS)` precheck described below, and walks
+relative paths from their descriptor with the same clamp applied in the walk.
+
+### Clamping `..` At The Guest Root
+
+A guest resolves `..` against its own root, and Linux clamps it there: `/..`
+names `/`, and no number of `..` components reaches the directory above
+(`path_resolution(7)`). The sysroot is an ordinary directory on the host, so
+the host kernel has somewhere to go, and a guest path handed over unchanged
+climbs straight out of the tree.
+
+`clamp_dotdot_at_guest_root()` rewrites exactly the components that would do
+that, and nothing else:
+
+| guest path | host spelling below the sysroot | why |
+|---|---|---|
+| `/..`, `/../..` | `/` | the clamp, applied once per escaping component |
+| `/../etc/hosts` | `/etc/hosts` | the escaping `..` is dropped, the rest is untouched |
+| `/a/../b` | `/a/../b` | interior, so the host resolves it |
+| `/a/../../etc/x` | `/a/../etc/x` | one `..` is interior, the second escapes |
+| `/file/.`, `/file/` | unchanged | the trailing form still demands a directory |
+
+Interior `..` survives on purpose. Collapsing it would spell a path whose
+popped components the host never looks at, and their existence and type are
+part of the answer Linux owes: `/absent/../b` is `ENOENT`, `/file/../b` is
+`ENOTDIR`, `rmdir("/a/b/..")` fails rather than removing `/a`, and a `..` past
+a symlink keeps that link in the path where the no-symlinks precheck can see
+it. Only the host walk can report those, so only the host walk decides them.
+
+Two spellings of a path therefore travel together: the clamped one, which is
+probed and handed to the syscall, and the fully collapsed one from
+`lexical_normalize_absolute_path()`, which is used solely to classify the path
+as a guest system directory or a temp root, where `/usr/../home/x` must be
+judged as `/home/x` rather than by its leading component.
+
+### Relative Paths And The Containment Recheck
+
+The resolvers key off a leading `/`, so a relative path reaches them
+unchanged: they have no dirfd to rebuild a location from. That would leave
+`openat(dirfd, name)` to the host kernel, whose resolution is not confined to
+the sysroot, so `path_check_relative_sysroot_containment()` reconstructs the
+absolute guest path from the descriptor's guest base path and runs it back
+through the same resolver.
+
+A reconstructed path that climbs above the guest root needs more than a
+verdict. Clamping makes the guest's own answer well defined, but the host
+still holds a descriptor from which `..` leads out of the sysroot, and the
+recheck cannot express "contained, but not by that route": a path the sysroot
+does not claim looks the same as one that never left. So when the
+reconstruction clamps, the recheck hands back the absolute host path it
+resolved and the caller uses that instead of the guest's relative spelling.
+POSIX has the kernel ignore `dirfd` for an absolute path, so the descriptor
+drops out of the resolution entirely, which is the point.
+
+A climbed path is the one case where the recheck's answer is the resolution
+itself rather than a discarded verdict, so it also honors the caller's create
+intent: missing sysroot parents are materialized exactly as they would be for
+the absolute spelling. The case-index sidecar declines a climbing relative
+create for the same reason (`sidecar_walk_parent_at()` in
+`src/syscall/sidecar.c`): its own walk from the descriptor has no clamp, and
+the clamped absolute spelling already bypasses sidecar lookup.
 
 ### Why The No-Symlinks Precheck Has No Component Budget
 
@@ -801,6 +861,13 @@ final component may not exist yet. `path_translate_at()` picks one by flags;
 path is a symlink. macOS has no equivalent flag, so `sys_path_has_symlink()`
 walks the path itself, one component at a time, and reports `ELOOP` at the
 first `S_ISLNK`.
+
+An absolute path is walked in its host spelling, which the resolvers have
+already clamped. A dirfd-relative path is walked from the descriptor, so the
+clamp happens in the walk: the descriptor's guest depth seeds a counter, and a
+`..` that would climb above the guest root stays in place instead of stepping
+onto the sysroot's host parent, whose entries, macOS's own symlinks among
+them, are not the guest's to trip over.
 
 That walk deliberately carries no `MAXSYMLINKS` counter. It never follows a
 link, so nothing can accumulate against a link budget; the only thing a
@@ -811,10 +878,12 @@ followed rather than components walked. The counter that does matter lives in
 `RESOLVE_NO_XDEV` and charges `MAXSYMLINKS` once per link actually crossed.
 
 Related implementation: `src/syscall/path.c` (`path_translate_at`,
-`sys_path_has_symlink`, `path_openat2_crosses_mount`),
-`src/syscall/proc-state.c` (the three resolvers). Validation: the
-`openat2` cases in `tests/test-syscall-fidelity.c`, run by
-`make test-matrix` against both `elfuse` and a reference kernel.
+`path_check_relative_sysroot_containment`, `sys_path_has_symlink`,
+`path_openat2_crosses_mount`), `src/syscall/proc-state.c`
+(`clamp_dotdot_at_guest_root`, `sysroot_seed_host_path`, the three resolvers).
+Validation: `make test-sysroot-dotdot` and `make test-sysroot-openat2-walk`,
+plus the `openat2` cases in `tests/test-syscall-fidelity.c`, which
+`make test-matrix` runs against both `elfuse` and a reference kernel.
 
 ## POSIX Shared Memory (`/dev/shm`)
 
