@@ -629,6 +629,8 @@ run_unit_tests()
 
     printf "\nSyscall coverage\n"
     test_check "$runner" "test-file-ops" "0 failed" "$bindir/test-file-ops"
+    test_check "$runner" "test-devpts" "all tests passed -- PASS" \
+        "$bindir/test-devpts"
     test_check "$runner" "test-sysinfo" "0 failed" "$bindir/test-sysinfo"
     test_check "$runner" "test-io-opt" "0 failed" "$bindir/test-io-opt"
     test_check "$runner" "test-poll" "0 failed" "$bindir/test-poll"

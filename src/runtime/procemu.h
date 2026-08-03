@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/mount.h>
@@ -44,6 +45,17 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz);
  * (fall through to real fstatat).
  */
 int proc_intercept_stat(const char *path, struct stat *mac_st);
+
+/* True when PATH names a live Unix98 pty slave (/dev/pts/N whose master is
+ * open), filling out with the same synthesized stat proc_intercept_stat would
+ * return. Such a path has no host backing, so metadata operations on it must be
+ * answered here rather than passed through to the host filesystem.
+ *
+ * Answering and stat'ing together keeps callers that need both from walking the
+ * locked pty table twice, which would leave a window where the slave goes away
+ * between the test and the stat. out may be NULL for a pure test.
+ */
+bool proc_pty_slave_stat(const char *path, struct stat *out);
 
 /* Intercept writes to synthetic proc files that need stateful behavior.
  * Returns 1 if handled (with *written_out set), 0 if not intercepted, or -1 on
