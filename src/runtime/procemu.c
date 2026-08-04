@@ -1589,6 +1589,45 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
  */
 #define PTY_KEEPALIVE_MAX 256
 #define PTY_KEEPALIVE_FREE (-1)
+/* Group that owns pty slaves. Linux distributions mount devpts with gid=5
+ * ("tty") and glibc's grantpt(3) looks that group up before deciding whether
+ * the slave needs chowning.
+ */
+#define PTY_SLAVE_TTY_GID 5u
+
+/* Parse the N out of "/dev/pts/N". Returns false for the directory itself, a
+ * missing or non-numeric tail, or trailing garbage.
+ *
+ * Deliberately stricter than strtoul, which would take leading whitespace, a
+ * "+" sign and leading zeros. devpts dentries are decimal and canonical, so
+ * Linux answers ENOENT for "/dev/pts/016" even while slave 16 is open, and
+ * accepting the alias here would let one live slave answer under many names --
+ * for its stat, its statfs identity, and for whether chmod and chown are
+ * intercepted at all.
+ */
+static bool pty_slave_num_from_path(const char *path, uint32_t *out)
+{
+    if (!path || strncmp(path, "/dev/pts/", 9) != 0)
+        return false;
+    const char *digits = path + 9;
+    if (!*digits)
+        return false;
+    /* "0" is the only name that may start with a zero. */
+    if (digits[0] == '0' && digits[1] != '\0')
+        return false;
+
+    unsigned long n = 0;
+    for (const char *d = digits; *d; d++) {
+        if (*d < '0' || *d > '9')
+            return false;
+        if (n > (UINT32_MAX - (unsigned long) (*d - '0')) / 10)
+            return false;
+        n = n * 10 + (unsigned long) (*d - '0');
+    }
+    if (out)
+        *out = (uint32_t) n;
+    return true;
+}
 /* PTY_SLAVE_PATH_MAX lives in procemu.h so this table and the fork-IPC payload
  * (proc_pty_ipc_entry_t) cannot drift apart.
  */
@@ -1952,6 +1991,16 @@ static int pty_lookup_slave_path(uint32_t linux_pts_num,
     memcpy(out, pty_keepalive_table[hit].slave_path, len + 1);
     pthread_mutex_unlock(&pty_keepalive_lock);
     return 0;
+}
+
+bool proc_pty_slave_stat(const char *path, struct stat *out)
+{
+    if (!path || strncmp(path, "/dev/pts/", 9) != 0 || !path[9])
+        return false;
+    struct stat st;
+    if (proc_intercept_stat(path, out ? out : &st) != 0)
+        return false;
+    return true;
 }
 
 static int pty_open_slave(uint32_t linux_pts_num, int linux_flags)
@@ -2816,14 +2865,8 @@ int proc_intercept_open(const guest_t *g,
      * Linux devpts behavior for an unallocated slave number.
      */
     if (!strncmp(path, "/dev/pts/", 9)) {
-        const char *digits = path + 9;
-        if (!*digits) {
-            errno = ENOENT;
-            return -1;
-        }
-        char *endp;
-        unsigned long n = strtoul(digits, &endp, 10);
-        if (endp == digits || *endp != '\0' || n > UINT32_MAX) {
+        uint32_t n;
+        if (!pty_slave_num_from_path(path, &n)) {
             errno = ENOENT;
             return -1;
         }
@@ -3539,14 +3582,8 @@ int proc_intercept_stat(const char *path, struct stat *st)
         return 0;
     }
     if (!strncmp(path, "/dev/pts/", 9)) {
-        const char *digits = path + 9;
-        if (!*digits) {
-            errno = ENOENT;
-            return -1;
-        }
-        char *endp;
-        unsigned long n = strtoul(digits, &endp, 10);
-        if (endp == digits || *endp != '\0' || n > UINT32_MAX) {
+        uint32_t n;
+        if (!pty_slave_num_from_path(path, &n)) {
             errno = ENOENT;
             return -1;
         }
@@ -3567,8 +3604,15 @@ int proc_intercept_stat(const char *path, struct stat *st)
         memset(st, 0, sizeof(*st));
         st->st_mode = S_IFCHR | 0620;
         st->st_nlink = 1;
-        st->st_uid = host_st.st_uid;
-        st->st_gid = host_st.st_gid;
+        /* devpts gives the slave to whoever opened the master, group tty --
+         * that is what grantpt(3) expects to find. Reporting the host owner
+         * instead makes glibc see a foreign uid, try to chown the slave, fail,
+         * and fall back to exec'ing the pt_chown helper, which does not exist
+         * on a modern distro: grantpt then fails with ENOENT and no pty can be
+         * allocated even though the master opened fine.
+         */
+        st->st_uid = (uid_t) proc_get_uid();
+        st->st_gid = (gid_t) PTY_SLAVE_TTY_GID;
         /* macOS dev_t = (major << 24) | minor; the fs-stat translation layer
          * (mac_to_linux_dev) re-encodes that into Linux's split major/minor
          * layout, so storing 136 in the macOS-major slot makes glibc's

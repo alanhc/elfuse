@@ -369,6 +369,67 @@ static bool statfs_path_is_proc(const char *path)
     return !strncmp(path, "/proc", 5) && (path[5] == '\0' || path[5] == '/');
 }
 
+/* /dev/pts itself and the pty slaves under it. /dev/ptmx is the multiplexer
+ * that hands out those slaves; Linux reports devpts for a master fd too.
+ */
+/* How statfs should answer for a path under the virtual devpts mount. */
+typedef enum {
+    DEVPTS_UNRELATED = 0, /* not under /dev/pts; carry on */
+    DEVPTS_MOUNT,         /* the mount point or a live slave: synthesize */
+    DEVPTS_ABSENT,        /* under /dev/pts but no such slave: ENOENT */
+} devpts_class_t;
+
+static devpts_class_t statfs_devpts_class(const char *path)
+{
+    if (!path || strncmp(path, "/dev/pts", 8) != 0)
+        return DEVPTS_UNRELATED;
+    if (path[8] != '\0' && path[8] != '/')
+        return DEVPTS_UNRELATED; /* "/dev/ptsfoo" is an ordinary name */
+
+    const char *tail = path + 8;
+    while (*tail == '/')
+        tail++;
+    if (!*tail)
+        return DEVPTS_MOUNT; /* "/dev/pts", "/dev/pts/", "/dev/pts//" */
+
+    /* The mount point exists for as long as the pty layer does. A particular
+     * slave does not: Linux answers ENOENT for an unallocated or malformed
+     * /dev/pts/N. Report that rather than falling through to the host, so the
+     * answer cannot depend on whether the sysroot happens to carry a file of
+     * the same name -- the devpts mount shadows whatever is underneath it, and
+     * the stat and open intercepts already treat the directory that way.
+     *
+     * Only the canonical spelling of a slave resolves, matching those
+     * intercepts: "/dev/pts/0" is the dentry, "/dev/pts/00" and "/dev/pts/./0"
+     * are not. Non-canonical spellings land here as ENOENT rather than
+     * resolving, which diverges from a real kernel for the "." form and is
+     * consistent across every /dev/pts intercept.
+     *
+     * /dev/ptmx is deliberately not claimed. Which filesystem backs it depends
+     * on whether it resolves to /dev/pts/ptmx or to the devtmpfs node, the same
+     * ambiguity that keeps sys_fstatfs from answering for a master fd, and
+     * nothing asks: glibc's getpt statfs's /dev/pts and /dev, never /dev/ptmx.
+     */
+    return proc_pty_slave_stat(path, NULL) ? DEVPTS_MOUNT : DEVPTS_ABSENT;
+}
+
+/* devpts is virtualized rather than host-backed, so answer synthetically.
+ * Matches what Linux reports for a devpts mount: no blocks, no inodes.
+ */
+static void fill_devpts_statfs(linux_statfs_t *lin)
+{
+    memset(lin, 0, sizeof(*lin));
+    lin->f_type = 0x1cd1; /* DEVPTS_SUPER_MAGIC */
+    lin->f_bsize = 4096;
+    lin->f_blocks = 0;
+    lin->f_bfree = 0;
+    lin->f_bavail = 0;
+    lin->f_files = 0;
+    lin->f_ffree = 0;
+    lin->f_namelen = 255;
+    lin->f_frsize = 4096;
+}
+
 static void fill_proc_statfs(linux_statfs_t *lin)
 {
     memset(lin, 0, sizeof(*lin));
@@ -431,6 +492,23 @@ static int64_t sys_statfs_impl(guest_t *g,
         }
     }
 
+    /* glibc's posix_openpt() opens /dev/ptmx and then confirms devpts is
+     * mounted before handing the master back (sysdeps/unix/sysv/linux/getpt.c).
+     * /dev/pts has no host backing here, so a pass-through statfs fails and
+     * glibc closes a perfectly good master -- breaking Unix98 pty allocation
+     * for every glibc program. Answer from the virtual filesystem instead.
+     */
+    devpts_class_t devpts = statfs_devpts_class(tx.intercept_path);
+    if (devpts == DEVPTS_ABSENT)
+        return -LINUX_ENOENT;
+    if (devpts == DEVPTS_MOUNT) {
+        linux_statfs_t lin_st;
+        fill_devpts_statfs(&lin_st);
+        if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
     /* Report /dev/shm and its leaves as tmpfs, from the backing dir. statfs()
      * on the leaf would follow a symlink onto the host and leak the host fs
      * identity, so answer synthetically; lstat is the nofollow existence probe.
@@ -480,6 +558,11 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
 
 int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
 {
+    /* Deliberately no devpts case for a pty master fd: Linux answers from
+     * whatever filesystem provides /dev/ptmx, which is devpts only when it is
+     * the bind-mounted /dev/pts/ptmx and tmpfs or devtmpfs otherwise. There is
+     * no single correct value to report, and nothing needs one.
+     */
     fd_entry_t snap;
     memset(&snap, 0, sizeof(snap));
     if (fd_snapshot(fd, &snap) && statfs_path_is_proc(snap.proc_path)) {

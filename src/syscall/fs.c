@@ -2709,6 +2709,20 @@ int64_t sys_fchmodat(guest_t *g,
     if (rc != INT64_MIN)
         return rc;
 
+    /* A pty slave has no host file to chmod -- its mode comes from the pty
+     * layer. Passing this through would hit the host and fail with ENOENT,
+     * which is what grantpt(3) does when it decides the slave's mode needs
+     * adjusting: it would then fall back to the pt_chown helper and fail.
+     *
+     * The requested mode is accepted but not retained, so a later stat still
+     * reports the 0620 the pty layer synthesizes. grantpt only ever asks for
+     * the owner-access bits it is about to hand out, so nothing observes the
+     * difference; keeping it would need per-slave state that also has to cross
+     * the fork-IPC boundary.
+     */
+    if (proc_pty_slave_stat(tx.intercept_path, NULL))
+        return 0;
+
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
@@ -2859,6 +2873,28 @@ int64_t sys_fchownat(guest_t *g,
     int64_t rc = reject_unsupported_fuse_path_op(&tx);
     if (rc != INT64_MIN)
         return rc;
+
+    /* A pty slave has no host file to chown -- its owner comes from the pty
+     * layer. Accept only a request that leaves the reported owner alone;
+     * anything else would have to be remembered to be observable, so refuse
+     * rather than report a success the next stat() contradicts.
+     *
+     * Not for grantpt(3): the synthesized stat already reports proc_get_uid(),
+     * so glibc's "chown only when st_uid != getuid()" test is false by
+     * construction and musl's grantpt is a no-op. This exists so that a request
+     * naming some other owner is refused instead of silently lost. The known
+     * divergence is a privileged guest -- login(1) or sshd handing a tty to a
+     * user -- which Linux would allow and which is refused here, because
+     * reporting success without retaining the owner would be the worse lie.
+     */
+    struct stat pty_st;
+    if (proc_pty_slave_stat(tx.intercept_path, &pty_st)) {
+        bool keeps_owner =
+            owner == (uint32_t) -1 || owner == (uint32_t) pty_st.st_uid;
+        bool keeps_group =
+            group == (uint32_t) -1 || group == (uint32_t) pty_st.st_gid;
+        return (keeps_owner && keeps_group) ? 0 : -LINUX_EPERM;
+    }
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
