@@ -10,8 +10,10 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <pthread.h>
+#include <string.h>
 
 #include "syscall/abi.h"
+#include "syscall/internal.h"
 #include "core/shim-globals.h"
 #include "runtime/thread.h"
 #include "syscall/proc-identity.h"
@@ -39,6 +41,27 @@ void proc_set_fakeroot_enabled(bool enabled)
 bool proc_fakeroot_enabled(void)
 {
     return atomic_load(&fakeroot_enabled);
+}
+
+/* Written once during startup, before any guest code runs, and only read after
+ * that. No lock: exec reads it from guest threads that all start later.
+ */
+static char fakeroot_exec_path[LINUX_PATH_MAX];
+
+bool proc_set_fakeroot_exec_path(const char *path)
+{
+    size_t len = path ? strlen(path) : 0;
+    if (len == 0 || path[0] != '/' || len >= sizeof(fakeroot_exec_path)) {
+        fakeroot_exec_path[0] = '\0';
+        return false;
+    }
+    memcpy(fakeroot_exec_path, path, len + 1);
+    return true;
+}
+
+const char *proc_fakeroot_exec_path(void)
+{
+    return fakeroot_exec_path[0] ? fakeroot_exec_path : NULL;
 }
 
 void proc_identity_init(void)

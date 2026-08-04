@@ -314,7 +314,17 @@ int main(int argc, char **argv)
                 "  --gdb PORT              Listen for GDB Remote Serial "
                 "Protocol on PORT\n"
                 "  --gdb-stop-on-entry     Halt before the first guest "
-                "instruction\n");
+                "instruction\n"
+                "\n"
+                "Environment:\n"
+                "  ELFUSE_NO_ROSETTA=1     Same as --no-rosetta\n"
+                "  ELFUSE_FAKEROOT=1       Same as --fakeroot\n"
+                "  ELFUSE_FAKEROOT_EXEC    Absolute path of the one executable "
+                "whose exec enters fakeroot mode, letting a guest start "
+                "unprivileged and raise privilege later; matched by file "
+                "identity, and never dropped afterwards, so that image and "
+                "everything it execs or forks stay root (unset: no exec ever "
+                "elevates)\n");
             return 0;
         }
     }
@@ -416,6 +426,27 @@ int main(int argc, char **argv)
             fakeroot = true;
     }
     proc_set_fakeroot_enabled(fakeroot);
+
+    /* Opt-in sudo-style transition: name one executable whose exec enters
+     * fakeroot, so a guest can start unprivileged and raise privilege later.
+     * Nothing happens unless the embedder sets this.
+     *
+     * A malformed value is fatal, like every other rejected option in the loop
+     * above. Starting anyway would leave a guest whose marked command silently
+     * never elevates, and a privilege boundary that fails quietly is worse than
+     * one that refuses to start. Arming only records the path; whether it names
+     * an existing file is decided per exec, so a missing file is not an error
+     * here.
+     */
+    const char *fakeroot_exec_env = getenv("ELFUSE_FAKEROOT_EXEC");
+    if (fakeroot_exec_env && *fakeroot_exec_env &&
+        !proc_set_fakeroot_exec_path(fakeroot_exec_env)) {
+        log_error(
+            "ELFUSE_FAKEROOT_EXEC must be an absolute path shorter than %d "
+            "bytes",
+            LINUX_PATH_MAX);
+        return 1;
+    }
 
     /* Top-level processes establish the capacity; fork helpers normally inherit
      * it, but recheck before receiving the parent's FD table. Guest
