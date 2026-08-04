@@ -35,6 +35,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/abi.h"
+#include "syscall/chown-overlay.h"
 #include "syscall/exec.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
@@ -369,6 +370,45 @@ static bool exec_matches_fakeroot_target(const struct stat *st)
     return marked_st.st_dev == st->st_dev && marked_st.st_ino == st->st_ino;
 }
 
+/* Is ID something the guest can actually mean?
+ *
+ * A sysroot is an ordinary directory tree owned by whoever unpacked it, and
+ * elfuse maps no host IDs into the guest, so most files report the invoking
+ * macOS user (e.g. 501) -- an ID that exists nowhere in the guest's own
+ * /etc/passwd. Honouring setuid on such a file would leave the process at an
+ * effective ID that is neither root nor its own, failing both `euid == 0`
+ * privilege checks and ownership comparisons against guest IDs, and the
+ * granted ID would follow whoever happens to own the tree rather than anything
+ * the guest chose.
+ *
+ * Accept only root and the caller's own ID, and only when both views of
+ * ownership agree on it.
+ *
+ * physical is what the host reports; seen is what the guest's own stat reports,
+ * after the virtual chown overlay. Elevating needs both because each view alone
+ * fails in a different direction. Reading the set-id owner through the overlay
+ * would make root self-service, since the overlay takes any unprivileged
+ * guest's chown -- chown its own file to 0, set the bit, exec. Reading it only
+ * from the host would let a file the guest's own stat says belongs to someone
+ * else still elevate, because a physically root-owned file keeps elevating
+ * after the guest chowns it away.
+ *
+ * Requiring agreement grants nothing new: root still means a file the host
+ * really owns as root, and a guest chown can only ever withdraw an elevation,
+ * never create one. The caller's own ID makes the bit a no-op, as on Linux.
+ * Anything else leaves the ID untouched and the program simply runs
+ * unprivileged -- the outcome Linux gives for a setuid binary on a nosuid
+ * mount, and never an exec failure.
+ */
+static bool exec_id_may_elevate(uint32_t physical,
+                                uint32_t seen,
+                                uint32_t self_id)
+{
+    if (physical != seen)
+        return false;
+    return physical == 0 || physical == self_id;
+}
+
 static int check_exec_permission(const struct stat *st)
 {
     uint32_t uid = proc_get_euid();
@@ -549,8 +589,22 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         err = linux_errno();
         goto fail;
     }
+    /* Judge access by the ownership the guest sees: fs-stat.c reports every
+     * guest stat through the virtual chown overlay, so the physical owner would
+     * refuse a file the guest's own stat says it may execute. Trusting a
+     * guest-writable overlay here -- chown_result records the intended owner on
+     * any EPERM, unchecked -- is a deliberate trade. A guest can chown a file
+     * into its own name to pass a check the physical mode refuses, and gains
+     * nothing: the host open must still succeed on the physical file.
+     *
+     * exec_st itself stays physical, and the set-id decision below takes both:
+     * it grants only where the two agree, so the overlay can withdraw an
+     * elevation but never conjure one.
+     */
+    struct stat exec_st_seen = exec_st;
+    chown_overlay_apply(&exec_st_seen);
 
-    err = check_exec_permission(&exec_st);
+    err = check_exec_permission(&exec_st_seen);
     if (err < 0) {
         goto fail;
     }
@@ -710,6 +764,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             err = linux_errno();
             goto fail;
         }
+        chown_overlay_apply(&interp_st);
         err = check_exec_permission(&interp_st);
         if (err < 0) {
             goto fail;
@@ -721,20 +776,32 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         goto fail;
     }
 
-    /* Compute setuid/setgid from the directly-executed file, matching Linux
-     * kernel behaviour (fs/exec.c bprm_fill_uid).  Scripts are
-     * deliberately excluded: the kernel ignores setuid/setgid on shebang
-     * scripts to prevent privilege escalation via interpreter manipulation.
-     * S_ISGID is only effective when the group-execute bit is also set,
-     * matching the kernel's mandatory-locking vs setgid distinction.
+    /* Compute setuid/setgid from the directly-executed file (fs/exec.c
+     * bprm_fill_uid). A set-id bit on the shebang script itself is ignored, as
+     * on Linux, so the interpreter named in the script cannot be manipulated
+     * into carrying the script's privilege. S_ISGID is only effective when the
+     * group-execute bit is also set, matching the kernel's mandatory-locking vs
+     * setgid distinction.
+     *
+     * Where this deliberately stops short of Linux: the kernel derives file
+     * creds from the file it finally executes, so a set-id *interpreter* named
+     * in a "#!" line does elevate there. exec_st is the directly-executed file
+     * and is never refreshed after the shebang loop, so it does not here.
+     * Elevating through an interpreter is unsupported, not accidentally lost.
      */
     uint32_t new_euid = proc_get_euid();
     uint32_t new_egid = proc_get_egid();
     if (have_exec_st && !exec_is_script && S_ISREG(exec_st.st_mode)) {
-        if (exec_st.st_mode & S_ISUID) {
+        if ((exec_st.st_mode & S_ISUID) &&
+            exec_id_may_elevate((uint32_t) exec_st.st_uid,
+                                (uint32_t) exec_st_seen.st_uid,
+                                proc_get_uid())) {
             new_euid = (uint32_t) exec_st.st_uid;
         }
-        if ((exec_st.st_mode & S_ISGID) && (exec_st.st_mode & S_IXGRP)) {
+        if ((exec_st.st_mode & S_ISGID) && (exec_st.st_mode & S_IXGRP) &&
+            exec_id_may_elevate((uint32_t) exec_st.st_gid,
+                                (uint32_t) exec_st_seen.st_gid,
+                                proc_get_gid())) {
             new_egid = (uint32_t) exec_st.st_gid;
         }
     }
@@ -844,6 +911,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             err = linux_errno();
             goto fail;
         }
+        chown_overlay_apply(&interp_st);
 
         err = check_exec_permission(&interp_st);
         if (err < 0) {
