@@ -27,6 +27,9 @@ linker resolved against an external sysroot via `--sysroot`.
   signals, timers, futexes (incl. PI ops), and polling
 - Guest reads and writes the macOS filesystem directly; no overlay or
   volume mount layer
+- Linux byte-exact filename semantics under `--sysroot`, including
+  case-colliding names on the default case-folding APFS (see
+  [docs/filenames.md](docs/filenames.md))
 - Synthetic `/proc` and selected `/dev` emulation for user-space probes
 - Guest-internal FUSE: `/dev/fuse` and `mount("fuse")` work without
   macFUSE / FUSE-T / FSKit
@@ -53,7 +56,7 @@ boot-time overhead those tools impose.
 - GNU `objcopy` or `llvm-objcopy`
 - Hypervisor entitlement: `com.apple.security.hypervisor`
 
-To build only (`make elfuse`) without running tests, just the 
+To build only (`make elfuse`) without running tests, just the
 Xcode Command Line Tools and `objcopy` (`brew install binutils`) suffice.
 
 For guest test binaries, the project also expects an AArch64 Linux cross
@@ -62,7 +65,7 @@ used by the repository test harness, but `CROSS_COMPILE` and
 `BAREMETAL_CROSS` are overridable.
 
 See
-[docs/testing.md](docs/testing.md#build-requirements) for toolchain setup guide. 
+[docs/testing.md](docs/testing.md#build-requirements) for toolchain setup guide.
 
 ## Quick Start
 
@@ -109,6 +112,9 @@ The build signs `build/elfuse` before use. Override the signing identity with
 - [docs/testing.md](docs/testing.md): build prerequisites, the
   `make check` flow, the QEMU and Rosetta cross-check matrices, and
   fixture handling.
+- [docs/filenames.md](docs/filenames.md): how a guest filename becomes a
+  name on disk and back: case folding and normalization on the sysroot
+  volume, the escape encoding, and the length limits both systems impose.
 - [docs/internals.md](docs/internals.md): canonical technical
   reference -- runtime lifecycle, HVF constraints, EL1 shim and HVC
   protocol, page-table splitting, syscall translation tables, threads

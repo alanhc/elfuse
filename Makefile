@@ -39,7 +39,8 @@ SRCS := \
     syscall/mem.c \
     syscall/path.c \
     syscall/fuse.c \
-    syscall/sidecar.c \
+    syscall/casefold.c \
+    syscall/casefold-walk.c \
     syscall/chown-overlay.c \
     syscall/fs.c \
     syscall/fs-stat.c \
@@ -192,6 +193,34 @@ $(BUILD_DIR)/test-teardown-live-vcpu-host: \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(HVF_LDFLAGS)
 
+## Build the volume naming probe (native macOS binary)
+# Standalone: it measures the filesystem, so it links nothing from the project.
+$(BUILD_DIR)/probe-volume-naming: $(BUILD_DIR)/probe-volume-naming.o \
+		| $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the filename codec host test (native macOS binary)
+# casefold.o is a leaf translation unit with no syscall-layer dependencies, so
+# the test links exactly the code under test and nothing else.
+$(BUILD_DIR)/test-casefold-host: $(BUILD_DIR)/test-casefold-host.o \
+		$(BUILD_DIR)/syscall/casefold.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the case-exact path resolution host test (native macOS binary)
+# Links the resolver and the codec; the two process-state symbols the resolver
+# reads are stubbed in the test.
+$(BUILD_DIR)/test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host.o \
+		$(BUILD_DIR)/syscall/casefold-walk.o \
+		$(BUILD_DIR)/syscall/casefold.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+$(BUILD_DIR)/test-absock-names-host: $(BUILD_DIR)/test-absock-names-host.o \
+		$(BUILD_DIR)/syscall/net-absock.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
@@ -211,6 +240,11 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 
 # test-pthread needs -lpthread
 $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
+# test-sysroot-name-soak churns from worker threads plus forked children
+$(BUILD_DIR)/test-sysroot-name-soak: tests/test-sysroot-name-soak.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 

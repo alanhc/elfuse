@@ -68,8 +68,30 @@ bool path_prefix_match(const char *path, const char *prefix, size_t plen);
  * from repeated slashes. Returns true with the component (not NUL-terminated)
  * reported through comp and len, leaving *pathp at its end; returns false once
  * only slashes or the terminating NUL remain.
+ *
+ * Inline beside path_component_copy, its usual companion, so a leaf module can
+ * walk a path without linking the rest of the translation layer.
  */
-bool path_next_component(const char **pathp, const char **comp, size_t *len);
+static inline bool path_next_component(const char **pathp,
+                                       const char **comp,
+                                       size_t *len)
+{
+    const char *p = *pathp;
+
+    while (*p == '/')
+        p++;
+    if (*p == '\0') {
+        *pathp = p;
+        return false;
+    }
+
+    *comp = p;
+    while (*p != '\0' && *p != '/')
+        p++;
+    *len = (size_t) (p - *comp);
+    *pathp = p;
+    return true;
+}
 
 /* Copy a counted component (not NUL-terminated, as path_next_component reports)
  * into dst and NUL-terminate it. Returns 0, or -1 with errno set to
@@ -98,7 +120,60 @@ int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,
                       path_translation_t *tx);
-int path_translate_dirent_name(guest_fd_t dirfd,
+/* Longest symlink chain a resolution may follow before reporting ELOOP, as
+ * Linux does (include/linux/namei.h). Shared so the path layer and the sysroot
+ * resolvers cannot disagree about when a chain has gone on too long.
+ */
+#ifndef MAXSYMLINKS
+#define MAXSYMLINKS 40
+#endif
+
+/* Splice a symlink target back into a path being resolved: @target followed by
+ * whatever of the original path was left unconsumed. @prefix is prepended for a
+ * relative target only, and names the directory holding the link; pass NULL
+ * when the caller re-anchors another way. One copy, because the concatenation
+ * is where a spliced path could be silently shortened into a different one.
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG.
+ */
+int path_splice_link_target(const char *prefix,
+                            size_t prefix_len,
+                            const char *target,
+                            const char *rest,
+                            char *out,
+                            size_t outsz);
+
+/* Convert a host path to the guest path naming the same object: strip the
+ * sysroot prefix, and decode any component the volume made elfuse store under
+ * an escape. The result is what the guest must be shown for its own cwd, and it
+ * has to be a path the guest can hand straight back to chdir(2).
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG when @out is too small.
+ */
+int path_host_to_guest(const char *host_path, char *out, size_t outsz);
+
+/* True when the directory behind @host_dirfd is one whose entries elfuse may
+ * have stored escaped: a folding sysroot is configured and the directory's
+ * canonical host path lies under it. One answer per directory read, not per
+ * entry: the answer is a property of the directory, and F_GETPATH is a
+ * syscall. When the fd's path cannot be read the answer is false: decoding is
+ * a claim that elfuse wrote the name, so it needs the directory proven inside
+ * the sysroot, or a foreign escape-shaped entry decodes into a phantom name no
+ * lookup can resolve. The directory-unlinked-while-open failure lists nothing
+ * either way, and the residual cost of failing closed, a live in-sysroot
+ * directory that lost its path showing stored spellings, at least shows names
+ * that open.
+ */
+bool path_dirent_dir_holds_escapes(host_fd_t host_dirfd);
+
+/* Decode one on-disk entry name to the guest-visible spelling.
+ * @dir_holds_escapes is the caller's per-directory answer from
+ * path_dirent_dir_holds_escapes(); when false every name means itself.
+ * Returns 0, or -1 with errno set: ENAMETOOLONG for a host name no guest
+ * dirent or event buffer could carry, which is the one failure a caller with
+ * real arguments sees; a missing argument is EINVAL.
+ */
+int path_translate_dirent_name(bool dir_holds_escapes,
                                const char *host_name,
                                char *guest_name,
                                size_t guest_name_sz);
@@ -144,13 +219,14 @@ int path_openat2_resolved_within_root(guest_fd_t dirfd,
  * on every non-error return so the caller can re-run the check against the
  * actually opened fd via path_openat2_check_fd_xdev. The post-open check is
  * what closes the symlink bypass for callers that do not also set
- * RESOLVE_NO_SYMLINKS: the precheck's fstatat walk cannot see symlinks that
- * live in a sidecar shadow directory (case-fold sysroot), so the kernel may
- * follow a link the walker did not, and only F_GETPATH on the resulting fd
- * reveals the real landing site.
+ * RESOLVE_NO_SYMLINKS: the precheck's fstatat walk probes each component by
+ * its stored spelling, and on a case-fold sysroot that spelling can change
+ * between the precheck and the open, so the kernel may follow a link the
+ * walker did not, and only F_GETPATH on the resulting fd reveals the real
+ * landing site.
  *
  * Known gaps (best-effort by design):
- * - host_path_to_guest_path strips the configured sysroot prefix with
+ * - path_host_to_guest strips the configured sysroot prefix with
  *    a case-sensitive strncmp; on case-insensitive macOS volumes a
  *    differently-cased F_GETPATH could fail to strip and the dirfd is
  *    then classified as the root class. Sysroots that happen to live

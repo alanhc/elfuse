@@ -39,7 +39,6 @@
 #include "syscall/path.h"
 #include "syscall/poll.h" /* epoll_dup_fd */
 #include "syscall/proc.h"
-#include "syscall/sidecar.h"
 
 /* Linux dirent64 layout. */
 typedef struct {
@@ -483,27 +482,6 @@ int64_t sys_openat_path(guest_t *g,
                         int linux_flags,
                         int mode)
 {
-    if (linux_flags & LINUX_O_CREAT) {
-        int sidecar_fd =
-            sidecar_openat(dirfd, pathp, linux_flags, (mode_t) mode);
-        if (sidecar_fd != (int) SIDECAR_NOT_HANDLED) {
-            if (sidecar_fd < 0)
-                return linux_errno();
-            int type = opened_fd_type(sidecar_fd, linux_flags);
-            if (type < 0) {
-                close_keep_errno(sidecar_fd);
-                return linux_errno();
-            }
-            int guest_fd = fd_alloc_opened_host(sidecar_fd, type, linux_flags,
-                                                -1, NULL, NULL);
-            if (guest_fd < 0) {
-                close_keep_errno(sidecar_fd);
-                return linux_errno();
-            }
-            return guest_fd;
-        }
-    }
-
     path_translation_t tx;
     unsigned int tx_flags =
         (linux_flags & LINUX_O_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE;
@@ -1621,6 +1599,11 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      */
     uint8_t entry_buf[280];
 
+    /* One answer per call, not per entry: which side of the sysroot boundary
+     * the stream reads from is a property of the directory.
+     */
+    const bool dir_holds_escapes = path_dirent_dir_holds_escapes(dirfd(dir));
+
     while (1) {
         /* Save position BEFORE readdir so getdents emulation can rewind if the
          * entry does not fit. macOS telldir returns an opaque cookie --
@@ -1632,10 +1615,8 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
             break;
 
         char guest_name[NAME_MAX + 1];
-        int name_rc = path_translate_dirent_name(fd, de->d_name, guest_name,
-                                                 sizeof(guest_name));
-        if (name_rc > 0)
-            continue;
+        int name_rc = path_translate_dirent_name(
+            dir_holds_escapes, de->d_name, guest_name, sizeof(guest_name));
         if (name_rc < 0) {
             /* macOS APFS accepts UTF-8 filenames whose byte length exceeds
              * Linux NAME_MAX (255). A guest libc cannot represent such a name
@@ -1957,10 +1938,6 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
     if (!validate_at_flags(flags, LINUX_AT_REMOVEDIR))
         return -LINUX_EINVAL;
 
-    int64_t sidecar_rc = sidecar_unlinkat(dirfd, path, flags);
-    if (sidecar_rc != SIDECAR_NOT_HANDLED)
-        return sidecar_rc;
-
     path_translation_t tx;
     int64_t rc =
         read_translated_path(g, dirfd, path_gva, PATH_TR_CREATE, path, &tx);
@@ -2004,10 +1981,6 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode)
     char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
-
-    int64_t sidecar_rc = sidecar_mkdirat(dirfd, path, (mode_t) mode);
-    if (sidecar_rc != SIDECAR_NOT_HANDLED)
-        return sidecar_rc;
 
     path_translation_t tx;
     int64_t rc = read_translated_path(
@@ -2062,11 +2035,6 @@ int64_t sys_renameat2(guest_t *g,
         ((flags & LINUX_RENAME_NOREPLACE) && (flags & LINUX_RENAME_EXCHANGE))) {
         return -LINUX_EINVAL;
     }
-
-    int64_t sidecar_rc =
-        sidecar_renameat(olddirfd, oldpath, newdirfd, newpath, flags);
-    if (sidecar_rc != SIDECAR_NOT_HANDLED)
-        return sidecar_rc;
 
     if (path_translate_at(olddirfd, oldpath, PATH_TR_NOFOLLOW, &old_tx) < 0 ||
         path_translate_at(newdirfd, newpath, PATH_TR_CREATE | PATH_TR_NOFOLLOW,
@@ -2391,11 +2359,6 @@ int64_t sys_linkat(guest_t *g,
 
     if (!validate_at_flags(flags, LINUX_AT_SYMLINK_FOLLOW))
         return -LINUX_EINVAL;
-
-    int64_t sidecar_rc =
-        sidecar_linkat(olddirfd, oldpath, newdirfd, newpath, flags);
-    if (sidecar_rc != SIDECAR_NOT_HANDLED)
-        return sidecar_rc;
 
     unsigned int old_flags =
         (flags & LINUX_AT_SYMLINK_FOLLOW) ? PATH_TR_NONE : PATH_TR_NOFOLLOW;

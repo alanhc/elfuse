@@ -24,6 +24,7 @@
 #include "syscall/net.h"
 #include "syscall/net-sockopt.h"
 #include "syscall/net-abi.h"
+#include "syscall/net-absock.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
@@ -222,10 +223,11 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
-        int ml = linux_to_mac_sockaddr(linux_sa, lmsg.msg_namelen, &mac_sa);
+        int ml =
+            net_sockaddr_to_mac(linux_sa, lmsg.msg_namelen, false, &mac_sa);
         if (ml < 0) {
             host_fd_ref_close(&host_ref);
-            return -LINUX_EINVAL;
+            return ml;
         }
         dest_sa = (struct sockaddr *) &mac_sa;
         dest_len = (socklen_t) ml;
@@ -584,13 +586,24 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     }
 
     if (lmsg.msg_name) {
+        /* Stays 0 when the host reported no address, and when one could not be
+         * converted: either way nothing was written for a length to describe.
+         */
+        uint32_t nl = 0;
         if (msg.msg_namelen > 0) {
             uint8_t linux_sa[128];
-            int out_len = mac_to_linux_sockaddr((struct sockaddr *) &mac_sa,
+            int out_len = net_sockaddr_from_mac((struct sockaddr *) &mac_sa,
                                                 msg.msg_namelen, linux_sa,
                                                 (uint32_t) sizeof(linux_sa));
             if (out_len > 0) {
-                uint32_t write_len = (uint32_t) out_len;
+                /* The length must describe the bytes written, which are the
+                 * translated address rather than the host one: a pathname
+                 * socket's host spelling is the longer of the two, so passing
+                 * the host length on leaves the guest reading past the address
+                 * it was given. Reported untruncated, per recvmsg(2).
+                 */
+                nl = (uint32_t) out_len;
+                uint32_t write_len = nl;
                 if (write_len > lmsg.msg_namelen)
                     write_len = lmsg.msg_namelen;
                 if (guest_write_small(g, lmsg.msg_name, linux_sa, write_len) <
@@ -602,7 +615,6 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                 }
             }
         }
-        uint32_t nl = (uint32_t) msg.msg_namelen;
         if (guest_write_small(g,
                               msg_gva + offsetof(linux_msghdr_t, msg_namelen),
                               &nl, sizeof(nl)) < 0) {

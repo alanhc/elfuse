@@ -328,6 +328,23 @@ static inline int bit_popcount64(uint64_t word)
     return __builtin_popcountll(word);
 }
 
+/* 64-bit FNV-1a over @len bytes. Not cryptographic: collision resistance is
+ * the birthday bound on 64 bits, which suits stable identifiers derived from
+ * names (synthetic inode numbers, derived filenames), not adversarial input.
+ * Constants from the FNV reference (offset basis, prime).
+ */
+static inline uint64_t fnv1a64(const void *data, size_t len)
+{
+    const unsigned char *p = (const unsigned char *) data;
+    uint64_t h = 1469598103934665603ULL;
+
+    while (len--) {
+        h ^= (uint64_t) *p++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 /* Compiler attribute wrappers.
  *
  * PACKED removes inter-field padding, used for Linux ABI structures whose

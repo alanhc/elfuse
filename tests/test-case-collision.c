@@ -3,6 +3,23 @@
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Names that a case-folding volume would merge must stay separate files to the
+ * guest, and every syscall that names a file has to agree about which one it
+ * means. This walks the whole surface (open, rename, renameat2 with EXCHANGE
+ * and NOREPLACE, linkat, symlinkat, getdents64, statx, xattr) against a set
+ * of names differing only in case.
+ *
+ * Code under test: the resolver in src/syscall/casefold-walk.c reached through
+ * src/syscall/path.c. A regression shows up as two guest names resolving to one
+ * file, so a write through one spelling is visible through the other, or as a
+ * listing reporting a name the guest cannot then open.
+ *
+ * Nothing here may be conditional on the sysroot's on-disk layout. Three checks
+ * once gated themselves on the presence of a per-directory index file that the
+ * stateless scheme does not create, which made them report success without
+ * running their assertions; a guard whose condition cannot hold is a silent
+ * pass, so these assert unconditionally. Run under --sysroot.
  */
 
 #include <dirent.h>
@@ -158,11 +175,49 @@ static int getdents_contains_after_partial(const char *dir_path,
     return saw_first && saw_second;
 }
 
-static int sidecar_fallback_active(const char *dir_path)
+/* One linkat case over a symlink: create @target_name, point @link_name at it
+ * (spelled relative or absolute by @absolute_target), and hard-link the
+ * symlink with @flags. @expect_link says which node the new name must be: the
+ * link itself without AT_SYMLINK_FOLLOW, the target with it. The hard-link
+ * names are case-protected, so on a folding sysroot every case exercises the
+ * escaped-create path through linkat rather than through open.
+ */
+static void check_linkat(const char *base,
+                         const char *target_name,
+                         const char *link_name,
+                         const char *hard_name,
+                         bool absolute_target,
+                         int flags,
+                         bool expect_link)
 {
-    char index_path[512];
-    snprintf(index_path, sizeof(index_path), "%s/.elfuse_case_index", dir_path);
-    return access(index_path, F_OK) == 0;
+    char target[320];
+    char link_path[320];
+    char hard_path[320];
+    struct stat st;
+
+    snprintf(target, sizeof(target), "%s/%s", base, target_name);
+    snprintf(link_path, sizeof(link_path), "%s/%s", base, link_name);
+    snprintf(hard_path, sizeof(hard_path), "%s/%s", base, hard_name);
+    unlink(hard_path);
+    unlink(link_path);
+    unlink(target);
+
+    if (create_file(target, "linkat\n") < 0) {
+        FAIL("failed to create link target");
+    } else if (symlink(absolute_target ? target : target_name, link_path) < 0) {
+        FAIL("failed to create symlink");
+    } else if (lstat(link_path, &st) < 0 || !S_ISLNK(st.st_mode)) {
+        FAIL("lstat did not report the symlink");
+    } else if (linkat(AT_FDCWD, link_path, AT_FDCWD, hard_path, flags) < 0) {
+        FAIL("linkat failed");
+    } else if (lstat(hard_path, &st) < 0) {
+        FAIL("lstat on the new hard link failed");
+    } else if (expect_link ? !S_ISLNK(st.st_mode) : !S_ISREG(st.st_mode)) {
+        FAIL(expect_link ? "followed the symlink when asked not to"
+                         : "linked the symlink itself instead of its target");
+    } else {
+        PASS();
+    }
 }
 
 int main(void)
@@ -349,7 +404,7 @@ int main(void)
         }
     }
 
-    TEST("plain rename updates sidecar mapping for colliding source");
+    TEST("plain rename moves a colliding source to its new spelling");
     {
         char old_path[320];
         char new_path[320];
@@ -373,7 +428,7 @@ int main(void)
             FAIL("rename disturbed untouched colliding entry");
         } else if (dir_has_entry(base, "foo") != 0 ||
                    dir_has_entry(base, "bar") != 1) {
-            FAIL("directory listing did not reflect sidecar rename");
+            FAIL("directory listing did not reflect the rename");
         } else {
             PASS();
         }
@@ -400,58 +455,73 @@ int main(void)
         }
     }
 
-    TEST("fallback linkat preserves AT_SYMLINK_FOLLOW semantics");
+    /* AT_SYMLINK_FOLLOW hard-links what the symlink points at, so the result
+     * is a regular file; without it linkat(2) links the symlink itself, and
+     * that holds for an absolute target too: nothing has to resolve the
+     * target to copy the link.
+     *
+     * The followed target is spelled relative in one case and absolute in the
+     * other: a symlink stores the bytes the guest wrote, so the two spellings
+     * reach the target through different resolution paths (the relative one
+     * against the translated parent, the absolute one through the
+     * guest-namespace splice), and only running both shows linkat follows
+     * each.
+     */
+    TEST("linkat AT_SYMLINK_FOLLOW links the target, not the symlink");
+    check_linkat(base, "real-target", "real-link", "REAL-HARD", false,
+                 AT_SYMLINK_FOLLOW, false);
+
+    TEST("linkat AT_SYMLINK_FOLLOW follows an absolute target too");
+    check_linkat(base, "Abs.Target", "abs-follow-link", "ABS-FOLLOW-HARD", true,
+                 AT_SYMLINK_FOLLOW, false);
+
+    TEST("linkat without AT_SYMLINK_FOLLOW links the symlink itself");
+    check_linkat(base, "abs-target", "abs-link", "ABS-HARD", true, 0, true);
+
+    /* One probe suffices for flag validation: the flag set is checked before
+     * the paths are resolved, so which fixture it runs against does not enter
+     * into it.
+     */
+    TEST("unsupported linkat flags are rejected");
     {
         char target[320];
-        char link_path[320];
         char hard_path[320];
-        struct stat st;
 
         snprintf(target, sizeof(target), "%s/real-target", base);
-        snprintf(link_path, sizeof(link_path), "%s/real-link", base);
-        snprintf(hard_path, sizeof(hard_path), "%s/REAL-HARD", base);
-        unlink(hard_path);
-        unlink(link_path);
-        unlink(target);
-
-        if (create_file(target, "follow\n") < 0) {
-            FAIL("failed to create link target");
-        } else if (symlink(target, link_path) < 0) {
-            FAIL("failed to create symlink");
-        } else if (!sidecar_fallback_active(base)) {
-            PASS();
-        } else if (linkat(AT_FDCWD, link_path, AT_FDCWD, hard_path,
-                          AT_SYMLINK_FOLLOW) < 0) {
-            FAIL("linkat with AT_SYMLINK_FOLLOW failed");
-        } else if (lstat(hard_path, &st) < 0) {
-            FAIL("lstat on hardlink target failed");
-        } else if (!S_ISREG(st.st_mode)) {
-            FAIL("sidecar fallback linked the symlink instead of its target");
-        } else if (linkat(AT_FDCWD, target, AT_FDCWD, hard_path, 0x40000000) !=
-                       -1 ||
-                   errno != EINVAL) {
-            FAIL("sidecar fallback accepted unsupported linkat flags");
-        } else {
-            PASS();
-        }
+        snprintf(hard_path, sizeof(hard_path), "%s/FLAG-HARD", base);
+        EXPECT_TRUE(
+            linkat(AT_FDCWD, target, AT_FDCWD, hard_path, 0x40000000) == -1 &&
+                errno == EINVAL,
+            "unsupported linkat flags were accepted");
     }
 
-    TEST("fallback rejects reserved sidecar basename for create paths");
+    /* Deriving the on-disk spelling from the guest name alone means the sysroot
+     * keeps no bookkeeping file of its own, so no basename is reserved and the
+     * guest may create any name Linux allows. An earlier scheme did reserve
+     * one, and refusing a name the guest is entitled to create is the failure
+     * this pins.
+     */
+    TEST("no basename is reserved for create paths");
     {
-        char poison[320];
-        snprintf(poison, sizeof(poison), "%s/.elfuse_case_index", base);
-        unlink(poison);
+        char plain[320];
+        char buf[64];
+        ssize_t n;
 
-        if (!sidecar_fallback_active(base)) {
-            PASS();
-        } else if (symlinkat("target", AT_FDCWD, poison) != -1 ||
-                   errno != ENOENT) {
-            FAIL("reserved sidecar basename was creatable");
-        } else if (!sidecar_fallback_active(base)) {
-            FAIL("reserved-name probe disturbed sidecar metadata");
+        snprintf(plain, sizeof(plain), "%s/.elfuse_case_index", base);
+        unlink(plain);
+
+        if (symlinkat("target", AT_FDCWD, plain) < 0) {
+            FAIL("a name the guest is entitled to create was refused");
+        } else if ((n = readlink(plain, buf, sizeof(buf) - 1)) < 0) {
+            FAIL("the created name does not resolve back");
         } else {
-            PASS();
+            buf[n] = '\0';
+            if (strcmp(buf, "target"))
+                FAIL("readlink returned the wrong target");
+            else
+                PASS();
         }
+        unlink(plain);
     }
 
     TEST("255-byte colliding basenames both open");

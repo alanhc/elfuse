@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "linux-openat2.h"
 #include "test-harness.h"
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -156,20 +157,6 @@ out:
 }
 
 /* openat2 (SYS 437). */
-
-#ifndef SYS_openat2
-#define SYS_openat2 437
-#endif
-
-struct open_how {
-    unsigned long long flags, mode, resolve;
-};
-
-#define RESOLVE_NO_XDEV 0x01
-#define RESOLVE_NO_MAGICLINKS 0x02
-#define RESOLVE_NO_SYMLINKS 0x04
-#define RESOLVE_BENEATH 0x08
-#define RESOLVE_IN_ROOT 0x10
 
 #ifndef O_TMPFILE
 #define O_TMPFILE (020000000 | O_DIRECTORY)
@@ -491,6 +478,72 @@ out:
     unlink(link_path);
     unlink(subfile);
     rmdir(target_dir);
+    rmdir(dir_template);
+}
+
+/* Deep enough to cross WALK_MAXSYMLINKS if a walker charged the link budget
+ * once per component.
+ */
+#define WALK_DEEP_COMPONENTS (WALK_MAXSYMLINKS + 4)
+
+static void test_openat2_resolve_no_symlinks_deep_path(void)
+{
+    TEST("openat2 RESOLVE_NO_SYMLINKS resolves a link-free deep path");
+
+    char dir_template[] = "/tmp/elfuse-openat2-deep-XXXXXX";
+    /* Where each component starts, so the teardown shortens the very path the
+     * setup built instead of re-deriving its shape.
+     */
+    size_t comp_off[WALK_DEEP_COMPONENTS];
+    char rel[PATH_MAX];
+    size_t len = 0;
+    int made = 0;
+    int dirfd = -1;
+
+    if (!mkdtemp(dir_template)) {
+        FAIL("mkdtemp");
+        return;
+    }
+    dirfd = open(dir_template, O_RDONLY | O_DIRECTORY);
+    if (dirfd < 0) {
+        FAIL("open dir");
+        goto out;
+    }
+
+    for (int depth = 0; depth < WALK_DEEP_COMPONENTS; depth++) {
+        int n = snprintf(rel + len, sizeof(rel) - len, "%sd", len ? "/" : "");
+        if (n < 0 || (size_t) n >= sizeof(rel) - len) {
+            FAIL("path buffer too small");
+            goto out;
+        }
+        comp_off[depth] = len;
+        len += (size_t) n;
+        if (mkdirat(dirfd, rel, 0700) < 0) {
+            rel[comp_off[depth]] = '\0';
+            FAIL("mkdirat");
+            goto out;
+        }
+        made = depth + 1;
+    }
+
+    struct open_how how = {.flags = O_RDONLY | O_DIRECTORY,
+                           .mode = 0,
+                           .resolve = RESOLVE_NO_SYMLINKS};
+    long fd = syscall(SYS_openat2, dirfd, rel, &how, sizeof(how));
+    if (fd < 0) {
+        FAIL("deep link-free path rejected");
+        goto out;
+    }
+    close((int) fd);
+    PASS();
+
+out:
+    for (int i = made; i-- > 0;) {
+        unlinkat(dirfd, rel, AT_REMOVEDIR);
+        rel[comp_off[i]] = '\0';
+    }
+    if (dirfd >= 0)
+        close(dirfd);
     rmdir(dir_template);
 }
 
@@ -1363,6 +1416,7 @@ int main(void)
     test_openat2_resolve_beneath_allows_internal_dotdot();
     test_openat2_resolve_in_root_clamps_dotdot();
     test_openat2_resolve_no_symlinks_intermediate();
+    test_openat2_resolve_no_symlinks_deep_path();
     test_openat2_resolve_beneath_rejects_symlink_escape();
     test_openat2_resolve_no_magiclinks_proc_fd();
     test_openat2_resolve_no_magiclinks_proc_cwd();
