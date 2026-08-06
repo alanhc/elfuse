@@ -23,13 +23,26 @@ int gdb_hex_encode(char *dst, const uint8_t *src, size_t len)
     return (int) bytes_to_hex(dst, src, len);
 }
 
-/* Combine two hex digits into a byte. Returns 0 when either is not a hex
- * digit, leaving *out untouched.
+/* Combine two hex digits into a byte.
+ *
+ * Returns 0 when either is not a hex digit, leaving *out untouched.
  *
  * Both nibbles are validated before either is shifted. hex_nibble returns -1
  * for a non-digit, and shifting a negative int left is undefined behavior, so
  * the obvious "(hex_nibble(hi) << 4) | hex_nibble(lo)" is UB on any input the
  * remote sends that is not hex. The remote controls these bytes completely.
+ */
+/*@ predicate is_hex_digit(integer c) =
+      ('0' <= c <= '9') || ('a' <= c <= 'f') || ('A' <= c <= 'F');
+ */
+/*@
+  requires \valid(out);
+  assigns *out;
+  ensures \result == 0 || \result == 1;
+  ensures \result != 0 <==> (is_hex_digit((unsigned char) hi) &&
+                             is_hex_digit((unsigned char) lo));
+  ensures \result != 0 ==> *out == 16 * hex_val((unsigned char) hi) +
+                                    hex_val((unsigned char) lo);
  */
 static int gdb_hex_pair(char hi, char lo, uint8_t *out)
 {
@@ -41,24 +54,53 @@ static int gdb_hex_pair(char hi, char lo, uint8_t *out)
     if (l < 0)
         return 0;
 
-    /* Unsigned: a signed left shift that overflows is undefined, and int is
-     * the type hex_nibble returns.
+    /* Unsigned arithmetic, and "* 16 +" rather than "<< 4 |": a signed left
+     * shift that overflows is undefined, and the prover reasons about the
+     * arithmetic form directly whereas the bitwise OR needs it to first
+     * establish that the two operands do not share bits.
      */
-    *out = (uint8_t) (((unsigned int) h << 4) | (unsigned int) l);
+    *out = (uint8_t) ((unsigned int) h * 16u + (unsigned int) l);
     return 1;
 }
 
-/* Decode len bytes from 2*len hex digits. Returns len, or -1 on the first
- * non-hex digit.
+/* Decode len bytes from 2*len hex digits.
  *
- * The caller must supply 2*len readable digits. Decoding stops at the first bad
- * digit without reading its partner: the pair used to be read together before
- * either was validated, so a NUL landing on an even index caused a one-byte
- * read past it, and gdb_rsp_recv can place that NUL at the last byte of the
- * packet buffer.
+ * Returns len, or -1 on the first non-hex digit.
+ *
+ * The caller must supply 2*len readable digits; nothing here can check that,
+ * which is why the contract states it. Decoding stops at the first bad digit
+ * without reading its partner: the pair used to be read together before either
+ * was validated, so a NUL landing on an even index caused a one-byte read past
+ * it, and gdb_rsp_recv can place that NUL at the last byte of the packet
+ * buffer.
+ */
+/*@
+  requires len <= INT_MAX;
+  requires \valid(dst + (0 .. len - 1));
+  requires \valid_read(src + (0 .. 2 * len - 1));
+  requires \separated(dst + (0 .. len - 1), src + (0 .. 2 * len - 1));
+  assigns dst[0 .. len - 1];
+  ensures \result == -1 || \result == (int) len;
+  ensures \result != -1 <==>
+            (\forall integer k; 0 <= k < 2 * len ==>
+               is_hex_digit((unsigned char) src[k]));
+  ensures \result != -1 ==>
+            (\forall integer k; 0 <= k < len ==>
+               dst[k] == 16 * hex_val((unsigned char) src[2 * k]) +
+                              hex_val((unsigned char) src[2 * k + 1]));
  */
 int gdb_hex_decode(uint8_t *dst, const char *src, size_t len)
 {
+    /*@
+      loop invariant 0 <= i <= len;
+      loop invariant \forall integer k; 0 <= k < 2 * i ==>
+                       is_hex_digit((unsigned char) src[k]);
+      loop invariant \forall integer k; 0 <= k < i ==>
+                       dst[k] == 16 * hex_val((unsigned char) src[2 * k]) +
+                                      hex_val((unsigned char) src[2 * k + 1]);
+      loop assigns i, dst[0 .. len - 1];
+      loop variant len - i;
+     */
     for (size_t i = 0; i < len; i++) {
         /* Read the digits in order and bail between them. Handing both to
          * gdb_hex_pair would not do: C evaluates both arguments before the
@@ -73,29 +115,99 @@ int gdb_hex_decode(uint8_t *dst, const char *src, size_t len)
         if (lo < 0)
             return -1;
 
-        dst[i] = (uint8_t) (((unsigned int) hi << 4) | (unsigned int) lo);
+        dst[i] = (uint8_t) ((unsigned int) hi * 16u + (unsigned int) lo);
     }
     return (int) len;
 }
 
+/* Consume a run of hex digits and return its value, advancing *pp past them.
+ *
+ * The scan is bounded only by the terminating NUL, so the caller must pass a
+ * NUL-terminated string; gdb_rsp_recv guarantees that for every packet it
+ * returns. The contract states it rather than leaving it to the reader.
+ *
+ * NOT proved: the returned value. Specifying it needs a recursive logic
+ * function over the digit run, and the resulting loop invariant (which must
+ * relate the accumulator to a pointer-offset expression through a modulo-2^64
+ * fold) times out in Z3 even at 120s. What is proved here is memory safety,
+ * termination, and that *pp only advances within the same object. The value is
+ * covered end to end by tests/test-gdbstub.sh, whose memory and register cases
+ * cannot pass if addresses parse wrongly.
+ *
+ * More than 16 digits wraps, which is deliberate and matches gdbserver: the
+ * value feeds addresses and lengths that every caller bound-checks against
+ * guest memory anyway, so a wrapped value is rejected downstream rather than
+ * here, where refusing it would change the parse position.
+ */
+/*@
+  requires \valid(pp);
+  requires valid_read_string(*pp);
+  assigns *pp;
+  ensures valid_read_string(*pp);
+  ensures \base_addr(*pp) == \base_addr(\old(*pp));
+  ensures \offset(*pp) >= \offset(\old(*pp));
+ */
 uint64_t gdb_parse_hex(const char **pp)
 {
     const char *p = *pp;
     uint64_t val = 0;
+
+    /*@
+      loop invariant valid_read_string(p);
+      loop invariant \base_addr(p) == \base_addr(\at(*pp, Pre));
+      loop invariant \offset(p) >= \offset(\at(*pp, Pre));
+      loop assigns p, val;
+      loop variant strlen(p);
+     */
     while (1) {
         int d = hex_nibble((unsigned char) *p);
         if (d < 0)
             break;
-        val = (val << 4) | (uint64_t) d;
+
+        /* val * 16 + d, not (val << 4) | d: same value for d <= 15 (the shift
+         * clears the low nibble), and the prover reasons about the arithmetic
+         * form without first proving the operands are disjoint.
+         */
+        val = val * 16u + (uint64_t) d;
         p++;
     }
     *pp = p;
     return val;
 }
 
+/* RSP checksum: the low byte of the sum of the payload. Wrapping is the
+ * protocol, not an accident, so uint8_t arithmetic is deliberate.
+ *
+ * byte_sum below defines that value recursively, folding modulo 256 at every
+ * step exactly as the uint8_t accumulator does. Defining it as a plain sum and
+ * taking "% 256" only in the postcondition also specifies the right value, but
+ * then every loop step asks the prover to show (x % 256 + b) % 256 == (x + b) %
+ * 256, which Z3 times out on.
+ */
+/*@ axiomatic RspByteSum {
+      logic integer byte_sum{L}(char *d, integer n) reads d[0 .. n - 1];
+      axiom byte_sum_empty{L}:
+        \forall char *d; byte_sum(d, 0) == 0;
+      axiom byte_sum_step{L}:
+        \forall char *d, integer n; n > 0 ==>
+          byte_sum(d, n) ==
+            (byte_sum(d, n - 1) + (unsigned char) d[n - 1]) % 256;
+    }
+ */
+/*@
+  requires \valid_read(data + (0 .. len - 1));
+  assigns \nothing;
+  ensures \result == byte_sum(data, len);
+ */
 static uint8_t rsp_checksum(const char *data, size_t len)
 {
     uint8_t sum = 0;
+    /*@
+      loop invariant 0 <= i <= len;
+      loop invariant sum == byte_sum(data, i);
+      loop assigns i, sum;
+      loop variant len - i;
+     */
     for (size_t i = 0; i < len; i++)
         sum += (uint8_t) data[i];
     return sum;
@@ -161,9 +273,10 @@ void gdb_rsp_set_noack(gdb_rsp_ctx_t *ctx, bool enabled)
 }
 
 /* Read one RSP packet from the client into @buf. Strips $...# framing and
- * verifies the checksum, sending + acknowledgment on success. Returns packet
- * length, 0 on EOF, -1 on error. Also handles bare 0x03 (Ctrl+C) by returning
- * "\x03" as a 1-byte packet.
+ * verifies the checksum, sending + acknowledgment on success.
+ *
+ * Returns packet length, 0 on EOF, -1 on error. Also handles bare 0x03 (Ctrl+C)
+ * by returning "\x03" as a 1-byte packet.
  *
  * Uses a static read buffer to batch socket reads instead of reading one byte
  * at a time. Packets exceeding @bufsz are rejected with E00.
@@ -172,7 +285,8 @@ int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz)
 {
     /* Two bytes minimum: every returned packet is NUL-terminated, and the bare
      * 0x03 (Ctrl+C) reply needs one byte for the payload and one for the
-     * terminator. A one-byte buffer could not honor that guarantee.
+     * terminator. Accepting bufsz 1 would hand back an unterminated packet and
+     * break the guarantee gdb_parse_hex's contract relies on.
      */
     if (bufsz < 2) {
         errno = EINVAL;
@@ -204,8 +318,10 @@ int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz)
 
             if (c == 0x03) {
                 buf[0] = 0x03;
-                /* Terminate like every other returned packet; bufsz >= 2 is
-                 * enforced above.
+
+                /* Terminate like every other returned packet: gdb_parse_hex's
+                 * contract requires a NUL-terminated string and cites this
+                 * function as the guarantee. bufsz >= 2 is enforced above.
                  */
                 buf[1] = '\0';
                 return 1;

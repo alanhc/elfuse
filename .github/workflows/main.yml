@@ -211,7 +211,7 @@ jobs:
       - name: clang-tidy (make lint)
         run: make lint
 
-  # Frama-C WP proof of the attacker-facing ELF arithmetic via `make verify`.
+  # Frama-C WP proofs of the attacker-facing arithmetic via `make verify`.
   #
   # GATING, unlike tidy-macos and scan-macos: the inputs these proofs cover come
   # from untrusted binaries and from the guest itself, so an unproved
@@ -237,7 +237,7 @@ jobs:
       # step exits 10.
       OPAMCONFIRMLEVEL: unsafe-yes
       # The gate fails on any single [Timeout], and a shared runner is slower
-      # than a dev machine (the proofs take a few seconds each locally). The job
+      # than a dev machine (the three proofs take 3-9s each locally). The job
       # already has a 60-minute budget, so headroom here costs nothing and
       # removes a flake class that would read as a proof regression.
       FRAMAC_TIMEOUT: 120
@@ -291,7 +291,7 @@ jobs:
             alt-ergo.$ALT_ERGO_VERSION \
             z3.$Z3_VERSION
 
-      - name: Prove the parser and translation (make verify)
+      - name: Prove the parsers and translation (make verify)
         # why3 config detect runs here rather than in the install step: it
         # writes ~/.why3.conf, which lives outside OPAMROOT and so is absent on
         # a cache hit. Skipping it makes WP abort with "Prover not found in

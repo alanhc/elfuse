@@ -1,6 +1,7 @@
 # Static analysis and formatting
 
-.PHONY: lint analyze check-format indent verify verify-elf verify-gva
+.PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
+        verify-gva
 
 CLANG_TIDY ?= clang-tidy
 
@@ -59,11 +60,13 @@ lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 #   uint64_t alignment       8             8            yes
 #   plain char signedness    unsigned      signed       see below
 #
-# Plain-char signedness is the one mismatch, and no proved function here reads a
-# plain char: the ELF parser works on uint8_t and fixed-width fields. That is
-# the invariant to preserve. Prove a function that reads a plain char without an
-# explicit (unsigned char) or (uint8_t) cast first, and supply a custom machdep
-# rather than extending this list.
+# Plain-char signedness is the one mismatch, and the RSP proof DOES cover
+# functions taking plain char (gdb_hex_pair, gdb_hex_decode, rsp_checksum).
+# What keeps the result signedness-independent is not their parameter types but
+# that every use of a char value goes through an explicit (unsigned char) or
+# (uint8_t) cast before it is compared or accumulated. That is the invariant to
+# preserve: no proved function may read a plain char without such a cast. Prove
+# one that does, and supply a custom machdep rather than extending this list.
 FRAMAC ?= frama-c
 FRAMAC_DATA_MODEL ?= gcc_x86_64
 FRAMAC_TIMEOUT ?= 30
@@ -81,10 +84,17 @@ FRAMAC_CPP_ARGS = -nostdinc \
 # evidence on its own: an emptied function body or a dropped contract proves
 # 0 of 0. Raise it when adding proved functions; it is a tripwire, not a target.
 
+# Contracts in the shared src/utils.h. Every proof whose source includes that
+# header must prove them too, not merely assume them, so this list is appended
+# to each such proof's -wp-fct. Proving hex_nibble twice costs a second or two;
+# assuming it once is how the RSP proof came to rest on an unchecked axiom.
+VERIFY_UTILS_FCTS := hex_nibble
+
 VERIFY_ELF_SRC   := src/core/elf.c
 VERIFY_ELF_FCTS  := elf_add_no_wrap elf_phdr_gpa_in_segment \
-                    elf_phdr_table_bytes elf_phdr_fetch elf_segment_extent
-VERIFY_ELF_MIN_GOALS ?= 64
+                    elf_phdr_table_bytes elf_phdr_fetch elf_segment_extent \
+                    $(VERIFY_UTILS_FCTS)
+VERIFY_ELF_MIN_GOALS ?= 78
 VERIFY_ELF_MODEL := caveat
 
 # Includes utils.h and elf.h: elf.c includes both, and utils.h already carries
@@ -102,6 +112,23 @@ VERIFY_GVA_MODEL := typed
 VERIFY_GVA_SCAN  := src/core/gva-math.h
 VERIFY_GVA_CLAIM := for ANY guest address, length, and page-table content
 VERIFY_GVA_UNPROVED := the walk and copy loops around them stay test-covered
+
+VERIFY_RSP_SRC   := src/debug/gdbstub-rsp.c
+VERIFY_RSP_FCTS  := $(VERIFY_UTILS_FCTS) gdb_hex_pair gdb_hex_decode \
+                    gdb_parse_hex rsp_checksum
+VERIFY_RSP_MIN_GOALS ?= 98
+
+# typed, not caveat: gdb_hex_decode assigns a pointer RANGE (dst[0 .. len-1]),
+# which caveat's flat single-region memory cannot express ("Undefined
+# array-size"). elf.c can use caveat because its proved functions assign only
+# single locations. Nothing here reinterprets bytes at an attacker-chosen
+# stride, which is the reason elf.c needed caveat in the first place.
+VERIFY_RSP_MODEL := typed
+
+# Includes utils.h: hex_nibble lives there and the whole RSP proof rests on it.
+VERIFY_RSP_SCAN  := src/debug/gdbstub-rsp.c src/utils.h
+VERIFY_RSP_CLAIM := for ANY packet bytes a GDB remote can send
+VERIFY_RSP_UNPROVED := the socket I/O and framing loop stay test-covered
 
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
@@ -137,15 +164,26 @@ verify-gva: SCAN := $(VERIFY_GVA_SCAN)
 verify-gva: CLAIM := $(VERIFY_GVA_CLAIM)
 verify-gva: UNPROVED := $(VERIFY_GVA_UNPROVED)
 
+## Prove the GDB RSP parser cannot be driven out of bounds by a remote
+verify-rsp: NAME := rsp
+verify-rsp: SRC := $(VERIFY_RSP_SRC)
+verify-rsp: FCTS := $(VERIFY_RSP_FCTS)
+verify-rsp: FCT_ARG := $(call commafy,$(VERIFY_RSP_FCTS))
+verify-rsp: MIN_GOALS := $(VERIFY_RSP_MIN_GOALS)
+verify-rsp: MODEL := $(VERIFY_RSP_MODEL)
+verify-rsp: SCAN := $(VERIFY_RSP_SCAN)
+verify-rsp: CLAIM := $(VERIFY_RSP_CLAIM)
+verify-rsp: UNPROVED := $(VERIFY_RSP_UNPROVED)
+
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
-# what gets proved, so a second proof is a variable block plus a target name.
+# what gets proved.
 #
 # The recipe only runs the prover. Deciding whether the run counts as a proof
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-verify-elf verify-gva: | $(BUILD_DIR)
+verify-elf verify-rsp verify-gva: | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -171,7 +209,7 @@ verify-elf verify-gva: | $(BUILD_DIR)
 	    --src $(SRC) --unproved "$(UNPROVED)"
 
 ## Run every Frama-C proof
-verify: verify-elf verify-gva
+verify: verify-elf verify-gva verify-rsp
 
 ## Run clang static analyzer (scan-build)
 analyze:
