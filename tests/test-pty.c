@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -73,6 +74,15 @@
 #endif
 
 int passes = 0, fails = 0;
+
+/* A master with no hangup support blocks these reads forever; the alarm turns
+ * that into a visible failure instead of a wedged run.
+ */
+static void hup_on_alarm(int sig)
+{
+    (void) sig;
+    _exit(2);
+}
 
 static int count_pts_entries(void)
 {
@@ -725,6 +735,62 @@ int main(void)
                 FAIL("TIOCGPTN/TIOCSPTLCK failed, no slave to test with");
             }
             close(pkt_master);
+        }
+    }
+
+    /* Hangup. macOS only hangs a master up once every slave fd is gone, and
+     * elfuse keeps one open for the master's whole life, so the pty layer has
+     * to report this itself. A terminal waiting for it to learn its shell
+     * exited -- foot polls for exactly this -- otherwise never closes.
+     */
+    {
+        int hup_master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        unsigned int hup_ptyno = (unsigned int) -1;
+        int hup_unlock = 0;
+        if (hup_master < 0 || ioctl(hup_master, TIOCGPTN, &hup_ptyno) != 0 ||
+            ioctl(hup_master, TIOCSPTLCK, &hup_unlock) != 0) {
+            TEST("master reports POLLHUP once the slave closes");
+            FAIL("could not stage a master");
+            if (hup_master >= 0)
+                close(hup_master);
+        } else {
+            char hup_path[32];
+            snprintf(hup_path, sizeof(hup_path), "/dev/pts/%u", hup_ptyno);
+            int hup_slave = open(hup_path, O_RDWR | O_NOCTTY);
+            if (hup_slave < 0) {
+                TEST("master reports POLLHUP once the slave closes");
+                FAIL("open slave");
+            } else {
+                /* Queued output must survive: Linux hands over what the slave
+                 * wrote before reporting the hangup, so a shell's parting
+                 * words are not swallowed.
+                 */
+                static const char bye[] = "bye";
+                ssize_t put = write(hup_slave, bye, sizeof(bye) - 1);
+                close(hup_slave);
+
+                struct pollfd hp = {.fd = hup_master, .events = POLLIN};
+                int hr = poll(&hp, 1, 2000);
+                TEST("master reports POLLHUP once the slave closes");
+                EXPECT_TRUE(hr > 0 && (hp.revents & POLLHUP),
+                            "no POLLHUP after the last slave closed");
+
+                char hbuf[16];
+                ssize_t drained = put == (ssize_t) (sizeof(bye) - 1)
+                                      ? read(hup_master, hbuf, sizeof(hbuf))
+                                      : -1;
+                TEST("queued output survives the hangup");
+                EXPECT_TRUE(drained == (ssize_t) (sizeof(bye) - 1) &&
+                                memcmp(hbuf, bye, sizeof(bye) - 1) == 0,
+                            "pending slave output was lost");
+
+                errno = 0;
+                TEST("read reports EIO once drained");
+                EXPECT_TRUE(
+                    read(hup_master, hbuf, sizeof(hbuf)) < 0 && errno == EIO,
+                    "read did not report the hangup as EIO");
+            }
+            close(hup_master);
         }
     }
 

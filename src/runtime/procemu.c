@@ -1633,8 +1633,33 @@ static struct {
     int slave_host_fd;
     uint32_t linux_pts_num;
     bool stale_open_once;
+    /* Slaves the guest has open, and whether it ever had one. Both are needed:
+     * a count of zero means hung up only after the first open.
+     */
+    int guest_slave_count;
+    bool guest_slave_seen;
     char slave_path[PTY_SLAVE_PATH_MAX];
 } pty_keepalive_table[PTY_KEEPALIVE_MAX];
+
+/* Guest-held slave fds, so a master can report the hangup Linux gives once the
+ * last slave closes.
+ *
+ * elfuse keeps one slave open for the master's whole life (see the side-table
+ * header above), which is what stops macOS from ever hanging the master up: it
+ * only does so when *every* slave fd is gone. A guest terminal waiting for that
+ * hangup to learn its shell exited therefore waits forever, which is what
+ * happens to foot. Counting the slaves the guest itself holds lets sys_poll and
+ * sys_read answer for the pty layer instead of the host, without giving up the
+ * keepalive the tty ioctls need.
+ *
+ * The count only means anything once the guest has opened a slave at least
+ * once; before that a master with no slave is ordinary, not hung up.
+ */
+#define PTY_GUEST_SLAVE_MAX (PTY_KEEPALIVE_MAX * 4)
+static struct {
+    int slave_host_fd; /* PTY_KEEPALIVE_FREE when the slot is unused */
+    uint32_t linux_pts_num;
+} pty_guest_slave_table[PTY_GUEST_SLAVE_MAX];
 static pthread_mutex_t pty_keepalive_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t pty_keepalive_once = PTHREAD_ONCE_INIT;
 
@@ -1645,6 +1670,8 @@ static void pty_keepalive_init(void)
 {
     for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
         pty_keepalive_table[i].master_host_fd = PTY_KEEPALIVE_FREE;
+        pty_keepalive_table[i].guest_slave_count = 0;
+        pty_keepalive_table[i].guest_slave_seen = false;
         pty_keepalive_table[i].slave_host_fd = PTY_KEEPALIVE_FREE;
     }
 }
@@ -1668,6 +1695,8 @@ static int pty_keepalive_clear_slot_locked(int slot)
 {
     int slave = pty_keepalive_table[slot].slave_host_fd;
     pty_keepalive_table[slot].master_host_fd = PTY_KEEPALIVE_FREE;
+    pty_keepalive_table[slot].guest_slave_count = 0;
+    pty_keepalive_table[slot].guest_slave_seen = false;
     pty_keepalive_table[slot].slave_host_fd = PTY_KEEPALIVE_FREE;
     pty_keepalive_table[slot].linux_pts_num = 0;
     pty_keepalive_table[slot].stale_open_once = false;
@@ -1767,6 +1796,8 @@ static int pty_keepalive_register_locked(int master_host_fd,
             return PTY_REG_FULL;
     }
     pty_keepalive_table[slot].master_host_fd = master_host_fd;
+    pty_keepalive_table[slot].guest_slave_count = 0;
+    pty_keepalive_table[slot].guest_slave_seen = false;
     if (pty_keepalive_table[slot].slave_host_fd >= 0 &&
         pty_keepalive_table[slot].slave_host_fd != slave_host_fd)
         close(pty_keepalive_table[slot].slave_host_fd);
@@ -2000,6 +2031,107 @@ bool proc_pty_slave_stat(const char *path, struct stat *out)
     return true;
 }
 
+/* The guest-slave table is zero-initialized, so mark every slot free the first
+ * time it is touched: fd 0 is a legitimate host descriptor and must not read as
+ * an occupied slot.
+ */
+static void pty_guest_slave_table_init_once(void)
+{
+    static bool done;
+    if (done)
+        return;
+    for (int i = 0; i < PTY_GUEST_SLAVE_MAX; i++)
+        pty_guest_slave_table[i].slave_host_fd = PTY_KEEPALIVE_FREE;
+    done = true;
+}
+
+/* Retire a recorded slave fd and credit its master. Caller holds the lock. */
+static void pty_guest_slave_release_locked(int slave_host_fd)
+{
+    for (int i = 0; i < PTY_GUEST_SLAVE_MAX; i++) {
+        if (pty_guest_slave_table[i].slave_host_fd != slave_host_fd)
+            continue;
+        uint32_t pts_num = pty_guest_slave_table[i].linux_pts_num;
+        pty_guest_slave_table[i].slave_host_fd = PTY_KEEPALIVE_FREE;
+        for (int k = 0; k < PTY_KEEPALIVE_MAX; k++) {
+            if (pty_keepalive_table[k].master_host_fd == PTY_KEEPALIVE_FREE)
+                continue;
+            if (pty_keepalive_table[k].linux_pts_num != pts_num)
+                continue;
+            if (pty_keepalive_table[k].guest_slave_count > 0)
+                pty_keepalive_table[k].guest_slave_count--;
+            break;
+        }
+        break;
+    }
+}
+
+void proc_pty_note_guest_slave(int slave_host_fd, uint32_t linux_pts_num)
+{
+    if (slave_host_fd < 0)
+        return;
+    pthread_mutex_lock(&pty_keepalive_lock);
+    pty_guest_slave_table_init_once();
+    /* Drop any entry left over for this host fd number first. The open is
+     * recorded before the guest fd is installed, so a failed fd_alloc closes
+     * the host fd without passing through the close hooks; retiring the stale
+     * slot on reuse keeps that from inflating an unrelated pty's count.
+     */
+    pty_guest_slave_release_locked(slave_host_fd);
+    for (int i = 0; i < PTY_GUEST_SLAVE_MAX; i++) {
+        if (pty_guest_slave_table[i].slave_host_fd != PTY_KEEPALIVE_FREE)
+            continue;
+        pty_guest_slave_table[i].slave_host_fd = slave_host_fd;
+        pty_guest_slave_table[i].linux_pts_num = linux_pts_num;
+        for (int k = 0; k < PTY_KEEPALIVE_MAX; k++) {
+            if (pty_keepalive_table[k].master_host_fd == PTY_KEEPALIVE_FREE)
+                continue;
+            if (pty_keepalive_table[k].linux_pts_num != linux_pts_num)
+                continue;
+            pty_keepalive_table[k].guest_slave_count++;
+            pty_keepalive_table[k].guest_slave_seen = true;
+            break;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&pty_keepalive_lock);
+}
+
+void proc_pty_slave_fd_closed(int host_fd)
+{
+    if (host_fd < 0)
+        return;
+    pthread_mutex_lock(&pty_keepalive_lock);
+    pty_guest_slave_table_init_once();
+    pty_guest_slave_release_locked(host_fd);
+    pthread_mutex_unlock(&pty_keepalive_lock);
+}
+
+bool proc_pty_master_hung_up(int guest_fd)
+{
+    /* Keyed on the guest fd rather than a host one: callers reach the master
+     * through host_fd_ref, which hands out a dup, and the keepalive table is
+     * keyed by the canonical host fd that dup does not share.
+     */
+    fd_entry_t snap;
+    if (!fd_snapshot(guest_fd, &snap))
+        return false;
+    int master_host_fd = snap.host_fd;
+    if (master_host_fd < 0)
+        return false;
+    bool hung_up = false;
+    pthread_mutex_lock(&pty_keepalive_lock);
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].master_host_fd != master_host_fd)
+            continue;
+        hung_up = pty_keepalive_table[i].guest_slave_seen &&
+                  pty_keepalive_table[i].guest_slave_count == 0;
+        break;
+    }
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    return hung_up;
+}
+
 static int pty_open_slave(uint32_t linux_pts_num, int linux_flags)
 {
     int oflags = translate_open_flags(linux_flags) &
@@ -2201,6 +2333,8 @@ void proc_pty_close_keepalive(int master_host_fd)
              * closes it on the first translated open attempt.
              */
             pty_keepalive_table[slot].master_host_fd = PTY_KEEPALIVE_FREE;
+            pty_keepalive_table[slot].guest_slave_count = 0;
+            pty_keepalive_table[slot].guest_slave_seen = false;
         } else {
             slave = pty_keepalive_clear_slot_locked(slot);
         }
@@ -2871,7 +3005,11 @@ int proc_intercept_open(const guest_t *g,
          * two-argument open(2) never sees a creation-mode-required combination
          * without a mode arg.
          */
-        return pty_open_slave((uint32_t) n, linux_flags);
+        {
+            int slave_fd = pty_open_slave((uint32_t) n, linux_flags);
+            proc_pty_note_guest_slave(slave_fd, (uint32_t) n);
+            return slave_fd;
+        }
     }
 
     /* /proc -> synthetic directory with PID entries for busybox ps, top, etc.

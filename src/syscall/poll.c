@@ -28,6 +28,7 @@
 
 #include "syscall/abi.h"
 #include "syscall/internal.h"
+#include "runtime/procemu.h"
 #include "syscall/poll.h"
 #include "syscall/proc.h" /* proc_exit_group_requested */
 #include "syscall/signal.h"
@@ -246,6 +247,17 @@ ppoll_retry:
          * and nothing happened, loop back. If the caller had a real timeout,
          * poll emulation only called poll once with that timeout, so break.
          */
+        /* An infinite poll re-arms on a 200ms slice; break out when a master
+         * has hung up, since the host will never make that fd ready.
+         */
+        if (ret == 0) {
+            bool hup_pending = false;
+            for (uint32_t i = 0; i < nfds && !hup_pending; i++)
+                hup_pending = !need_pollnval[i] && guest_fds[i].fd >= 0 &&
+                              proc_pty_master_hung_up(guest_fds[i].fd);
+            if (hup_pending)
+                break;
+        }
     } while (ret == 0 && poll_timeout_ms < 0);
 
     /* POSIX poll() ignores entries with fd < 0 and resets revents to 0, so
@@ -257,6 +269,23 @@ ppoll_retry:
             if (need_pollnval[i])
                 host_fds[i].revents = POLLNVAL;
         ret += (int) invalid_count;
+    }
+
+    /* A pty master whose guest-side slaves have all closed is hung up, but the
+     * host still sees elfuse's keepalive slave and reports nothing. Stamp
+     * POLLHUP here so a terminal waiting for its shell to exit -- foot polls
+     * for exactly this -- is not left waiting forever.
+     */
+    if (ret >= 0) {
+        for (uint32_t i = 0; i < nfds; i++) {
+            if (need_pollnval[i] || guest_fds[i].fd < 0)
+                continue;
+            if (!proc_pty_master_hung_up(guest_fds[i].fd))
+                continue;
+            if (host_fds[i].revents == 0)
+                ret++;
+            host_fds[i].revents |= POLLHUP;
+        }
     }
 
     int saved_errno = errno;

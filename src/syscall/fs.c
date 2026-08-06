@@ -748,6 +748,12 @@ int64_t sys_close(int fd)
          * no per-type cleanup is registered.
          */
         proc_pty_close_keepalive(host_fd);
+        /* A pty slave is an ordinary FD_REGULAR slot, so every guest close of
+         * one lands here rather than in fd_cleanup_entry. Without this the
+         * per-master slave count never falls back to zero and the master never
+         * reports its hangup.
+         */
+        proc_pty_slave_fd_closed(host_fd);
         chown_overlay_clear_closed_unlinked_fd(host_fd);
         if (close(host_fd) < 0)
             return linux_errno();
