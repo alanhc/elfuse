@@ -267,6 +267,7 @@ uint64_t build_linux_stack(guest_t *g,
     do {                                      \
         stack_err |= push_u64(g, &sp, (val)); \
     } while (0)
+
     /* Serialize auxv once, then push it in reverse so guest memory and
      * /proc/self/auxv expose the same bytes.
      */
@@ -282,7 +283,14 @@ uint64_t build_linux_stack(guest_t *g,
     if (vdso_base != 0)
         AUX(AT_SYSINFO_EHDR, vdso_base);
     AUX(AT_PAGESZ, 4096);
-    AUX(AT_PHDR, elf_info->phdr_gpa + elf_load_base);
+
+    /* phdr_valid is false when no PT_LOAD covers the program header table, so
+     * there is no guest address to report and Linux passes AT_PHDR 0. Testing
+     * phdr_gpa itself would be wrong: an ET_DYN image whose covering segment
+     * sits at p_vaddr 0 has a legitimate phdr_gpa of 0 and must still be
+     * relocated by elf_load_base.
+     */
+    AUX(AT_PHDR, elf_info->phdr_valid ? elf_info->phdr_gpa + elf_load_base : 0);
     AUX(AT_PHENT, elf_info->phentsize);
     AUX(AT_PHNUM, elf_info->phnum);
     AUX(AT_ENTRY, elf_info->entry + elf_load_base);
@@ -290,6 +298,7 @@ uint64_t build_linux_stack(guest_t *g,
     AUX(AT_EUID, proc_get_euid());
     AUX(AT_GID, proc_get_gid());
     AUX(AT_EGID, proc_get_egid());
+
     /* Bionic's __libc_init_AT_SECURE aborts when AT_SECURE is absent. elfuse
      * never elevates privileges, so AT_SECURE is always 0.
      */

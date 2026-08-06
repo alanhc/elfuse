@@ -257,16 +257,15 @@ int rosetta_prepare(guest_t *g,
             return -1;
         }
 
-        /* Load rosetta into the primary buffer. load_base = guest_base -
-         * va_base places p_vaddr+load_base inside host_base+guest_base. The
-         * wrap math is the same trick elf.c documents for high-VA binaries:
-         * uint64_t arithmetic, two's-complement intentional.
+        /* Load rosetta into the primary buffer: the [va_base, ...) window of
+         * the image lands at guest_base. Passing the pair rather than a
+         * pre-subtracted base keeps the arithmetic free of wraparound.
          */
-        uint64_t load_base = guest_base - va_base;
         uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
         uint64_t infra_hi = g->interp_base;
         if (elf_map_segments(ri, ROSETTA_PATH, g->host_base, g->guest_size,
-                             load_base, infra_lo, infra_hi) < 0) {
+                             (elf_window_t) {va_base, guest_base}, infra_lo,
+                             infra_hi) < 0) {
             log_error("rosetta: elf_map_segments failed");
             return -1;
         }
@@ -312,11 +311,11 @@ int rosetta_prepare(guest_t *g,
          * be rebuilt. Segments get reloaded in place.
          */
         guest_base = g->rosetta_guest_base;
-        uint64_t load_base = guest_base - va_base;
         uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
         uint64_t infra_hi = g->interp_base;
         if (elf_map_segments(ri, ROSETTA_PATH, g->host_base, g->guest_size,
-                             load_base, infra_lo, infra_hi) < 0) {
+                             (elf_window_t) {va_base, guest_base}, infra_lo,
+                             infra_hi) < 0) {
             log_error("rosetta: re-entry elf_map_segments failed");
             return -1;
         }

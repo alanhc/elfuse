@@ -902,7 +902,22 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      */
     uint64_t elf_load_base = (elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
 
-    /* Validate that the ELF fits within the guest address space */
+    /* Validate that the ELF fits within the guest address space.
+     *
+     * load_max can be exactly UINT64_MAX: elf_load_fd rejects a PT_LOAD whose
+     * p_vaddr + p_memsz wraps, but a segment ending precisely at UINT64_MAX
+     * does not wrap and is recorded. Adding the load base to that truncates to
+     * a small value which passes the bound below, and the load then fails
+     * inside elf_map_segments_fd, which is past the point of no return where
+     * the only option left is exit(128). Reject it here, where execve can still
+     * return an error.
+     */
+    if (elf_info.load_max > UINT64_MAX - elf_load_base) {
+        log_error("execve: ELF load extent overflows the address space for %s",
+                  path);
+        err = -LINUX_ENOEXEC;
+        goto fail;
+    }
     uint64_t elf_end = elf_info.load_max + elf_load_base;
     if (elf_end > g->guest_size) {
         log_error(
@@ -977,6 +992,22 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         if (interp_info.e_machine != EM_AARCH64) {
             log_error("execve: interpreter has unsupported machine type %u: %s",
                       interp_info.e_machine, interp_resolved);
+            err = -LINUX_ENOEXEC;
+            goto fail;
+        }
+
+        /* Bound the interpreter's extent here, the same way the executable's is
+         * bounded above. Without this the only thing that rejects an
+         * over-large interpreter is elf_map_segments_fd, which runs after the
+         * point of no return where the sole remaining option is exit(128). A
+         * guest able to write its own sysroot could kill elfuse on demand by
+         * patching a PT_LOAD in ld-musl; Linux returns ENOEXEC and the caller
+         * survives.
+         */
+        if (interp_info.load_max > UINT64_MAX - g->interp_base ||
+            interp_info.load_max + g->interp_base > g->guest_size) {
+            log_error("execve: interpreter extends beyond guest memory: %s",
+                      interp_resolved);
             err = -LINUX_ENOEXEC;
             goto fail;
         }
@@ -1264,8 +1295,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
     uint64_t infra_hi = g->interp_base;
     if (elf_map_segments_fd(&elf_info, exec_fd, path_host, g->host_base,
-                            g->guest_size, elf_load_base, infra_lo,
-                            infra_hi) < 0) {
+                            g->guest_size, (elf_window_t) {0, elf_load_base},
+                            infra_lo, infra_hi) < 0) {
         log_fatal(
             "execve failed after point of no return: "
             "failed to map ELF segments for %s",
@@ -1286,8 +1317,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     if (elf_info.interp_path[0] != '\0') {
         interp_base = g->interp_base;
         if (elf_map_segments_fd(&interp_info, interp_fd, interp_resolved,
-                                g->host_base, g->guest_size, interp_base,
-                                infra_lo, infra_hi) < 0) {
+                                g->host_base, g->guest_size,
+                                (elf_window_t) {0, interp_base}, infra_lo,
+                                infra_hi) < 0) {
             log_fatal(
                 "execve failed after point of no return: "
                 "failed to map interpreter segments");

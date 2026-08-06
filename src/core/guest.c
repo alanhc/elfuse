@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include "core/guest.h"
+#include "core/gva-math.h"
 #include "core/startup-trace.h"
 #include "debug/log.h"
 #include "utils.h"
@@ -207,9 +208,36 @@ static uint64_t pt_alloc_page(guest_t *g)
     return gpa;
 }
 
-/* Get host pointer to a page table entry array at a given GPA */
+/* Get host pointer to a page table entry array at a given GPA.
+ *
+ * Every caller indexes a full 4 KiB table (512 descriptors) from the result, so
+ * the whole table must fit inside the primary buffer, not merely its first
+ * byte. The walker screens descriptors through gva_pt_table_offset before
+ * getting here, but the ~20 other call sites -- find_l2_entry,
+ * guest_map_va_range, guest_extend_page_tables, guest_invalidate_ptes,
+ * guest_update_perms, guest_install_va_pages, and the ttbr0 roots -- derive the
+ * offset with a bare "ipa - base" and no bound at all, and unlike the walker
+ * they WRITE descriptors.
+ *
+ * Bounding here rather than at each of those sites keeps one check instead of
+ * twenty and cannot be forgotten by the next one added. A violation is not a
+ * guest-reachable condition (every descriptor value originates from
+ * pt_alloc_page, and the PT pool is absent from the boot region set so EL0
+ * cannot map it) -- it means the pool allocator itself is broken, which is
+ * unrecoverable and must not be allowed to scribble outside the slab.
+ */
 static uint64_t *pt_at(const guest_t *g, uint64_t gpa)
 {
+    /* Underflow guard first, matching gva_pt_table_offset. Written the other
+     * way round the subtraction wraps for a sub-page slab and the comparison
+     * silently passes, leaving the second clause to catch it by luck.
+     */
+    if (g->guest_size < GVA_PT_TABLE_BYTES ||
+        gpa > g->guest_size - GVA_PT_TABLE_BYTES) {
+        log_fatal("pt_at: page table offset 0x%llx outside the %llu-byte slab",
+                  (unsigned long long) gpa, (unsigned long long) g->guest_size);
+        abort();
+    }
     return (uint64_t *) ((uint8_t *) g->host_base + gpa);
 }
 
@@ -1308,19 +1336,19 @@ static int gva_translate_perm(const guest_t *g,
     if (!(l0e & PT_VALID))
         return -1;
 
-    uint64_t l1_ipa = l0e & 0xFFFFFFFFF000ULL;
-    if (l1_ipa < base || l1_ipa - base >= g->guest_size)
+    uint64_t l1_off;
+    if (!gva_pt_table_offset(l0e, base, g->guest_size, &l1_off))
         return -1;
-    const uint64_t *l1 = pt_at(g, l1_ipa - base);
+    const uint64_t *l1 = pt_at(g, l1_off);
     unsigned l1_idx = (unsigned) ((gva / BLOCK_1GIB) % 512);
     uint64_t l1e = pte_load_acquire(&l1[l1_idx]);
     if (!(l1e & PT_VALID))
         return -1;
 
-    uint64_t l2_ipa = l1e & 0xFFFFFFFFF000ULL;
-    if (l2_ipa < base || l2_ipa - base >= g->guest_size)
+    uint64_t l2_off;
+    if (!gva_pt_table_offset(l1e, base, g->guest_size, &l2_off))
         return -1;
-    const uint64_t *l2 = pt_at(g, l2_ipa - base);
+    const uint64_t *l2 = pt_at(g, l2_off);
     unsigned l2_idx = (unsigned) ((gva / BLOCK_2MIB) % 512);
     uint64_t l2e = pte_load_acquire(&l2[l2_idx]);
     if (!(l2e & PT_VALID))
@@ -1328,10 +1356,10 @@ static int gva_translate_perm(const guest_t *g,
 
     if (l2e & PT_TABLE) {
         /* L3 page descriptor: 4KiB granularity. */
-        uint64_t l3_ipa = l2e & 0xFFFFFFFFF000ULL;
-        if (l3_ipa < base || l3_ipa - base >= g->guest_size)
+        uint64_t l3_off;
+        if (!gva_pt_table_offset(l2e, base, g->guest_size, &l3_off))
             return -1;
-        const uint64_t *l3 = pt_at(g, l3_ipa - base);
+        const uint64_t *l3 = pt_at(g, l3_off);
         unsigned l3_idx = (unsigned) ((gva / PAGE_SIZE) % 512);
         uint64_t l3e = pte_load_acquire(&l3[l3_idx]);
         if (!(l3e & PT_VALID))
@@ -1351,10 +1379,10 @@ static int gva_translate_perm(const guest_t *g,
         if ((perms & required_perms) != required_perms)
             return -1;
 
-        uint64_t page_ipa = l3e & 0xFFFFFFFFF000ULL;
-        if (page_ipa < base)
+        uint64_t page_ipa = l3e & GVA_PT_ADDR_MASK;
+        uint64_t gpa, leaf_chunk;
+        if (!gva_leaf_target(page_ipa, base, gva, PAGE_SIZE, &gpa, &leaf_chunk))
             return -1;
-        uint64_t gpa = (page_ipa - base) + (gva & (PAGE_SIZE - 1));
 
         /* Accept GPAs inside the primary buffer or covered by an extra IPA
          * mapping (rosetta segments, kbuf, etc.). Anything else is a dangling
@@ -1365,7 +1393,7 @@ static int gva_translate_perm(const guest_t *g,
             return -1;
 
         out->gpa = gpa;
-        out->chunk = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
+        out->chunk = leaf_chunk;
 
         /* Populate TLB cache for this 4KiB page */
         gva_tlb.owner = g;
@@ -1390,15 +1418,15 @@ static int gva_translate_perm(const guest_t *g,
         return -1;
 
     uint64_t block_ipa = l2e & L2_BLOCK_ADDR_MASK;
-    if (block_ipa < base)
+    uint64_t gpa, leaf_chunk;
+    if (!gva_leaf_target(block_ipa, base, gva, BLOCK_2MIB, &gpa, &leaf_chunk))
         return -1;
-    uint64_t gpa = (block_ipa - base) + (gva & (BLOCK_2MIB - 1));
     if (gpa >= g->guest_size && !guest_find_mapping(g, gpa) &&
         !guest_find_overflow(g, gpa))
         return -1;
 
     out->gpa = gpa;
-    out->chunk = BLOCK_2MIB - (gva & (BLOCK_2MIB - 1));
+    out->chunk = leaf_chunk;
 
     /* Populate TLB cache for this 2MiB block */
     gva_tlb.owner = g;
@@ -1445,10 +1473,18 @@ static uint64_t gva_contiguous_avail(const guest_t *g,
                 region_end = o->ipa_start + o->size;
             }
         }
-        if (chunk > region_end - cur.gpa)
-            chunk = region_end - cur.gpa;
-        if (chunk > limit - total)
-            chunk = limit - total;
+
+        /* gva_chunk_clamp requires gpa < region_end, and nothing checks that:
+         * guest.c cannot be handed to Frama-C, so its call sites are outside
+         * the proof. Violating it would clamp chunk to 0, make this function
+         * return 0 for a non-NULL translation, and spin guest_copy forever on a
+         * guest-supplied address. Every path that reaches here satisfies it
+         * today; this makes that structural rather than argued.
+         */
+        if (region_end <= cur.gpa)
+            break;
+
+        chunk = gva_chunk_clamp(chunk, cur.gpa, region_end, limit, total);
 
         total += chunk;
         if (total == limit)
@@ -1495,12 +1531,29 @@ static void *gva_resolve_perm(const guest_t *g,
     if (gva_translate_perm(g, gva, required_perms, &first) < 0)
         return NULL;
 
-    if (avail) {
-        *avail =
-            gva_contiguous_avail(g, gva, required_perms, &first, avail_limit);
-    }
-    if (first.gpa < g->guest_size)
+    /* Computed once and clamped once per branch below. Writing *avail twice
+     * (here, then again in the branch) left the analyzers unable to relate the
+     * final value to the returned pointer.
+     */
+    uint64_t bytes = avail ? gva_contiguous_avail(g, gva, required_perms,
+                                                  &first, avail_limit)
+                           : 0;
+
+    if (first.gpa < g->guest_size) {
+        /* Clamp to the end of the primary buffer, the same way the mapping and
+         * overflow branches below clamp to the end of the region their pointer
+         * points into. gva_contiguous_avail only stops at guest_size when the
+         * clamp shortens a chunk, so a leaf whose extent ends flush with
+         * guest_size lets the walk continue into whatever the next descriptor
+         * resolves to, and the caller's memcpy would run off the end of the
+         * host buffer.
+         */
+        if (avail) {
+            uint64_t cap = g->guest_size - first.gpa;
+            *avail = bytes < cap ? bytes : cap;
+        }
         return (uint8_t *) g->host_base + first.gpa;
+    }
 
     /* GPA outside the primary buffer: consult the extra IPA mappings (rosetta
      * segments, kbuf) first, then the overflow segments (lazy 1 GiB bump
@@ -1512,8 +1565,7 @@ static void *gva_resolve_perm(const guest_t *g,
     if (m) {
         if (avail) {
             uint64_t cap = (m->gpa + m->size) - first.gpa;
-            if (*avail > cap)
-                *avail = cap;
+            *avail = bytes < cap ? bytes : cap;
         }
         return (uint8_t *) m->host_va + (first.gpa - m->gpa);
     }
@@ -1521,8 +1573,7 @@ static void *gva_resolve_perm(const guest_t *g,
     if (o) {
         if (avail) {
             uint64_t cap = (o->ipa_start + o->size) - first.gpa;
-            if (*avail > cap)
-                *avail = cap;
+            *avail = bytes < cap ? bytes : cap;
         }
         return (uint8_t *) o->host_base + (first.gpa - o->ipa_start);
     }
@@ -1568,7 +1619,7 @@ static inline int guest_copy(const guest_t *g,
     if ((required_perms == MEM_PERM_R && !dst) ||
         (required_perms == MEM_PERM_W && !src))
         return -1;
-    if (gva > UINT64_MAX - len)
+    if (!gva_span_ok(gva, len))
         return -1;
 
     size_t copied = 0;

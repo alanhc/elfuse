@@ -114,7 +114,9 @@ static inline void close_keep_errno(int fd)
 
 /* Encode @len bytes of @src as lowercase hex into @dst, writing len*2 hex
  * characters followed by a terminating NUL. @dst must hold at least len*2+1
- * bytes. Returns the number of hex characters written (len*2).
+ * bytes.
+ *
+ * Returns the number of hex characters written (len*2).
  */
 static inline size_t bytes_to_hex(char *dst, const uint8_t *src, size_t len)
 {
@@ -128,7 +130,22 @@ static inline size_t bytes_to_hex(char *dst, const uint8_t *src, size_t len)
 }
 
 /* Decode a single hex digit to its 0-15 value, or -1 if @c is not a hex digit.
- * The inverse building block of bytes_to_hex; accepts either case.
+ * The inverse building block of bytes_to_hex; accepts either case. The bounds
+ * matter to callers that shift the result: "hex_nibble(c) << 4" is undefined
+ * behavior when c is not a hex digit, so the range and the digit-or-not
+ * equivalence are both stated for Frama-C (make verify-rsp).
+ */
+/*@ logic integer hex_val(integer c) =
+      ('0' <= c <= '9')   ? c - '0' :
+      ('a' <= c <= 'f')   ? c - 'a' + 10 :
+      ('A' <= c <= 'F')   ? c - 'A' + 10 : -1;
+ */
+/*@
+  assigns \nothing;
+  ensures -1 <= \result <= 15;
+  ensures \result >= 0 <==> (('0' <= c <= '9') || ('a' <= c <= 'f') ||
+                             ('A' <= c <= 'F'));
+  ensures \result == hex_val(c);
  */
 static inline int hex_nibble(unsigned char c)
 {
@@ -142,9 +159,11 @@ static inline int hex_nibble(unsigned char c)
 }
 
 /* Write exactly @len bytes to a blocking @fd, resuming across short writes and
- * EINTR. Returns 0 once every byte is written, or -1 with errno set on error.
- * An unexpected zero-byte return is treated as EIO rather than spun on, since
- * the offset would otherwise never advance. A zero-length request returns 0.
+ * EINTR.
+ *
+ * Returns 0 once every byte is written, or -1 with errno set on error. An
+ * unexpected zero-byte return is treated as EIO rather than spun on, since the
+ * offset would otherwise never advance. A zero-length request returns 0.
  */
 static inline int write_all(int fd, const void *buf, size_t len)
 {
@@ -328,9 +347,9 @@ static inline int bit_popcount64(uint64_t word)
     return __builtin_popcountll(word);
 }
 
-/* 64-bit FNV-1a over @len bytes. Not cryptographic: collision resistance is
- * the birthday bound on 64 bits, which suits stable identifiers derived from
- * names (synthetic inode numbers, derived filenames), not adversarial input.
+/* 64-bit FNV-1a over @len bytes. Not cryptographic: collision resistance is the
+ * birthday bound on 64 bits, which suits stable identifiers derived from names
+ * (synthetic inode numbers, derived filenames), not adversarial input.
  * Constants from the FNV reference (offset basis, prime).
  */
 static inline uint64_t fnv1a64(const void *data, size_t len)

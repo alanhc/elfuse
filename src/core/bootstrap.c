@@ -270,8 +270,9 @@ static bool load_interpreter(guest_t *g,
     uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
     uint64_t infra_hi = g->interp_base;
     if (elf_map_segments(&boot->interp_info, boot->interp_resolved,
-                         g->host_base, g->guest_size, boot->interp_base,
-                         infra_lo, infra_hi) < 0) {
+                         g->host_base, g->guest_size,
+                         (elf_window_t) {0, boot->interp_base}, infra_lo,
+                         infra_hi) < 0) {
         log_error("failed to map interpreter segments");
         if (interp_host_temp)
             unlink(boot->interp_resolved);
@@ -444,7 +445,8 @@ int guest_bootstrap_prepare(guest_t *g,
         uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
         uint64_t infra_hi = g->interp_base;
         if (elf_map_segments(&boot->elf_info, elf_host_path, g->host_base,
-                             g->guest_size, boot->elf_load_base, infra_lo,
+                             g->guest_size,
+                             (elf_window_t) {0, boot->elf_load_base}, infra_lo,
                              infra_hi) < 0) {
             log_error("failed to map ELF segments");
             return -1;

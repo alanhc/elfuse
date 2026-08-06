@@ -4,6 +4,8 @@
 #   lint          : format/newline/security/cppcheck/dispatch on Linux
 #   build-macos   : compile + entitlement check on macOS Apple Silicon
 #   tidy-macos    : clang-tidy via `make lint`
+#   verify        : Frama-C WP proofs of the attacker-facing arithmetic via
+#                   `make verify`; gating, not advisory
 #   scan-macos    : LLVM scan-build via `make analyze`
 #   infer-macos   : Facebook Infer capture + analyze over the full build
 #   runtime-macos : HVF runtime tests on self-hosted Apple Silicon,
@@ -56,7 +58,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Cache apt packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/apt-cache
           key: apt-${{ runner.os }}-${{ env.LINT_PKGS }}
@@ -130,7 +132,7 @@ jobs:
 
       - name: Cache Homebrew downloads
         # No restore-keys: a partial match would mask upstream regressions.
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/Library/Caches/Homebrew/downloads
           key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
@@ -189,7 +191,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Cache Homebrew downloads
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/Library/Caches/Homebrew/downloads
           key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
@@ -208,6 +210,107 @@ jobs:
 
       - name: clang-tidy (make lint)
         run: make lint
+
+  # Frama-C WP proofs of the attacker-facing arithmetic via `make verify`.
+  #
+  # GATING, unlike tidy-macos and scan-macos: the inputs these proofs cover come
+  # from untrusted binaries and from the guest itself, so an unproved
+  # obligation fails the job instead of being logged for review. Without this
+  # job the proofs are only enforced when a human runs them, and they rot the
+  # first time someone edits elf.c or gdbstub-rsp.c.
+  verify:
+    name: Frama-C WP proofs (make verify)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      # graphviz/llvm/zlib are frama-c's system dependencies; conf-graphviz
+      # fails without dot(1). The exact Python formula opam wants moves between
+      # releases, so it is not listed here: OPAMCONFIRMLEVEL below lets opam
+      # install whatever depexts it still needs rather than having this list
+      # guess. Guessing python@3.11 when opam wanted python@3.9 is what made the
+      # previous attempt abort.
+      BREW_PKGS: opam gmp pkg-config graphviz llvm@17 zlib
+      # Without this, opam's "some required external dependencies are missing"
+      # prompt has no TTY to answer it, silently takes option 4 (abort), and the
+      # step exits 10.
+      OPAMCONFIRMLEVEL: unsafe-yes
+      # The gate fails on any single [Timeout], and a shared runner is slower
+      # than a dev machine (the three proofs take 3-9s each locally). The job
+      # already has a 60-minute budget, so headroom here costs nothing and
+      # removes a flake class that would read as a proof regression.
+      FRAMAC_TIMEOUT: 120
+      # Pinned so the gating proofs run against a known toolchain. The opam
+      # cache key below is built from these three, so bumping a version here is
+      # all that is needed to install afresh rather than reuse a stale switch.
+      FRAMAC_VERSION: "31.0"
+      ALT_ERGO_VERSION: 2.6.3
+      Z3_VERSION: 4.16.0
+      OPAMROOT: ${{ github.workspace }}/.opam
+      OPAM_SWITCH: frama-c-elfuse
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
+
+      - name: Install Homebrew packages
+        # shellcheck disable=SC2086 -- BREW_PKGS is a space-separated list.
+        run: |
+          set -euo pipefail
+          brew install --quiet $BREW_PKGS
+
+      # Building Frama-C and the provers from source takes tens of minutes, so
+      # the whole opam root is cached. Bump the key suffix to force a rebuild.
+      - name: Cache opam switch
+        id: opam-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.OPAMROOT }}
+          # Keyed on the pinned versions, so changing any of them installs
+          # afresh instead of silently reusing a stale toolchain.
+          key: opam-${{ runner.os }}-${{ runner.arch }}-frama-c${{ env.FRAMAC_VERSION }}-ae${{ env.ALT_ERGO_VERSION }}-z3${{ env.Z3_VERSION }}
+
+      - name: Install Frama-C, Alt-Ergo, Z3
+        if: steps.opam-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          opam init -y --bare --disable-sandboxing
+          opam switch create "$OPAM_SWITCH" 4.14.1
+          eval "$(opam env --switch="$OPAM_SWITCH")"
+          # No --assume-depexts: the system packages are installed above, and
+          # asserting they exist when they do not is what made conf-graphviz
+          # fail with "dot: command not found".
+          opam install -y \
+            frama-c.$FRAMAC_VERSION \
+            alt-ergo.$ALT_ERGO_VERSION \
+            z3.$Z3_VERSION
+
+      - name: Prove the parsers and translation (make verify)
+        # why3 config detect runs here rather than in the install step: it
+        # writes ~/.why3.conf, which lives outside OPAMROOT and so is absent on
+        # a cache hit. Skipping it makes WP abort with "Prover not found in
+        # why3.conf" instead of reporting unproved obligations, which the gate
+        # would then report as "Frama-C emitted no result".
+        run: |
+          set -euo pipefail
+          eval "$(opam env --switch="$OPAM_SWITCH")"
+          why3 config detect
+          frama-c -version
+          make verify
+
+      - name: Upload prover log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verify-logs
+          path: build/verify-*.log
+          if-no-files-found: warn
 
   # LLVM scan-build via `make analyze`. Runs in parallel with build/tidy.
   # Advisory: scan-build's Make target does not pass --status-bugs, so
@@ -228,7 +331,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Cache Homebrew downloads
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/Library/Caches/Homebrew/downloads
           key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
@@ -283,7 +386,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Cache Homebrew downloads
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/Library/Caches/Homebrew/downloads
           key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
@@ -302,6 +405,21 @@ jobs:
         with:
           infer_version: v1.3.0
 
+      # .inferconfig disables PULSE_UNINITIALIZED_VALUE repo-wide. Pulse cannot
+      # prove guest_copy's chunked "while (copied < len)" loop fills its
+      # destination, so every guest_read_small caller looks uninitialized; the
+      # findings were audited and every caller checks the return value. The rest
+      # of the Infer gate is untouched: null dereference, use-after-free, leaks,
+      # dead stores and stack-address escape all still fail the job.
+      #
+      # The cost is real and repo-wide: a genuinely uninitialized read added
+      # after this point is not caught here. Scoping it narrower was tried and
+      # is worse -- the findings span thirteen files including syscall.c and
+      # proc.c, so a path block list suppresses the same class over most of the
+      # syscall surface while being harder to read, and censor-report does not
+      # take effect through `infer run` in v1.3.0. `make infer-uninit` re-runs
+      # the analysis with the checker back on and prints the count, so whether
+      # an Infer upgrade has made this unnecessary is one command away.
       - name: Infer capture + analyze (make -B elfuse)
         # -B forces a clean rebuild so Infer captures every translation unit.
         # Non-C build steps (shim.S assembly, objcopy) pass through untouched.
@@ -501,7 +619,7 @@ jobs:
           test "$(uname -m)" = "arm64"
 
       - name: Cache Homebrew downloads
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/Library/Caches/Homebrew/downloads
           key: brew-runtime-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}

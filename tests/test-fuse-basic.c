@@ -135,6 +135,11 @@ struct linux_dirent64 {
     char d_name[];
 };
 
+/* Byte the over-reply daemon floods with, distinct from anything in hello_data
+ * so a canary check can tell a spill apart from stale memory.
+ */
+#define OVER_REPLY_FILL 0xA5
+
 static const char hello_name[] = "hello";
 static const char hello_data[] = "hello from guest fuse\n";
 static const char source_name[] = "elfuse-test";
@@ -150,6 +155,12 @@ typedef struct {
     uint64_t pending_read_unique;
     int stall_read_once;
     int stalled_read_active;
+
+    /* When set, FUSE_READ answers with more bytes than fuse_read_in.size asked
+     * for. A daemon is a guest process like any other, so nothing stops it; the
+     * transport must not pass the surplus through to the reader's buffer.
+     */
+    int over_reply_read;
 } daemon_ctx_t;
 
 static volatile sig_atomic_t got_usr1;
@@ -347,6 +358,17 @@ static void *daemon_main(void *arg)
             if (ctx->stall_read_once && !ctx->stalled_read_active) {
                 ctx->stalled_read_active = 1;
                 ctx->pending_read_unique = in->unique;
+                break;
+            }
+            if (ctx->over_reply_read) {
+                /* Deliberately antisocial: answer a small request with a large
+                 * payload. reply_frame's buffer caps this at 4096 - 16.
+                 */
+                static uint8_t flood[4096 - 16];
+                memset(flood, OVER_REPLY_FILL, sizeof(flood));
+                if (reply_frame(ctx->fusefd, in->unique, 0, flood,
+                                sizeof(flood)) < 0)
+                    exit(1);
                 break;
             }
             size_t len = sizeof(hello_data) - 1;
@@ -564,9 +586,9 @@ int main(void)
         return 1;
     }
 
-    /* Close the original device fd: the session must repoint synchronous
-     * SIGIO delivery at the surviving dup, so the next request still raises
-     * the signal.
+    /* Close the original device fd: the session must repoint synchronous SIGIO
+     * delivery at the surviving dup, so the next request still raises the
+     * signal.
      */
     if (close(sigio_origfd) < 0)
         die("close(original /dev/fuse fd)");
@@ -579,9 +601,10 @@ int main(void)
         fprintf(stderr, "no SIGIO after closing the original /dev/fuse fd\n");
         return 1;
     }
-    /* Disarm O_ASYNC: every later FUSE request would otherwise raise SIGIO,
-     * and a non-SA_RESTART handler firing mid-syscall surfaces spurious EINTR
-     * in the unrelated tests below.
+
+    /* Disarm O_ASYNC: every later FUSE request would otherwise raise SIGIO, and
+     * a non-SA_RESTART handler firing mid-syscall surfaces spurious EINTR in
+     * the unrelated tests below.
      */
     fuse_fl = fcntl(fusefd, F_GETFL);
     if (fuse_fl < 0 || fcntl(fusefd, F_SETFL, fuse_fl & ~O_ASYNC) < 0)
@@ -679,6 +702,42 @@ int main(void)
         fprintf(stderr, "SIGUSR1 handler did not run\n");
         return 1;
     }
+    expect_hello_fd(fd);
+
+    /* A daemon that answers with more than it was asked for must not reach past
+     * the reader's buffer. Linux sizes the copy from the request, so read(2)
+     * can never return more than count; elfuse must match. Canaries around a
+     * deliberately small buffer catch a spill in either direction.
+     */
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        die("lseek(fuse-file)");
+    ctx.over_reply_read = 1;
+    struct {
+        uint8_t lead[64];
+        uint8_t body[16];
+        uint8_t trail[64];
+    } guarded;
+    memset(&guarded, 0x5C, sizeof(guarded));
+    ssize_t over_rc = read(fd, guarded.body, sizeof(guarded.body));
+    ctx.over_reply_read = 0;
+    if (over_rc < 0)
+        die("read(over-replying fuse file)");
+    if ((size_t) over_rc > sizeof(guarded.body)) {
+        fprintf(stderr, "read returned %zd for a %zu-byte request\n", over_rc,
+                sizeof(guarded.body));
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(guarded.lead); i++) {
+        if (guarded.lead[i] != 0x5C || guarded.trail[i] != 0x5C) {
+            fprintf(stderr,
+                    "FUSE over-reply overran the read buffer at guard byte %zu "
+                    "(lead=0x%02x trail=0x%02x)\n",
+                    i, guarded.lead[i], guarded.trail[i]);
+            return 1;
+        }
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        die("lseek(fuse-file)");
     expect_hello_fd(fd);
 
     void *map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);

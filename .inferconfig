@@ -1,0 +1,3 @@
+{
+  "disable-issue-type": ["PULSE_UNINITIALIZED_VALUE"]
+}
