@@ -409,7 +409,11 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
     /* Collect only the program headers that affect process startup. */
     int seg_count = 0;
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
-        elf64_phdr_t ph;
+        /* Zero-initialized so the phdr scratch is never read uninitialized
+         * on a path Pulse cannot follow; three of the suppressed Infer
+         * findings were here. One 56-byte clear per program header.
+         */
+        elf64_phdr_t ph = {0};
         if (!elf_phdr_fetch(ph_buf, ph_total, i, ehdr.e_phentsize, &ph)) {
             log_error("%s: program header %u outside the header table",
                       display_path, i);

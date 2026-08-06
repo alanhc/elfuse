@@ -405,6 +405,21 @@ jobs:
         with:
           infer_version: v1.3.0
 
+      # .inferconfig disables PULSE_UNINITIALIZED_VALUE repo-wide. Pulse cannot
+      # prove guest_copy's chunked "while (copied < len)" loop fills its
+      # destination, so every guest_read_small caller looks uninitialized; the
+      # findings were audited and every caller checks the return value. The rest
+      # of the Infer gate is untouched: null dereference, use-after-free, leaks,
+      # dead stores and stack-address escape all still fail the job.
+      #
+      # The cost is real and repo-wide: a genuinely uninitialized read added
+      # after this point is not caught here. Scoping it narrower was tried and
+      # is worse -- the findings span thirteen files including syscall.c and
+      # proc.c, so a path block list suppresses the same class over most of the
+      # syscall surface while being harder to read, and censor-report does not
+      # take effect through `infer run` in v1.3.0. `make infer-uninit` re-runs
+      # the analysis with the checker back on and prints the count, so whether
+      # an Infer upgrade has made this unnecessary is one command away.
       - name: Infer capture + analyze (make -B elfuse)
         # -B forces a clean rebuild so Infer captures every translation unit.
         # Non-C build steps (shim.S assembly, objcopy) pass through untouched.
