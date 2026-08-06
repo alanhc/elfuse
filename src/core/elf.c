@@ -20,6 +20,26 @@
 #include "debug/log.h"
 #include "utils.h"
 
+/* Verified parsing core.
+ *
+ * The five functions below take scalars and a bounded byte buffer, touch no
+ * I/O, and carry ACSL contracts discharged by Frama-C WP with -wp-rte (make
+ * verify-elf). They are ordered primitive-first.
+ *
+ * Covered: the offsets and extents feeding the host-side reads and writes in
+ * THIS file. The unproved code around them computes no guest-slab offset or
+ * extent of its own, so no pread, memcpy, or memset here can leave the slab.
+ *
+ * NOT covered, and do not assume otherwise:
+ * - info->segments[] holds p_vaddr and p_memsz verbatim, never bounds-checked
+ *   here. Callers add a load base to them and build the mem_region_t ranges
+ *   that decide RX vs RW page-table permissions (bootstrap.c
+ *   append_elf_segment_regions, register_elf_segment_regions, and the exec.c
+ *   region tables). That arithmetic is unproved.
+ * - The pread return-length checks and the interp_path handling are ordinary
+ *   reviewed code.
+ */
+
 /* a + b, or 0 when the sum does not fit in 64 bits.
  *
  * ELF address fields are unconstrained uint64_t, so the addresses derived from
@@ -28,6 +48,11 @@
  * consumer adds a load base to the result, so the clamp only relocates the wrap
  * into the consumer, where the bound check it defeats reads "elf_end >
  * guest_size" and silently passes.
+ */
+/*@
+  requires \valid(sum);
+  assigns *sum;
+  ensures \result != 0 ==> *sum == a + b;
  */
 static int elf_add_no_wrap(uint64_t a, uint64_t b, uint64_t *sum)
 {
@@ -41,6 +66,13 @@ static int elf_add_no_wrap(uint64_t a, uint64_t b, uint64_t *sum)
 /* Size of the program header table in bytes, or 0 when the header geometry is
  * unusable. Rejects an empty table, an entry stride too small to hold a program
  * header, and a total past the kernel's 64KiB cap.
+ */
+/*@
+  requires \valid(total);
+  assigns *total;
+  ensures \result != 0 ==> *total == (size_t) phnum * phentsize;
+  ensures \result != 0 ==> phentsize >= sizeof(elf64_phdr_t);
+  ensures \result != 0 ==> 0 < *total <= ELF_PHDR_TABLE_MAX;
  */
 static int elf_phdr_table_bytes(uint16_t phnum,
                                 uint16_t phentsize,
@@ -57,40 +89,27 @@ static int elf_phdr_table_bytes(uint16_t phnum,
     return 1;
 }
 
-/* Guest VA of the program header table, given one PT_LOAD's file range.
- *
- * Linux derives AT_PHDR from the PT_LOAD whose file data contains e_phoff
- * (fs/binfmt_elf.c), not from the lowest mapped address. The two agree for the
- * usual layout where the first PT_LOAD maps from file offset 0, and diverge
- * otherwise.
- *
- * Returns 0 unless the whole table lies inside this segment's file data. Linux
- * only requires e_phoff itself to be inside a PT_LOAD, but Linux keeps the
- * headers reachable through the file mapping; elfuse has no separate phdr copy,
- * so a table spanning two PT_LOADs would only stay readable if those segments
- * happened to be adjacent in guest VA, which nothing checks. Requiring one
- * segment to hold it all is what makes the no-copy scheme sound.
- */
-static int elf_phdr_gpa_in_segment(uint64_t phoff,
-                                   size_t total,
-                                   uint64_t p_offset,
-                                   uint64_t p_filesz,
-                                   uint64_t p_vaddr,
-                                   uint64_t *gpa_out)
-{
-    if (phoff < p_offset)
-        return 0;
-
-    uint64_t rel = phoff - p_offset;
-    if (rel > p_filesz || p_filesz - rel < total)
-        return 0;
-
-    return elf_add_no_wrap(p_vaddr, rel, gpa_out);
-}
-
 /* Copy program header idx out of a buffer of buflen bytes.
  *
  * Returns 0 when the entry does not lie wholly inside the buffer.
+ *
+ * The contract below constrains the copy's SAFETY (the source range lies in the
+ * buffer), not its correctness (that *out holds those bytes). Stating the
+ * latter was tried and does not work: an ensures over ((char *) out)[k] is
+ * discharged vacuously, because WP's memory model does not relate byte-level
+ * access through a cast to the struct's typed contents. Verified by mutation:
+ * with the byte-equality postcondition in place, replacing this memcpy with
+ * memset(out, 0, sizeof(*out)) still proved every obligation. Do not restate it
+ * without re-running that mutation.
+ */
+/*@
+  requires \valid_read(buf + (0 .. buflen - 1));
+  requires \valid(out);
+  requires \separated(out, buf + (0 .. buflen - 1));
+  requires phentsize >= sizeof(elf64_phdr_t);
+  assigns *out;
+  ensures \result != 0 ==>
+            (size_t) idx * phentsize + sizeof(elf64_phdr_t) <= buflen;
  */
 static int elf_phdr_fetch(const uint8_t *buf,
                           size_t buflen,
@@ -110,10 +129,60 @@ static int elf_phdr_fetch(const uint8_t *buf,
     return 1;
 }
 
+/* Guest VA of the program header table, given one PT_LOAD's file range.
+ *
+ * Linux derives AT_PHDR from the PT_LOAD whose file data contains e_phoff
+ * (fs/binfmt_elf.c), not from the lowest mapped address. The two agree for the
+ * usual layout where the first PT_LOAD maps from file offset 0, and diverge
+ * otherwise.
+ *
+ * Returns 0 unless the whole table lies inside this segment's file data, which
+ * Returns 0 unless the whole table lies inside this segment's file data. Linux
+ * only requires e_phoff itself to be inside a PT_LOAD, but Linux keeps the
+ * headers reachable through the file mapping; elfuse dropped the separate phdr
+ * copy, so a table spanning two PT_LOADs would only stay readable if those
+ * segments happened to be adjacent in guest VA, which nothing checks. Requiring
+ * one segment to hold it all is what makes the no-copy scheme sound.
+ */
+/*@
+  requires \valid(gpa_out);
+  assigns *gpa_out;
+  ensures \result != 0 ==> p_offset <= phoff;
+  ensures \result != 0 ==> phoff + total <= p_offset + p_filesz;
+  ensures \result != 0 ==> *gpa_out == p_vaddr + (phoff - p_offset);
+ */
+static int elf_phdr_gpa_in_segment(uint64_t phoff,
+                                   size_t total,
+                                   uint64_t p_offset,
+                                   uint64_t p_filesz,
+                                   uint64_t p_vaddr,
+                                   uint64_t *gpa_out)
+{
+    if (phoff < p_offset)
+        return 0;
+
+    uint64_t rel = phoff - p_offset;
+    if (rel > p_filesz || p_filesz - rel < total)
+        return 0;
+
+    return elf_add_no_wrap(p_vaddr, rel, gpa_out);
+}
+
 /* Place one PT_LOAD segment in the guest slab. On success gpa_out is the
  * relocated load address and zero_len_out is the extent the loader may touch,
  * rounded up to the page boundary after the segment ends. Both outputs are
  * bounded by guest_size, and zero_len_out is never smaller than filesz.
+ */
+/*@
+  requires \valid(gpa_out);
+  requires \valid(zero_len_out);
+  requires \separated(gpa_out, zero_len_out);
+  assigns *gpa_out, *zero_len_out;
+  ensures \result != 0 ==> vaddr >= va_base;
+  ensures \result != 0 ==> *gpa_out == target_base + (vaddr - va_base);
+  ensures \result != 0 ==> *gpa_out + *zero_len_out <= guest_size;
+  ensures \result != 0 ==> memsz <= *zero_len_out;
+  ensures \result != 0 ==> filesz <= *zero_len_out;
  */
 static int elf_segment_extent(uint64_t vaddr,
                               uint64_t va_base,
