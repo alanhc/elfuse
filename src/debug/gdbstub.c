@@ -575,6 +575,17 @@ static void handle_write_mem(const char *pkt)
         return;
     }
 
+    /* len comes from the packet's length field, which need not agree with how
+     * many hex digits actually follow the ':'. gdb_hex_decode requires 2*len
+     * readable digits, so bound it by what is there rather than trusting the
+     * field; otherwise a short payload walks the decoder off the end of the
+     * packet buffer.
+     */
+    if (len > strlen(p) / 2) {
+        rsp_reply_error(1);
+        return;
+    }
+
     uint8_t *tmp = malloc(len);
     if (!tmp) {
         rsp_reply_error(12);
@@ -602,14 +613,23 @@ static void handle_write_mem(const char *pkt)
 static void handle_set_thread(const char *pkt)
 {
     char op = pkt[0];
+
+    /* A bare "H" leaves op as the terminator, and p would then start one byte
+     * past it, parsing whatever follows the packet as a thread id.
+     */
+    if (op == '\0') {
+        rsp_reply_error(1);
+        return;
+    }
+
     const char *p = pkt + 1;
-    int64_t tid;
     bool negative = false;
     if (*p == '-') {
         negative = true;
         p++;
     }
-    tid = (int64_t) gdb_parse_hex(&p);
+
+    int64_t tid = (int64_t) gdb_parse_hex(&p);
     if (negative)
         tid = -tid;
 
@@ -695,6 +715,7 @@ static void handle_breakpoint(const char *pkt, int insert)
 static void handle_q_supported(const char *pkt)
 {
     (void) pkt;
+
     /* Advertise features:
      * - PacketSize: max packet the stub accepts
      * - hwbreak+: the GDB stub supports hardware breakpoints
@@ -787,7 +808,21 @@ static void handle_vcont(const char *pkt)
 
     while (*p == ';') {
         p++;
-        char action = *p++;
+
+        /* A payload ending in ';' leaves the terminator here. Advancing past it
+         * unconditionally would step off the end of the packet buffer, and
+         * gdb_rsp_recv can place that terminator at its very last byte.
+         */
+        char action = *p;
+        if (action == '\0') {
+            /* A trailing ';' with no action is malformed. Falling out of the
+             * loop here would resume every stopped thread, letting invalid
+             * debugger input change execution state.
+             */
+            rsp_reply_error(1);
+            return;
+        }
+        p++;
 
         int64_t tid = -1;
         if (*p == ':') {

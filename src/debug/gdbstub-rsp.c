@@ -23,14 +23,57 @@ int gdb_hex_encode(char *dst, const uint8_t *src, size_t len)
     return (int) bytes_to_hex(dst, src, len);
 }
 
+/* Combine two hex digits into a byte. Returns 0 when either is not a hex
+ * digit, leaving *out untouched.
+ *
+ * Both nibbles are validated before either is shifted. hex_nibble returns -1
+ * for a non-digit, and shifting a negative int left is undefined behavior, so
+ * the obvious "(hex_nibble(hi) << 4) | hex_nibble(lo)" is UB on any input the
+ * remote sends that is not hex. The remote controls these bytes completely.
+ */
+static int gdb_hex_pair(char hi, char lo, uint8_t *out)
+{
+    int h = hex_nibble((unsigned char) hi);
+    if (h < 0)
+        return 0;
+
+    int l = hex_nibble((unsigned char) lo);
+    if (l < 0)
+        return 0;
+
+    /* Unsigned: a signed left shift that overflows is undefined, and int is
+     * the type hex_nibble returns.
+     */
+    *out = (uint8_t) (((unsigned int) h << 4) | (unsigned int) l);
+    return 1;
+}
+
+/* Decode len bytes from 2*len hex digits. Returns len, or -1 on the first
+ * non-hex digit.
+ *
+ * The caller must supply 2*len readable digits. Decoding stops at the first bad
+ * digit without reading its partner: the pair used to be read together before
+ * either was validated, so a NUL landing on an even index caused a one-byte
+ * read past it, and gdb_rsp_recv can place that NUL at the last byte of the
+ * packet buffer.
+ */
 int gdb_hex_decode(uint8_t *dst, const char *src, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
-        int hi = hex_nibble((unsigned char) src[i * 2]),
-            lo = hex_nibble((unsigned char) src[i * 2 + 1]);
-        if (hi < 0 || lo < 0)
+        /* Read the digits in order and bail between them. Handing both to
+         * gdb_hex_pair would not do: C evaluates both arguments before the
+         * call, so the low digit gets read before the high one is rejected,
+         * which is the overread this loop is supposed to avoid.
+         */
+        int hi = hex_nibble((unsigned char) src[i * 2]);
+        if (hi < 0)
             return -1;
-        dst[i] = (uint8_t) ((hi << 4) | lo);
+
+        int lo = hex_nibble((unsigned char) src[i * 2 + 1]);
+        if (lo < 0)
+            return -1;
+
+        dst[i] = (uint8_t) (((unsigned int) hi << 4) | (unsigned int) lo);
     }
     return (int) len;
 }
@@ -127,7 +170,11 @@ void gdb_rsp_set_noack(gdb_rsp_ctx_t *ctx, bool enabled)
  */
 int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz)
 {
-    if (bufsz == 0) {
+    /* Two bytes minimum: every returned packet is NUL-terminated, and the bare
+     * 0x03 (Ctrl+C) reply needs one byte for the payload and one for the
+     * terminator. A one-byte buffer could not honor that guarantee.
+     */
+    if (bufsz < 2) {
         errno = EINVAL;
         return -1;
     }
@@ -157,6 +204,10 @@ int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz)
 
             if (c == 0x03) {
                 buf[0] = 0x03;
+                /* Terminate like every other returned packet; bufsz >= 2 is
+                 * enforced above.
+                 */
+                buf[1] = '\0';
                 return 1;
             }
 
@@ -198,9 +249,19 @@ int gdb_rsp_recv(gdb_rsp_ctx_t *ctx, int fd, char *buf, size_t bufsz)
 
                 buf[pos] = '\0';
 
-                uint8_t expected =
-                    (uint8_t) ((hex_nibble((unsigned char) ck_hi) << 4) |
-                               hex_nibble((unsigned char) ck_lo));
+                /* A non-hex checksum is a corrupt packet, handled like a
+                 * mismatch. Decoding it as a number first would shift a
+                 * negative nibble.
+                 */
+                uint8_t expected;
+                if (!gdb_hex_pair(ck_hi, ck_lo, &expected)) {
+                    if (!ctx->no_ack_mode)
+                        (void) rsp_send_byte(fd, '-');
+                    state = 0;
+                    pos = 0;
+                    break;
+                }
+
                 uint8_t actual = rsp_checksum(buf, pos);
                 if (expected == actual) {
                     if (!ctx->no_ack_mode)
