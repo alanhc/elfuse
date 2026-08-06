@@ -198,6 +198,16 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
         }
 
         if (ph->p_type == PT_LOAD) {
+            /* Linux ignores a PT_LOAD that maps no bytes, and so does the
+             * mapper. Recording it anyway would still feed load_min/load_max,
+             * the boot region tables and /proc/self/maps: a zero-memsz segment
+             * at p_vaddr == guest_size satisfies the mapper's extent bound
+             * (gpa > guest_size - memsz is false when memsz is 0), so load_max
+             * reaches the end of the slab and brk_base follows it there.
+             */
+            if (ph->p_memsz == 0)
+                continue;
+
             if (seg_count >= ELF_MAX_SEGMENTS) {
                 log_error("%s: too many PT_LOAD segments", display_path);
                 free(ph_buf);
