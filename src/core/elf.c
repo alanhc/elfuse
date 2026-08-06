@@ -171,6 +171,93 @@ static int elf_segment_extent(uint64_t vaddr,
     return 1;
 }
 
+/* Read a PT_INTERP segment's dynamic linker path into info->interp_path.
+ *
+ * Returns 0 on success, -1 when the path does not fit. The path lives in the
+ * file rather than in a loadable segment, so it is read while the ELF is still
+ * open.
+ */
+static int elf_read_interp(int fd,
+                           const elf64_phdr_t *ph,
+                           const char *display_path,
+                           elf_info_t *info)
+{
+    size_t len = ph->p_filesz;
+    if (len >= sizeof(info->interp_path)) {
+        log_error("%s: PT_INTERP path too long (%zu >= %zu)", display_path, len,
+                  sizeof(info->interp_path));
+        return -1;
+    }
+    if (len == 0)
+        return 0;
+
+    /* len counts the NUL stored in the file. A short read leaves the path
+     * unusable, so clear it rather than act on a truncated interpreter name; a
+     * full read is force-terminated as insurance.
+     */
+    if (pread(fd, info->interp_path, len, ph->p_offset) < (ssize_t) len)
+        info->interp_path[0] = '\0';
+    else
+        info->interp_path[len - 1] = '\0';
+    return 0;
+}
+
+/* Record one PT_LOAD segment and fold its extent into the load bounds.
+ *
+ * Returns 0 on success, -1 when the segment table is full or the extent wraps.
+ * seg_count is the caller's running total, kept out of info until the whole
+ * table parses so a rejected ELF leaves no partial segment list behind.
+ */
+static int elf_record_load(const elf64_phdr_t *ph,
+                           const char *display_path,
+                           uint16_t idx,
+                           int *seg_count,
+                           elf_info_t *info)
+{
+    /* Linux ignores a PT_LOAD that maps no bytes, and so does the mapper.
+     * Recording it anyway would still feed load_min/load_max, the boot region
+     * tables and /proc/self/maps: a zero-memsz segment at p_vaddr ==
+     * guest_size satisfies the extent bound (gpa > guest_size - memsz is false
+     * when memsz is 0), so load_max reaches the end of the slab and brk_base
+     * follows it there.
+     */
+    if (ph->p_memsz == 0)
+        return 0;
+
+    if (*seg_count >= ELF_MAX_SEGMENTS) {
+        log_error("%s: too many PT_LOAD segments", display_path);
+        return -1;
+    }
+
+    /* A PT_LOAD whose extent wraps past the end of the address space is
+     * unloadable in any case, and it must be rejected here rather than
+     * saturated: consumers of load_max add a load base before comparing against
+     * guest_size (exec.c "ELF extends beyond guest address space"), so a
+     * UINT64_MAX sentinel wraps there and passes the very check it should trip.
+     */
+    uint64_t seg_end;
+    if (!elf_add_no_wrap(ph->p_vaddr, ph->p_memsz, &seg_end)) {
+        log_error("%s: PT_LOAD %u extent 0x%llx+0x%llx wraps the address space",
+                  display_path, idx, (unsigned long long) ph->p_vaddr,
+                  (unsigned long long) ph->p_memsz);
+        return -1;
+    }
+
+    int slot = *seg_count;
+    info->segments[slot].gpa = ph->p_vaddr;
+    info->segments[slot].offset = ph->p_offset;
+    info->segments[slot].filesz = ph->p_filesz;
+    info->segments[slot].memsz = ph->p_memsz;
+    info->segments[slot].flags = (int) ph->p_flags;
+    *seg_count = slot + 1;
+
+    if (ph->p_vaddr < info->load_min)
+        info->load_min = ph->p_vaddr;
+    if (seg_end > info->load_max)
+        info->load_max = seg_end;
+    return 0;
+}
+
 int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
 {
     memset(info, 0, sizeof(*info));
@@ -247,102 +334,33 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
 
     if (pread(fd, ph_buf, ph_total, ehdr.e_phoff) != (ssize_t) ph_total) {
         log_error("%s: failed to read program headers", display_path);
-        free(ph_buf);
-        return -1;
+        goto fail;
     }
 
     /* Collect only the program headers that affect process startup. */
     int seg_count = 0;
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
-        elf64_phdr_t phent;
-        if (!elf_phdr_fetch(ph_buf, ph_total, i, ehdr.e_phentsize, &phent)) {
+        elf64_phdr_t ph;
+        if (!elf_phdr_fetch(ph_buf, ph_total, i, ehdr.e_phentsize, &ph)) {
             log_error("%s: program header %u outside the header table",
                       display_path, i);
-            free(ph_buf);
-            return -1;
-        }
-        const elf64_phdr_t *ph = &phent;
-
-        /* PT_INTERP stores the dynamic linker path in the file, not in a
-         * loadable segment, so read it before closing the ELF.
-         */
-        if (ph->p_type == PT_INTERP) {
-            size_t interp_len = ph->p_filesz;
-            if (interp_len >= sizeof(info->interp_path)) {
-                log_error("%s: PT_INTERP path too long (%zu >= %zu)",
-                          display_path, interp_len, sizeof(info->interp_path));
-                free(ph_buf);
-                return -1;
-            }
-            if (interp_len > 0) {
-                ssize_t n =
-                    pread(fd, info->interp_path, interp_len, ph->p_offset);
-                /* interp_len includes the NUL from the ELF file. On short
-                 * read, clear the path (unusable). On full read,
-                 * force-terminate as insurance.
-                 */
-                if (n < (ssize_t) interp_len)
-                    info->interp_path[0] = '\0';
-                else
-                    info->interp_path[interp_len - 1] = '\0';
-            }
+            goto fail;
         }
 
-        if (ph->p_type == PT_LOAD) {
-            /* Linux ignores a PT_LOAD that maps no bytes, and so does the
-             * mapper. Recording it anyway would still feed load_min/load_max,
-             * the boot region tables and /proc/self/maps: a zero-memsz segment
-             * at p_vaddr == guest_size satisfies the mapper's extent bound
-             * (gpa > guest_size - memsz is false when memsz is 0), so load_max
-             * reaches the end of the slab and brk_base follows it there.
-             */
-            if (ph->p_memsz == 0)
-                continue;
+        if (ph.p_type == PT_INTERP &&
+            elf_read_interp(fd, &ph, display_path, info) < 0)
+            goto fail;
 
-            if (seg_count >= ELF_MAX_SEGMENTS) {
-                log_error("%s: too many PT_LOAD segments", display_path);
-                free(ph_buf);
-                return -1;
-            }
-
-            info->segments[seg_count].gpa = ph->p_vaddr;
-            info->segments[seg_count].offset = ph->p_offset;
-            info->segments[seg_count].filesz = ph->p_filesz;
-            info->segments[seg_count].memsz = ph->p_memsz;
-            info->segments[seg_count].flags = (int) ph->p_flags;
-            seg_count++;
-
-            /* Track load bounds. A PT_LOAD whose extent wraps past the end of
-             * the address space is unloadable in any case, and it must be
-             * rejected rather than saturated: consumers of load_max add a load
-             * base before comparing against guest_size (exec.c "ELF extends
-             * beyond guest address space"), so a UINT64_MAX sentinel wraps
-             * there and passes the very check it should trip.
-             */
-            uint64_t seg_end;
-            if (!elf_add_no_wrap(ph->p_vaddr, ph->p_memsz, &seg_end)) {
-                log_error(
-                    "%s: PT_LOAD %u extent 0x%llx+0x%llx wraps the address "
-                    "space",
-                    display_path, i, (unsigned long long) ph->p_vaddr,
-                    (unsigned long long) ph->p_memsz);
-                free(ph_buf);
-                return -1;
-            }
-
-            if (ph->p_vaddr < info->load_min)
-                info->load_min = ph->p_vaddr;
-            if (seg_end > info->load_max)
-                info->load_max = seg_end;
-        }
+        if (ph.p_type == PT_LOAD &&
+            elf_record_load(&ph, display_path, i, &seg_count, info) < 0)
+            goto fail;
     }
 
     info->num_segments = seg_count;
 
     if (seg_count == 0) {
         log_error("%s: no PT_LOAD segments", display_path);
-        free(ph_buf);
-        return -1;
+        goto fail;
     }
 
     /* AT_PHDR, following Linux 5.19+ (commit 0da1d5002745, which replaced the
@@ -359,12 +377,17 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
      * segment: for build/test-hello that landed 0x1a bytes past the end of
      * .text.
      *
-     * A segment that covers e_phoff but whose p_vaddr + rel is unrepresentable
-     * is skipped rather than distinguished, so in principle the table could be
-     * attributed to a later segment. Unreachable: such a p_vaddr sits within a
-     * few bytes of UINT64_MAX, and the mapper rejects it because every accepted
-     * segment satisfies gpa <= guest_size - memsz with guest_size at most
-     * 1 TiB, so phdr_gpa never reaches build_linux_stack.
+     * Requiring the whole table inside one segment's file data is what lets
+     * elf_map_segments_fd deliver it with no separate copy and no second
+     * destination to bound-check.
+     */
+    /* A segment that covers e_phoff but whose p_vaddr + rel is
+     * unrepresentable is skipped rather than distinguished, so in principle
+     * the table could be attributed to a later segment. Unreachable: such a
+     * p_vaddr sits within a few bytes of UINT64_MAX, and elf_segment_extent
+     * rejects it at map time because every accepted segment satisfies
+     * gpa <= guest_size - memsz with guest_size at most 1 TiB, so phdr_gpa
+     * never reaches build_linux_stack.
      */
     for (int i = 0; i < seg_count; i++) {
         if (elf_phdr_gpa_in_segment(ehdr.e_phoff, ph_total,
@@ -378,6 +401,10 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
 
     free(ph_buf);
     return 0;
+
+fail:
+    free(ph_buf);
+    return -1;
 }
 
 int elf_load(const char *path, elf_info_t *info)
