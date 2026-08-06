@@ -21,6 +21,47 @@
 #include "debug/log.h"
 #include "utils.h"
 
+/* Size of the program header table in bytes, or 0 when the header geometry is
+ * unusable. Rejects an empty table, an entry stride too small to hold a program
+ * header, and a total past the kernel's 64KiB cap.
+ */
+static int elf_phdr_table_bytes(uint16_t phnum,
+                                uint16_t phentsize,
+                                size_t *total)
+{
+    if (phnum == 0 || phentsize < sizeof(elf64_phdr_t))
+        return 0;
+
+    size_t bytes = (size_t) phnum * phentsize;
+    if (bytes > ELF_PHDR_TABLE_MAX)
+        return 0;
+
+    *total = bytes;
+    return 1;
+}
+
+/* Copy program header idx out of a buffer of buflen bytes.
+ *
+ * Returns 0 when the entry does not lie wholly inside the buffer.
+ */
+static int elf_phdr_fetch(const uint8_t *buf,
+                          size_t buflen,
+                          uint16_t idx,
+                          uint16_t phentsize,
+                          elf64_phdr_t *out)
+{
+    size_t off = (size_t) idx * phentsize;
+    if (off > buflen || buflen - off < sizeof(*out))
+        return 0;
+
+    /* memcpy rather than an aliased struct pointer: e_phentsize is attacker
+     * controlled and need not be a multiple of the program header alignment, so
+     * buf + off is not guaranteed to be suitably aligned.
+     */
+    memcpy(out, buf + off, sizeof(*out));
+    return 1;
+}
+
 int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
 {
     memset(info, 0, sizeof(*info));
@@ -76,26 +117,19 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
     info->load_min = UINT64_MAX;
     info->load_max = 0;
 
-    /* Program headers drive both memory mappings and auxv AT_PHDR. */
-    if (ehdr.e_phnum == 0) {
-        log_error("%s: no program headers", display_path);
-        return -1;
-    }
-    if (ehdr.e_phentsize < sizeof(elf64_phdr_t)) {
-        log_error("%s: e_phentsize too small (%u < %zu)", display_path,
-                  ehdr.e_phentsize, sizeof(elf64_phdr_t));
-        return -1;
-    }
-    /* Linux kernel caps program headers at 64KiB. Reject pathological inputs
-     * before allocating to avoid attacker-controlled large allocations.
+    /* Program headers drive both memory mappings and auxv AT_PHDR. The table
+     * geometry is rejected before anything is allocated, so a pathological
+     * e_phnum/e_phentsize pair cannot drive a large attacker-chosen malloc.
      */
-    if ((size_t) ehdr.e_phnum * ehdr.e_phentsize > 65536) {
-        log_error("%s: program header table too large (%u * %u)", display_path,
-                  ehdr.e_phnum, ehdr.e_phentsize);
+    size_t ph_total;
+    if (!elf_phdr_table_bytes(ehdr.e_phnum, ehdr.e_phentsize, &ph_total)) {
+        log_error(
+            "%s: unusable program header table (e_phnum=%u, "
+            "e_phentsize=%u)",
+            display_path, ehdr.e_phnum, ehdr.e_phentsize);
         return -1;
     }
 
-    size_t ph_total = (size_t) ehdr.e_phnum * ehdr.e_phentsize;
     uint8_t *ph_buf = malloc(ph_total);
     if (!ph_buf) {
         perror("malloc");
@@ -111,8 +145,14 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
     /* Collect only the program headers that affect process startup. */
     int seg_count = 0;
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
-        const elf64_phdr_t *ph =
-            (const elf64_phdr_t *) (ph_buf + (size_t) i * ehdr.e_phentsize);
+        elf64_phdr_t phent;
+        if (!elf_phdr_fetch(ph_buf, ph_total, i, ehdr.e_phentsize, &phent)) {
+            log_error("%s: program header %u outside the header table",
+                      display_path, i);
+            free(ph_buf);
+            return -1;
+        }
+        const elf64_phdr_t *ph = &phent;
 
         /* PT_INTERP stores the dynamic linker path in the file, not in a
          * loadable segment, so read it before closing the ELF.
@@ -216,12 +256,17 @@ int elf_map_segments_fd(const elf_info_t *info,
         return -1;
     }
 
-    /* Read and parse program headers again to get file offsets. The size was
-     * already bound-checked during elf_load(); recheck defensively in case the
-     * header sizes changed since (e.g. corrupt file races).
+    /* Read and parse program headers again to get file offsets.
+     *
+     * This is a SECOND parse of a file that may have changed since the first:
+     * elf_map_segments re-opens by path, and elfuse has no ETXTBSY, so a guest
+     * thread can rewrite the image another thread is execve'ing. The geometry
+     * is therefore revalidated with the same helper the first parse used,
+     * rather than the total-size-only check that used to live here, which let
+     * e_phentsize=1 walk the stride off the end of ph_buf.
      */
-    size_t ph_total = (size_t) ehdr.e_phnum * ehdr.e_phentsize;
-    if (ph_total == 0 || ph_total > 65536) {
+    size_t ph_total;
+    if (!elf_phdr_table_bytes(ehdr.e_phnum, ehdr.e_phentsize, &ph_total)) {
         return -1;
     }
     uint8_t *ph_buf = malloc(ph_total);
@@ -270,8 +315,12 @@ int elf_map_segments_fd(const elf_info_t *info,
     int seg_idx = 0;
     for (uint16_t i = 0; i < ehdr.e_phnum && seg_idx < info->num_segments;
          i++) {
-        const elf64_phdr_t *ph =
-            (const elf64_phdr_t *) (ph_buf + (size_t) i * ehdr.e_phentsize);
+        elf64_phdr_t phent;
+        if (!elf_phdr_fetch(ph_buf, ph_total, i, ehdr.e_phentsize, &phent)) {
+            free(ph_buf);
+            return -1;
+        }
+        const elf64_phdr_t *ph = &phent;
 
         if (ph->p_type != PT_LOAD)
             continue;

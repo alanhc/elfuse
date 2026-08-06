@@ -67,6 +67,12 @@ typedef struct {
     uint64_t p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
 } elf64_phdr_t;
 
+/* Upper bound on the program header table, matching the Linux kernel's 64KiB
+ * cap (fs/binfmt_elf.c). e_phnum and e_phentsize come straight from an
+ * untrusted file, so the product is rejected before anything is allocated.
+ */
+#define ELF_PHDR_TABLE_MAX 65536
+
 /* Loaded ELF info */
 
 #define ELF_MAX_SEGMENTS 16
