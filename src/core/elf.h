@@ -90,12 +90,14 @@ typedef struct {
     uint64_t load_min; /* Lowest loaded GPA (page-aligned) */
     uint64_t load_max; /* Highest loaded GPA + memsz (page-aligned up) */
 
-    /* Program headers location in guest memory (for AT_PHDR auxv). phdr_valid
-     * distinguishes "no PT_LOAD covers the table" from a legitimate phdr_gpa of
-     * 0, which an ET_DYN image whose covering segment sits at p_vaddr 0 has.
+    /* GPA of the program headers, derived from the PT_LOAD whose file data
+     * contains them. Only meaningful when phdr_valid is set: an ET_DYN image
+     * whose covering segment has p_vaddr == 0 and p_offset == e_phoff yields a
+     * legitimate phdr_gpa of 0, which a zero sentinel could not tell apart from
+     * "no segment covers the table".
      */
+    uint64_t phdr_gpa;
     bool phdr_valid;
-    uint64_t phdr_gpa; /* GPA of program headers in guest memory */
 
     /* PT_INTERP: dynamic linker path (empty if statically linked) */
     char interp_path[256];
@@ -111,6 +113,19 @@ typedef struct {
     } segments[ELF_MAX_SEGMENTS];
 } elf_info_t;
 
+/* Where a loaded image lands: a segment at p_vaddr goes to
+ * target_base + (p_vaddr - va_base).
+ *
+ * A struct rather than two uint64_t parameters on purpose. They were adjacent
+ * same-typed arguments once, and a signature change left three call sites
+ * passing the old shape: identical arity, all integers, so it compiled clean
+ * and broke every exec path. Naming the fields makes that a compile error.
+ */
+typedef struct {
+    uint64_t va_base;     /* lowest p_vaddr the image is described against */
+    uint64_t target_base; /* GPA that va_base maps to */
+} elf_window_t;
+
 /* API */
 
 /* Load and parse an ELF64 file. Validates header, extracts PT_LOAD info.
@@ -120,21 +135,27 @@ int elf_load(const char *path, elf_info_t *info);
 int elf_load_fd(int fd, const char *display_path, elf_info_t *info);
 
 /* Copy ELF segments into guest memory. Call after elf_load() and guest_init().
- * Also copies program headers into guest memory for AT_PHDR. load_base is added
- * to all virtual addresses (0 for ET_EXEC at link addr, non-zero for ET_DYN
- * loaded at a chosen base). infra_lo and infra_hi delimit the runtime infra
- * reserve (page-table pool, shim text, shim_data, vDSO). Any PT_LOAD or PT_PHDR
- * copy whose destination intersects [infra_lo, infra_hi) is rejected: those
- * writes go through host_base directly and would otherwise bypass the EL1-only
- * page-table protection on shim_data. Pass 0,0 only when the guest_t is not yet
- * built.
- * Returns 0 on success, -1 on failure.
+ *
+ * Reads nothing from the file but the segment contents: the layout comes
+ * entirely from info, filled by the single parse in elf_load(). The program
+ * headers need no separate copy because elf_load() only sets phdr_gpa to an
+ * address inside a PT_LOAD, so the segment read here delivers them.
+ *
+ * Guest images pass a window of {0, load_base} (load_base 0 for ET_EXEC at its
+ * link address, non-zero for ET_DYN). Rosetta passes its own va_base so its
+ * 0x800000000000 link address maps low without relying on unsigned
+ * wraparound. infra_lo and infra_hi
+ * delimit the runtime infra reserve (page-table pool, shim text, shim_data,
+ * vDSO). Any PT_LOAD copy whose destination intersects [infra_lo, infra_hi) is
+ * rejected: those writes go through host_base directly and would otherwise
+ * bypass the EL1-only page-table protection on shim_data. Pass 0,0 only when
+ * the guest_t is not yet built. Returns 0 on success, -1 on failure.
  */
 int elf_map_segments(const elf_info_t *info,
                      const char *path,
                      void *guest_base,
                      uint64_t guest_size,
-                     uint64_t load_base,
+                     elf_window_t window,
                      uint64_t infra_lo,
                      uint64_t infra_hi);
 int elf_map_segments_fd(const elf_info_t *info,
@@ -142,7 +163,7 @@ int elf_map_segments_fd(const elf_info_t *info,
                         const char *display_path,
                         void *guest_base,
                         uint64_t guest_size,
-                        uint64_t load_base,
+                        elf_window_t window,
                         uint64_t infra_lo,
                         uint64_t infra_hi);
 

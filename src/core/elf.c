@@ -14,7 +14,6 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/stat.h>
 #include <errno.h>
 
 #include "core/elf.h"
@@ -108,6 +107,67 @@ static int elf_phdr_fetch(const uint8_t *buf,
      * buf + off is not guaranteed to be suitably aligned.
      */
     memcpy(out, buf + off, sizeof(*out));
+    return 1;
+}
+
+/* Place one PT_LOAD segment in the guest slab. On success gpa_out is the
+ * relocated load address and zero_len_out is the extent the loader may touch,
+ * rounded up to the page boundary after the segment ends. Both outputs are
+ * bounded by guest_size, and zero_len_out is never smaller than filesz.
+ */
+static int elf_segment_extent(uint64_t vaddr,
+                              uint64_t va_base,
+                              uint64_t target_base,
+                              uint64_t filesz,
+                              uint64_t memsz,
+                              uint64_t guest_size,
+                              uint64_t *gpa_out,
+                              uint64_t *zero_len_out)
+{
+    /* Relocation is expressed as a window, not a pre-wrapped base: the segment
+     * at vaddr sits at target_base + (vaddr - va_base).
+     *
+     * The Rosetta translator links at 0x800000000000 and is mapped low, which
+     * rosetta.c used to arrange by passing load_base = guest_base - va_base and
+     * relying on the truncated sum. That is the same value this computes
+     * without any wrapping, so the pair states the intent the wrap only
+     * implied, and a guest ELF (va_base 0) can no longer reach an address by
+     * overflowing into it.
+     */
+    if (vaddr < va_base)
+        return 0;
+
+    uint64_t gpa;
+    if (!elf_add_no_wrap(target_base, vaddr - va_base, &gpa))
+        return 0;
+
+    /* A segment cannot contain more initialized file data than its in-memory
+     * extent.
+     */
+    if (filesz > memsz)
+        return 0;
+
+    /* Keep the mapped segment inside the configured IPA-sized guest slab. */
+    if (memsz > guest_size || gpa > guest_size - memsz)
+        return 0;
+
+    /* The loader zeros up to the next page boundary AFTER the segment ends, so
+     * the extent is PAGE_ALIGN_UP(gpa + memsz) rather than gpa +
+     * PAGE_ALIGN_UP(memsz): gpa is not always page-aligned (e.g. ld.so's RW
+     * segment at vaddr 0x2f650), and with the older bytes-from-gpa formula the
+     * page covering the last memsz byte kept its mid-page tail untouched.
+     * execve into a dynamic-linked target then read stale state from the prior
+     * incarnation of the same interpreter at offsets ld.so allocates beyond
+     * memsz (e.g. the first link_map in _dl_new_object).
+     */
+    uint64_t end = gpa + memsz;
+    uint64_t aligned = PAGE_ALIGN_UP(end);
+    /* aligned < end catches the align-up carrying past UINT64_MAX. */
+    if (aligned < end || aligned > guest_size)
+        aligned = guest_size;
+
+    *gpa_out = gpa;
+    *zero_len_out = aligned - gpa;
     return 1;
 }
 
@@ -337,7 +397,7 @@ int elf_map_segments_fd(const elf_info_t *info,
                         const char *display_path,
                         void *guest_base,
                         uint64_t guest_size,
-                        uint64_t load_base,
+                        elf_window_t window,
                         uint64_t infra_lo,
                         uint64_t infra_hi)
 {
@@ -348,115 +408,60 @@ int elf_map_segments_fd(const elf_info_t *info,
      */
     bool infra_active = infra_lo < infra_hi;
 
-    /* Re-read ELF header to get phoff */
-    elf64_ehdr_t ehdr;
-    if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr)) {
-        return -1;
-    }
-
-    /* Read and parse program headers again to get file offsets.
+    /* The layout comes entirely from the single parse in elf_load_fd. Do not
+     * re-read or re-parse the header here.
      *
-     * This is a SECOND parse of a file that may have changed since the first:
-     * elf_map_segments re-opens by path, and elfuse has no ETXTBSY, so a guest
-     * thread can rewrite the image another thread is execve'ing. The geometry
-     * is therefore revalidated with the same helper the first parse used,
-     * rather than the total-size-only check that used to live here, which let
-     * e_phentsize=1 walk the stride off the end of ph_buf.
+     * This function used to, and that was unsound rather than merely wasteful.
+     * elf_map_segments re-opens by path and elfuse has no ETXTBSY, so a guest
+     * thread can rewrite the image another thread is execve'ing. A second parse
+     * then validates bytes that nothing downstream consumes: bootstrap.c and
+     * exec.c build the page-table permissions from info->segments[]. A changed
+     * PT_LOAD count or order left a segment mapped but never loaded, and the
+     * guest read pre-execve bytes at an address /proc/self/maps calls
+     * file-backed.
+     *
+     * The program headers need no separate copy either. elf_load_fd sets
+     * phdr_gpa only to an address inside a PT_LOAD whose file data holds the
+     * whole table, so the segment read below delivers them at phdr_gpa +
+     * load_base as a side effect; when no segment covers the table phdr_gpa is
+     * 0 and AT_PHDR reports 0, as on Linux. Dropping that copy removed the last
+     * hand-written extent check in this file along with the second destination
+     * it guarded.
      */
-    size_t ph_total;
-    if (!elf_phdr_table_bytes(ehdr.e_phnum, ehdr.e_phentsize, &ph_total)) {
-        return -1;
-    }
-    uint8_t *ph_buf = malloc(ph_total);
-    if (!ph_buf) {
-        return -1;
-    }
+    for (int i = 0; i < info->num_segments; i++) {
+        uint64_t filesz = info->segments[i].filesz;
+        uint64_t memsz = info->segments[i].memsz;
+        uint64_t gpa, zero_len;
 
-    if (pread(fd, ph_buf, ph_total, ehdr.e_phoff) != (ssize_t) ph_total) {
-        free(ph_buf);
-        return -1;
-    }
-
-    /* The program headers need no separate copy. elf_load_fd sets phdr_gpa only
-     * to an address inside a PT_LOAD whose file data holds the whole table, so
-     * the segment reads below deliver them at phdr_gpa + load_base as a side
-     * effect; when no segment covers the table phdr_gpa is 0, phdr_valid is
-     * false, and AT_PHDR reports 0 as on Linux. Dropping the copy removes a
-     * second destination to bound-check, and with it the case where the copy
-     * landed at an address inside no segment.
-     */
-
-    /* ET_DYN segments are relocated by load_base before writing into guest
-     * memory.
-     */
-    int seg_idx = 0;
-    for (uint16_t i = 0; i < ehdr.e_phnum && seg_idx < info->num_segments;
-         i++) {
-        elf64_phdr_t phent;
-        if (!elf_phdr_fetch(ph_buf, ph_total, i, ehdr.e_phentsize, &phent)) {
-            free(ph_buf);
-            return -1;
-        }
-        const elf64_phdr_t *ph = &phent;
-
-        if (ph->p_type != PT_LOAD)
-            continue;
-
-        /* p_vaddr + load_base may wrap via 2's complement for high-VA binaries
-         * (see comment above). Bounds check below catches invalid results.
-         */
-        uint64_t gpa = ph->p_vaddr + load_base, filesz = ph->p_filesz;
-        uint64_t memsz = ph->p_memsz;
-
-        /* A segment cannot contain more initialized file data than its
-         * in-memory extent.
-         */
-        if (filesz > memsz) {
+        if (!elf_segment_extent(info->segments[i].gpa, window.va_base,
+                                window.target_base, filesz, memsz, guest_size,
+                                &gpa, &zero_len)) {
             log_error(
-                "%s: segment at 0x%llx has filesz > memsz "
-                "(0x%llx > 0x%llx)",
-                display_path, (unsigned long long) gpa,
-                (unsigned long long) filesz, (unsigned long long) memsz);
-            free(ph_buf);
-            return -1;
-        }
-
-        /* Keep the mapped segment inside the configured IPA-sized guest slab.
-         */
-        if (memsz > guest_size || gpa > guest_size - memsz) {
-            log_error("%s: segment at 0x%llx+0x%llx exceeds guest memory",
-                      display_path, (unsigned long long) gpa,
-                      (unsigned long long) memsz);
-            free(ph_buf);
+                "%s: segment vaddr 0x%llx (memsz 0x%llx, filesz 0x%llx) is "
+                "not loadable: %s [window va_base 0x%llx target 0x%llx, guest "
+                "size 0x%llx]",
+                display_path, (unsigned long long) info->segments[i].gpa,
+                (unsigned long long) memsz, (unsigned long long) filesz,
+                info->segments[i].gpa < window.va_base
+                    ? "below the relocation window"
+                    : (filesz > memsz ? "filesz exceeds memsz"
+                                      : "does not fit guest memory"),
+                (unsigned long long) window.va_base,
+                (unsigned long long) window.target_base,
+                (unsigned long long) guest_size);
             return -1;
         }
 
         /* PT_LOAD with memsz == 0 maps no bytes, but the page-tail zero extent
-         * below still rounds up to the next page boundary. For an unaligned gpa
-         * that means a crafted ELF could splat zeros across the tail of a
-         * previously loaded segment in the same page, or trip the infra-overlap
-         * check with no live mapping behind it. Linux ignores zero-memsz
-         * PT_LOADs; mirror that here.
+         * still rounds up to the next page boundary. For an unaligned gpa that
+         * means a crafted ELF could splat zeros across the tail of a previously
+         * loaded segment in the same page, or trip the infra-overlap check with
+         * no live mapping behind it. Linux ignores zero-memsz PT_LOADs; mirror
+         * that here.
          */
-        if (memsz == 0) {
-            seg_idx++;
+        if (memsz == 0)
             continue;
-        }
 
-        /* The host memset zeros up to the next page boundary AFTER the segment
-         * ends, so the infra-overlap check has to use the same rounded extent.
-         * The end is PAGE_ALIGN_UP(gpa + memsz) rather than gpa +
-         * PAGE_ALIGN_UP(memsz) because gpa is not always page-aligned (e.g.
-         * ld.so's RW segment at vaddr 0x2f650): with the older bytes-from-gpa
-         * formula the page covering the last memsz byte kept its mid-page tail
-         * untouched, and execve into a dynamic-linked target then read stale
-         * state from the prior incarnation of the same interpreter at offsets
-         * ld.so allocates from beyond memsz (e.g. the first link_map in
-         * _dl_new_object).
-         */
-        uint64_t zero_len = PAGE_ALIGN_UP(gpa + memsz) - gpa;
-        if (gpa + zero_len > guest_size)
-            zero_len = guest_size - gpa;
         if (infra_active && gpa < infra_hi && gpa + zero_len > infra_lo) {
             log_error(
                 "%s: segment at 0x%llx+0x%llx (zero-extent 0x%llx) overlaps "
@@ -464,14 +469,13 @@ int elf_map_segments_fd(const elf_info_t *info,
                 display_path, (unsigned long long) gpa,
                 (unsigned long long) memsz, (unsigned long long) zero_len,
                 (unsigned long long) infra_lo, (unsigned long long) infra_hi);
-            free(ph_buf);
             return -1;
         }
 
         /* Zero only the tail beyond filesz: the BSS portion [filesz, memsz)
          * plus the page-padding [memsz, zero_len) that Linux guarantees clean
          * for dynamic linkers allocating from the last mapped page's tail.
-         * Skipping the file-data range avoids writing zeros that the fread
+         * Skipping the file-data range avoids writing zeros that the pread
          * below would immediately overwrite; for typical shared libraries that
          * is a hundreds-of-KiB win per segment.
          */
@@ -479,22 +483,18 @@ int elf_map_segments_fd(const elf_info_t *info,
             memset((uint8_t *) guest_base + gpa + filesz, 0, zero_len - filesz);
 
         if (filesz > 0) {
-            if (pread(fd, (uint8_t *) guest_base + gpa, filesz, ph->p_offset) !=
-                (ssize_t) filesz) {
+            if (pread(fd, (uint8_t *) guest_base + gpa, filesz,
+                      info->segments[i].offset) != (ssize_t) filesz) {
                 log_error(
                     "%s: short read for segment at 0x%llx "
                     "(expected %llu)",
                     display_path, (unsigned long long) gpa,
                     (unsigned long long) filesz);
-                free(ph_buf);
                 return -1;
             }
         }
-
-        seg_idx++;
     }
 
-    free(ph_buf);
     return 0;
 }
 
@@ -502,7 +502,7 @@ int elf_map_segments(const elf_info_t *info,
                      const char *path,
                      void *guest_base,
                      uint64_t guest_size,
-                     uint64_t load_base,
+                     elf_window_t window,
                      uint64_t infra_lo,
                      uint64_t infra_hi)
 {
@@ -511,8 +511,8 @@ int elf_map_segments(const elf_info_t *info,
         perror(path);
         return -1;
     }
-    int rc = elf_map_segments_fd(info, fd, path, guest_base, guest_size,
-                                 load_base, infra_lo, infra_hi);
+    int rc = elf_map_segments_fd(info, fd, path, guest_base, guest_size, window,
+                                 infra_lo, infra_hi);
     close(fd);
     return rc;
 }

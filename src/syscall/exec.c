@@ -1295,8 +1295,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     uint64_t infra_lo = g->interp_base - INFRA_RESERVE;
     uint64_t infra_hi = g->interp_base;
     if (elf_map_segments_fd(&elf_info, exec_fd, path_host, g->host_base,
-                            g->guest_size, elf_load_base, infra_lo,
-                            infra_hi) < 0) {
+                            g->guest_size, (elf_window_t) {0, elf_load_base},
+                            infra_lo, infra_hi) < 0) {
         log_fatal(
             "execve failed after point of no return: "
             "failed to map ELF segments for %s",
@@ -1317,8 +1317,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     if (elf_info.interp_path[0] != '\0') {
         interp_base = g->interp_base;
         if (elf_map_segments_fd(&interp_info, interp_fd, interp_resolved,
-                                g->host_base, g->guest_size, interp_base,
-                                infra_lo, infra_hi) < 0) {
+                                g->host_base, g->guest_size,
+                                (elf_window_t) {0, interp_base}, infra_lo,
+                                infra_hi) < 0) {
             log_fatal(
                 "execve failed after point of no return: "
                 "failed to map interpreter segments");
