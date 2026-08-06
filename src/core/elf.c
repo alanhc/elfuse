@@ -58,6 +58,37 @@ static int elf_phdr_table_bytes(uint16_t phnum,
     return 1;
 }
 
+/* Guest VA of the program header table, given one PT_LOAD's file range.
+ *
+ * Linux derives AT_PHDR from the PT_LOAD whose file data contains e_phoff
+ * (fs/binfmt_elf.c), not from the lowest mapped address. The two agree for the
+ * usual layout where the first PT_LOAD maps from file offset 0, and diverge
+ * otherwise.
+ *
+ * Returns 0 unless the whole table lies inside this segment's file data. Linux
+ * only requires e_phoff itself to be inside a PT_LOAD, but Linux keeps the
+ * headers reachable through the file mapping; elfuse has no separate phdr copy,
+ * so a table spanning two PT_LOADs would only stay readable if those segments
+ * happened to be adjacent in guest VA, which nothing checks. Requiring one
+ * segment to hold it all is what makes the no-copy scheme sound.
+ */
+static int elf_phdr_gpa_in_segment(uint64_t phoff,
+                                   size_t total,
+                                   uint64_t p_offset,
+                                   uint64_t p_filesz,
+                                   uint64_t p_vaddr,
+                                   uint64_t *gpa_out)
+{
+    if (phoff < p_offset)
+        return 0;
+
+    uint64_t rel = phoff - p_offset;
+    if (rel > p_filesz || p_filesz - rel < total)
+        return 0;
+
+    return elf_add_no_wrap(p_vaddr, rel, gpa_out);
+}
+
 /* Copy program header idx out of a buffer of buflen bytes.
  *
  * Returns 0 when the entry does not lie wholly inside the buffer.
@@ -254,11 +285,36 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
         return -1;
     }
 
-    /* Store program header file offset for later phdr_gpa calculation. The
-     * loader places program headers at the same GPA as they would be in the
-     * first PT_LOAD segment (they are typically within it).
+    /* AT_PHDR, following Linux 5.19+ (commit 0da1d5002745, which replaced the
+     * older load_addr + e_phoff): the program headers are visible to the guest
+     * only because some PT_LOAD maps the file range they occupy, so their
+     * address comes from that segment. The two formulas agree for the usual
+     * layout where the first PT_LOAD starts at file offset 0.
+     *
+     * phdr_gpa stays 0 when no PT_LOAD covers the table, which is what Linux
+     * reports and what a hand-linked static binary with its phdrs outside the
+     * loaded range gets. Such a program cannot use AT_PHDR on Linux either, so
+     * there is nothing to deliver and the load is not an error. The old code
+     * instead memcpy'd the table to load_min + e_phoff, an address inside no
+     * segment: for build/test-hello that landed 0x1a bytes past the end of
+     * .text.
+     *
+     * A segment that covers e_phoff but whose p_vaddr + rel is unrepresentable
+     * is skipped rather than distinguished, so in principle the table could be
+     * attributed to a later segment. Unreachable: such a p_vaddr sits within a
+     * few bytes of UINT64_MAX, and the mapper rejects it because every accepted
+     * segment satisfies gpa <= guest_size - memsz with guest_size at most
+     * 1 TiB, so phdr_gpa never reaches build_linux_stack.
      */
-    info->phdr_gpa = info->load_min + ehdr.e_phoff;
+    for (int i = 0; i < seg_count; i++) {
+        if (elf_phdr_gpa_in_segment(ehdr.e_phoff, ph_total,
+                                    info->segments[i].offset,
+                                    info->segments[i].filesz,
+                                    info->segments[i].gpa, &info->phdr_gpa)) {
+            info->phdr_valid = true;
+            break;
+        }
+    }
 
     free(ph_buf);
     return 0;
@@ -321,38 +377,17 @@ int elf_map_segments_fd(const elf_info_t *info,
         return -1;
     }
 
-    /* Copy program headers into guest memory at phdr_gpa + load_base (needed
-     * for AT_PHDR auxv entry). Fail hard if they do not fit. A missing copy
-     * would leave AT_PHDR pointing at uninitialized memory, crashing the
-     * dynamic linker.
-     *
-     * phdr_gpa + load_base may wrap via 2's complement for high-VA binaries.
-     * The bounds check below catches invalid results.
+    /* The program headers need no separate copy. elf_load_fd sets phdr_gpa only
+     * to an address inside a PT_LOAD whose file data holds the whole table, so
+     * the segment reads below deliver them at phdr_gpa + load_base as a side
+     * effect; when no segment covers the table phdr_gpa is 0, phdr_valid is
+     * false, and AT_PHDR reports 0 as on Linux. Dropping the copy removes a
+     * second destination to bound-check, and with it the case where the copy
+     * landed at an address inside no segment.
      */
-    uint64_t phdr_dest = info->phdr_gpa + load_base;
-    if (phdr_dest + ph_total < phdr_dest || phdr_dest + ph_total > guest_size) {
-        log_error(
-            "%s: program headers at 0x%llx exceed guest memory "
-            "(size 0x%llx)",
-            display_path, (unsigned long long) (phdr_dest + ph_total),
-            (unsigned long long) guest_size);
-        free(ph_buf);
-        return -1;
-    }
-    if (infra_active && phdr_dest < infra_hi &&
-        phdr_dest + ph_total > infra_lo) {
-        log_error(
-            "%s: program headers at 0x%llx overlap infra reserve "
-            "[0x%llx, 0x%llx)",
-            display_path, (unsigned long long) phdr_dest,
-            (unsigned long long) infra_lo, (unsigned long long) infra_hi);
-        free(ph_buf);
-        return -1;
-    }
-    memcpy((uint8_t *) guest_base + phdr_dest, ph_buf, ph_total);
 
-    /* Copy PT_LOAD contents after AT_PHDR is in place; ET_DYN segments are
-     * relocated by load_base before writing into guest memory.
+    /* ET_DYN segments are relocated by load_base before writing into guest
+     * memory.
      */
     int seg_idx = 0;
     for (uint16_t i = 0; i < ehdr.e_phnum && seg_idx < info->num_segments;

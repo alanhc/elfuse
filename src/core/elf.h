@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -89,7 +90,11 @@ typedef struct {
     uint64_t load_min; /* Lowest loaded GPA (page-aligned) */
     uint64_t load_max; /* Highest loaded GPA + memsz (page-aligned up) */
 
-    /* Program headers location in guest memory (for AT_PHDR auxv) */
+    /* Program headers location in guest memory (for AT_PHDR auxv). phdr_valid
+     * distinguishes "no PT_LOAD covers the table" from a legitimate phdr_gpa of
+     * 0, which an ET_DYN image whose covering segment sits at p_vaddr 0 has.
+     */
+    bool phdr_valid;
     uint64_t phdr_gpa; /* GPA of program headers in guest memory */
 
     /* PT_INTERP: dynamic linker path (empty if statically linked) */
