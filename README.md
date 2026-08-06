@@ -48,6 +48,32 @@ single-binary tooling, language runtimes, test harnesses, and
 debugger-driven workflows, `elfuse` removes the disk-image and
 boot-time overhead those tools impose.
 
+## Why C
+
+`elfuse` is C11 plus a small amount of aarch64 assembly. In short:
+
+- Most of the hazard sits inside the safety boundary, not outside it. Guest
+  memory is an `mmap`-ed slab the guest rewrites from another vCPU thread, so
+  host access already runs through bounds-checked accessors (`guest_ptr`,
+  `guest_read`, `guest_write`). Rust would enforce that discipline rather
+  than leave it to convention, which is a real gain, but the checks inside
+  those accessors are the same ones to get right.
+- The defects that surface here are arithmetic and design errors, not
+  memory-safety errors. An overflow-saturated `load_max` in `src/core/elf.c`
+  wraps once the PIE load base is added in `src/syscall/exec.c`, pushing a
+  rejection past the `execve` point of no return. Rust's `+` wraps in release
+  builds too; catching it takes an explicit checked add either way.
+- What guards the memory-safety side is language-independent and already
+  gates CI: `cppcheck`, `clang-tidy`, `scan-build`, Infer, and a runtime
+  matrix under ASAN, UBSAN, and TSAN. That catches such defects after the
+  fact rather than excluding them by construction, which is the honest cost
+  of the choice.
+- The host surface is nearly all C ABI: Hypervisor.framework, Mach, pthreads,
+  macOS syscalls, `SCM_RIGHTS`, and hosting Apple Rosetta. The EL1 shim is
+  aarch64 assembly under any host language.
+
+Longer version in [docs/internals.md](docs/internals.md#language-choice).
+
 ## Requirements
 
 - macOS on Apple Silicon

@@ -1088,6 +1088,74 @@ The split mirrors the architectural boundary: transport and encoding are
 independent of guest execution; register layout is independent of socket I/O;
 stop/resume sequencing remains tightly coupled to process and thread state.
 
+## Language Choice
+
+`elfuse` is C11 plus a small amount of aarch64 assembly. This section records
+why, against the specifics of this codebase rather than in the abstract.
+
+### Where The Safety Boundary Falls
+
+The central data structure is a slab of guest memory obtained from `mmap`,
+which the guest rewrites at will from another vCPU thread. Host access goes
+through bounds-checked accessors over that slab: `guest_ptr`, `guest_ptr_w`,
+`guest_ptr_avail`, `guest_ptr_bound`, `guest_read`, and `guest_write` (see
+[Memory Layout](#memory-layout)), each resolving a guest-controlled address
+against the recorded mappings.
+
+Rust would express the same shape as a safe wrapper over an `unsafe` core,
+and would enforce that callers stay on the safe side, which C leaves to
+convention. That enforcement is a real gain. What it does not do is validate
+the checks inside the wrapper, and those checks are where the defects below
+live: the interior of the guest slab, the page-table walk itself, and syscall
+arguments arriving as guest-controlled integers.
+
+### What Defects Surface In Practice
+
+One worked example, from the loader. `elf_load_fd` saturates `load_max` to
+`UINT64_MAX` when `p_vaddr + p_memsz` overflows (`src/core/elf.c`). For
+`ET_EXEC` the saturation does its job: the fits-in-guest check in
+`src/syscall/exec.c` sees `UINT64_MAX` and rejects the image. For `ET_DYN`
+that check first adds `PIE_LOAD_BASE`, and the sum wraps to `0x3FFFFF`, which
+passes. Nothing lands out of bounds, because `elf_map_segments_fd`
+bounds-checks every segment against `guest_size`. What moves is the
+rejection: it lands at a call site past the `execve` point of no return,
+turning a recoverable `-ENOEXEC` into a fatal exec. Guarding it takes an
+explicit checked add where `load_max` meets the load base.
+
+The class of defect is the point. That is integer arithmetic, not memory
+safety. Rust's `+` wraps silently in release builds too, so the same checked
+add is required there.
+
+`elf_map_segments_fd` also re-reads the header and program headers from the
+fd, and can disagree with the first parse: a TOCTOU on the ELF image. Its own
+bounds checks contain the damage, but no language rules the disagreement out.
+It is a property of how the loader is structured.
+
+### Verification Actually In Place
+
+No formal-methods gate exists today. What gates CI is language-independent
+tooling: `clang-format`, a banned-API and unsafe-preprocessor scan,
+`cppcheck`, and the dispatch-table consistency check on Linux; `clang-tidy`
+and `scan-build` as advisory jobs; an Infer run that fails on any finding;
+and a runtime matrix under ASAN, UBSAN, and TSAN (see [Testing And
+Confidence](#testing-and-confidence)).
+
+That catches memory-safety defects after the fact rather than excluding them
+by construction, which is the honest cost of the choice. The improvement
+worth pursuing on this surface is a proof obligation over the ELF parser
+rather than another runtime check, because a guest-triggerable abort inside a
+VMM is a denial of service, and a language that panics on bad input does not
+address that.
+
+### Host Interface Surface
+
+`hv_vcpu_run`, `hv_vcpu_set_sys_reg`, Mach (`host_statistics64` behind
+`/proc/meminfo`), pthreads, macOS syscalls, file descriptor passing over
+`SCM_RIGHTS`, and hosting the Apple Rosetta translator are all C ABI. The EL1
+shim is aarch64 assembly (`src/core/shim.S`) under any host language. A
+safe-language port would spend a significant share of its effort on binding
+layers for that surface.
+
 ## Testing And Confidence
 
 `elfuse` uses several layers of validation:
