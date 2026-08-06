@@ -1,6 +1,6 @@
 # Static analysis and formatting
 
-.PHONY: lint analyze check-format indent verify verify-elf
+.PHONY: lint analyze check-format indent verify verify-elf verify-gva
 
 CLANG_TIDY ?= clang-tidy
 
@@ -32,6 +32,13 @@ lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 # The callers are not in -wp-fct, so nothing checks that they honor it: today
 # they pass a malloc'd ph_buf plus distinct stack locals, but a future
 # elf_segment_extent(..., &x, &x) would invalidate the proof with no diagnostic.
+#
+# That caveat is general, and it bites hardest for gva-math.h: guest.c cannot be
+# given to Frama-C at all, so NOTHING checks that its call sites honor the eight
+# `requires` clauses there. check-acsl-coverage.py closes the other direction
+# (a contract assumed because its function was left out of -wp-fct); it says
+# nothing about preconditions at call sites. Those are reviewed by hand, and
+# gva_contiguous_avail additionally guards itself at runtime.
 #
 # Install: opam install frama-c, then why3 config detect (without the latter WP
 # aborts with "Prover not found" instead of reporting unproved goals).
@@ -87,6 +94,15 @@ VERIFY_ELF_SCAN  := src/core/elf.c src/core/elf.h src/utils.h
 VERIFY_ELF_CLAIM := for ANY byte sequence an untrusted ELF can supply
 VERIFY_ELF_UNPROVED := the pread/malloc I/O around them stays test-covered
 
+VERIFY_GVA_SRC   := src/core/gva-math.h
+VERIFY_GVA_FCTS  := gva_pt_table_offset gva_leaf_target gva_chunk_clamp \
+                    gva_span_ok
+VERIFY_GVA_MIN_GOALS ?= 40
+VERIFY_GVA_MODEL := typed
+VERIFY_GVA_SCAN  := src/core/gva-math.h
+VERIFY_GVA_CLAIM := for ANY guest address, length, and page-table content
+VERIFY_GVA_UNPROVED := the walk and copy loops around them stay test-covered
+
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
 verify_empty :=
@@ -110,6 +126,17 @@ verify-elf: SCAN := $(VERIFY_ELF_SCAN)
 verify-elf: CLAIM := $(VERIFY_ELF_CLAIM)
 verify-elf: UNPROVED := $(VERIFY_ELF_UNPROVED)
 
+## Prove guest address translation cannot compute an out-of-bounds window
+verify-gva: NAME := gva
+verify-gva: SRC := $(VERIFY_GVA_SRC)
+verify-gva: FCTS := $(VERIFY_GVA_FCTS)
+verify-gva: FCT_ARG := $(call commafy,$(VERIFY_GVA_FCTS))
+verify-gva: MIN_GOALS := $(VERIFY_GVA_MIN_GOALS)
+verify-gva: MODEL := $(VERIFY_GVA_MODEL)
+verify-gva: SCAN := $(VERIFY_GVA_SCAN)
+verify-gva: CLAIM := $(VERIFY_GVA_CLAIM)
+verify-gva: UNPROVED := $(VERIFY_GVA_UNPROVED)
+
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
 # what gets proved, so a second proof is a variable block plus a target name.
@@ -118,7 +145,7 @@ verify-elf: UNPROVED := $(VERIFY_ELF_UNPROVED)
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-verify-elf: | $(BUILD_DIR)
+verify-elf verify-gva: | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -144,7 +171,7 @@ verify-elf: | $(BUILD_DIR)
 	    --src $(SRC) --unproved "$(UNPROVED)"
 
 ## Run every Frama-C proof
-verify: verify-elf
+verify: verify-elf verify-gva
 
 ## Run clang static analyzer (scan-build)
 analyze:
