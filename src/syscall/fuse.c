@@ -197,6 +197,7 @@ typedef struct {
 #define FUSE_MAX_MOUNTS 8
 #define FUSE_MAX_OPEN_FILES 128
 #define FUSE_MAX_PENDING 128
+
 /* Per-session capacity for held lookup references. Sized for recursive
  * directory walks (ls -R style) without pushing the per-session struct into
  * multi-page territory; node_refs at this cap is ~96 KiB, kept off the stack.
@@ -265,6 +266,7 @@ typedef struct {
     char source[256];
     char fstype[16];
     int mount_id;
+
     /* session is the live transport for this mount; NULL once the owning
      * /dev/fuse fd is closed (the slot is tombstoned, keeping path/source/
      * fstype/mount_id intact so consumers stuck on this mount path can be
@@ -277,6 +279,7 @@ typedef struct {
 
 typedef struct {
     bool used;
+
     /* refcount keeps the slot alive while any thread holds a snapshot or does
      * an in-flight FUSE request against this fd. 1 = held by the underlying
      * open fd; +1 per in-flight op acquired via fuse_file_get_locked. The slot
@@ -291,6 +294,7 @@ typedef struct {
     uint64_t offset;
     int linux_flags;
     bool path_only;
+
     /* session is pinned by the file's own session ref taken at open time. The
      * mount slot the file came from may be reassigned independently; mount_id
      * is the stable identifier used to detect that case without dereferencing a
@@ -300,6 +304,7 @@ typedef struct {
     int mount_id;
     char path[LINUX_PATH_MAX];
     fuse_attr_t attr;
+
     /* Serialize stream read() / readdir() against the offset field. lseek also
      * waits on io_in_progress to avoid clobbering an in-flight read's
      * post-update.
@@ -361,6 +366,7 @@ static int fuse_join_virtual_path(const char *base,
     }
 
     size_t depth = 0;
+
     /* marks[i] stores the output index at which the i-th surviving component
      * begins. Each value is bounded by outsz (capped at LINUX_PATH_MAX = 4096),
      * so uint16_t is sufficient and shrinks the host-stack footprint from 16
@@ -474,8 +480,8 @@ static fuse_session_t *fuse_unbind_dev_fd_locked(int guest_fd)
     return NULL;
 }
 
-/* First guest fd still bound to session, or -1 when none remain. Doubles as
- * the alias-count > 0 test and names the surviving alias so the close path can
+/* First guest fd still bound to session, or -1 when none remain. Doubles as the
+ * alias-count > 0 test and names the surviving alias so the close path can
  * repoint session->guest_fd (the synchronous SIGIO target) at a live slot.
  */
 static int fuse_dev_alias_fd_locked(fuse_session_t *session)
@@ -532,6 +538,7 @@ static void fuse_notify_readable_locked(fuse_session_t *session)
         return;
     uint8_t byte = 1;
     write(session->notify_wr, &byte, 1);
+
     /* Fire SIGIO synchronously: a parked daemon can dequeue the request and
      * drain the notify byte before the asyncio watcher's kevent() revalidates
      * the readiness edge, silently losing the signal (FUSE_INIT is one-shot).
@@ -984,6 +991,7 @@ static int fuse_walk_path_locked(fuse_session_t *session,
             return -LINUX_ENOENT;
         memcpy(name, p, len);
         name[len] = '\0';
+
         /* The path is canonicalized before reaching the walk, so "." and ".."
          * should never appear as a real component. Defend against accidental
          * forwarding to the daemon (which has no notion of the mount root's
@@ -1169,6 +1177,7 @@ static int fuse_release_common_locked(fuse_session_t *session,
 {
     if (!session || session->daemon_dead || session->closed)
         return 0;
+
     /* O_PATH opens skip FUSE_OPEN, so there is no fh to release. The path walk
      * still incremented the daemon's nlookup, so emit FORGET to balance it.
      * Without this, every successful O_PATH close leaks one reference.
@@ -1387,6 +1396,7 @@ int fuse_proc_open(int linux_flags)
         return -1;
     }
     pthread_mutex_unlock(&fuse_lock);
+
     /* Publish under fd_lock so the write is on the same lock domain as
      * sys_fcntl(F_SETFL/F_SETFD), not stranded behind fuse_lock.
      */
@@ -1414,6 +1424,7 @@ static int parse_mount_fd(const char *data)
     char *endp;
     errno = 0;
     long fd = strtol(fdp, &endp, 10);
+
     /* Reject empty digit run, overflow, negative, and out-of-range fd values so
      * a malformed options string cannot smuggle in an integer that bypasses
      * later RANGE_CHECK gates.
@@ -1491,6 +1502,7 @@ int64_t sys_mount(guest_t *g,
             return -LINUX_EBUSY;
         }
     }
+
     /* Prefer reclaiming a tombstoned slot at the same path so the mount_id
      * sequence stays stable for consumers that cached it.
      */
@@ -1539,6 +1551,7 @@ bool fuse_path_matches_mount(const char *path)
     if (fuse_canonical_abs(path, canon, sizeof(canon)) < 0)
         return false;
     pthread_mutex_lock(&fuse_lock);
+
     /* Matches both live and tombstoned mounts so post-daemon-death operations
      * get routed to a deterministic -LINUX_ENOTCONN instead of silently falling
      * through to host-filesystem resolution.
@@ -1859,6 +1872,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         pthread_mutex_unlock(&fuse_lock);
         return -LINUX_ENOTDIR;
     }
+
     /* Linux open(2): when O_PATH is set, access-mode bits (O_RDONLY / O_WRONLY
      * / O_RDWR) are ignored. The descriptor is opaque to read/write but usable
      * for fstat, fchdir, *at() dirfd, etc. Reject non-RDONLY only for ordinary
@@ -1922,6 +1936,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     file->fh = out.fh;
     file->linux_flags = linux_flags;
     file->path_only = path_only;
+
     /* Donate the session ref taken above to the file's own ref slot. The mount
      * pointer itself is not cached; mount_id is enough to detect stale
      * mount-slot reassignment without dereferencing a recycled fuse_mount_t.
@@ -1945,6 +1960,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         return -LINUX_EMFILE;
     }
     pthread_mutex_unlock(&fuse_lock);
+
     /* Publish under fd_lock so the open's flags land on the same lock domain
      * that sys_fcntl(F_SETFL/F_SETFD) uses.
      */
@@ -2094,6 +2110,19 @@ static int64_t fuse_read_common(guest_t *g,
     pthread_mutex_unlock(&snap->session->lock);
     if (rc < 0)
         return rc;
+
+    /* Never deliver more than was asked for. Linux sizes the copy from the
+     * request rather than the reply, so a daemon answering with more data than
+     * it was asked for cannot overrun the reader's buffer. Without this clamp a
+     * guest process serving a FUSE mount could reply to a 16-byte read with a
+     * FUSE_FRAME_CAP-sized payload and smash the memory of any other guest
+     * process reading the mount -- a cross-process corruption primitive the
+     * kernel does not offer. It would also make read(2) return more than count
+     * and advance the stream offset past what was delivered.
+     */
+    if (reply_len > size)
+        reply_len = size;
+
     if (guest_write(g, buf_gva, reply, reply_len) < 0) {
         free(reply);
         return -LINUX_EFAULT;
@@ -2172,6 +2201,7 @@ int64_t fuse_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     size_t dst = 0;
     while (src + FUSE_NAME_OFFSET <= (size_t) raw) {
         fuse_dirent_t *fde = (fuse_dirent_t *) (tmp + src);
+
         /* The daemon supplies fde->namelen; bound it to Linux NAME_MAX before
          * any further arithmetic so a malicious daemon cannot make lreclen
          * overflow the fixed entry[] buffer below or exceed the remaining frame
@@ -2189,6 +2219,7 @@ int64_t fuse_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
             break;
 
         size_t lreclen = (19 + fde->namelen + 1 + 7) & ~7ULL;
+
         /* d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + name(<=255) + NUL(1)
          * + padding(<=7) <= 280. Defense in depth against an arithmetic error
          * -- never trust the daemon's record length.
@@ -2265,6 +2296,7 @@ int64_t fuse_dev_read(int guest_fd,
             host_fd_ref_close(&notify_ref);
             return -LINUX_EAGAIN;
         }
+
         /* An untimed cond_wait has no re-check point: a FUSE daemon thread
          * parked here with no requests queued is invisible to
          * thread_join_workers' poll cap and touches guest memory (the reply
@@ -2339,6 +2371,7 @@ int64_t fuse_dev_write(guest_t *g,
 {
     if (count < sizeof(fuse_out_header_t))
         return -LINUX_EINVAL;
+
     /* Reject any daemon write that exceeds the implementation hard ceiling. The
      * same ceiling is applied at FUSE_INIT negotiation, so a daemon cannot
      * advertise max_write larger than this and then have its reply payload
@@ -2391,6 +2424,7 @@ int64_t fuse_dev_write(guest_t *g,
     }
 
     req->answered = true;
+
     /* The daemon's error field is in Linux errno space (negative). Pass it
      * through unchanged; the consumer side already treats req->error as a
      * negative Linux errno.
@@ -2506,6 +2540,7 @@ int64_t fuse_lseek_fd(int fd, int64_t offset, int whence)
     fd_entry_t snap;
     if (!fd_snapshot(fd, &snap))
         return -LINUX_EBADF;
+
     /* /dev/fuse: stream-like, no absolute position. Linux returns ESPIPE on
      * lseek of a pipe-equivalent fd.
      */
@@ -2536,6 +2571,7 @@ int64_t fuse_lseek_fd(int fd, int64_t offset, int whence)
         return -LINUX_EINVAL;
 
     pthread_mutex_lock(&fuse_lock);
+
     /* Block while a stream read is in flight on this fd so the seek does not
      * race the post-read offset update. The wait holds a file ref so io_cond
      * cannot be destroyed under it.
