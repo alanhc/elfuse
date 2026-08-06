@@ -1495,12 +1495,25 @@ static void *gva_resolve_perm(const guest_t *g,
     if (gva_translate_perm(g, gva, required_perms, &first) < 0)
         return NULL;
 
-    if (avail) {
-        *avail =
-            gva_contiguous_avail(g, gva, required_perms, &first, avail_limit);
-    }
-    if (first.gpa < g->guest_size)
+    uint64_t bytes = avail ? gva_contiguous_avail(g, gva, required_perms,
+                                                  &first, avail_limit)
+                           : 0;
+
+    if (first.gpa < g->guest_size) {
+        /* Clamp to the end of the primary buffer, the same way the mapping and
+         * overflow branches below clamp to the end of the region their pointer
+         * points into. gva_contiguous_avail only stops at guest_size when the
+         * clamp shortens a chunk, so a leaf whose extent ends flush with
+         * guest_size lets the walk continue into whatever the next descriptor
+         * resolves to, and the caller's memcpy would run off the end of the
+         * host buffer.
+         */
+        if (avail) {
+            uint64_t cap = g->guest_size - first.gpa;
+            *avail = bytes < cap ? bytes : cap;
+        }
         return (uint8_t *) g->host_base + first.gpa;
+    }
 
     /* GPA outside the primary buffer: consult the extra IPA mappings (rosetta
      * segments, kbuf) first, then the overflow segments (lazy 1 GiB bump
@@ -1512,8 +1525,7 @@ static void *gva_resolve_perm(const guest_t *g,
     if (m) {
         if (avail) {
             uint64_t cap = (m->gpa + m->size) - first.gpa;
-            if (*avail > cap)
-                *avail = cap;
+            *avail = bytes < cap ? bytes : cap;
         }
         return (uint8_t *) m->host_va + (first.gpa - m->gpa);
     }
@@ -1521,8 +1533,7 @@ static void *gva_resolve_perm(const guest_t *g,
     if (o) {
         if (avail) {
             uint64_t cap = (o->ipa_start + o->size) - first.gpa;
-            if (*avail > cap)
-                *avail = cap;
+            *avail = bytes < cap ? bytes : cap;
         }
         return (uint8_t *) o->host_base + (first.gpa - o->ipa_start);
     }
