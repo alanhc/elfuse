@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -55,7 +56,11 @@ static char sysroot_path[LINUX_PATH_MAX] = {0};
  * the snprintf input buffer underneath that thread.
  */
 static pthread_mutex_t sysroot_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool sysroot_casefold = false;
+/* Atomic, not guarded by sysroot_lock: published once at startup and to a
+ * forked child before any vCPU thread issues a syscall, and no other state is
+ * kept consistent with it.
+ */
+static _Atomic bool sysroot_casefold = false;
 
 /* Cached current working directory for getcwd() and /proc/self/cwd. */
 static pthread_mutex_t cwd_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -427,18 +432,12 @@ bool proc_sysroot_snapshot(char *out, size_t outsz)
 
 void proc_set_sysroot_casefold(bool enabled)
 {
-    pthread_mutex_lock(&sysroot_lock);
-    sysroot_casefold = enabled;
-    pthread_mutex_unlock(&sysroot_lock);
+    atomic_store(&sysroot_casefold, enabled);
 }
 
 bool proc_sysroot_casefold_enabled(void)
 {
-    bool enabled;
-    pthread_mutex_lock(&sysroot_lock);
-    enabled = sysroot_casefold;
-    pthread_mutex_unlock(&sysroot_lock);
-    return enabled;
+    return atomic_load(&sysroot_casefold);
 }
 
 /* True when realpath(3) failed because the path stopped resolving rather than
