@@ -14,6 +14,8 @@
  *   4. /dev/pts/N open + stat intercept and the slave fd's window size
  *   5. /dev/pts/N open in a forked child after the child has already closed
  *      its master (foot/sshd/openssh sftp-server pattern)
+ *   6. TIOCPKT packet mode on the master, which libvte turns on right after
+ *      posix_openpt and treats as fatal on failure
  *
  * The test stays self-contained on the syscall surface (no libutil/openpty), so
  * it runs the same way under elfuse-aarch64, qemu-aarch64, and any future
@@ -24,6 +26,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +42,13 @@
 #include <unistd.h>
 
 #include "test-harness.h"
+
+/* Linux spells the ordinary-data packet type this way; the
+ * value is 0 and matches macOS.
+ */
+#ifndef TIOCPKT_DATA
+#define TIOCPKT_DATA 0
+#endif
 
 #ifndef TIOCSWINSZ
 #define TIOCSWINSZ 0x5414
@@ -567,6 +578,26 @@ int main(void)
                         char recv_pts_path[32];
                         snprintf(recv_pts_path, sizeof(recv_pts_path),
                                  "/dev/pts/%u", recv_ptyno);
+                        /* TIOCPKT has to work on a master the receiver never
+                         * opened itself, the shape libvte sees when a terminal
+                         * is handed a pty from elsewhere.
+                         *
+                         * This does not isolate the proc_pty_master_adopt call
+                         * in the TIOCPKT path: TIOCSWINSZ above has already
+                         * adopted this fd, and every master a guest can obtain
+                         * came from the /dev/ptmx intercept, which eagerly
+                         * opens the keepalive slave (see the side-table header
+                         * in procemu.c). The cold-master ENOTTY that adoption
+                         * exists to prevent is therefore not reachable from
+                         * inside the guest, so the call stays as the same
+                         * defence TIOCSWINSZ carries rather than something a
+                         * test here can pin.
+                         */
+                        TEST("TIOCPKT on SCM_RIGHTS-received master");
+                        int recv_pkt = 1;
+                        EXPECT_TRUE(ioctl(recv_master, TIOCPKT, &recv_pkt) == 0,
+                                    "TIOCPKT rejected on an adopted master");
+
                         TEST("stat(/dev/pts/N) after SCM_RIGHTS adoption");
                         struct stat recv_st;
                         EXPECT_TRUE(stat(recv_pts_path, &recv_st) == 0 &&
@@ -578,6 +609,122 @@ int main(void)
             }
             close(sp[0]);
             close(sp[1]);
+        }
+    }
+
+    /* 6. Packet mode. libvte enables it on the master immediately after
+     * posix_openpt and aborts the whole PTY setup if the ioctl fails, so
+     * gnome-terminal and its relatives never start without it. Assert the
+     * observable effect rather than just the return code: in packet mode a
+     * master read is prefixed with a status byte, and ordinary data carries
+     * TIOCPKT_DATA (0).
+     */
+    {
+        int pkt_master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        if (pkt_master < 0) {
+            TEST("TIOCPKT packet mode on master");
+            FAIL("open /dev/ptmx");
+        } else {
+            unsigned int pkt_ptyno = (unsigned int) -1;
+            int unlock = 0;
+            TEST("TIOCPKT enable on master");
+            int one = 1;
+            EXPECT_TRUE(ioctl(pkt_master, TIOCPKT, &one) == 0,
+                        "TIOCPKT(1) rejected");
+
+            if (ioctl(pkt_master, TIOCGPTN, &pkt_ptyno) == 0 &&
+                ioctl(pkt_master, TIOCSPTLCK, &unlock) == 0) {
+                char pkt_path[32];
+                snprintf(pkt_path, sizeof(pkt_path), "/dev/pts/%u", pkt_ptyno);
+                int pkt_slave = open(pkt_path, O_RDWR | O_NOCTTY);
+                if (pkt_slave < 0) {
+                    TEST("packet-mode read carries a status byte");
+                    FAIL("open slave");
+                } else {
+                    /* Raw mode so the slave does not echo the payload back
+                     * at the master and confuse the packet stream. A failure
+                     * here is a setup failure rather than a verdict on packet
+                     * mode, so it gets its own message below: reporting it as
+                     * a bad read would blame the feature under test.
+                     */
+                    struct termios tio;
+                    bool raw_ok = tcgetattr(pkt_slave, &tio) == 0;
+                    if (raw_ok) {
+                        cfmakeraw(&tio);
+                        raw_ok = tcsetattr(pkt_slave, TCSANOW, &tio) == 0;
+                    }
+
+                    /* A pty may take a short write, so loop rather than
+                     * assuming one call moves the payload.
+                     */
+                    static const char payload[] = "pkt";
+                    const size_t want = sizeof(payload) - 1;
+                    size_t sent = 0;
+                    while (raw_ok && sent < want) {
+                        ssize_t n =
+                            write(pkt_slave, payload + sent, want - sent);
+                        if (n <= 0)
+                            break;
+                        sent += (size_t) n;
+                    }
+
+                    TEST("packet-mode read carries a status byte");
+                    if (!raw_ok) {
+                        FAIL("could not put the slave in raw mode");
+                    } else if (sent != want) {
+                        FAIL("short write to the slave");
+                    } else {
+                        /* Reassemble instead of expecting one packet to hold
+                         * the payload: the stream may split it, and control
+                         * packets are interleaved -- the termios change above
+                         * emits TIOCPKT_NOSTOP, and TIOCPKT_IOCTL carries a
+                         * termios of its own after the status byte. Skip any
+                         * packet that is not TIOCPKT_DATA and accumulate the
+                         * rest until the payload is whole or the budget runs
+                         * out, so a missing packet fails rather than blocks.
+                         */
+                        char acc[sizeof(payload)];
+                        size_t have = 0;
+                        bool overflow = false;
+                        for (int attempt = 0; have < want && attempt < 8;
+                             attempt++) {
+                            struct pollfd pfd = {
+                                .fd = pkt_master,
+                                .events = POLLIN,
+                            };
+                            if (poll(&pfd, 1, 2000) <= 0)
+                                break;
+                            char buf[32];
+                            ssize_t got = read(pkt_master, buf, sizeof(buf));
+                            if (got < 1)
+                                break;
+                            if (buf[0] != TIOCPKT_DATA)
+                                continue; /* control packet */
+                            size_t chunk = (size_t) got - 1;
+                            if (chunk > sizeof(acc) - have) {
+                                overflow = true;
+                                break;
+                            }
+                            memcpy(acc + have, buf + 1, chunk);
+                            have += chunk;
+                        }
+                        EXPECT_TRUE(!overflow && have == want &&
+                                        memcmp(acc, payload, want) == 0,
+                                    "master reads did not reassemble a "
+                                    "TIOCPKT_DATA payload");
+                    }
+                    close(pkt_slave);
+                }
+            } else {
+                /* Never skip quietly: without the pts number and the unlock
+                 * there is no slave to write through, so the packet-read check
+                 * cannot run and the file would otherwise report a pass having
+                 * asserted only the ioctl return code.
+                 */
+                TEST("packet-mode read carries a status byte");
+                FAIL("TIOCGPTN/TIOCSPTLCK failed, no slave to test with");
+            }
+            close(pkt_master);
         }
     }
 

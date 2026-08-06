@@ -2038,6 +2038,33 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         return rc < 0 ? linux_errno() : 0;
     }
 
+    case LINUX_TIOCPKT: {
+        /* Packet mode on a pty master: each master read is then prefixed with a
+         * status byte carrying flush/stop/start events. libvte switches it on
+         * immediately after posix_openpt and treats any failure as fatal, so
+         * without this every VTE terminal -- gnome-terminal, xfce4-terminal,
+         * tilix -- dies at startup with "Failed to open PTY: Inappropriate
+         * ioctl for device" from the default arm below.
+         *
+         * macOS numbers the request differently but takes the same int flag
+         * through a pointer, and its TIOCPKT_* status bits match Linux value
+         * for value, so the packet stream itself needs no translation.
+         *
+         * A master received through SCM_RIGHTS bypasses the /dev/ptmx open
+         * intercept, so adopt it first the way TIOCSWINSZ does; the helper is a
+         * no-op for non-pty fds and the host ioctl still supplies the errno.
+         */
+        int pktmode = 0;
+        if (guest_read_small(g, arg, &pktmode, sizeof(pktmode)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        (void) proc_pty_master_adopt(fd);
+        int rc = ioctl(host_fd, TIOCPKT, &pktmode);
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
+    }
+
     case LINUX_TCGETS: {
         /* Get terminal attributes. c_cc index mapping is in file-scope
          * linux_mac_cc[].
