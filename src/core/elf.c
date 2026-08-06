@@ -21,6 +21,24 @@
 #include "debug/log.h"
 #include "utils.h"
 
+/* a + b, or 0 when the sum does not fit in 64 bits.
+ *
+ * ELF address fields are unconstrained uint64_t, so the addresses derived from
+ * them (segment end, program header GPA) can only be formed with the carry
+ * checked. Saturating to UINT64_MAX instead is worse than rejecting: every
+ * consumer adds a load base to the result, so the clamp only relocates the wrap
+ * into the consumer, where the bound check it defeats reads "elf_end >
+ * guest_size" and silently passes.
+ */
+static int elf_add_no_wrap(uint64_t a, uint64_t b, uint64_t *sum)
+{
+    if (a > UINT64_MAX - b)
+        return 0;
+
+    *sum = a + b;
+    return 1;
+}
+
 /* Size of the program header table in bytes, or 0 when the header geometry is
  * unusable. Rejects an empty table, an entry stride too small to hold a program
  * header, and a total past the kernel's 64KiB cap.
@@ -193,12 +211,26 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
             info->segments[seg_count].flags = (int) ph->p_flags;
             seg_count++;
 
-            /* Track load bounds */
+            /* Track load bounds. A PT_LOAD whose extent wraps past the end of
+             * the address space is unloadable in any case, and it must be
+             * rejected rather than saturated: consumers of load_max add a load
+             * base before comparing against guest_size (exec.c "ELF extends
+             * beyond guest address space"), so a UINT64_MAX sentinel wraps
+             * there and passes the very check it should trip.
+             */
+            uint64_t seg_end;
+            if (!elf_add_no_wrap(ph->p_vaddr, ph->p_memsz, &seg_end)) {
+                log_error(
+                    "%s: PT_LOAD %u extent 0x%llx+0x%llx wraps the address "
+                    "space",
+                    display_path, i, (unsigned long long) ph->p_vaddr,
+                    (unsigned long long) ph->p_memsz);
+                free(ph_buf);
+                return -1;
+            }
+
             if (ph->p_vaddr < info->load_min)
                 info->load_min = ph->p_vaddr;
-            uint64_t seg_end = ph->p_vaddr + ph->p_memsz;
-            if (seg_end < ph->p_vaddr)
-                seg_end = UINT64_MAX; /* overflow */
             if (seg_end > info->load_max)
                 info->load_max = seg_end;
         }
