@@ -1072,6 +1072,22 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (count > avail)
         count = avail;
 
+    /* A pty master whose guest-side slaves have all closed is hung up. Linux
+     * answers EIO there; the host would block forever instead, because
+     * elfuse's keepalive slave keeps the pty alive from its point of view.
+     *
+     * Only once nothing is left to read: a shell that printed on its way out
+     * leaves that output queued, and Linux hands it over before reporting the
+     * hangup. Deciding on the hangup first would swallow it.
+     */
+    if (proc_pty_master_hung_up(fd)) {
+        struct pollfd drain = {.fd = host_ref.fd, .events = POLLIN};
+        if (poll(&drain, 1, 0) <= 0 || !(drain.revents & POLLIN)) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EIO;
+        }
+    }
+
     off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
     if (offset >= 0) {
         int64_t intercepted =

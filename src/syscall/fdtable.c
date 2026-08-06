@@ -713,6 +713,12 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
      */
     proc_pty_close_keepalive(snap->host_fd);
 
+    /* Mirror for the slave side: the master reports a hangup once the guest
+     * has closed every slave it held, which only this accounting can see --
+     * elfuse's own keepalive slave stays open. No-op for other fds.
+     */
+    proc_pty_slave_fd_closed(snap->host_fd);
+
     /* Deregister any SIGIO/SIGURG readiness watch before the host fd closes.
      * Closing the fd auto-removes the knote too, but doing it explicitly avoids
      * a stale event landing on a host fd number reused by a racing open.

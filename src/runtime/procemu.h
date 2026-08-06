@@ -111,6 +111,23 @@ int proc_dev_shm_resolve(const char *guest_suffix,
  */
 void proc_pty_close_keepalive(int master_host_fd);
 
+/* Record a slave fd the guest now holds, so the master knows it is not yet
+ * hung up. Both guest-facing slave opens report through this: the /dev/pts/N
+ * intercept and the TIOCGPTPEER ioctl.
+ */
+void proc_pty_note_guest_slave(int slave_host_fd, uint32_t linux_pts_num);
+
+/* Drop a guest-held pty slave fd from the per-master accounting. Called for
+ * every closing host fd and a no-op for anything that is not a tracked slave.
+ */
+void proc_pty_slave_fd_closed(int host_fd);
+
+/* True when the guest has closed every slave fd it held for this master, the
+ * state Linux reports as a hangup: poll gives POLLHUP and read gives EIO.
+ * elfuse's own keepalive slave stays open, so the host cannot answer this.
+ */
+bool proc_pty_master_hung_up(int guest_fd);
+
 /* Caller-locked variant of pty keepalive duplication. Brackets the host
  * fd_snapshot_and_dup and the keepalive mirror under one pty_keepalive_lock
  * window so a sibling close cannot run proc_pty_close_keepalive in the gap and
