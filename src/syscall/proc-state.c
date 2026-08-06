@@ -61,6 +61,11 @@ static pthread_mutex_t sysroot_lock = PTHREAD_MUTEX_INITIALIZER;
  * kept consistent with it.
  */
 static _Atomic bool sysroot_casefold = false;
+/* True when proc_set_sysroot's realpath succeeded, so containment checks can
+ * copy sysroot_path instead of re-deriving it; false leaves them the per-call
+ * realpath. Atomic for the same reason as the fold flag above.
+ */
+static _Atomic bool sysroot_canonical = false;
 
 /* Cached current working directory for getcwd() and /proc/self/cwd. */
 static pthread_mutex_t cwd_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -79,6 +84,7 @@ void proc_state_init(void)
     auxv_len = 0;
     sysroot_path[0] = '\0';
     sysroot_casefold = false;
+    sysroot_canonical = false;
 
     pthread_mutex_lock(&cwd_lock);
     cwd_path[0] = '\0';
@@ -387,14 +393,17 @@ const void *proc_get_auxv(size_t *len_out)
 void proc_set_sysroot(const char *path)
 {
     pthread_mutex_lock(&sysroot_lock);
+    sysroot_canonical = false;
     if (path && path[0]) {
         str_copy_trunc(sysroot_path, path, sizeof(sysroot_path));
         size_t len = strlen(sysroot_path);
         while (len > 1 && sysroot_path[len - 1] == '/')
             sysroot_path[--len] = '\0';
         char resolved[LINUX_PATH_MAX];
-        if (realpath(sysroot_path, resolved))
+        if (realpath(sysroot_path, resolved)) {
             str_copy_trunc(sysroot_path, resolved, sizeof(sysroot_path));
+            sysroot_canonical = true;
+        }
     } else {
         sysroot_path[0] = '\0';
     }
@@ -475,7 +484,12 @@ static bool sysroot_path_is_contained(const char *resolved_path,
 {
     char real_sysroot[LINUX_PATH_MAX], real_path[LINUX_PATH_MAX];
 
-    if (!realpath(sysroot, real_sysroot))
+    /* proc_set_sysroot canonicalized @sysroot at configuration time, so
+     * re-deriving it here would realpath() a process constant per check.
+     */
+    if (sysroot_canonical)
+        str_copy_trunc(real_sysroot, sysroot, sizeof(real_sysroot));
+    else if (!realpath(sysroot, real_sysroot))
         return realpath_vanished();
 
     if (follow_final) {
@@ -681,6 +695,8 @@ static bool clamp_dotdot_at_guest_root(char *dest,
 /* Snapshot the sysroot, clamp @path, and spell the host path it names.
  * Returns 1 with @buf, @sr, and @clamped filled, 0 when sysroot resolution
  * does not apply and the caller owes its input back, or -1 with errno set.
+ * On 0 the outputs are indeterminate: a relative path opts out before the
+ * snapshot runs, so @sr is not even the empty string.
  */
 static int sysroot_seed_host_path(const char *path,
                                   char *buf,
@@ -689,7 +705,8 @@ static int sysroot_seed_host_path(const char *path,
                                   char clamped[LINUX_PATH_MAX],
                                   bool follow_final)
 {
-    if (!proc_sysroot_snapshot(sr, LINUX_PATH_MAX) || !path || path[0] != '/')
+    /* Ordered so a relative path opts out before the snapshot locks. */
+    if (!path || path[0] != '/' || !proc_sysroot_snapshot(sr, LINUX_PATH_MAX))
         return 0;
 
     char real_path[LINUX_PATH_MAX];
