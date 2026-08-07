@@ -43,8 +43,8 @@ STATICBIN=""
 # Shared report_pass / report_fail / report_skip + Results: summary
 # emitter. Matches the matrix runner's aarch64 per-binary format so
 # tests/test-matrix.sh elfuse-x86_64 output reads uniformly.
-# shellcheck source=tests/lib/rosetta-test.sh
-. "$(dirname "$0")/lib/rosetta-test.sh"
+# shellcheck source=tests/lib/report.sh
+. "$(dirname "$0")/lib/report.sh"
 
 pass=0
 fail=0

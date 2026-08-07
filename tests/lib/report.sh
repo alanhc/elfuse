@@ -1,4 +1,5 @@
-# Shared reporting helpers for the tests/test-rosetta-*.sh scripts.
+# Shared reporting helpers for standalone test scripts (the
+# tests/test-rosetta-*.sh suite).
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
@@ -8,7 +9,7 @@
 # Sources tests/lib/test-runner.sh and exposes report_pass / report_fail
 # / report_skip on top of test_report so per-binary output matches the
 # matrix runner's aarch64 format ([ OK ] / [ FAIL ] / [ SKIP ] aligned
-# to TEST_LABEL_WIDTH). Each Rosetta script still owns its pass/fail
+# to TEST_LABEL_WIDTH). Each script still owns its pass/fail
 # /skip/total counters; this lib only centralizes the report sites and
 # the trailing Results: summary line that tests/test-matrix.sh scrapes.
 
@@ -16,9 +17,9 @@
 # matrix output looks uniform across aarch64 and x86_64 modes.
 : "${TEST_LABEL_WIDTH:=45}"
 
-_rosetta_test_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_report_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/lib/test-runner.sh
-. "${_rosetta_test_lib_dir}/test-runner.sh"
+. "${_report_lib_dir}/test-runner.sh"
 
 # report_pass / report_fail / report_skip accept a single label argument
 # matching the original Rosetta helpers' single-string contract; the

@@ -17,8 +17,8 @@ ROSETTA_PATH="${MATRIX_ROSETTA_TRANSLATOR:-/Library/Apple/usr/libexec/oah/Rosett
 AUDIT_BIN="$(pwd)/tests/fixtures/rosetta/x86_64-rosetta-audit"
 TLS0_BIN="$(pwd)/tests/fixtures/rosetta/x86_64-rosetta-tls0"
 
-# shellcheck source=tests/lib/rosetta-test.sh
-. "$(dirname "$0")/lib/rosetta-test.sh"
+# shellcheck source=tests/lib/report.sh
+. "$(dirname "$0")/lib/report.sh"
 
 pass=0
 fail=0

@@ -23,8 +23,8 @@ TLS_BIN="${ROOTFS}/usr/bin/tls-probe"
 GDTLS_BIN="${ROOTFS}/usr/bin/gdtls-probe"
 PTHREAD_TLS_BIN="${ROOTFS}/usr/bin/pthread-tls-probe"
 
-# shellcheck source=tests/lib/rosetta-test.sh
-. "$(dirname "$0")/lib/rosetta-test.sh"
+# shellcheck source=tests/lib/report.sh
+. "$(dirname "$0")/lib/report.sh"
 
 pass=0
 fail=0

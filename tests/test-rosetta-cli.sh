@@ -12,8 +12,8 @@ ELFUSE="${1:-build/elfuse}"
 # colors. The matrix runner reads only the Results: line emitted by
 # report_summary at the bottom; per-binary lines now match the aarch64
 # modes' [ OK ] / [ FAIL ] format.
-# shellcheck source=tests/lib/rosetta-test.sh
-. "$(dirname "$0")/lib/rosetta-test.sh"
+# shellcheck source=tests/lib/report.sh
+. "$(dirname "$0")/lib/report.sh"
 
 pass=0
 fail=0

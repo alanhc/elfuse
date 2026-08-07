@@ -35,8 +35,8 @@ FIXTURES="${FIXTURES_DIR:-externals/test-fixtures}"
 BUSYBOX="$(pwd)/${FIXTURES}/x86_64-musl/staticbin/bin/busybox"
 ROSETTA_PATH="${MATRIX_ROSETTA_TRANSLATOR:-/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta}"
 
-# shellcheck source=tests/lib/rosetta-test.sh
-. "$(dirname "$0")/lib/rosetta-test.sh"
+# shellcheck source=tests/lib/report.sh
+. "$(dirname "$0")/lib/report.sh"
 
 pass=0
 fail=0
