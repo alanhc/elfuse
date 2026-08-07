@@ -35,6 +35,11 @@ ELFUSE="${ELFUSE:-${REPO_ROOT}/build/elfuse}"
 # shellcheck source=tests/test-config.sh
 source "${REPO_ROOT}/tests/test-config.sh"
 
+# The mremap EMFILE case uses the minimum host limit only to satisfy elfuse's
+# startup check; its guest-side probe consumes the remaining host reserve and
+# verifies that the filler failure is descriptor-driven before asserting the
+# mremap ENOMEM path.
+
 # Default fixture paths. Each variable points at the actual directory (or file
 # for busybox); no implicit /bin suffix is appended.
 : "${GUEST_TEST_BINARIES:=${REPO_ROOT}/build}"

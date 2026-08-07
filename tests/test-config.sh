@@ -80,6 +80,11 @@ elfuse_test_host_nofile()
     elfuse_resolve_host_nofile "$spec"
 }
 
-if [ "${1:-}" = "--host-nofile" ]; then
+# A sourced configuration inherits the caller's positional parameters. Only
+# inspect --host-nofile when this file itself is the executed script; otherwise
+# a test runner whose first argument happens to match the CLI flag would emit
+# an unexpected value while being initialized.
+if [ "$_test_config_script" = "$0" ] \
+    && [ "${1:-}" = "--host-nofile" ]; then
     printf '%s\n' "$ELFUSE_HOST_NOFILE_MIN"
 fi

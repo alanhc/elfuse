@@ -107,27 +107,37 @@ static void child_probe(int file_fd, unsigned char *base)
         child_fail(16);
 
     /* Prove that the filler stopped on host descriptor pressure rather than
-     * address-space or region-table capacity. Release two guest duplicate
-     * slots (a file-backed mmap needs one temporary and one tracked host fd),
-     * then map the next gap while leaving every existing region in place. If
-     * this probe still fails, the later ENOMEM assertions would be ambiguous.
+     * address-space or region-table capacity. Retry the same gap before
+     * releasing anything: it must still fail with ENOMEM while the host table
+     * is exhausted. Then release two guest duplicate slots (a file-backed
+     * mmap may need one temporary and one tracked host fd) and map the gap
+     * successfully while leaving every existing region in place. If either
+     * attribution step fails, the later ENOMEM assertions would be ambiguous.
      */
     if (spare_dup_count < 2)
         child_fail(28);
+
+    void *descriptor_probe_address =
+        (char *) reserved + (size_t) filler_count * 2 * PAGE_SIZE;
+    errno = 0;
+    void *descriptor_probe =
+        mmap(descriptor_probe_address, PAGE_SIZE, PROT_NONE,
+             MAP_PRIVATE | MAP_FIXED, file_fd, 0);
+    if (descriptor_probe != MAP_FAILED || errno != ENOMEM)
+        child_fail(29);
+
     for (int i = 0; i < spare_dup_count; i++) {
         if (close(spare_dups[i]) != 0)
             child_fail(28);
     }
-    void *descriptor_probe_address =
-        (char *) reserved + (size_t) filler_count * 2 * PAGE_SIZE;
-    void *descriptor_probe =
-        mmap(descriptor_probe_address, PAGE_SIZE, PROT_NONE,
-             MAP_PRIVATE | MAP_FIXED, file_fd, 0);
+    errno = 0;
+    descriptor_probe = mmap(descriptor_probe_address, PAGE_SIZE, PROT_NONE,
+                            MAP_PRIVATE | MAP_FIXED, file_fd, 0);
     if (descriptor_probe == MAP_FAILED ||
         descriptor_probe != descriptor_probe_address)
-        child_fail(29);
-    if (munmap(descriptor_probe, PAGE_SIZE) != 0)
         child_fail(30);
+    if (munmap(descriptor_probe, PAGE_SIZE) != 0)
+        child_fail(31);
 
     if (munmap(last_filler, PAGE_SIZE) != 0)
         child_fail(17);

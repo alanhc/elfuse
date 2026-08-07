@@ -1,8 +1,10 @@
 # Test targets
 
 # Keep the mremap descriptor-exhaustion regression at elfuse's documented host
-# minimum. The manifest annotation, Make recipe, and shell runners all derive
-# this value from src/elfuse-limits.h.
+# minimum. The guest probe consumes the remaining host reserve after startup
+# and verifies that its filler failure is descriptor-driven. The manifest
+# annotation, Make recipe, and shell runners all derive this value from
+# src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
 .PHONY: test-hello test-all check check-syscall-coverage test-gdbstub test-coreutils test-busybox \
@@ -20,6 +22,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-create-paths test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-dynamic-array-host test-string-builder-host \
+        test-config \
         test-mremap-tail-emfile \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
@@ -46,6 +49,10 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
 test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@printf "$(BLUE)▸ Running$(RESET) test-hello\n"
 	$(ELFUSE_BIN) $(TEST_DIR)/test-hello
+
+## Verify test-config.sh keeps its CLI mode separate from sourced mode
+test-config:
+	@bash tests/test-config-cli.sh
 
 ## Run the libc-based file-backed region removal EMFILE regression probe
 test-mremap-tail-emfile: $(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile
@@ -187,7 +194,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage test-config \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
