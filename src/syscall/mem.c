@@ -835,6 +835,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
     int replaced_flags = 0;
     uint64_t replaced_offset = 0;
     bool replaced_region_removed = false;
+    int replaced_remove_fd = -1;
     region_snapshot_t *replaced_snaps = NULL;
     int replaced_nsnaps = 0;
     bool replaced_ptes_modified = false;
@@ -923,12 +924,20 @@ static int64_t sys_mmap_high_va(guest_t *g,
         if (!region_has_capacity_after_removes(
                 g, &(remove_range_t) {addr, addr + length}, 1, 1))
             return -LINUX_ENOMEM;
-        replaced_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*replaced_snaps));
-        if (!replaced_snaps)
+        if (guest_region_remove_prepare(g, addr, addr + length,
+                                        &replaced_remove_fd) < 0)
             return -LINUX_ENOMEM;
+        replaced_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*replaced_snaps));
+        if (!replaced_snaps) {
+            if (replaced_remove_fd >= 0)
+                close(replaced_remove_fd);
+            return -LINUX_ENOMEM;
+        }
         replaced_nsnaps = capture_region_snapshots(
             g, addr, addr + length, replaced_snaps, GUEST_MAX_REGIONS);
         if (replaced_nsnaps < 0) {
+            if (replaced_remove_fd >= 0)
+                close(replaced_remove_fd);
             free(replaced_snaps);
             return replaced_nsnaps;
         }
@@ -950,8 +959,11 @@ static int64_t sys_mmap_high_va(guest_t *g,
         backing_limit =
             g->kbuf_gpa ? g->kbuf_gpa : (g->interp_base - INFRA_RESERVE);
         if (backing_gpa_start >= backing_limit ||
-            backing_span > backing_limit - backing_gpa_start)
+            backing_span > backing_limit - backing_gpa_start) {
+            if (replaced_remove_fd >= 0)
+                close(replaced_remove_fd);
             return -LINUX_ENOMEM;
+        }
     }
 
     if (!is_anon) {
@@ -959,19 +971,27 @@ static int64_t sys_mmap_high_va(guest_t *g,
             char materialized_path[PATH_MAX];
             int rc = fuse_materialize_fd(fd, materialized_path,
                                          sizeof(materialized_path));
-            if (rc < 0)
+            if (rc < 0) {
+                if (replaced_remove_fd >= 0)
+                    close(replaced_remove_fd);
                 return rc;
+            }
             host_backing_fd = open(materialized_path, O_RDONLY | O_CLOEXEC);
             int saved_errno = errno;
             unlink(materialized_path);
             if (host_backing_fd < 0) {
                 errno = saved_errno;
+                if (replaced_remove_fd >= 0)
+                    close(replaced_remove_fd);
                 return linux_errno();
             }
             close_host_backing_fd = true;
         } else {
-            if (host_fd_ref_open(fd, &backing_ref) < 0)
+            if (host_fd_ref_open(fd, &backing_ref) < 0) {
+                if (replaced_remove_fd >= 0)
+                    close(replaced_remove_fd);
                 return -LINUX_EBADF;
+            }
             host_backing_fd = backing_ref.fd;
         }
         track_backing_fd = dup(host_backing_fd);
@@ -1153,7 +1173,9 @@ populate_existing:
             replacing_existing ? 1 : 0, 1))
         goto fail;
     if (replacing_existing) {
-        guest_region_remove(g, addr, addr + length);
+        guest_region_remove_reserved(g, addr, addr + length,
+                                     replaced_remove_fd);
+        replaced_remove_fd = -1;
         replaced_region_removed = true;
     }
     if (guest_region_add_ex_owned_gpa(g, addr, addr + length, gpa_base, prot,
@@ -1231,7 +1253,8 @@ fail:
     }
     if (track_backing_fd >= 0)
         close(track_backing_fd);
-
+    if (replaced_remove_fd >= 0)
+        close(replaced_remove_fd);
     /* Restore region/PTE snapshots when this call mutated regions[] or the page
      * tables; otherwise just drop the snapshot allocation. Whichever path runs,
      * the common cleanup below frees snapshots and fds and resumes siblings, so
@@ -2254,6 +2277,26 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
     uint64_t host_start = ALIGN_DOWN(start, hps);
     uint64_t host_end = ALIGN_UP(end, hps);
 
+    /* Boundary splits are only needed to isolate live host overlays.  A plain
+     * guest range removal must not consume a region-table slot just to prove
+     * that there is no overlay to tear down; when the table is full that would
+     * turn an operation that only reduces mappings into a spurious ENOMEM.
+     */
+    bool has_overlay = false;
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= host_end)
+            break;
+        if (r->end <= host_start)
+            continue;
+        if (region_has_live_overlay(r)) {
+            has_overlay = true;
+            break;
+        }
+    }
+    if (!has_overlay)
+        return 0;
+
     region_array_txn_t split_txn;
     int txn_err = begin_region_array_txn(g, &split_txn);
     if (txn_err < 0)
@@ -2507,6 +2550,7 @@ int64_t sys_mmap(guest_t *g,
     region_snapshot_t *replaced_snaps = NULL;
     int replaced_nsnaps = 0;
     bool replaced_regions_removed = false;
+    int replaced_remove_fd = -1;
     int track_flags =
         ((flags & LINUX_MAP_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE);
     if (is_anon)
@@ -2634,8 +2678,15 @@ int64_t sys_mmap(guest_t *g,
             host_fd_ref_close(&backing_ref);
             return -LINUX_ENOMEM;
         }
+        if (guest_region_remove_prepare(g, result_off, result_off + length,
+                                        &replaced_remove_fd) < 0) {
+            host_fd_ref_close(&backing_ref);
+            return -LINUX_ENOMEM;
+        }
         replaced_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*replaced_snaps));
         if (!replaced_snaps) {
+            if (replaced_remove_fd >= 0)
+                close(replaced_remove_fd);
             host_fd_ref_close(&backing_ref);
             return -LINUX_ENOMEM;
         }
@@ -2643,6 +2694,8 @@ int64_t sys_mmap(guest_t *g,
             capture_region_snapshots(g, result_off, result_off + length,
                                      replaced_snaps, GUEST_MAX_REGIONS);
         if (replaced_nsnaps < 0) {
+            if (replaced_remove_fd >= 0)
+                close(replaced_remove_fd);
             free(replaced_snaps);
             host_fd_ref_close(&backing_ref);
             return replaced_nsnaps;
@@ -2650,6 +2703,8 @@ int64_t sys_mmap(guest_t *g,
         if (!is_anon) {
             track_backing_fd = dup(host_backing_fd);
             if (track_backing_fd < 0) {
+                if (replaced_remove_fd >= 0)
+                    close(replaced_remove_fd);
                 dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
                 host_fd_ref_close(&backing_ref);
                 return -LINUX_ENOMEM;
@@ -2662,6 +2717,8 @@ int64_t sys_mmap(guest_t *g,
                 } while (nr < 0 && errno == EINTR);
                 if (nr < 0) {
                     close(track_backing_fd);
+                    if (replaced_remove_fd >= 0)
+                        close(replaced_remove_fd);
                     dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
                     host_fd_ref_close(&backing_ref);
                     return linux_errno();
@@ -2696,6 +2753,8 @@ int64_t sys_mmap(guest_t *g,
                                                           replaced_nsnaps);
                 if (track_backing_fd >= 0)
                     close(track_backing_fd);
+                if (replaced_remove_fd >= 0)
+                    close(replaced_remove_fd);
                 dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
                 host_fd_ref_close(&backing_ref);
                 return cleanup_err;
@@ -2707,6 +2766,8 @@ int64_t sys_mmap(guest_t *g,
                                                           replaced_nsnaps);
                 if (track_backing_fd >= 0)
                     close(track_backing_fd);
+                if (replaced_remove_fd >= 0)
+                    close(replaced_remove_fd);
                 dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
                 host_fd_ref_close(&backing_ref);
                 return -LINUX_ENOMEM;
@@ -2715,7 +2776,9 @@ int64_t sys_mmap(guest_t *g,
             /* Remove old metadata only after fallible page-table preparation
              * succeeds.
              */
-            guest_region_remove(g, result_off, result_off + length);
+            guest_region_remove_reserved(g, result_off, result_off + length,
+                                         replaced_remove_fd);
+            replaced_remove_fd = -1;
             replaced_regions_removed = true;
 
             /* Fine-tune permissions for the exact range. Handles L3 splitting
@@ -2826,13 +2889,17 @@ int64_t sys_mmap(guest_t *g,
                                                           replaced_nsnaps);
                 if (track_backing_fd >= 0)
                     close(track_backing_fd);
+                if (replaced_remove_fd >= 0)
+                    close(replaced_remove_fd);
                 dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
                 host_fd_ref_close(&backing_ref);
                 return cleanup_err;
             }
 
             /* Remove any existing region coverage in the fixed range. */
-            guest_region_remove(g, result_off, result_off + length);
+            guest_region_remove_reserved(g, result_off, result_off + length,
+                                         replaced_remove_fd);
+            replaced_remove_fd = -1;
             replaced_regions_removed = true;
 
             /* PROT_NONE with MAP_FIXED: invalidate existing page table entries
@@ -3526,6 +3593,33 @@ int64_t sys_mremap(guest_t *g,
             return finish_mremap(&source, dest_nsnaps);
         }
 
+        /* Reserve the backing descriptors needed by both removals before any
+         * overlay teardown, page-table changes, or host-memory copies. The
+         * snapshots above may split region boundaries, so prepare against the
+         * final metadata shape while the outer transaction can still roll it
+         * back if either reservation fails.
+         */
+        int source_remove_fd = -1;
+        int dest_remove_fd = -1;
+        if (guest_region_remove_prepare(g, old_off, old_off + old_size,
+                                        &source_remove_fd) < 0 ||
+            guest_region_remove_prepare(g, new_off, new_off + new_size,
+                                        &dest_remove_fd) < 0) {
+            if (source_remove_fd >= 0)
+                close(source_remove_fd);
+            if (dest_remove_fd >= 0)
+                close(dest_remove_fd);
+            rollback_region_array_txn(g, &capture_txn);
+            finish_region_array_txn(&capture_txn);
+            dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
+            dispose_region_snapshots(&source_snaps, &source_nsnaps);
+            if (track_backing_fd >= 0)
+                close(track_backing_fd);
+            if (tail_backing_fd >= 0)
+                close(tail_backing_fd);
+            return finish_mremap(&source, -LINUX_ENOMEM);
+        }
+
         int64_t flush_err = flush_mremap_source_shared(g, &source);
         if (flush_err < 0) {
             rollback_region_array_txn(g, &capture_txn);
@@ -3536,6 +3630,10 @@ int64_t sys_mremap(guest_t *g,
                 close(track_backing_fd);
             if (tail_backing_fd >= 0)
                 close(tail_backing_fd);
+            if (source_remove_fd >= 0)
+                close(source_remove_fd);
+            if (dest_remove_fd >= 0)
+                close(dest_remove_fd);
             return finish_mremap(&source, flush_err);
         }
         finish_region_array_txn(&capture_txn);
@@ -3552,6 +3650,10 @@ int64_t sys_mremap(guest_t *g,
                     close(track_backing_fd);
                 if (tail_backing_fd >= 0)
                     close(tail_backing_fd);
+                if (source_remove_fd >= 0)
+                    close(source_remove_fd);
+                if (dest_remove_fd >= 0)
+                    close(dest_remove_fd);
                 return finish_mremap(&source, cleanup_err);
             }
         }
@@ -3568,6 +3670,10 @@ int64_t sys_mremap(guest_t *g,
                     close(track_backing_fd);
                 if (tail_backing_fd >= 0)
                     close(tail_backing_fd);
+                if (source_remove_fd >= 0)
+                    close(source_remove_fd);
+                if (dest_remove_fd >= 0)
+                    close(dest_remove_fd);
                 return finish_mremap(&source, restore_err);
             }
             (void) restore_snapshot_overlays_in_place(g, dest_snaps,
@@ -3578,6 +3684,10 @@ int64_t sys_mremap(guest_t *g,
                 close(track_backing_fd);
             if (tail_backing_fd >= 0)
                 close(tail_backing_fd);
+            if (source_remove_fd >= 0)
+                close(source_remove_fd);
+            if (dest_remove_fd >= 0)
+                close(dest_remove_fd);
             return finish_mremap(&source, cleanup_err);
         }
 
@@ -3591,6 +3701,10 @@ int64_t sys_mremap(guest_t *g,
                     close(track_backing_fd);
                 if (tail_backing_fd >= 0)
                     close(tail_backing_fd);
+                if (source_remove_fd >= 0)
+                    close(source_remove_fd);
+                if (dest_remove_fd >= 0)
+                    close(dest_remove_fd);
                 return finish_mremap(&source, restore_err);
             }
             (void) restore_snapshot_overlays_in_place(g, dest_snaps,
@@ -3601,13 +3715,19 @@ int64_t sys_mremap(guest_t *g,
                 close(track_backing_fd);
             if (tail_backing_fd >= 0)
                 close(tail_backing_fd);
+            if (source_remove_fd >= 0)
+                close(source_remove_fd);
+            if (dest_remove_fd >= 0)
+                close(dest_remove_fd);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
 
         /* Remove existing mappings at the destination after all fallible
          * preparation is complete.
          */
-        guest_region_remove(g, new_off, new_off + new_size);
+        guest_region_remove_reserved(g, new_off, new_off + new_size,
+                                     dest_remove_fd);
+        dest_remove_fd = -1;
 
         /* Copy each logical source segment according to its own backing state.
          * The destination receives a private snapshot at mremap time (no
@@ -3645,6 +3765,8 @@ int64_t sys_mremap(guest_t *g,
                     close(track_backing_fd);
                 if (tail_backing_fd >= 0)
                     close(tail_backing_fd);
+                if (source_remove_fd >= 0)
+                    close(source_remove_fd);
                 dispose_region_snapshots(&source_snaps, &source_nsnaps);
                 dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
                 if (restore_err < 0)
@@ -3661,7 +3783,9 @@ int64_t sys_mremap(guest_t *g,
         if (old_size > 0) {
             memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
                    old_size);
-            guest_region_remove(g, old_off, old_off + old_size);
+            guest_region_remove_reserved(g, old_off, old_off + old_size,
+                                         source_remove_fd);
+            source_remove_fd = -1;
             guest_invalidate_ptes(g, old_off, old_off + old_size);
             if (old_off < g->mmap_rw_gap_hint)
                 g->mmap_rw_gap_hint = old_off;

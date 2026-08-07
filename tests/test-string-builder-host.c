@@ -182,6 +182,22 @@ static void test_formatted_alias_append(void)
     string_builder_destroy(&builder);
 }
 
+static void test_formatted_errno_expansion(void)
+{
+    string_builder_t builder = {0};
+    char expected[128];
+
+    /* `%m` is a GNU printf extension; use the host libc as the oracle so
+     * Darwin (which leaves it literal) remains a valid host-test platform. */
+    errno = ENOENT;
+    assert(snprintf(expected, sizeof(expected), "errno=%m") >= 0);
+    errno = ENOENT;
+    assert(string_builder_appendf(&builder, "errno=%m") == 0);
+    assert(strcmp(string_builder_data_const(&builder), expected) == 0);
+    assert(errno == ENOENT);
+    string_builder_destroy(&builder);
+}
+
 static void test_overflow_preserves_content(void)
 {
     string_builder_t builder = {0};
@@ -224,6 +240,7 @@ int main(void)
     test_growth_preserves_content();
     test_alias_append();
     test_formatted_alias_append();
+    test_formatted_errno_expansion();
     test_overflow_preserves_content();
     puts("test-string-builder-host: PASS");
     return 0;

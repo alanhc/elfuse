@@ -810,9 +810,9 @@ VmFlags
 `Size` is the VMA length in KiB. `KernelPageSize` and `MMUPageSize` are
 reported as 4 KiB. In a fork child, writable private anonymous VMAs that
 existed in the parent's CoW snapshot report their full VMA size for
-`Shared_Dirty`, `Rss`, and `Pss`, keeping those coarse counters internally
-consistent. Newly-created VMAs are excluded from that signal. Every other
-numeric counter, including `THPeligible`, is emitted as a stable zero.
+`Shared_Dirty`, `Rss`, `Pss`, and `Pss_Dirty`, keeping those coarse counters
+internally consistent. Newly-created VMAs are excluded from that signal. Every
+other numeric counter, including `THPeligible`, is emitted as a stable zero.
 `ProtectionKey` (a Linux pkeys field added in Linux 4.9) is intentionally
 omitted because the macOS host has no equivalent; consumers comparing against a
 real Linux kernel should treat it as optional. `VmFlags` is evidence-based and

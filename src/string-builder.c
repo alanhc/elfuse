@@ -157,7 +157,8 @@ int string_builder_appendf(string_builder_t *builder, const char *format, ...)
     va_start(arguments, format);
 
     va_copy(sizing, arguments);
-    errno = 0;
+    /* Keep the caller's errno visible to printf extensions such as %m. */
+    errno = saved_errno;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wformat-nonliteral"
     /* A non-NULL destination keeps static analyzers from treating the
@@ -178,7 +179,7 @@ int string_builder_appendf(string_builder_t *builder, const char *format, ...)
     }
 
     va_copy(rendering, arguments);
-    errno = 0;
+    errno = saved_errno;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wformat-nonliteral"
     int rendered_len =

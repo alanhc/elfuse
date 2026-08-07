@@ -111,6 +111,7 @@ test-mmap-hint
 test-mremap
 test-mremap-infra
 test-mremap-fork-tracking
+test-mremap-tail-emfile
 test-shim-cred-race
 
 [section] msync MAP_SHARED tests

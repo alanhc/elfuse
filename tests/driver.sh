@@ -37,6 +37,11 @@ TAP=0
 # explicitly.
 ALLOW_MISSING_BINARIES="${ALLOW_MISSING_BINARIES:-0}"
 
+# The regression intentionally consumes elfuse's host descriptor reserve after
+# filling the guest table. Keep the host soft limit at the documented minimum
+# so the failure comes from the reserved dup rather than the region table.
+MREMAP_TAIL_EMFILE_HOST_NOFILE=1280
+
 usage()
 {
     echo "Usage: $0 [-e elfuse] [-d testdir] [-t timeout] [-f filter] [-s section] [-l] [-v] [-T] [test ...]" >&2
@@ -359,7 +364,16 @@ for i in "${filtered_idx[@]}"; do
     # ${args[@]+...} guards the array expansion so a test with no extra
     # arguments (args=()) does not trip bash 3.2's set -u rejection of
     # an empty "${array[@]}".
-    if output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" ${args[@]+"${args[@]}"} 2>&1); then
+    if [ "$name" = "test-mremap-tail-emfile" ]; then
+        if output=$(ulimit -n "$MREMAP_TAIL_EMFILE_HOST_NOFILE" && \
+            timeout "$TIMEOUT" "$ELFUSE" "$binary" \
+            ${args[@]+"${args[@]}"} 2>&1); then
+            rc=0
+        else
+            rc=$?
+        fi
+    elif output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" \
+        ${args[@]+"${args[@]}"} 2>&1); then
         rc=0
     else
         rc=$?
