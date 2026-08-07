@@ -32,6 +32,9 @@ MODE="${1:?Usage: $0 <elfuse-aarch64|qemu-aarch64|elfuse-x86_64|all>}"
 # Tool paths.
 ELFUSE="${ELFUSE:-${REPO_ROOT}/build/elfuse}"
 
+# shellcheck source=tests/test-config.sh
+source "${REPO_ROOT}/tests/test-config.sh"
+
 # Default fixture paths. Each variable points at the actual directory (or file
 # for busybox); no implicit /bin suffix is appended.
 : "${GUEST_TEST_BINARIES:=${REPO_ROOT}/build}"
@@ -42,10 +45,6 @@ ELFUSE="${ELFUSE:-${REPO_ROOT}/build/elfuse}"
 : "${GUEST_DYNAMIC_COREUTILS:=${FIXTURES}/aarch64-musl/dyn-bin}"
 : "${GUEST_GLIBC_SYSROOT:=}"
 : "${GUEST_GLIBC_DYNAMIC_COREUTILS:=}"
-
-# Keep the mremap descriptor-exhaustion regression below elfuse's host reserve
-# while still leaving the guest's virtual limit at FD_TABLE_SIZE.
-MREMAP_TAIL_EMFILE_HOST_NOFILE=1280
 
 # x86_64-via-Rosetta fixture roots. Populated by scripts/fetch-fixtures.sh once
 # the x86_64 corpus lands. Empty defaults make the suite skip cleanly on hosts
@@ -155,9 +154,12 @@ run_elfuse()
             "${FIXTURES}/aarch64-musl/dyn-bin"/*) args+=(--sysroot "$GUEST_SYSROOT") ;;
         esac
     fi
-    if [ "$(basename "$first")" = "test-mremap-tail-emfile" ]; then
+    local host_nofile
+    host_nofile=$(elfuse_test_host_nofile \
+        "${REPO_ROOT}/tests/manifest.txt" "$first") || return 1
+    if [ -n "$host_nofile" ]; then
         (
-            ulimit -n "$MREMAP_TAIL_EMFILE_HOST_NOFILE" || exit 1
+            ulimit -n "$host_nofile" || exit 1
             timeout 30 "$ELFUSE" ${args[@]+"${args[@]}"} "$@" 2> /dev/null
         )
     else
@@ -340,9 +342,10 @@ QEMU_SKIP="
 # test-mmap-hint / test-msync: pin mmap addresses against elfuse's own
 #   deterministic placement heuristics (2 MiB-aligned hint fallback, a fixed
 #   neighbor address); a real kernel's allocator places mappings differently.
-# test-mremap-tail-emfile: fills elfuse's fixed region table and then requires
-#   its host descriptor reserve to make the source reopen fail with EMFILE;
-#   real Linux has neither emulated table nor reserve.
+# test-mremap-tail-emfile: fills the guest FD table, consumes elfuse's host
+#   descriptor reserve with file-backed fillers, and verifies that the filler
+#   failure is descriptor-driven before asserting the mremap ENOMEM path; real
+#   Linux has neither emulated table nor reserve.
 # test-credentials: pins elfuse's restricted "fakeroot" setuid/capset/
 #   getgroups model (deliberately narrower than real root); the qemu
 #   reference lane runs as genuine root, which has unrestricted privilege.
@@ -626,10 +629,11 @@ test_pipe()
 # check") binary except the handful that assert elfuse-internal implementation
 # details with no meaningful counterpart on a real kernel (the EL1 shim
 # fast-path suite -- test-shim-* and test-shim-cred-race, which probe elfuse's
-# own shim_data block and identity cache -- test-mremap-infra and
-# test-mremap-tail-emfile, which guard elfuse-specific memory bookkeeping --
-# and test-oom-proc, documented in its own header). There is no "core" vs
-# "extended" split here; everything below runs
+# own shim_data block and identity cache -- test-mremap-infra, which guards
+# elfuse's guest-IPA infra reserve, and test-oom-proc, documented in its own
+# header). test-mremap-tail-emfile is listed here as an elfuse-lane regression
+# and marked QEMU_SKIP because its host-reserve assertion has no Linux analogue.
+# There is no "core" vs "extended" split here; everything below runs
 # in both elfuse-aarch64 and qemu-aarch64 modes, and genuine, understood
 # divergences from the qemu reference kernel are called out via QEMU_SKIP with
 # a comment rather than silently dropped from this list.

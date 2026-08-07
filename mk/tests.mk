@@ -1,8 +1,9 @@
 # Test targets
 
-# Keep the mremap descriptor-exhaustion regression below elfuse's host reserve
-# while still leaving the guest's virtual limit at FD_TABLE_SIZE.
-MREMAP_TAIL_EMFILE_HOST_NOFILE ?= 1280
+# Keep the mremap descriptor-exhaustion regression at elfuse's documented host
+# minimum. The manifest annotation, Make recipe, and shell runners all derive
+# this value from src/elfuse-limits.h.
+ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
 .PHONY: test-hello test-all check check-syscall-coverage test-gdbstub test-coreutils test-busybox \
         test-static-bins \
@@ -49,7 +50,7 @@ test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 ## Run the libc-based file-backed region removal EMFILE regression probe
 test-mremap-tail-emfile: $(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile
 	@printf "$(BLUE)▸ Running$(RESET) test-mremap-tail-emfile\n"
-	(ulimit -n $(MREMAP_TAIL_EMFILE_HOST_NOFILE) && \
+	(ulimit -n $(ELFUSE_HOST_NOFILE_MIN) && \
 		$(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile)
 
 ## Verify dispatch.tbl coverage of the kernel-supported syscall set

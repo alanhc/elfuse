@@ -37,11 +37,6 @@ TAP=0
 # explicitly.
 ALLOW_MISSING_BINARIES="${ALLOW_MISSING_BINARIES:-0}"
 
-# The regression intentionally consumes elfuse's host descriptor reserve after
-# filling the guest table. Keep the host soft limit at the documented minimum
-# so the failure comes from the reserved dup rather than the region table.
-MREMAP_TAIL_EMFILE_HOST_NOFILE=1280
-
 usage()
 {
     echo "Usage: $0 [-e elfuse] [-d testdir] [-t timeout] [-f filter] [-s section] [-l] [-v] [-T] [test ...]" >&2
@@ -98,6 +93,9 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_LIST="$SCRIPT_DIR/manifest.txt"
+
+# shellcheck source=tests/test-config.sh
+source "$SCRIPT_DIR/test-config.sh"
 
 case "$ELFUSE" in
     /*) ;;
@@ -364,19 +362,27 @@ for i in "${filtered_idx[@]}"; do
     # ${args[@]+...} guards the array expansion so a test with no extra
     # arguments (args=()) does not trip bash 3.2's set -u rejection of
     # an empty "${array[@]}".
-    if [ "$name" = "test-mremap-tail-emfile" ]; then
-        if output=$(ulimit -n "$MREMAP_TAIL_EMFILE_HOST_NOFILE" && \
-            timeout "$TIMEOUT" "$ELFUSE" "$binary" \
+    # Host-limit annotations live in the manifest. Keep this execution path
+    # generic so adding another constrained test does not require a
+    # name-qualified branch here.
+    if host_nofile=$(elfuse_test_host_nofile "$TEST_LIST" "$name"); then
+        if [ -n "$host_nofile" ]; then
+            if output=$(ulimit -n "$host_nofile" && \
+                timeout "$TIMEOUT" "$ELFUSE" "$binary" \
+                ${args[@]+"${args[@]}"} 2>&1); then
+                rc=0
+            else
+                rc=$?
+            fi
+        elif output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" \
             ${args[@]+"${args[@]}"} 2>&1); then
             rc=0
         else
             rc=$?
         fi
-    elif output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" \
-        ${args[@]+"${args[@]}"} 2>&1); then
-        rc=0
     else
-        rc=$?
+        output="invalid host_nofile test annotation"
+        rc=125
     fi
 
     if evaluate_result "$rc" "$expected" "$stdout_pat" "$output"; then

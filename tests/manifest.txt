@@ -6,7 +6,10 @@
 #
 # Format:
 #   [section] SECTION_NAME
-#   BINARY [ARGS...]           # optional: expected_rc=N
+#   BINARY [ARGS...]           # optional: expected_rc=N, stdout=REGEX,
+#                              #           host_nofile=LIMIT
+# `host_nofile=elfuse-minimum` resolves from src/elfuse-limits.h and is applied
+# by both the data-driven driver and the elfuse matrix runner.
 #
 # BINARY is resolved relative to TESTDIR (default: build/).
 # Lines starting with # are comments. Blank lines are ignored.
@@ -111,7 +114,7 @@ test-mmap-hint
 test-mremap
 test-mremap-infra
 test-mremap-fork-tracking
-test-mremap-tail-emfile
+test-mremap-tail-emfile # host_nofile=elfuse-minimum
 test-shim-cred-race
 
 [section] msync MAP_SHARED tests

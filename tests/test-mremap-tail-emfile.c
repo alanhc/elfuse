@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -54,6 +55,8 @@ static void child_probe(int file_fd, unsigned char *base)
     /* Exhaust both descriptor tables, then leave one slot available. */
     int last_dup = -1;
     int dup_error = 0;
+    int spare_dups[2] = {-1, -1};
+    int spare_dup_count = 0;
     for (;;) {
         int duplicated = dup(file_fd);
         if (duplicated < 0) {
@@ -61,13 +64,19 @@ static void child_probe(int file_fd, unsigned char *base)
             break;
         }
         last_dup = duplicated;
+        if (spare_dup_count < 2)
+            spare_dups[spare_dup_count++] = duplicated;
     }
-    if (dup_error != EMFILE || last_dup < 0)
+    struct rlimit guest_nofile;
+    if (getrlimit(RLIMIT_NOFILE, &guest_nofile) != 0 || dup_error != EMFILE ||
+        last_dup < 0 || (rlim_t) last_dup + 1 != guest_nofile.rlim_cur)
         child_fail(11);
     if (close(last_dup) != 0)
         child_fail(12);
 
-    /* Fill the region table with one-page file mappings separated by holes. */
+    /* Consume the host descriptor reserve with one-page file mappings separated
+     * by holes. The attribution probe below rejects a region/address-capacity
+     * failure, so this loop cannot silently become a different regression. */
     const size_t filler_length = (size_t) FILL_LIMIT * 2 * PAGE_SIZE;
     void *reserved = mmap(NULL, filler_length, PROT_NONE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -77,6 +86,7 @@ static void child_probe(int file_fd, unsigned char *base)
         child_fail(13);
 
     void *last_filler = MAP_FAILED;
+    int filler_error = 0;
     int filler_count = 0;
     for (; filler_count < FILL_LIMIT; filler_count++) {
         void *address =
@@ -84,9 +94,9 @@ static void child_probe(int file_fd, unsigned char *base)
         void *filler = mmap(address, PAGE_SIZE, PROT_NONE,
                             MAP_PRIVATE | MAP_FIXED, file_fd, 0);
         if (filler == MAP_FAILED) {
-            int filler_errno = errno;
-            if (filler_errno != ENOMEM || filler_count == 0)
-                child_fail(filler_errno == ENOMEM ? 16 : 14);
+            filler_error = errno;
+            if (filler_error != ENOMEM || filler_count == 0)
+                child_fail(filler_error == ENOMEM ? 16 : 14);
             break;
         }
         if (filler != address)
@@ -95,13 +105,42 @@ static void child_probe(int file_fd, unsigned char *base)
     }
     if (filler_count == FILL_LIMIT || last_filler == MAP_FAILED)
         child_fail(16);
+
+    /* Prove that the filler stopped on host descriptor pressure rather than
+     * address-space or region-table capacity. Release two guest duplicate
+     * slots (a file-backed mmap needs one temporary and one tracked host fd),
+     * then map the next gap while leaving every existing region in place. If
+     * this probe still fails, the later ENOMEM assertions would be ambiguous.
+     */
+    if (spare_dup_count < 2)
+        child_fail(28);
+    for (int i = 0; i < spare_dup_count; i++) {
+        if (close(spare_dups[i]) != 0)
+            child_fail(28);
+    }
+    void *descriptor_probe_address =
+        (char *) reserved + (size_t) filler_count * 2 * PAGE_SIZE;
+    void *descriptor_probe =
+        mmap(descriptor_probe_address, PAGE_SIZE, PROT_NONE,
+             MAP_PRIVATE | MAP_FIXED, file_fd, 0);
+    if (descriptor_probe == MAP_FAILED ||
+        descriptor_probe != descriptor_probe_address)
+        child_fail(29);
+    if (munmap(descriptor_probe, PAGE_SIZE) != 0)
+        child_fail(30);
+
     if (munmap(last_filler, PAGE_SIZE) != 0)
         child_fail(17);
 
-    /* Consume the one descriptor released by the last filler mapping. */
-    int probe_fd = dup(file_fd);
-    if (probe_fd < 0)
-        child_fail(22);
+    /* Consume every descriptor released by the attribution probe and the
+     * removed filler region. The following mremap/munmap calls must have no
+     * host descriptor available for their internal dup(). */
+    int probe_fds[3] = {-1, -1, -1};
+    for (int i = 0; i < 3; i++) {
+        probe_fds[i] = dup(file_fd);
+        if (probe_fds[i] < 0)
+            child_fail(22);
+    }
 
     /* Splitting either boundary of the child-private tail must fail before
      * changing memory or PTEs when no descriptor is available. */
@@ -119,8 +158,10 @@ static void child_probe(int file_fd, unsigned char *base)
         base[SPAN + 3 * PAGE_SIZE] != 'M')
         child_fail(25);
 
-    if (close(probe_fd) != 0)
-        child_fail(27);
+    for (int i = 0; i < 3; i++) {
+        if (close(probe_fds[i]) != 0)
+            child_fail(27);
+    }
 
     /* old_size ends inside the child-private tail. */
     errno = 0;
