@@ -319,7 +319,7 @@ int fd_alloc_dir_at(int fd,
     pthread_mutex_lock(&fd_lock);
     if (fd_table[fd].type != FD_CLOSED) {
         old = fd_table[fd];
-        epoll_note_fd_closed(fd);
+        epoll_note_fd_closed(fd, old.ofd_id);
     }
     fd_init_entry(fd, type, host_fd, cleanup);
     fd_table[fd].dir = dir;
@@ -438,7 +438,7 @@ int fd_alloc_at(int fd,
          * this fd number without routing through fd_mark_closed_unlocked, so
          * clear its epoll registrations here too (see epoll_note_fd_closed).
          */
-        epoll_note_fd_closed(fd);
+        epoll_note_fd_closed(fd, old.ofd_id);
     }
     fd_init_entry(fd, type, host_fd, cleanup);
     if (out_gen)
@@ -484,6 +484,8 @@ int fd_alloc_at_relaxed(int fd,
  */
 void fd_mark_closed_unlocked(int fd)
 {
+    uint64_t closing_ofd_id = fd_table[fd].ofd_id;
+
     /* Clear before publishing FD_CLOSED/free. The EL1 urandom read fast path
      * intentionally avoids fd_lock, so it must not observe a stale urandom bit
      * after this slot has become invalid or reusable.
@@ -506,7 +508,7 @@ void fd_mark_closed_unlocked(int fd)
      * just-closed epoll fd skips itself; caller holds fd_lock (or is
      * single-threaded on the relaxed path).
      */
-    epoll_note_fd_closed(fd);
+    epoll_note_fd_closed(fd, closing_ofd_id);
 }
 
 void fd_mark_closed(int fd)
@@ -601,6 +603,14 @@ bool fd_snapshot(int guest_fd, fd_entry_t *out)
     bool ok = fd_snapshot_locked(guest_fd, out, false);
     pthread_mutex_unlock(&fd_lock);
     return ok;
+}
+
+uint64_t fd_current_generation(int guest_fd)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(guest_fd, &snap))
+        return 0;
+    return snap.generation;
 }
 
 int fd_snapshot_and_dup(int guest_fd, fd_entry_t *out)
