@@ -225,7 +225,9 @@ static probe_result_t probe_exact(host_fd_t base_fd,
              * mismatch pays for the scan.
              *
              * The listing carries no type, and this call typed the entry the
-             * volume named, not the one the listing finds, so withdraw it.
+             * volume named, not the one the listing finds, so withdraw it:
+             * all_types_known below is what lets a caller skip the canonical
+             * containment recheck.
              */
             *type_known = false;
             return probe_by_readdir(base_fd, path, leaf);
@@ -468,6 +470,7 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
     walk->notdir = false;
     walk->leaf_type_known = false;
     walk->leaf_is_link = false;
+    walk->all_types_known = true;
 
     len = str_copy_trunc(out, base_host_prefix ? base_host_prefix : "", outsz);
     if (len >= outsz) {
@@ -516,6 +519,8 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
                 return CASEFOLD_ERROR;
             walk->leaf_type_known = verdict == PROBE_EXACT && type_known;
             walk->leaf_is_link = walk->leaf_type_known && is_link;
+            if (verdict == PROBE_EXACT && !type_known)
+                walk->all_types_known = false;
 
             /* A link the walk has to pass through stops it. That is every
              * intermediate component, and the final one only when the caller
