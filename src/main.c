@@ -12,7 +12,9 @@
  *   - Guest memory identity-mapped at GVA=GPA with 2MiB block page tables.
  *   - Syscall handlers that translate Linux syscalls to macOS equivalents.
  *
- * Usage: elfuse [--verbose] [--timeout N] [--sysroot PATH] <elf-path> [args...]
+ * Usage: elfuse [options] <elf-path> [args...]; `elfuse --help` lists the
+ * options. The flag list lives once in ELFUSE_USAGE_BODY below; --help and
+ * the argument-error paths render it differently but cannot drift apart.
  */
 
 #include <Hypervisor/Hypervisor.h>
@@ -239,6 +241,24 @@ static int host_dc_zva_assert(void)
     return 0;
 }
 
+/* Usage synopsis: one flag list, two renderings. @sep joins the groups,
+ * with a space for ELFUSE_USAGE and a newline plus an indent to the column
+ * after "usage: elfuse " for ELFUSE_USAGE_WRAPPED.
+ *
+ * The error paths need the flat form because log_error stamps a timestamp
+ * and a source location on the first line only, so a wrapped string prints
+ * ragged under the prefix; --help has no prefix and takes the wrapped form,
+ * which fits 80 columns. Sharing one body keeps the flag list from drifting
+ * between them (one copy had already lost the --gdb flags).
+ */
+#define ELFUSE_USAGE_BODY(sep)                                     \
+    "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]" sep \
+    "[--create-sysroot PATH] [--no-rosetta] [--fakeroot]" sep      \
+    "[--gdb PORT] [--gdb-stop-on-entry] <elf-path> [args...]"
+
+#define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
+#define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
+
 int main(int argc, char **argv)
 {
     log_init();
@@ -291,11 +311,8 @@ int main(int argc, char **argv)
         }
         if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
             printf(
-                "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]\n"
-                "              [--create-sysroot PATH]\n"
-                "              [--no-rosetta] [--fakeroot]\n"
-                "              [--gdb PORT] [--gdb-stop-on-entry]\n"
-                "              <elf-path> [args...]\n"
+                ELFUSE_USAGE_WRAPPED
+                "\n"
                 "\n"
                 "Options:\n"
                 "  -h, --help              Show this help and exit\n"
@@ -393,11 +410,7 @@ int main(int argc, char **argv)
             break;
         } else {
             log_error("unknown option: %s", argv[arg_start]);
-            log_error(
-                "usage: elfuse [--verbose] [--timeout N] "
-                "[--sysroot PATH] [--create-sysroot PATH] [--no-rosetta] "
-                "[--fakeroot] [--gdb PORT] "
-                "[--gdb-stop-on-entry] <elf-path> [args...]");
+            log_error(ELFUSE_USAGE);
             return 1;
         }
     }
@@ -470,10 +483,7 @@ int main(int argc, char **argv)
                                timeout_sec);
 
     if (arg_start >= argc) {
-        log_error(
-            "usage: elfuse [--verbose] [--timeout N] "
-            "[--sysroot PATH] [--create-sysroot PATH] [--no-rosetta] "
-            "[--fakeroot] <elf-path> [args...]");
+        log_error(ELFUSE_USAGE);
         return 1;
     }
 
