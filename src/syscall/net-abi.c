@@ -13,6 +13,7 @@
 
 #include "syscall/net.h"
 #include "syscall/net-abi.h"
+#include "syscall/sockaddr-math.h"
 
 int socket_small_int_normalize(int level, int optname, int value)
 {
@@ -206,12 +207,12 @@ int linux_to_mac_sockaddr(const void *linux_sa,
                           uint32_t linux_len,
                           struct sockaddr_storage *mac_sa)
 {
-    if (linux_len < 2)
+    if (!sockaddr_len_ok(linux_len))
         return -1;
 
     const uint8_t *src = linux_sa;
     uint16_t linux_family;
-    memcpy(&linux_family, src, 2);
+    memcpy(&linux_family, src, SOCKADDR_FAMILY_BYTES);
 
     int mac_family = translate_af_to_mac((int) linux_family);
 
@@ -219,10 +220,13 @@ int linux_to_mac_sockaddr(const void *linux_sa,
     mac_sa->ss_len = (uint8_t) linux_len;
     mac_sa->ss_family = (uint8_t) mac_family;
 
-    uint32_t data_len = linux_len - 2;
-    if (data_len > sizeof(*mac_sa) - 2)
-        data_len = sizeof(*mac_sa) - 2;
-    memcpy((uint8_t *) mac_sa + 2, src + 2, data_len);
+    /* Proved in src/syscall/sockaddr-math.h: the copy below stays inside both
+     * the source length and this destination.
+     */
+    uint32_t data_len =
+        (uint32_t) sockaddr_payload_len(linux_len, sizeof(*mac_sa));
+    memcpy((uint8_t *) mac_sa + SOCKADDR_FAMILY_BYTES,
+           src + SOCKADDR_FAMILY_BYTES, data_len);
 
     return (int) linux_len;
 }
@@ -232,20 +236,26 @@ int mac_to_linux_sockaddr(const struct sockaddr *mac_sa,
                           uint8_t *linux_sa,
                           uint32_t linux_buf_len)
 {
-    if (mac_len < 2 || linux_buf_len < 2)
+    /* Widening mac_len to uint64_t rejects short addresses only because
+     * socklen_t is unsigned here. Were it signed, a negative length would widen
+     * to a huge value, pass this guard, and be clamped to the destination size
+     * rather than rejected.
+     */
+    _Static_assert((socklen_t) -1 > 0, "socklen_t must be unsigned");
+    if (!sockaddr_len_ok((uint64_t) mac_len) || !sockaddr_len_ok(linux_buf_len))
         return -1;
 
     int linux_family = translate_af_to_linux(mac_sa->sa_family);
     uint16_t fam16 = (uint16_t) linux_family;
 
-    memcpy(linux_sa, &fam16, 2);
+    memcpy(linux_sa, &fam16, SOCKADDR_FAMILY_BYTES);
 
-    uint32_t data_len = (uint32_t) mac_len - 2;
-    if (data_len > linux_buf_len - 2)
-        data_len = linux_buf_len - 2;
-    memcpy(linux_sa + 2, (const uint8_t *) mac_sa + 2, data_len);
+    uint32_t data_len =
+        (uint32_t) sockaddr_payload_len((uint64_t) mac_len, linux_buf_len);
+    memcpy(linux_sa + SOCKADDR_FAMILY_BYTES,
+           (const uint8_t *) mac_sa + SOCKADDR_FAMILY_BYTES, data_len);
 
-    return (int) (2 + data_len);
+    return (int) (SOCKADDR_FAMILY_BYTES + data_len);
 }
 
 int extract_sock_type(int linux_type)

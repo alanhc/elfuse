@@ -1,8 +1,8 @@
 # Static analysis and formatting
 
 .PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
-        verify-gva verify-cmsg verify-fuse verify-stack check-contracts \
-        infer-uninit
+        verify-gva verify-cmsg verify-fuse verify-stack verify-sockaddr \
+        check-contracts infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -170,6 +170,14 @@ VERIFY_STACK_SCAN := src/core/stack-math.h
 VERIFY_STACK_CLAIM := for ANY argv, envp, and auxv set a guest can present
 VERIFY_STACK_UNPROVED := the string writes and push loop stay test-covered
 
+VERIFY_SOCKADDR_SRC  := src/syscall/sockaddr-math.h
+VERIFY_SOCKADDR_FCTS := sockaddr_len_ok sockaddr_payload_len
+VERIFY_SOCKADDR_MIN_GOALS ?= 11
+VERIFY_SOCKADDR_MODEL := typed
+VERIFY_SOCKADDR_SCAN := src/syscall/sockaddr-math.h
+VERIFY_SOCKADDR_CLAIM := for ANY address length a guest or host can present
+VERIFY_SOCKADDR_UNPROVED := the family translation and memcpy stay test-covered
+
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
 verify_empty :=
@@ -254,6 +262,17 @@ verify-stack: SCAN := $(VERIFY_STACK_SCAN)
 verify-stack: CLAIM := $(VERIFY_STACK_CLAIM)
 verify-stack: UNPROVED := $(VERIFY_STACK_UNPROVED)
 
+## Prove sockaddr reshaping cannot overrun either representation
+verify-sockaddr: NAME := sockaddr
+verify-sockaddr: SRC := $(VERIFY_SOCKADDR_SRC)
+verify-sockaddr: FCTS := $(VERIFY_SOCKADDR_FCTS)
+verify-sockaddr: FCT_ARG := $(call commafy,$(VERIFY_SOCKADDR_FCTS))
+verify-sockaddr: MIN_GOALS := $(VERIFY_SOCKADDR_MIN_GOALS)
+verify-sockaddr: MODEL := $(VERIFY_SOCKADDR_MODEL)
+verify-sockaddr: SCAN := $(VERIFY_SOCKADDR_SCAN)
+verify-sockaddr: CLAIM := $(VERIFY_SOCKADDR_CLAIM)
+verify-sockaddr: UNPROVED := $(VERIFY_SOCKADDR_UNPROVED)
+
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
 # what gets proved.
@@ -262,8 +281,8 @@ verify-stack: UNPROVED := $(VERIFY_STACK_UNPROVED)
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack: \
-    | $(BUILD_DIR)
+verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack \
+    verify-sockaddr: | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -289,7 +308,8 @@ verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack: \
 	    --src $(SRC) --unproved "$(UNPROVED)"
 
 ## Run every Frama-C proof
-verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse verify-stack
+verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse verify-stack \
+        verify-sockaddr
 
 ## Rebuild with the gva-math.h precondition checks live, then run the suite
 #
