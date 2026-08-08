@@ -16,7 +16,9 @@
 #include <unistd.h>
 #include <sys/random.h>
 
+#include "core/stack-math.h"
 #include "core/stack.h"
+#include "debug/log.h"
 #include "syscall/abi.h" /* GUEST_UID, GUEST_GID */
 #include "syscall/proc.h"
 
@@ -167,7 +169,17 @@ uint64_t build_linux_stack(guest_t *g,
  */
 #define MAX_ARGS 131072
 #define MAX_ENVS 131072
-    if (argc > MAX_ARGS || envc > MAX_ENVS)
+
+    /* argc is bounded below as well as above, and the lower bound is the one
+     * that matters here: a negative argc makes the (uint64_t) total_entries
+     * cast below about 2^64, which violates the entries <= STACK_MAX_WORDS
+     * precondition of stack_pushed_words and stack_final_sp. Past that the word
+     * count wraps and stack_final_sp can report success with a garbage
+     * expect_sp. No caller passes a negative argc today; this makes the code
+     * discharge the precondition instead of leaving it as an argument about
+     * other files.
+     */
+    if (argc < 0 || argc > MAX_ARGS || envc > MAX_ENVS)
         return 0; /* Caller treats 0 as failure */
 
     /* Phase 1: Write strings and random data at the top of the stack. stack
@@ -175,8 +187,23 @@ uint64_t build_linux_stack(guest_t *g,
      */
     uint64_t str_ptr = stack_top;
 
+    /* Floor for the whole descent: every step below goes through stack_take,
+     * whose postcondition is that the pointer never crosses this.
+     *
+     * The floor is the first WRITABLE byte, not stack_base: the low
+     * STACK_GUARD_SIZE bytes of the region are the PROT_NONE stack guard (the
+     * [stack-guard] region bootstrap.c and sys_execve both install), and the
+     * writable stack starts above it. Using stack_base would let the descent
+     * walk into the guard and only fail later inside guest_write, with a worse
+     * diagnostic.
+     */
+    const uint64_t stack_floor = g->stack_base + STACK_GUARD_SIZE;
+    if (str_ptr < stack_floor)
+        return 0;
+
     /* AT_RANDOM: 16 random bytes */
-    str_ptr -= 16;
+    if (!stack_take(&str_ptr, stack_floor, 16))
+        return 0;
     uint64_t random_ptr = str_ptr;
     uint8_t random_bytes[16];
     if (getentropy(random_bytes, 16) != 0)
@@ -186,7 +213,8 @@ uint64_t build_linux_stack(guest_t *g,
         guest_write_small(g, random_ptr, random_bytes, sizeof(random_bytes));
 
     /* AT_PLATFORM: "aarch64\0" */
-    str_ptr -= 8; /* strlen("aarch64") + 1 */
+    if (!stack_take(&str_ptr, stack_floor, 8)) /* strlen("aarch64") + 1 */
+        return 0;
     uint64_t platform_ptr = str_ptr;
     str_err |= write_str(g, platform_ptr, "aarch64");
 
@@ -197,20 +225,19 @@ uint64_t build_linux_stack(guest_t *g,
      * which simplifies subsequent code and avoids tripping static analyzers
      * that cannot correlate the empty-loop case with the NULL pointer.
      */
+    uint64_t ret = 0; /* every exit from here on runs the cleanup at out: */
     uint64_t *env_ptrs =
         calloc((size_t) (envc > 0 ? envc : 1), sizeof(uint64_t));
     uint64_t *arg_ptrs =
         calloc((size_t) (argc > 0 ? argc : 1), sizeof(uint64_t));
-    if (!env_ptrs || !arg_ptrs) {
-        free(env_ptrs);
-        free(arg_ptrs);
-        return 0;
-    }
+    if (!env_ptrs || !arg_ptrs)
+        goto out;
 
     /* Environment strings */
     for (int i = envc - 1; i >= 0; i--) {
         size_t len = strlen(envp[i]) + 1;
-        str_ptr -= len;
+        if (!stack_take(&str_ptr, stack_floor, len))
+            goto out;
         env_ptrs[i] = str_ptr;
         str_err |= write_str(g, str_ptr, envp[i]);
     }
@@ -218,7 +245,8 @@ uint64_t build_linux_stack(guest_t *g,
     /* Argument strings (written backward so argv[0] is at lowest addr) */
     for (int i = argc - 1; i >= 0; i--) {
         size_t len = strlen(argv[i]) + 1;
-        str_ptr -= len;
+        if (!stack_take(&str_ptr, stack_floor, len))
+            goto out;
         arg_ptrs[i] = str_ptr;
         str_err |= write_str(g, str_ptr, argv[i]);
     }
@@ -229,7 +257,7 @@ uint64_t build_linux_stack(guest_t *g,
     /* Phase 2: Build the structured part of the stack. Align str_ptr down to 16
      * bytes first.
      */
-    str_ptr &= ~15ULL;
+    str_ptr = stack_align_down(str_ptr);
     uint64_t sp = str_ptr;
 
     /* Count auxv entries: base 15 (always) + AT_EXECFN (always) + AT_BASE
@@ -254,13 +282,27 @@ uint64_t build_linux_stack(guest_t *g,
         extra += 2; /* AT_EXECFD (binfmt_misc binary fd) */
     int total_entries = 35 + extra + argc + envc;
 
+    /* Where SP must land, computed before a single word is pushed.
+     *
+     * total_entries is a hand-maintained count of the pushes below. Adding an
+     * AUX() entry without updating it would leave SP misaligned or short of
+     * argc, and nothing would say so: the guest would just read argv from the
+     * wrong offset. Comparing against this at the end turns that into a clean
+     * failure. stack_final_sp proves the value is 16-byte aligned and inside
+     * the region, given a 16-aligned base and an even word count.
+     */
+    uint64_t pushed_words = stack_pushed_words((uint64_t) total_entries);
+    uint64_t expect_sp = 0;
+    if (!stack_final_sp(str_ptr, stack_floor, pushed_words, &expect_sp))
+        goto out;
+
     /* Track cumulative write errors. Any failure means the stack is incomplete.
      *
      * Return 0 so the caller sees the failure.
      */
     int stack_err = str_err;
 
-    if (total_entries & 1)
+    if (pushed_words != (uint64_t) total_entries)
         stack_err |= push_u64(g, &sp, 0); /* alignment padding */
 
 #define PUSH(val)                             \
@@ -332,7 +374,22 @@ uint64_t build_linux_stack(guest_t *g,
     PUSH((uint64_t) argc);
 #undef PUSH
 
+    /* The pushes must have landed exactly where the count said they would. A
+     * mismatch means total_entries no longer describes the code below it.
+     */
+    if (sp != expect_sp) {
+        log_error(
+            "build_linux_stack: pushed to 0x%llx, entry count says 0x%llx "
+            "(total_entries=%d is out of sync with the pushes)",
+            (unsigned long long) sp, (unsigned long long) expect_sp,
+            total_entries);
+        goto out;
+    }
+
+    ret = stack_err ? 0 : sp;
+
+out:
     free(env_ptrs);
     free(arg_ptrs);
-    return stack_err ? 0 : sp;
+    return ret;
 }

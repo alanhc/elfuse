@@ -1,7 +1,8 @@
 # Static analysis and formatting
 
 .PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
-        verify-gva verify-cmsg verify-fuse check-contracts infer-uninit
+        verify-gva verify-cmsg verify-fuse verify-stack check-contracts \
+        infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -160,6 +161,15 @@ VERIFY_FUSE_SCAN := src/syscall/fuse-math.h
 VERIFY_FUSE_CLAIM := for ANY reply frame a guest FUSE daemon can write
 VERIFY_FUSE_UNPROVED := the per-opcode payload extents stay test-covered
 
+VERIFY_STACK_SRC  := src/core/stack-math.h
+VERIFY_STACK_FCTS := stack_take stack_align_down stack_pushed_words \
+                    stack_final_sp
+VERIFY_STACK_MIN_GOALS ?= 36
+VERIFY_STACK_MODEL := typed
+VERIFY_STACK_SCAN := src/core/stack-math.h
+VERIFY_STACK_CLAIM := for ANY argv, envp, and auxv set a guest can present
+VERIFY_STACK_UNPROVED := the string writes and push loop stay test-covered
+
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
 verify_empty :=
@@ -233,6 +243,17 @@ verify-fuse: SCAN := $(VERIFY_FUSE_SCAN)
 verify-fuse: CLAIM := $(VERIFY_FUSE_CLAIM)
 verify-fuse: UNPROVED := $(VERIFY_FUSE_UNPROVED)
 
+## Prove the initial stack stays in its region and lands SP aligned on argc
+verify-stack: NAME := stack
+verify-stack: SRC := $(VERIFY_STACK_SRC)
+verify-stack: FCTS := $(VERIFY_STACK_FCTS)
+verify-stack: FCT_ARG := $(call commafy,$(VERIFY_STACK_FCTS))
+verify-stack: MIN_GOALS := $(VERIFY_STACK_MIN_GOALS)
+verify-stack: MODEL := $(VERIFY_STACK_MODEL)
+verify-stack: SCAN := $(VERIFY_STACK_SCAN)
+verify-stack: CLAIM := $(VERIFY_STACK_CLAIM)
+verify-stack: UNPROVED := $(VERIFY_STACK_UNPROVED)
+
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
 # what gets proved.
@@ -241,7 +262,8 @@ verify-fuse: UNPROVED := $(VERIFY_FUSE_UNPROVED)
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-verify-elf verify-rsp verify-gva verify-cmsg verify-fuse: | $(BUILD_DIR)
+verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack: \
+    | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -267,7 +289,7 @@ verify-elf verify-rsp verify-gva verify-cmsg verify-fuse: | $(BUILD_DIR)
 	    --src $(SRC) --unproved "$(UNPROVED)"
 
 ## Run every Frama-C proof
-verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse
+verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse verify-stack
 
 ## Rebuild with the gva-math.h precondition checks live, then run the suite
 #
