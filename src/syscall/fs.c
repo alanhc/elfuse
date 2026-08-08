@@ -213,6 +213,15 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
     return false;
 }
 
+/* Every /proc virtual directory this loader answers for, other than
+ * /proc/self/task/<tid> below, which needs numeric parsing instead of a literal
+ * match.
+ */
+static const char *const PROC_VIRTUAL_DIRS[] = {
+    "/proc",         "/proc/self",        "/proc/net",
+    "/proc/self/fd", "/proc/self/fdinfo", "/proc/self/task",
+};
+
 static const char *proc_virtual_dir_path(const char *path,
                                          char *buf,
                                          size_t bufsz)
@@ -220,58 +229,59 @@ static const char *proc_virtual_dir_path(const char *path,
     if (!path || strncmp(path, "/proc", 5) != 0)
         return NULL;
 
-    const char *virt = NULL;
-    if (!strcmp(path, "/proc") || !strcmp(path, "/proc/")) {
-        virt = "/proc";
-    } else if (!strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/")) {
-        virt = "/proc/self";
-    } else if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/")) {
-        virt = "/proc/net";
-    } else if (!strcmp(path, "/proc/self/fd") ||
-               !strcmp(path, "/proc/self/fd/")) {
-        virt = "/proc/self/fd";
-    } else if (!strcmp(path, "/proc/self/fdinfo") ||
-               !strcmp(path, "/proc/self/fdinfo/")) {
-        virt = "/proc/self/fdinfo";
-    } else if (!strcmp(path, "/proc/self/task") ||
-               !strcmp(path, "/proc/self/task/")) {
-        virt = "/proc/self/task";
-    } else if (!strncmp(path, "/proc/self/task/", 16)) {
-        char *endp;
-        long tid = strtol(path + 16, &endp, 10);
-        if (endp != path + 16 && tid > 0 &&
-            (*endp == '\0' || !strcmp(endp, "/"))) {
-            snprintf(buf, bufsz, "/proc/self/task/%ld", tid);
-            virt = buf;
-        }
-    } else if (!strncmp(path, "/proc/", 6)) {
+    /* "/proc/<mypid>/..." names the same things as "/proc/self/...": rewrite
+     * the prefix up front so the table below only has to know the "self"
+     * spelling once instead of duplicating every entry for the numeric-pid one.
+     * A pid that fails to parse (not "/proc/<digits>...", including
+     * "/proc/self...") leaves lookup at the original path untouched, since
+     * strtol's endp stops at the first non-digit and never advances past
+     * "/proc/" for a non-numeric next component.
+     */
+    char normalized[64];
+    const char *lookup = path;
+    if (!strncmp(path, "/proc/", 6)) {
         char *endp;
         long pid = strtol(path + 6, &endp, 10);
-        if (endp != path + 6 && pid == (long) proc_get_pid() &&
-            (*endp == '\0' || !strcmp(endp, "/"))) {
-            virt = "/proc/self";
-        } else if (endp != path + 6 && pid == (long) proc_get_pid() &&
-                   (!strcmp(endp, "/fdinfo") || !strcmp(endp, "/fdinfo/"))) {
-            virt = "/proc/self/fdinfo";
-        } else if (endp != path + 6 && pid == (long) proc_get_pid() &&
-                   !strcmp(endp, "/fd")) {
-            virt = "/proc/self/fd";
-        } else if (endp != path + 6 && pid == (long) proc_get_pid() &&
-                   !strcmp(endp, "/task")) {
-            virt = "/proc/self/task";
-        } else if (endp != path + 6 && pid == (long) proc_get_pid() &&
-                   !strncmp(endp, "/task/", 6)) {
-            char *tid_endp;
-            long tid = strtol(endp + 6, &tid_endp, 10);
-            if (tid_endp != endp + 6 &&
-                (*tid_endp == '\0' || !strcmp(tid_endp, "/"))) {
-                snprintf(buf, bufsz, "/proc/self/task/%ld", tid);
-                virt = buf;
-            }
+        if (endp != path + 6 && pid == (long) proc_get_pid()) {
+            int n =
+                snprintf(normalized, sizeof(normalized), "/proc/self%s", endp);
+
+            /* A truncated rewrite must not be used as a lookup key: it would
+             * silently match a different, shorter virtual path than the one
+             * actually requested. Fall through with the untranslated pid
+             * spelling instead, which the table below simply will not match.
+             */
+            if (n >= 0 && (size_t) n < sizeof(normalized))
+                lookup = normalized;
         }
     }
 
-    return virt;
+    /* Tolerate exactly one trailing slash, same as the literal-match chain this
+     * replaced; a table of full canonical paths only has to list one spelling
+     * per entry this way.
+     */
+    char stripped[64];
+    size_t len = strlen(lookup);
+    if (len > 1 && lookup[len - 1] == '/' && len < sizeof(stripped)) {
+        memcpy(stripped, lookup, len - 1);
+        stripped[len - 1] = '\0';
+        lookup = stripped;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(PROC_VIRTUAL_DIRS); i++)
+        if (!strcmp(lookup, PROC_VIRTUAL_DIRS[i]))
+            return PROC_VIRTUAL_DIRS[i];
+
+    if (!strncmp(lookup, "/proc/self/task/", 16)) {
+        char *endp;
+        long tid = strtol(lookup + 16, &endp, 10);
+        if (endp != lookup + 16 && tid > 0 && *endp == '\0') {
+            snprintf(buf, bufsz, "/proc/self/task/%ld", tid);
+            return buf;
+        }
+    }
+
+    return NULL;
 }
 
 /* Reference-counted wrapper around a directory stream. See the declaration in
