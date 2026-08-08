@@ -204,6 +204,19 @@ typedef struct {
  * daemon balanced instead of leaking a reference.
  */
 #define FUSE_MAX_NODE_REFS 4096
+
+/* node_ref_hash maps nodeid -> node_refs[] index by open addressing with linear
+ * probing, so a directory walk holding thousands of refs does not pay an O(n)
+ * scan per FUSE_LOOKUP/FORGET. Sized to 2x FUSE_MAX_NODE_REFS to keep the load
+ * factor low enough that probing stays close to O(1) even at capacity.
+ * HASH_EMPTY marks a slot that has never held an entry (probing stops there);
+ * HASH_TOMBSTONE marks one whose entry was since removed (probing must continue
+ * past it, or a lookup could miss an entry placed after the removed one
+ * collided into this slot).
+ */
+#define FUSE_NODE_REF_HASH_SIZE (FUSE_MAX_NODE_REFS * 2)
+#define FUSE_NODE_REF_HASH_EMPTY (-1)
+#define FUSE_NODE_REF_HASH_TOMBSTONE (-2)
 #define FUSE_FAKE_DEV 0xF00D
 
 /* FUSE_FRAME_CAP and FUSE_MAX_NEGOTIATED_WRITE live in syscall/fuse-math.h. */
@@ -246,6 +259,14 @@ typedef struct {
         uint64_t nodeid;
         uint64_t nlookup;
     } node_refs[FUSE_MAX_NODE_REFS];
+    int32_t node_ref_hash[FUSE_NODE_REF_HASH_SIZE]; /* nodeid -> node_refs[]
+                                                       index
+                                                       */
+    int32_t node_ref_free[FUSE_MAX_NODE_REFS];      /* stack of free node_refs[]
+                                                        indices
+                                                        */
+    int node_ref_free_count;
+    int node_ref_tombstones; /* live entries tracked via node_ref_free_count */
 } fuse_session_t;
 
 typedef struct {
@@ -639,28 +660,126 @@ static fuse_request_t *fuse_alloc_request_locked(fuse_session_t *session)
     return NULL;
 }
 
+/* Fibonacci hashing: multiplying by an odd constant derived from the golden
+ * ratio mixes better than a raw modulo when nodeids arrive in sequential runs,
+ * which is a common daemon allocation pattern.
+ */
+static unsigned fuse_node_ref_hash(uint64_t nodeid)
+{
+    uint64_t h = nodeid * 0x9E3779B97F4A7C15ULL;
+    return (unsigned) (h % FUSE_NODE_REF_HASH_SIZE);
+}
+
+/* node_refs[] index holding @nodeid, or -1 if not present. */
+static int fuse_node_ref_hash_find(fuse_session_t *session, uint64_t nodeid)
+{
+    unsigned start = fuse_node_ref_hash(nodeid);
+    for (unsigned probe = 0; probe < FUSE_NODE_REF_HASH_SIZE; probe++) {
+        unsigned slot = (start + probe) % FUSE_NODE_REF_HASH_SIZE;
+        int32_t idx = session->node_ref_hash[slot];
+        if (idx == FUSE_NODE_REF_HASH_EMPTY)
+            return -1;
+        if (idx != FUSE_NODE_REF_HASH_TOMBSTONE &&
+            session->node_refs[idx].nodeid == nodeid)
+            return idx;
+    }
+    return -1;
+}
+
+/* Makes node_refs[idx] (already holding @nodeid) reachable by hash lookup. */
+static void fuse_node_ref_hash_insert(fuse_session_t *session,
+                                      uint64_t nodeid,
+                                      int idx)
+{
+    unsigned start = fuse_node_ref_hash(nodeid);
+    for (unsigned probe = 0; probe < FUSE_NODE_REF_HASH_SIZE; probe++) {
+        unsigned slot = (start + probe) % FUSE_NODE_REF_HASH_SIZE;
+        int32_t cur = session->node_ref_hash[slot];
+        if (cur == FUSE_NODE_REF_HASH_EMPTY ||
+            cur == FUSE_NODE_REF_HASH_TOMBSTONE) {
+            if (cur == FUSE_NODE_REF_HASH_TOMBSTONE)
+                session->node_ref_tombstones--;
+            session->node_ref_hash[slot] = (int32_t) idx;
+            return;
+        }
+    }
+
+    /* Unreachable: every caller rebuilds first (see fuse_node_ref_hash_rebuild)
+     * whenever live+tombstone occupancy would reach 3/4 of the table, and a
+     * rebuild never holds more than FUSE_MAX_NODE_REFS live entries in a table
+     * sized to 2x that, so a fresh open slot always exists before the probe
+     * sequence wraps all the way around.
+     */
+}
+
+static void fuse_node_ref_hash_remove(fuse_session_t *session, uint64_t nodeid)
+{
+    unsigned start = fuse_node_ref_hash(nodeid);
+    for (unsigned probe = 0; probe < FUSE_NODE_REF_HASH_SIZE; probe++) {
+        unsigned slot = (start + probe) % FUSE_NODE_REF_HASH_SIZE;
+        int32_t idx = session->node_ref_hash[slot];
+        if (idx == FUSE_NODE_REF_HASH_EMPTY)
+            return;
+        if (idx != FUSE_NODE_REF_HASH_TOMBSTONE &&
+            session->node_refs[idx].nodeid == nodeid) {
+            session->node_ref_hash[slot] = FUSE_NODE_REF_HASH_TOMBSTONE;
+            session->node_ref_tombstones++;
+            return;
+        }
+    }
+}
+
+/* Clears every tombstone by rebuilding the table from the live entries in
+ * node_refs[]. Open addressing with tombstones does not free capacity on
+ * removal (a removed slot still blocks probing until overwritten by a fresh
+ * insert landing exactly there), so enough hold/drop churn across different
+ * nodeids fills the table with tombstones even while the live count stays far
+ * below capacity. Without this, fuse_node_ref_hash_insert's probe can exhaust
+ * the whole table and find nowhere to land despite live entries being a small
+ * fraction of it: reproduced with a two-million-op randomized hold/drop/lookup
+ * stress test run outside the tree, which aborted inside a few hundred thousand
+ * operations before this existed.
+ */
+static void fuse_node_ref_hash_rebuild(fuse_session_t *session)
+{
+    for (int i = 0; i < FUSE_NODE_REF_HASH_SIZE; i++)
+        session->node_ref_hash[i] = FUSE_NODE_REF_HASH_EMPTY;
+    session->node_ref_tombstones = 0;
+    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
+        if (session->node_refs[i].used)
+            fuse_node_ref_hash_insert(session, session->node_refs[i].nodeid, i);
+    }
+}
+
 static int fuse_node_ref_hold_locked(fuse_session_t *session,
                                      uint64_t nodeid,
                                      uint64_t nlookup)
 {
     if (nodeid == FUSE_ROOT_ID || nlookup == 0)
         return 0;
-    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
-        if (session->node_refs[i].used &&
-            session->node_refs[i].nodeid == nodeid) {
-            session->node_refs[i].nlookup += nlookup;
-            return 0;
-        }
+    int idx = fuse_node_ref_hash_find(session, nodeid);
+    if (idx >= 0) {
+        session->node_refs[idx].nlookup += nlookup;
+        return 0;
     }
-    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
-        if (!session->node_refs[i].used) {
-            session->node_refs[i].used = true;
-            session->node_refs[i].nodeid = nodeid;
-            session->node_refs[i].nlookup = nlookup;
-            return 0;
-        }
-    }
-    return -LINUX_ENOMEM;
+    if (session->node_ref_free_count == 0)
+        return -LINUX_ENOMEM;
+
+    /* Keep live+tombstone occupancy under 3/4 of the table before adding
+     * another live entry, so fuse_node_ref_hash_insert's probe is always
+     * guaranteed to land on a true empty slot rather than wrapping the whole
+     * table. See fuse_node_ref_hash_rebuild for why this is needed at all
+     * despite live entries alone never reaching capacity.
+     */
+    int live = FUSE_MAX_NODE_REFS - session->node_ref_free_count;
+    if (live + session->node_ref_tombstones >= FUSE_NODE_REF_HASH_SIZE * 3 / 4)
+        fuse_node_ref_hash_rebuild(session);
+    idx = session->node_ref_free[--session->node_ref_free_count];
+    session->node_refs[idx].used = true;
+    session->node_refs[idx].nodeid = nodeid;
+    session->node_refs[idx].nlookup = nlookup;
+    fuse_node_ref_hash_insert(session, nodeid, idx);
+    return 0;
 }
 
 static int fuse_queue_noreply_locked(fuse_session_t *session,
@@ -704,22 +823,29 @@ static int fuse_node_ref_drop_locked(fuse_session_t *session,
 {
     if (nodeid == FUSE_ROOT_ID || nlookup == 0)
         return 0;
-    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
-        if (!session->node_refs[i].used ||
-            session->node_refs[i].nodeid != nodeid)
-            continue;
-        if (nlookup >= session->node_refs[i].nlookup) {
-            nlookup = session->node_refs[i].nlookup;
-            memset(&session->node_refs[i], 0, sizeof(session->node_refs[i]));
-        } else {
-            session->node_refs[i].nlookup -= nlookup;
-        }
-        if (!emit_forget)
-            return 0;
-        fuse_forget_one_t one = {.nodeid = nodeid, .nlookup = nlookup};
-        return fuse_emit_forget_multi_locked(session, &one, 1);
+    int idx = fuse_node_ref_hash_find(session, nodeid);
+    if (idx < 0)
+        return 0;
+    if (nlookup >= session->node_refs[idx].nlookup) {
+        nlookup = session->node_refs[idx].nlookup;
+
+        /* Order matters: fuse_node_ref_hash_remove's probe identifies the right
+         * hash slot by comparing node_refs[idx].nodeid against @nodeid, so it
+         * must run before that field is cleared, or the comparison fails
+         * (unless nodeid happens to be 0) and the hash slot is never
+         * tombstoned, silently corrupting the table for whatever nodeid later
+         * reuses this same node_refs[] index.
+         */
+        fuse_node_ref_hash_remove(session, nodeid);
+        memset(&session->node_refs[idx], 0, sizeof(session->node_refs[idx]));
+        session->node_ref_free[session->node_ref_free_count++] = idx;
+    } else {
+        session->node_refs[idx].nlookup -= nlookup;
     }
-    return 0;
+    if (!emit_forget)
+        return 0;
+    fuse_forget_one_t one = {.nodeid = nodeid, .nlookup = nlookup};
+    return fuse_emit_forget_multi_locked(session, &one, 1);
 }
 
 static int fuse_queue_request_locked(fuse_session_t *session,
@@ -1342,6 +1468,17 @@ int fuse_proc_open(int linux_flags)
             slot->max_write = 64 * 1024;
             slot->max_pages = 16;
             slot->next_unique = 1;
+
+            /* memset above leaves node_ref_hash at all-zero, which collides
+             * with a valid node_refs[] index of 0; every slot must be set to
+             * the empty sentinel explicitly. node_ref_free lists every
+             * node_refs[] slot as available.
+             */
+            for (int j = 0; j < FUSE_NODE_REF_HASH_SIZE; j++)
+                slot->node_ref_hash[j] = FUSE_NODE_REF_HASH_EMPTY;
+            for (int j = 0; j < FUSE_MAX_NODE_REFS; j++)
+                slot->node_ref_free[j] = j;
+            slot->node_ref_free_count = FUSE_MAX_NODE_REFS;
             break;
         }
     }
