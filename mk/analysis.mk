@@ -2,7 +2,8 @@
 
 .PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
         verify-gva verify-cmsg verify-fuse verify-stack verify-sockaddr \
-        check-contracts infer-uninit
+        verify-netlink \
+        check-contracts verify-mutants infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -69,12 +70,17 @@ lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 #   plain char signedness    unsigned      signed       see below
 #
 # Plain-char signedness is the one mismatch, and the RSP proof DOES cover
-# functions taking plain char (gdb_hex_pair, gdb_hex_decode, rsp_checksum).
-# What keeps the result signedness-independent is not their parameter types but
-# that every use of a char value goes through an explicit (unsigned char) or
-# (uint8_t) cast before it is compared or accumulated. That is the invariant to
-# preserve: no proved function may read a plain char without such a cast. Prove
-# one that does, and supply a custom machdep rather than extending this list.
+# functions taking plain char: gdb_hex_pair, gdb_hex_decode, gdb_parse_hex and
+# rsp_checksum. What keeps the result signedness-independent is not their
+# parameter types but that every use of a char value goes through an explicit
+# (unsigned char) or (uint8_t) cast before it is compared or accumulated. That
+# is the invariant to preserve: no proved function may read a plain char
+# without such a cast.
+#
+# check-acsl-coverage.py enforces the part a regex can, and its
+# CHAR_PARAM_ALLOWLIST carries the rest of the reasoning: a proved function
+# that takes a plain char at all must be listed there, so a new one cannot be
+# added silently.
 FRAMAC ?= frama-c
 FRAMAC_DATA_MODEL ?= gcc_x86_64
 FRAMAC_TIMEOUT ?= 30
@@ -178,6 +184,14 @@ VERIFY_SOCKADDR_SCAN := src/syscall/sockaddr-math.h
 VERIFY_SOCKADDR_CLAIM := for ANY address length a guest or host can present
 VERIFY_SOCKADDR_UNPROVED := the family translation and memcpy stay test-covered
 
+VERIFY_NETLINK_SRC  := src/syscall/netlink-math.h
+VERIFY_NETLINK_FCTS := netlink_align_up netlink_rta_bounds netlink_msg_span
+VERIFY_NETLINK_MIN_GOALS ?= 44
+VERIFY_NETLINK_MODEL := typed
+VERIFY_NETLINK_SCAN := src/syscall/netlink-math.h
+VERIFY_NETLINK_CLAIM := for ANY netlink message bytes a guest can send
+VERIFY_NETLINK_UNPROVED := the walk loops and attribute copies stay test-covered
+
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
 verify_empty :=
@@ -273,6 +287,17 @@ verify-sockaddr: SCAN := $(VERIFY_SOCKADDR_SCAN)
 verify-sockaddr: CLAIM := $(VERIFY_SOCKADDR_CLAIM)
 verify-sockaddr: UNPROVED := $(VERIFY_SOCKADDR_UNPROVED)
 
+## Prove the netlink TLV walks stay in the message and terminate
+verify-netlink: NAME := netlink
+verify-netlink: SRC := $(VERIFY_NETLINK_SRC)
+verify-netlink: FCTS := $(VERIFY_NETLINK_FCTS)
+verify-netlink: FCT_ARG := $(call commafy,$(VERIFY_NETLINK_FCTS))
+verify-netlink: MIN_GOALS := $(VERIFY_NETLINK_MIN_GOALS)
+verify-netlink: MODEL := $(VERIFY_NETLINK_MODEL)
+verify-netlink: SCAN := $(VERIFY_NETLINK_SCAN)
+verify-netlink: CLAIM := $(VERIFY_NETLINK_CLAIM)
+verify-netlink: UNPROVED := $(VERIFY_NETLINK_UNPROVED)
+
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
 # what gets proved.
@@ -282,7 +307,7 @@ verify-sockaddr: UNPROVED := $(VERIFY_SOCKADDR_UNPROVED)
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
 verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack \
-    verify-sockaddr: | $(BUILD_DIR)
+    verify-sockaddr verify-netlink: | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -307,9 +332,20 @@ verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack \
 	    --log $(BUILD_DIR)/verify-$(NAME).log --min-goals $(MIN_GOALS) \
 	    --src $(SRC) --unproved "$(UNPROVED)"
 
+## Assert every proof target rejects a known-broken source
+#
+# Complements the other two gates rather than duplicating them: MIN_GOALS
+# catches a gutted body, check-acsl-coverage.py catches a contracted function
+# left out of the proof set, and this catches a contract whose clauses do not
+# actually bite. Mutations run against copies under $(BUILD_DIR)/mutants, so a
+# run never edits the tree.
+verify-mutants:
+	@echo "  MUTANT  proof targets against known-broken sources"
+	$(Q)python3 scripts/check-mutants.py
+
 ## Run every Frama-C proof
 verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse verify-stack \
-        verify-sockaddr
+        verify-sockaddr verify-netlink
 
 ## Rebuild with the gva-math.h precondition checks live, then run the suite
 #
