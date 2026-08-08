@@ -80,8 +80,8 @@ int64_t sys_getxattr(guest_t *g,
         return -LINUX_EFAULT;
 
     path_translation_t tx;
-    if (path_translate_at(LINUX_AT_FDCWD, path,
-                          nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE, &tx) < 0)
+    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
+                          &tx) < 0)
         return linux_errno();
     if (tx.fuse_path)
         return -LINUX_ENOSYS;
@@ -119,8 +119,8 @@ int64_t sys_setxattr(guest_t *g,
         return -LINUX_EFAULT;
 
     path_translation_t tx;
-    if (path_translate_at(LINUX_AT_FDCWD, path,
-                          nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE, &tx) < 0)
+    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
+                          &tx) < 0)
         return linux_errno();
     if (tx.fuse_path)
         return -LINUX_ENOSYS;
@@ -157,8 +157,8 @@ int64_t sys_listxattr(guest_t *g,
         return -LINUX_EFAULT;
 
     path_translation_t tx;
-    if (path_translate_at(LINUX_AT_FDCWD, path,
-                          nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE, &tx) < 0)
+    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
+                          &tx) < 0)
         return linux_errno();
     if (tx.fuse_path)
         return -LINUX_ENOSYS;
@@ -193,8 +193,8 @@ int64_t sys_removexattr(guest_t *g,
         return -LINUX_EFAULT;
 
     path_translation_t tx;
-    if (path_translate_at(LINUX_AT_FDCWD, path,
-                          nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE, &tx) < 0)
+    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
+                          &tx) < 0)
         return linux_errno();
     if (tx.fuse_path)
         return -LINUX_ENOSYS;
@@ -248,6 +248,7 @@ int64_t sys_fsetxattr(guest_t *g,
                       int flags)
 {
     host_fd_ref_t host_ref;
+
     /* Linux: fsetxattr on an O_PATH fd returns EBADF (the descriptor lacks the
      * write reference required by mnt_want_write_file).
      */
@@ -317,6 +318,7 @@ int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size)
 int64_t sys_fremovexattr(guest_t *g, int fd, uint64_t name_gva)
 {
     host_fd_ref_t host_ref;
+
     /* Linux: fremovexattr on an O_PATH fd returns EBADF, same reason as
      * fsetxattr above.
      */

@@ -748,6 +748,7 @@ int64_t sys_close(int fd)
          * no per-type cleanup is registered.
          */
         proc_pty_close_keepalive(host_fd);
+
         /* A pty slave is an ordinary FD_REGULAR slot, so every guest close of
          * one lands here rather than in fd_cleanup_entry. Without this the
          * per-master slave count never falls back to zero and the master never
@@ -850,6 +851,7 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
 
     bool installed = false;
     pthread_mutex_lock(&fd_lock);
+
     /* Generation is the unique discriminator: a close+reopen can reuse the same
      * (type, host_fd) tuple, so only the monotonic generation stamped at alloc
      * proves this is still the slot this dup created (matches asyncio_apply /
@@ -913,6 +915,7 @@ static int duplicate_guest_fd(int src_fd,
         return fuse_dup_fd(src_fd, min_guest_fd, fixed_guest_fd, fixed_slot,
                            linux_flags);
     }
+
     /* eventfd dup must share the underlying counter and pipe state across the
      * source and destination fds (Linux contract). Pass src_snap's identity
      * through so eventfd_dup_fd can reject a close+reopen ABA between the
@@ -926,6 +929,7 @@ static int duplicate_guest_fd(int src_fd,
                               min_guest_fd, fixed_guest_fd, fixed_slot,
                               linux_flags);
     }
+
     /* epoll dup must share the source's eventpoll instance so the alias sees
      * the same interest list. Pass src_snap's identity so epoll_dup_fd can
      * reject a close+reopen ABA before pinning the shared instance.
@@ -964,6 +968,7 @@ static int duplicate_guest_fd(int src_fd,
     if (guest_fd < 0) {
         if (fixed_slot)
             errno = EBADF;
+
         /* fd_cleanup_entry never ran on new_host_fd (no guest fd was
          * registered), so the keepalive must be dropped explicitly here.
          */
@@ -1060,8 +1065,8 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags)
 }
 
 /* Translate a Linux struct flock (aarch64) at `arg` to macOS layout, run
- * fcntl(host_fd, mac_cmd, ...), and for a GETLK command write the result
- * back translated to Linux layout. Shared by the traditional (F_GETLK/
+ * fcntl(host_fd, mac_cmd, ...), and for a GETLK command write the result back
+ * translated to Linux layout. Shared by the traditional (F_GETLK/
  * F_SETLK/F_SETLKW) and OFD (F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW) lock
  * commands, which differ only in the macOS cmd values and in how l_pid is
  * reported back for a GETLK conflict.
@@ -1070,8 +1075,8 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags)
  *   long l_start, long l_len, int l_pid, pad[4]}
  * macOS layout: {off_t l_start, off_t l_len, pid_t l_pid,
  *   short l_type, short l_whence}
- * Use guest_read/guest_write (not guest_ptr) to safely handle structs that
- * span 2MiB page table block boundaries.
+ * Use guest_read/guest_write (not guest_ptr) to safely handle structs that span
+ * 2MiB page table block boundaries.
  */
 static int64_t fcntl_flock_op(guest_t *g,
                               host_fd_ref_t *host_ref,
@@ -1093,10 +1098,10 @@ static int64_t fcntl_flock_op(guest_t *g,
     memcpy(&l_len, lflock + 16, 8);
     memcpy(&l_pid, lflock + 24, 4);
 
-    /* Linux rejects F_OFD_GETLK/SETLK/SETLKW requests with a nonzero l_pid:
-     * OFD locks are owned by the open file description, not a process, so
-     * the field is reserved on input (fs/locks.c fcntl_getlk/fcntl_setlk
-     * both `return -EINVAL` on a nonzero request l_pid for these commands).
+    /* Linux rejects F_OFD_GETLK/SETLK/SETLKW requests with a nonzero l_pid: OFD
+     * locks are owned by the open file description, not a process, so the field
+     * is reserved on input (fs/locks.c fcntl_getlk/fcntl_setlk both return
+     * -EINVAL on a nonzero request l_pid for these commands).
      */
     if (is_ofd && l_pid != 0)
         return -LINUX_EINVAL;
@@ -1162,12 +1167,12 @@ static int64_t fcntl_flock_op(guest_t *g,
     } else if (rt == 2) {
         rp = (int32_t) mac_fl.l_pid; /* F_UNLCK: no conflict to translate */
     } else {
-        /* mac_fl.l_pid is a raw host PID, meaningless to guest code that
-         * treats it as a real PID (e.g. a liveness check via kill(pid, 0)).
-         * Translate it to the conflicting process's guest PID when it is
-         * part of this guest's fork family; fall back to the host PID only
-         * when the lock holder cannot be resolved (e.g. an unrelated host
-         * process), since no guest identity exists for it to report.
+        /* mac_fl.l_pid is a raw host PID, meaningless to guest code that treats
+         * it as a real PID (e.g. a liveness check via kill(pid, 0)). Translate
+         * it to the conflicting process's guest PID when it is part of this
+         * guest's fork family; fall back to the host PID only when the lock
+         * holder cannot be resolved (e.g. an unrelated host process), since no
+         * guest identity exists for it to report.
          */
         int64_t gpid = proc_host_to_guest_pid((pid_t) mac_fl.l_pid);
         rp = (gpid > 0) ? (int32_t) gpid : (int32_t) mac_fl.l_pid;
@@ -1246,6 +1251,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     case 3: { /* F_GETFL */
         if (fuse_fd)
             return fd_snap.linux_flags;
+
         /* Linux timerfd F_GETFL reports O_RDWR plus the writable status bits
          * the kernel honors. Surface only those bits from the shadow rather
          * than echoing arbitrary linux_flags bits so stray F_SETFL args cannot
@@ -1270,6 +1276,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         linux_fl |= fd_snap.linux_flags &
                     (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
                      LINUX_O_DIRECT | LINUX_O_LARGEFILE);
+
         /* O_ASYNC is tracked in the shadow (never armed on the host fd), so
          * surface it from there. See linux_to_mac_status_flags in translate.c.
          */
@@ -1308,6 +1315,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             asyncio_apply(fd, fd_snap.generation, ((int) arg & LINUX_O_ASYNC));
             return 0;
         }
+
         /* Timerfd: kqueue host fd rejects fcntl(F_SETFL), so mirror Linux's
          * file-status word in the linux_flags shadow. Of Linux's writable
          * status flags (O_APPEND, O_ASYNC, O_DIRECT, O_NOATIME, O_NONBLOCK) the
@@ -1347,6 +1355,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             host_fd_ref_close(&host_ref);
             return err;
         }
+
         /* O_ASYNC is elfuse-managed: track the armed bit and (dis)arm the SIGIO
          * watcher. asyncio_apply rescans the slot under fd_lock and uses each
          * alias's real backing fd, not host_ref.fd (a per-syscall dup for
@@ -1432,6 +1441,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         default:
             return -LINUX_EINVAL;
         }
+
         /* F_SETOWN_EX carries the recipient in the type field, so the pid is a
          * plain positive identifier: a negative pid is invalid (Linux owner
          * semantics), and 0 clears the owner.
@@ -1568,6 +1578,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         return -LINUX_EBADF;
     if (fuse_is_dir_fd(fd))
         return fuse_getdents64(g, fd, buf_gva, count);
+
     /* Linux: getdents on an O_PATH fd returns EBADF, even when the underlying
      * inode is a directory. The early gate keeps the next NOTDIR fallback
      * specific to non-directory regular fds.
@@ -1733,6 +1744,7 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
 
     if (tx.intercept_path && fuse_path_matches_mount(tx.intercept_path)) {
         struct stat st;
+
         /* chdir() always follows symlinks, so do not pass AT_SYMLINK_NOFOLLOW.
          */
         int stat_rc = fuse_stat_path(tx.intercept_path, &st, 0);
@@ -1801,6 +1813,7 @@ int64_t sys_chroot(guest_t *g, uint64_t path_gva)
     char path[LINUX_PATH_MAX];
     if (guest_read_str(g, path_gva, path, sizeof(path)) < 0)
         return -LINUX_EFAULT;
+
     /* Only accept chroot("/") as a no-op. The original motivation was coreutils
      * stdbuf (fork -> chroot("/") -> exec) which never changes roots in
      * practice. Accepting an arbitrary path was a containment escape: a guest
@@ -1957,9 +1970,8 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
-    /* path_translate_at rewrites /dev/shm/<name> to the absolute backing
-     * path, so shm_unlink works; path_translation_dirfd drops the guest dirfd
-     * there.
+    /* path_translate_at rewrites /dev/shm/<name> to the absolute backing path,
+     * so shm_unlink works; path_translation_dirfd drops the guest dirfd there.
      */
     host_fd_t unlink_dirfd = path_translation_dirfd(&tx, &dir_ref);
 
@@ -2073,6 +2085,7 @@ int64_t sys_renameat2(guest_t *g,
             }
             return close_dir_refs_result(&olddir_ref, &newdir_ref, 0);
         }
+
         /* For non-CWD dirfds, emulate with link+unlink. This is not atomic, but
          * linkat() still preserves the "destination must not exist"
          * requirement. This path still cannot handle directories because
@@ -2192,10 +2205,10 @@ typedef enum {
 /* Absolute host path of the new symlink itself.
  *
  * path_translate_at() only rewrites absolute guest paths; a relative linkpath
- * is handed back untouched because the resolvers have no dirfd context (see
- * the comment in path_translate_at). Measuring depth against that bare name
- * would silently skip the rewrite and leave an escaping absolute target on
- * disk, so rebuild the location from the dirfd first.
+ * is handed back untouched because the resolvers have no dirfd context (see the
+ * comment in path_translate_at). Measuring depth against that bare name would
+ * silently skip the rewrite and leave an escaping absolute target on disk, so
+ * rebuild the location from the dirfd first.
  */
 static bool symlink_host_location(int dirfd,
                                   const host_fd_ref_t *dir_ref,
@@ -2233,10 +2246,10 @@ static bool symlink_host_location(int dirfd,
  * result can never climb above the sysroot.
  *
  * VERBATIM covers the cases where no rewrite is owed: a relative target, no
- * sysroot configured, or a symlink created outside the sysroot, where the
- * guest is deliberately working against host paths. Anything that must be
- * rewritten but cannot is FAILED rather than VERBATIM -- falling back to the
- * literal target there would hand back the very escape this closes.
+ * sysroot configured, or a symlink created outside the sysroot, where the guest
+ * is deliberately working against host paths. Anything that must be rewritten
+ * but cannot is FAILED rather than VERBATIM, not a fallback to the literal
+ * target there would hand back the very escape this closes.
  */
 static symlink_target_rewrite_t symlink_rewrite_target(const char *target,
                                                        int dirfd,
@@ -2262,8 +2275,8 @@ static symlink_target_rewrite_t symlink_rewrite_target(const char *target,
 
     /* One ".." per directory between the sysroot and the symlink itself.
      * Counting components rather than separators keeps repeated or trailing
-     * slashes ("/a//b/link") from inflating the depth and walking out above
-     * the sysroot -- host_path is a plain concatenation with no normalization.
+     * slashes ("/a//b/link") from inflating the depth and walking out above the
+     * sysroot: host_path is a plain concatenation with no normalization.
      */
     size_t components = 0;
     for (const char *p = link_host + sr_len; *p;) {
@@ -2319,9 +2332,9 @@ int64_t sys_symlinkat(guest_t *g,
      * sysroot and survives the tree being moved, where "<sysroot><target>"
      * would strand every such link.
      *
-     * Two divergences the guest can see: readlink() reports the rewritten
-     * form, since nothing on disk tells a rewritten target from a relative one
-     * the guest wrote; and an absolute target loses the host fallback a direct
+     * Two divergences the guest can see: readlink() reports the rewritten form,
+     * since nothing on disk tells a rewritten target from a relative one the
+     * guest wrote; and an absolute target loses the host fallback a direct
      * open() would get, the choice being made once at creation rather than at
      * follow time.
      */
@@ -2387,6 +2400,7 @@ int64_t sys_linkat(guest_t *g,
 
     /* Resolve both paths through sysroot */
     int mac_flags = translate_at_flags(flags);
+
     /* Clear AT_SYMLINK_FOLLOW so a shm symlink is hard-linked as the leaf
      * itself, never dereferenced to its host target (see dev_shm_resolve_path).
      */
@@ -2398,11 +2412,11 @@ int64_t sys_linkat(guest_t *g,
          * a symlink itself (rather than its target) "may result in some file
          * systems returning an error" -- reproduced here as ENOTSUP on
          * Case-sensitive HFS+ (EPERM has also been reported on other
-         * filesystems/macOS versions for the same condition), unlike APFS
-         * which allows it. Linux allows it unconditionally, so recreate the
-         * same effect with a plain symlink to the same target: a new
-         * directory entry that resolves identically, even though it is a
-         * distinct inode rather than a second link to the original.
+         * filesystems/macOS versions for the same condition), unlike APFS which
+         * allows it. Linux allows it unconditionally, so recreate the same
+         * effect with a plain symlink to the same target: a new directory entry
+         * that resolves identically, even though it is a distinct inode rather
+         * than a second link to the original.
          */
         if ((errno != EPERM && errno != ENOTSUP && errno != EINVAL) ||
             (flags & LINUX_AT_SYMLINK_FOLLOW)) {
@@ -2468,8 +2482,7 @@ int64_t sys_faccessat(guest_t *g,
     char path[LINUX_PATH_MAX];
     path_translation_t tx;
     int64_t rc = read_translated_path(
-        g, dirfd, path_gva,
-        (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE,
+        g, dirfd, path_gva, path_tr_nofollow(flags & LINUX_AT_SYMLINK_NOFOLLOW),
         path, &tx);
     if (rc < 0)
         return rc;
@@ -2670,8 +2683,7 @@ int64_t sys_fchmodat(guest_t *g,
 
     path_translation_t tx;
     if (path_translate_at(dirfd, path,
-                          (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW
-                                                              : PATH_TR_NONE,
+                          path_tr_nofollow(flags & LINUX_AT_SYMLINK_NOFOLLOW),
                           &tx) < 0)
         return linux_errno();
     int64_t rc = reject_unsupported_fuse_path_op(&tx);
@@ -2729,13 +2741,13 @@ static int64_t chown_result(int host_rc,
     if (host_rc < 0 && errno != EPERM)
         return linux_errno();
     if (host_st) {
-        /* cur_uid/cur_gid must be the owner the guest *currently sees*, not
-         * the raw host stat values.  The two differ on macOS where the host
-         * user UID (e.g. 501) does not match GUEST_UID (1000), and whenever
-         * the file already has an overlay entry that virtualises its owner.
-         * chown_overlay_set uses cur_uid/cur_gid for both the early-exit
-         * no-op guard and the stale-entry removal guard; passing the physical
-         * UID evaluates those guards in the wrong ID namespace.
+        /* cur_uid/cur_gid must be the owner the guest *currently sees*, not the
+         * raw host stat values. The two differ on macOS where the host user UID
+         * (e.g. 501) does not match GUEST_UID (1000), and whenever the file
+         * already has an overlay entry that virtualises its owner.
+         * chown_overlay_set uses cur_uid/cur_gid for both the early-exit no-op
+         * guard and the stale-entry removal guard; passing the physical UID
+         * evaluates those guards in the wrong ID namespace.
          *
          * Apply the existing overlay to a temporary copy of the host stat to
          * obtain the guest-visible owner before forwarding to
@@ -2746,10 +2758,10 @@ static int64_t chown_result(int host_rc,
         if (chown_overlay_set((uint64_t) host_st->st_dev,
                               (uint64_t) host_st->st_ino, owner, group,
                               guest_st.st_uid, guest_st.st_gid) < 0) {
-            /* Override allocation failed; reporting success would lie about
-             * the post-call stat round-trip. Linux's chown(2) lists ENOMEM
-             * among its possible errors for related allocation paths, so
-             * surface that to the guest instead.
+            /* Override allocation failed; reporting success would lie about the
+             * post-call stat round-trip. Linux's chown(2) lists ENOMEM among
+             * its possible errors for related allocation paths, so surface that
+             * to the guest instead.
              */
             return -LINUX_ENOMEM;
         }
@@ -2773,9 +2785,9 @@ int64_t sys_fchownat(guest_t *g,
 
     /* AT_EMPTY_PATH with an empty path chowns dirfd itself rather than a name
      * beneath it. This is the only way to chown an O_PATH fd (plain fchown()
-     * rejects FD_PATH, matching Linux's EBADF there), so unlike the other
-     * *at() flag validation here it has to actually be handled, not just
-     * accepted. dirfd == AT_FDCWD resolves to the current directory, mirroring
+     * rejects FD_PATH, matching Linux's EBADF there), so unlike the other *at()
+     * flag validation here it has to actually be handled, not just accepted.
+     * dirfd == AT_FDCWD resolves to the current directory, mirroring
      * stat_at_path's identical AT_EMPTY_PATH branch in fs-stat.c. Neither
      * sub-case below goes through path_translate_at, so FUSE and /proc
      * interception has to be checked by hand, same as sys_fchmodat above.
@@ -2835,8 +2847,7 @@ int64_t sys_fchownat(guest_t *g,
 
     path_translation_t tx;
     if (path_translate_at(dirfd, path,
-                          (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW
-                                                              : PATH_TR_NONE,
+                          path_tr_nofollow(flags & LINUX_AT_SYMLINK_NOFOLLOW),
                           &tx) < 0)
         return linux_errno();
     int64_t rc = reject_unsupported_fuse_path_op(&tx);
