@@ -46,6 +46,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
 #include "syscall/exec.h"
 #include "syscall/fd.h"

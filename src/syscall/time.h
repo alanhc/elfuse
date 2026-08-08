@@ -14,7 +14,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "core/guest.h"
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 
 /* Return true when a guest-supplied timespec is well-formed: non-negative
  * seconds and a nanosecond field in [0, NSEC_PER_SEC). Mirrors the kernel

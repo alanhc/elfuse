@@ -22,7 +22,7 @@
 #include "core/vdso.h"
 #include "debug/log.h"
 #include "runtime/thread.h"
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/fd.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
@@ -75,6 +75,7 @@ _Static_assert(SHIM_URANDOM_INLINE_LIMIT == 256,
  */
 _Static_assert(SHIM_COUNTERS_OFF == 0x10C8,
                "shim.S COUNTER_INC hard-codes SHIM_COUNTERS_OFF=0x10C8");
+
 /* shim.S splits SHIM_COUNTERS_OFF into a shifted-add carry (0x1000) plus an
  * imm12 load/store offset (0xC8 + slot byte). Pin the split so any future
  * layout shift fails the build instead of silently routing increments to the
@@ -266,12 +267,14 @@ void shim_globals_rebuild_urandom_bitmap(void)
 {
     if (!singleton_g)
         return;
+
     /* Wipe the bitmap region first; concurrent fd_alloc / close from other
      * vCPUs is impossible during fork-child init (the child has not yet started
      * executing guest code), so a non-atomic memset is safe here.
      */
     memset(cache_base(singleton_g) + SHIM_URANDOM_OFF_BITMAP, 0,
            SHIM_URANDOM_BITMAP_BYTES);
+
     /* Walk the fd table; mark every readable FD_URANDOM slot. Reuses the
      * atomic-OR setter so the visible memory order matches the normal fd_alloc
      * path.
@@ -356,6 +359,7 @@ out:
 void shim_globals_attn_or(guest_t *g, uint32_t bits)
 {
     uint32_t *slot = (uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
+
     /* SEQ_CST, not ACQ_REL. The CRED_BRACKETED invariant is the contrapositive
      * of release-acquire: if a sibling vCPU LDAR-loads attn and sees 0, that
      * sibling also does not yet observe any of the post-OR publish_creds
@@ -374,6 +378,7 @@ void shim_globals_attn_or(guest_t *g, uint32_t bits)
 void shim_globals_attn_and(guest_t *g, uint32_t mask)
 {
     uint32_t *slot = (uint32_t *) (cache_base(g) + SHIM_GLOBALS_OFF_ATTN);
+
     /* RELEASE is sufficient for the clear path: the bracket runs publish_creds
      * BEFORE this clear, and RELEASE here pairs with the shim's LDAR so any
      * sibling that observes the cleared bit also sees the published cred slots.
@@ -435,6 +440,7 @@ static const char *const counter_names[SHIM_COUNTERS_N] = {
     [SHIM_COUNTER_URANDOM_HIT] = "URANDOM_HIT",
     [SHIM_COUNTER_GETRANDOM_HIT] = "GETRANDOM_HIT",
     [SHIM_COUNTER_PGSID_HIT] = "PGSID_HIT",
+
     /* Slots 12..15 (SHIM_COUNTERS_N == 16) are intentionally unnamed; the dump
      * prints "(reserved)" so they appear in the output when non-zero, which
      * would flag an out-of-band increment. Bind a name here when a future EL1
@@ -484,6 +490,7 @@ void shim_globals_publish_stats_gate(guest_t *g)
 {
     uint8_t *slot = cache_base(g) + SHIM_GLOBALS_OFF_STATS_EN;
     uint8_t v = shim_globals_stats_enabled() ? 1 : 0;
+
     /* One-shot bring-up publish. Every caller (bootstrap, fork-child receive,
      * execve) runs before the guest vCPU starts executing, so the host-side
      * ordering between this store and the first hv_vcpu_run is what makes the

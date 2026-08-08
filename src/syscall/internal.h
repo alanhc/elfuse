@@ -32,7 +32,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/linux-limits.h"
 #include "runtime/thread.h"
 

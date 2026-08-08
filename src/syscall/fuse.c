@@ -22,7 +22,7 @@
 
 #include "runtime/procemu.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
 #include "syscall/fuse-math.h"
 #include "syscall/fuse.h"

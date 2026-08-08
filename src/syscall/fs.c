@@ -28,7 +28,7 @@
 
 #include "runtime/procemu.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
 #include "syscall/chown-overlay.h"
 #include "syscall/fd.h" /* eventfd_dup_fd */

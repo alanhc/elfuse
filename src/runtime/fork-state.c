@@ -22,6 +22,7 @@
 
 #include "debug/log.h"
 #include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
 #include "syscall/internal.h"
 #include "syscall/io.h"
@@ -72,6 +73,7 @@ int fork_ipc_send_fds(int sock, const int *fds, int count)
         msg.msg_controllen = cmsg_size;
 
         struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+
         /* cmsg_buf is sized via CMSG_SPACE for chunk >= 1, so this never
          * returns NULL; the guard keeps the deref provably safe.
          */
@@ -986,6 +988,7 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
 
     for (int i = 0; i < g->nregions; i++) {
         g->regions[i].backing_fd = -1;
+
         /* Drop inherited overlay metadata; the host MAP_FIXED|MAP_SHARED
          * mapping does not exist yet in the child. Re-establishment runs after
          * fork_ipc_recv_backing_fds populates backing_fd from the

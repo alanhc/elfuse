@@ -22,8 +22,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "core/guest.h"     /* guest_t (for thread_alloc_sp_el1) */
-#include "syscall/abi.h"    /* linux_user_pt_regs_t */
+#include "core/guest.h"         /* guest_t (for thread_alloc_sp_el1) */
+#include "syscall/linux-wire.h" /* linux_user_pt_regs_t */
 #include "syscall/signal.h" /* signal_pending_t (per-thread directed signals) */
 
 /* Maximum number of concurrent guest threads in one VM. */

@@ -12,7 +12,7 @@
 #include <pthread.h>
 #include <string.h>
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "core/shim-globals.h"
 #include "runtime/thread.h"
@@ -260,6 +260,7 @@ int64_t proc_sys_setpriority(int which, int who, int prio)
 {
     if (which != 0)
         return -LINUX_EINVAL;
+
     /* emu_nice is process-global. Reject non-self task IDs until nice is
      * tracked per task rather than silently changing every thread's value.
      */

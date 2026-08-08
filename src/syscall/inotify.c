@@ -37,7 +37,7 @@
 
 #include "utils.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/inotify.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
@@ -334,10 +334,11 @@ static bool dir_snapshot_fd(int dirfd, char ***out, int *n_out)
     int fd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0)
         return false;
-    /* The snapshot answers the same per-directory ownership question
-     * getdents64 asks, from the host fd it already holds (before fdopendir
-     * takes ownership), so a watch on a directory outside the sysroot
-     * carries entry names as they are stored.
+
+    /* The snapshot answers the same per-directory ownership question getdents64
+     * asks, from the host fd it already holds (before fdopendir takes
+     * ownership), so a watch on a directory outside the sysroot carries entry
+     * names as they are stored.
      */
     const bool dir_holds_escapes = path_dirent_dir_holds_escapes(fd);
     DIR *d = fdopendir(fd);
@@ -363,12 +364,13 @@ static bool dir_snapshot_fd(int dirfd, char ***out, int *n_out)
         }
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
+
         /* Snapshots feed named IN_CREATE/IN_DELETE events, so they carry
          * guest-visible names: the same per-name decode getdents64 applies,
-         * through the same choke point. An over-long name is skipped exactly
-         * as getdents64 skips it (unrepresentable in an event's name field
-         * too), and any other failure keeps the previous baseline rather
-         * than diffing every decoded child as deleted.
+         * through the same choke point. An over-long name is skipped exactly as
+         * getdents64 skips it (unrepresentable in an event's name field too),
+         * and any other failure keeps the previous baseline rather than diffing
+         * every decoded child as deleted.
          */
         char guest_name[NAME_MAX + 1];
         if (path_translate_dirent_name(dir_holds_escapes, de->d_name,
@@ -521,6 +523,7 @@ static int process_vnode_event(inotify_instance_t *inst,
 
     if (!overflow) {
         uint32_t in_mask = notes_to_in_mask(fflags, w->mask, w->is_dir);
+
         /* A successful diff already emitted named IN_CREATE/IN_DELETE per
          * child, so strip those bits from the bare event. Only strip on
          * success: when the snapshot failed no named event was emitted, so keep
@@ -661,9 +664,9 @@ int64_t sys_inotify_add_watch(guest_t *g,
         return -LINUX_EFAULT;
 
     /* Watches are backed by kqueue on a host fd, so an object elfuse answers
-     * itself (with no host vnode behind it) cannot be watched at all.
-     * That is exactly a FUSE node and a synthetic /proc file, and refusing
-     * those beats watching an unrelated host path.
+     * itself (with no host vnode behind it) cannot be watched at all. That is
+     * exactly a FUSE node and a synthetic /proc file, and refusing those beats
+     * watching an unrelated host path.
      *
      * Deliberately not gated on path_might_use_open_intercept: that predicate
      * is a "might" prefilter for the open path, true for every name beginning
@@ -686,9 +689,9 @@ int64_t sys_inotify_add_watch(guest_t *g,
      * A shm leaf is opened nofollow on top of that. The guest may write a
      * symlink into the backing directory, and a watch that followed one would
      * report the existence of, and every change to, whatever it names. That
-     * includes a host path is_guest_system_path() exists to keep the guest
-     * from addressing at all. Linux follows here, but the redirect is elfuse's
-     * own and every other consumer of a shm leaf departs the same way; see
+     * includes a host path is_guest_system_path() exists to keep the guest from
+     * addressing at all. Linux follows here, but the redirect is elfuse's own
+     * and every other consumer of a shm leaf departs the same way; see
      * dev_shm_resolve_path() in procemu.c.
      */
     int host_fd = open(tx.host_path,
@@ -929,6 +932,7 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             int host_fd = (int) kev.ident;
             int r = process_vnode_event(inst, guest_fd, host_fd,
                                         (uint32_t) kev.fflags);
+
             /* process_vnode_event may release the lock for the snapshot; bail
              * if the instance was closed in that window.
              */

@@ -34,7 +34,7 @@
 #include "runtime/forkipc.h"
 #include "runtime/futex.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
 #include "syscall/exec.h"
 #include "syscall/fuse.h"

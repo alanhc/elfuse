@@ -37,7 +37,7 @@
 #include "runtime/futex.h"
 #include "runtime/thread.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
 #include "syscall/fd.h"
 #include "syscall/fuse.h"
@@ -1073,8 +1073,8 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         count = avail;
 
     /* A pty master whose guest-side slaves have all closed is hung up. Linux
-     * answers EIO there; the host would block forever instead, because
-     * elfuse's keepalive slave keeps the pty alive from its point of view.
+     * answers EIO there; the host would block forever instead, because elfuse's
+     * keepalive slave keeps the pty alive from its point of view.
      *
      * Only once nothing is left to read: a shell that printed on its way out
      * leaves that output queued, and Linux hands it over before reporting the

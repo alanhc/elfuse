@@ -10,13 +10,14 @@
  * (caller falls through to real syscall).
  */
 
-/* Maximum /proc/self/maps entries. Array is sized to this; loop bounds use
+/*
+ * Maximum /proc/self/maps entries. Array is sized to this; loop bounds use
  * MAPS_ENTRY_MAX - 1 to leave room for safe increment.
  */
 #define MAPS_ENTRY_MAX 256
 
-/* Bound the transient host-PID snapshot used by /proc/net enumeration. This
- * is an output-work limit, not the dynamically growing lifecycle-table cap.
+/* Bound the transient host-PID snapshot used by /proc/net enumeration. This is
+ * an output-work limit, not the dynamically growing lifecycle-table cap.
  */
 #define PROC_NET_PID_SNAPSHOT_MAX 1024
 
@@ -58,7 +59,7 @@
 #include "core/rosetta.h"
 #include "runtime/thread.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/fd.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
@@ -478,6 +479,7 @@ static void shm_dir_init(void)
     shm_dir_errno = EACCES;
     snprintf(shm_dir, sizeof(shm_dir), "/tmp/elfuse-shm-%u",
              (unsigned) getuid());
+
     /* create_private_dir rejects a symlink or foreign-owned directory that a
      * local user could have pre-planted at this guessable /tmp path.
      */
@@ -690,9 +692,8 @@ static int proc_parse_fd_index(const char *path,
  * host directory (/tmp/elfuse-shm-<uid>/). This is the single source of truth
  * for that mapping. Callers proc_intercept_open, proc_intercept_stat, and
  * path_translate_at (which records the hit in path_translation_t.is_dev_shm)
- * all resolve through here, so one guest shm path never resolves two ways
- * (e.g. open landing in the backing dir while chmod falls through to the
- * sysroot).
+ * all resolve through here, so one guest shm path never resolves two ways (e.g.
+ * open landing in the backing dir while chmod falls through to the sysroot).
  *
  * A POSIX shm name is always a single flat component: glibc's __shm_get_name
  * (posix/shm-directory.c) strips the leading slash and rejects an empty name or
@@ -1009,6 +1010,7 @@ static bool proc_net_unix_visit(const struct socket_fdinfo *sinfo,
 {
     (void) pid;
     struct proc_net_unix_ctx *c = ctx_v;
+
     /* A unix row is up to 56 bytes of fixed format plus a sun_path of up to 108
      * bytes plus the trailing newline -- ~165 bytes worst case. The 128-byte
      * margin previously inherited from the inline loop could leave a
@@ -1306,6 +1308,7 @@ static void syscpu_dir_remove_tree(void)
                 snprintf(path, sizeof(path), "%s/%s", syscpu_dir, ent->d_name);
             if (n <= 0 || (size_t) n >= sizeof(path))
                 continue;
+
             /* cpuN entries are directories, range files are regular files.
              * rmdir succeeds for the dirs, fails with ENOTDIR for files; unlink
              * covers the latter without an extra stat.
@@ -1322,6 +1325,7 @@ static void syscpu_dir_cleanup(void)
 {
     if (!syscpu_dir_ok)
         return;
+
     /* Only the process that ran mkdtemp may remove the tree. CLONE_VM children
      * inherit this atexit handler and the populated state, but the scratch dir
      * itself belongs to the parent.
@@ -1510,6 +1514,7 @@ static bool syscpu_open_is_readonly(int linux_flags)
  */
 #define SYSFS_CPU "/sys/devices/system/cpu"
 #define SYSFS_CPU_LEN (sizeof(SYSFS_CPU) - 1)
+
 /* Host scratch-dir path buffer size: scratch dir is /tmp/elfuse-syscpu-<6>
  * (under 30 chars) plus a /sys/devices/system/cpu/<suffix> remainder bounded by
  * LINUX_PATH_MAX. 256 is comfortable for the realistic suffixes the stub
@@ -1586,14 +1591,17 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
  */
 #define PTY_KEEPALIVE_MAX 256
 #define PTY_KEEPALIVE_FREE (-1)
+
 /* Group that owns pty slaves. Linux distributions mount devpts with gid=5
  * ("tty") and glibc's grantpt(3) looks that group up before deciding whether
  * the slave needs chowning.
  */
 #define PTY_SLAVE_TTY_GID 5u
 
-/* Parse the N out of "/dev/pts/N". Returns false for the directory itself, a
- * missing or non-numeric tail, or trailing garbage.
+/* Parse the N out of "/dev/pts/N".
+ *
+ * Returns false for the directory itself, a missing or non-numeric tail, or
+ * trailing garbage.
  *
  * Deliberately stricter than strtoul, which would take leading whitespace, a
  * "+" sign and leading zeros. devpts dentries are decimal and canonical, so
@@ -1625,6 +1633,7 @@ static bool pty_slave_num_from_path(const char *path, uint32_t *out)
         *out = (uint32_t) n;
     return true;
 }
+
 /* PTY_SLAVE_PATH_MAX lives in procemu.h so this table and the fork-IPC payload
  * (proc_pty_ipc_entry_t) cannot drift apart.
  */
@@ -1633,6 +1642,7 @@ static struct {
     int slave_host_fd;
     uint32_t linux_pts_num;
     bool stale_open_once;
+
     /* Slaves the guest has open, and whether it ever had one. Both are needed:
      * a count of zero means hung up only after the first open.
      */
@@ -1758,6 +1768,7 @@ static int pty_keepalive_register_locked(int master_host_fd,
         }
         if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE)
             continue;
+
         /* Prefer a stale-path slot with the same pts number: the macOS minor
          * deterministically maps to the same slave_path string, so reusing
          * keeps lookups path-correct and bounds the table at one slot per live
@@ -1985,6 +1996,7 @@ static int pty_lookup_slave_path(uint32_t linux_pts_num,
     }
     int hit = -1;
     pty_keepalive_lock_acquire();
+
     /* Prefer a live entry (master still open in this process) over a stale path
      * entry. Both encode the same slave_path for a given minor on macOS, so the
      * preference only matters if a future change ever lets the two diverge -
@@ -2072,6 +2084,7 @@ void proc_pty_note_guest_slave(int slave_host_fd, uint32_t linux_pts_num)
         return;
     pthread_mutex_lock(&pty_keepalive_lock);
     pty_guest_slave_table_init_once();
+
     /* Drop any entry left over for this host fd number first. The open is
      * recorded before the guest fd is installed, so a failed fd_alloc closes
      * the host fd without passing through the close hooks; retiring the stale
@@ -2220,6 +2233,7 @@ static int pty_open_pts_dir(int linux_flags)
         return -1;
 
     pty_keepalive_lock_acquire();
+
     /* Enumerate live masters and fork-child one-shot stale entries. The stale
      * entries retain a slave fd until the first open attempt consumes them, so
      * they cannot name a reused unrelated tty while they appear in readdir.
@@ -2231,6 +2245,7 @@ static int pty_open_pts_dir(int linux_flags)
             (!pty_keepalive_table[i].stale_open_once ||
              pty_keepalive_table[i].slave_host_fd < 0))
             continue;
+
         /* The recycle/reuse-by-pts_num invariant in
          * pty_keepalive_register_locked keeps at most one entry per minor, so
          * no de-duplication pass is needed here.
@@ -2500,6 +2515,7 @@ static int pty_open_master(int linux_flags)
         errno = EMFILE;
         return -1;
     }
+
     /* Defense-in-depth: the freshly-opened master fd should not already have a
      * keepalive (would indicate a stale entry from a prior close that did not
      * run proc_pty_close_keepalive). Drop the redundant slave so it does not
@@ -2618,6 +2634,7 @@ static int proc_open_self_maps(const guest_t *g)
             snprintf(line, sizeof(line), "%llx-%llx %s %08llx 00:00 0",
                      (unsigned long long) e->start, (unsigned long long) e->end,
                      perms, (unsigned long long) e->offset);
+
         /* Cap lineoff to buffer size (snprintf may return more than available
          * on truncation)
          */
@@ -2928,6 +2945,7 @@ int proc_intercept_open(const guest_t *g,
             host_accmode = O_RDWR;
     } else if (!strcmp(path, "/dev/urandom") || !strcmp(path, "/dev/random")) {
         host_dev = "/dev/urandom";
+
         /* Linux guests may open random devices writable, but macOS requires a
          * readable host fd for those cases.
          */
@@ -2962,6 +2980,7 @@ int proc_intercept_open(const guest_t *g,
         if (dev_shm_resolve_path(path + 9, host_path, sizeof(host_path)) < 0)
             return -1;
         int oflags = translate_open_flags(linux_flags);
+
         /* O_NOFOLLOW: do not follow symlinks created by the guest inside the
          * shm directory (prevents symlink-based escape).
          */
@@ -3435,6 +3454,7 @@ int proc_intercept_open(const guest_t *g,
         extra[0] = '\0';
         if (snap.type == FD_EVENTFD) {
             uint64_t count;
+
             /* fs/eventfd.c uses a single space after the colon, matching the
              * timerfd convention (and unlike pos:/flags:/mnt_id: in
              * fs/proc/fd.c which use tabs).
@@ -3444,6 +3464,7 @@ int proc_intercept_open(const guest_t *g,
                          (unsigned long long) count);
         } else if (snap.type == FD_SIGNALFD) {
             uint64_t mask;
+
             /* fs/signalfd.c uses a tab after the colon (matching the
              * pos:/flags:/mnt_id: convention in fs/proc/fd.c, not the
              * single-space style of eventfd/timerfd). Verified against a real
@@ -3584,6 +3605,7 @@ int proc_intercept_open(const guest_t *g,
             ncpu = 1;
         char buf[4096];
         int off = 0;
+
         /* Aggregate CPU line (user, nice, system, idle, iowait, irq, softirq)
          */
         off += snprintf(buf + off, sizeof(buf) - off,
@@ -3644,6 +3666,7 @@ int proc_intercept_open(const guest_t *g,
             char host_path[SYSCPU_HOST_PATH_MAX];
             if (syscpu_resolve_path(suffix, host_path, sizeof(host_path)) < 0)
                 return -1;
+
             /* O_NOFOLLOW: the scratch dir contents are owned by elfuse, but a
              * caller could still race a symlink into the tree before this open.
              * Block any cross-tree escape attempt regardless.
@@ -3694,6 +3717,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
                            path); /* sticky bit, like real /dev/shm */
         return 0;
     }
+
     /* /dev/shm/<name> files: check the host backing dir, and lstat rather than
      * stat so a planted symlink leaf is never followed (see
      * dev_shm_resolve_path).
@@ -3722,6 +3746,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
             errno = ENOENT;
             return -1;
         }
+
         /* Resolve through the captured-path table: ENOENT unless the
          * corresponding master is currently open. This avoids the host stat
          * false-positive where /dev/ttysNNN happens to exist for an unrelated
@@ -3739,6 +3764,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
         memset(st, 0, sizeof(*st));
         st->st_mode = S_IFCHR | 0620;
         st->st_nlink = 1;
+
         /* devpts gives the slave to whoever opened the master, group tty --
          * that is what grantpt(3) expects to find. Reporting the host owner
          * instead makes glibc see a foreign uid, try to chown the slave, fail,
@@ -3748,6 +3774,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
          */
         st->st_uid = (uid_t) proc_get_uid();
         st->st_gid = (gid_t) PTY_SLAVE_TTY_GID;
+
         /* macOS dev_t = (major << 24) | minor; the fs-stat translation layer
          * (mac_to_linux_dev) re-encodes that into Linux's split major/minor
          * layout, so storing 136 in the macOS-major slot makes glibc's
@@ -3963,6 +3990,7 @@ static int proc_readlink_self_exe(char *buf, size_t bufsiz)
     const char *exe = exe_buf;
     char exe_real[LINUX_PATH_MAX];
     char exe_guest[LINUX_PATH_MAX];
+
     /* proc_set_sysroot stores a realpath()-canonicalized form, so canonicalize
      * exe before the reverse map or the sysroot strip fails when /var ->
      * /private/var (and similar macOS symlinks) make the two strings diverge.
@@ -4037,6 +4065,7 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
             errno = ENOENT;
             return -1;
         }
+
         /* Under rosetta, open("/proc/self/exe") returns a host fd pointing at
          * the rosetta translator (needed by the VZ ioctl gate). readlink on
          * that fd must still report the guest binary, not the translator, or
@@ -4045,6 +4074,7 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
          */
         if (proc_rosetta_active() && !strcmp(fdpath, ROSETTA_PATH))
             return proc_readlink_self_exe(buf, bufsiz);
+
         /* F_GETPATH reports the raw host path; the guest must see its own
          * namespace (sysroot stripped, escaped components decoded).
          */

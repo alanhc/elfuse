@@ -19,7 +19,7 @@
 #include "core/stack-math.h"
 #include "core/stack.h"
 #include "debug/log.h"
-#include "syscall/abi.h" /* GUEST_UID, GUEST_GID */
+#include "syscall/linux-wire.h" /* GUEST_UID, GUEST_GID */
 #include "syscall/proc.h"
 
 /* Linux aarch64 HWCAP bits (from asm/hwcap.h). Only the bits the VZ-sanitized

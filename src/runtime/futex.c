@@ -33,7 +33,7 @@
 #include "runtime/futex.h"
 #include "runtime/thread.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
@@ -221,6 +221,7 @@ void futex_init(void)
 #if ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS
     if (__builtin_available(macOS 14.4, *)) {
         os_sync_available = true;
+
         /* Plain FUTEX_WAIT / FUTEX_WAKE take the Darwin address-wait path.
          * Enable the gate only where the API is actually available so the two
          * flags cannot disagree. The late-EAGAIN gap is bridged by the
@@ -363,6 +364,7 @@ static uint64_t futex_remaining_ns(const struct timespec *deadline,
         return 0;
     if (delta_sec >= 1)
         return cap_ns;
+
     /* delta_sec == 0 and delta_nsec > 0; the borrow above guarantees delta_nsec
      * < NSEC_PER_SEC.
      */
@@ -374,9 +376,9 @@ static uint64_t futex_remaining_ns(const struct timespec *deadline,
  * deadline capped at FUTEX_OS_SYNC_POLL_CAP_NS. Every condvar sleep in the
  * timed-wait paths goes through this so a waiter parked on a distant guest
  * deadline still re-checks the process-wide teardown flags
- * (proc_exit_group_requested / futex_interrupt) each quantum; an uncapped
- * sleep would outlive thread_join_workers' poll cap and race
- * guest_destroy's unmap of the memory the waiter touches on wake.
+ * (proc_exit_group_requested / futex_interrupt) each quantum; an uncapped sleep
+ * would outlive thread_join_workers' poll cap and race guest_destroy's unmap of
+ * the memory the waiter touches on wake.
  * Returns false when the guest deadline has already passed.
  */
 static bool futex_quantum_deadline(const struct timespec *deadline,
@@ -541,6 +543,7 @@ static int64_t futex_os_sync_wait(guest_t *g,
          */
         if (signal_pending())
             return -LINUX_EINTR;
+
         /* For has_timeout: futex_remaining_ns returns 0 next iteration once the
          * user deadline elapses, so the loop exits with -ETIMEDOUT.
          */
@@ -653,9 +656,9 @@ static int64_t futex_wait(guest_t *g,
             /* Sleep in bounded quanta rather than to the guest deadline: a
              * worker parked here for a long guest timeout (JVM parkNanos,
              * sem_timedwait) would otherwise be unreachable by exit_group /
-             * futex_interrupt, outlive thread_join_workers' poll cap, and
-             * race guest_destroy's unmap. The interrupt checks mirror the
-             * no-timeout branch below.
+             * futex_interrupt, outlive thread_join_workers' poll cap, and race
+             * guest_destroy's unmap. The interrupt checks mirror the no-timeout
+             * branch below.
              */
             struct timespec quantum = {0};
             if (!futex_quantum_deadline(&deadline, &quantum)) {
@@ -673,11 +676,11 @@ static int64_t futex_wait(guest_t *g,
 
             /* Mirror the no-timeout branch's itimer/queued-signal re-check
              * below: without it, a thread parked in a timed FUTEX_WAIT_BITSET
-             * (glibc sem_timedwait, pthread_cond_timedwait, JVM parkNanos)
-             * only observes an expired guest itimer or a deliverable queued
-             * signal once the futex wakes or the full guest deadline elapses.
-             * Lock order requires dropping the bucket lock before touching
-             * sig_lock (4).
+             * (glibc sem_timedwait, pthread_cond_timedwait, JVM parkNanos) only
+             * observes an expired guest itimer or a deliverable queued signal
+             * once the futex wakes or the full guest deadline elapses. Lock
+             * order requires dropping the bucket lock before touching sig_lock
+             * (4).
              */
             pthread_mutex_unlock(&b->lock);
             signal_check_timer();
@@ -764,6 +767,7 @@ static int64_t futex_wait(guest_t *g,
             }
             if (found)
                 break;
+
             /* Not found: waiter was requeued again between the current hash
              * computation and lock acquisition. Re-read uaddr and retry.
              */
@@ -1258,11 +1262,10 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
 
                     /* Mirror futex_wait's untimed branch: without this, a
                      * thread parked here with a timeout only observes an
-                     * expired guest itimer or a deliverable queued signal
-                     * once the lock is acquired or the full guest deadline
-                     * elapses. Lock order requires dropping the bucket lock
-                     * before signal_check_timer/signal_pending touch
-                     * sig_lock (4).
+                     * expired guest itimer or a deliverable queued signal once
+                     * the lock is acquired or the full guest deadline elapses.
+                     * Lock order requires dropping the bucket lock before
+                     * signal_check_timer/signal_pending touch sig_lock (4).
                      */
                     pthread_mutex_unlock(&b->lock);
                     signal_check_timer();
@@ -1323,8 +1326,8 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
 
                 /* Mirror futex_wait's untimed branch: without this, a thread
                  * parked in FUTEX_LOCK_PI with no timeout never observes an
-                 * expired guest itimer or a deliverable queued signal until
-                 * the lock is acquired or the owner dies. Lock order requires
+                 * expired guest itimer or a deliverable queued signal until the
+                 * lock is acquired or the owner dies. Lock order requires
                  * dropping the bucket lock before signal_check_timer/
                  * signal_pending touch sig_lock (4).
                  */
@@ -1582,6 +1585,7 @@ static void waitv_unlink(futex_waiter_t *w)
         pthread_mutex_unlock(&b->lock);
         if (found || was_woken)
             return;
+
         /* w must have been requeued to another bucket while we hashed. Re-read
          * uaddr and try again.
          */
@@ -1728,6 +1732,7 @@ int64_t sys_futex_waitv(guest_t *g,
             return -LINUX_EINVAL;
         if ((elts[i].flags & FUTEX2_SIZE_MASK) != FUTEX2_SIZE_U32)
             return -LINUX_EINVAL;
+
         /* uaddr must be naturally aligned for the declared size. For
          * FUTEX2_SIZE_U32 that is 4-byte alignment; an unaligned futex word
          * loses atomicity on aarch64 and matches no kernel-side behavior.
@@ -1926,6 +1931,7 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
             futex_gva = list_ptr + (uint64_t) futex_offset;
         else
             futex_gva = list_ptr - (uint64_t) (-futex_offset);
+
         /* Canonical user-VA range check (bits 47:0). Anything with bit 63 set
          * is kernel-VA territory and is never a valid futex address. The
          * previous primary-buffer-only check (futex_gva < ipa_base +
@@ -1985,6 +1991,7 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
             futex_gva = pending + (uint64_t) futex_offset;
         else
             futex_gva = pending - (uint64_t) (-futex_offset);
+
         /* Canonical user-VA + alignment only; guest_read_small below is the
          * actual reachability test, so rosetta high-VA robust futexes are not
          * silently skipped (was: futex_gva >= ipa_base + guest_size).

@@ -31,7 +31,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/io.h" /* io_wait_fd_or_interrupted */
 #include "syscall/net.h"

@@ -24,7 +24,7 @@
 #include "utils.h"
 
 #include "syscall/sysvipc.h"
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/mem.h"
 
@@ -210,6 +210,7 @@ static int translate_semctl_cmd(int linux_cmd)
 int64_t sys_shmget(guest_t *g, int32_t key, uint64_t size, int shmflg)
 {
     (void) g;
+
     /* IPC_CREAT, IPC_EXCL, IPC_PRIVATE, and permission bits are the same
      * numeric values on Linux and macOS. Pass through directly.
      */

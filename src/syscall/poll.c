@@ -26,7 +26,7 @@
 
 #include "runtime/futex.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "runtime/procemu.h"
 #include "syscall/poll.h"
@@ -245,10 +245,9 @@ ppoll_retry:
 
         /* If poll emulation used a short timeout (200ms) on an infinite poll
          * and nothing happened, loop back. If the caller had a real timeout,
-         * poll emulation only called poll once with that timeout, so break.
-         */
-        /* An infinite poll re-arms on a 200ms slice; break out when a master
-         * has hung up, since the host will never make that fd ready.
+         * poll emulation only called poll once with that timeout, so break. An
+         * infinite poll re-arms on a 200ms slice; break out when a master has
+         * hung up, since the host will never make that fd ready.
          */
         if (ret == 0) {
             bool hup_pending = false;
@@ -781,6 +780,7 @@ typedef struct {
      * (including across a blocking kevent()).
      */
     int refcount;
+
     /* Serializes all regs[] reads and writes: epoll_ctl / epoll_pwait take it
      * for their short reg bookkeeping (never across the blocking kevent()
      * wait), and epoll_note_fd_closed takes it while holding fd_lock. Mirrors
@@ -938,6 +938,7 @@ void epoll_note_fd_closed(int closed_fd)
         epoll_instance_t *inst = (epoll_instance_t *) fd_table[epfd].dir;
         if (!inst)
             continue;
+
         /* fd_lock -> inst->lock ordering; the instance is in the table so its
          * refcount is at least the table's reference and cannot be freed here.
          */
@@ -1288,6 +1289,7 @@ int64_t sys_epoll_pwait(guest_t *g,
     }
 
 epoll_retry:;
+
     /* For indefinite waits, register the wakeup pipe with the kqueue so
      * exit_group/futex/signal requests can interrupt threads blocked in
      * kevent().

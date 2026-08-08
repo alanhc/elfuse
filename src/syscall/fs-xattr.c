@@ -12,7 +12,7 @@
 
 #include "core/guest.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/fs.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"

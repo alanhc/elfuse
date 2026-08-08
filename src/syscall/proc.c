@@ -43,6 +43,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/abi.h"
+#include "syscall/abi.h"
 #include "syscall/internal.h"
 #include "syscall/net.h"
 #include "syscall/proc-identity.h"

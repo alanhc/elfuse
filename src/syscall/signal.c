@@ -34,7 +34,7 @@
 
 #include "runtime/thread.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/fd.h"   /* signalfd_notify */
 #include "syscall/poll.h" /* wakeup_pipe_signal */
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */

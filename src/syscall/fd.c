@@ -27,7 +27,7 @@
 #include "debug/log.h"
 #include <sys/event.h>
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/fd.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
@@ -351,6 +351,7 @@ int64_t sys_timerfd_settime(guest_t *g,
         }
         timerfd_state[slot].armed = true;
         timerfd_state[slot].interval_ns = interval_ns;
+
         /* Use separate clamping for nanosecond computation: val_sec is clamped
          * for microsecond use (INT64_MAX / 1e6), which overflows when * 1e9.
          */
@@ -775,6 +776,7 @@ int eventfd_dup_fd(int src_fd,
         eventfd_state[slot].pipe_rd != original_pipe_rd) {
         pthread_mutex_unlock(&sfd_lock);
         pthread_mutex_unlock(&fd_lock);
+
         /* If the destination is still open but the source went away, tear it
          * down. (If the destination already closed itself, the snapshot below
          * sees FD_CLOSED and is a no-op.)
@@ -834,6 +836,7 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             return linux_errno();
 
         pthread_mutex_lock(&sfd_lock);
+
         /* Re-validate via the owner table, not eventfd_state[slot].guest_fd:
          * dup'd aliases bind multiple guest_fds to the same slot, so a
          * legitimate caller's guest_fd may not equal the primary owner.
@@ -932,6 +935,7 @@ int64_t eventfd_write(int guest_fd,
                 "eventfd_write: pipe write failed: %s (gfd=%d pipe_wr=%d)",
                 strerror(errno), guest_fd, eventfd_state[slot].pipe_wr);
     }
+
     /* Always log eventfd writes, since this is critical for diagnosing shutdown
      * hangs
      */
@@ -1143,6 +1147,7 @@ retry:
     signal_rt_info_t pending_stack[LINUX_NSIG];
     signal_rt_info_t *pending = pending_stack;
     signal_rt_info_t *heap = NULL;
+
     /* Parallel source-set tag per peeked entry (0 = private, 1 = shared) so the
      * take consumes each signal from the exact set it was peeked from.
      */
@@ -1150,6 +1155,7 @@ retry:
     uint8_t *src = src_stack;
     uint8_t *src_heap = NULL;
     size_t total = 0;
+
     /* Match pending signals against the signalfd mask. Do NOT filter by the
      * blocked mask because signalfd is specifically designed to read signals
      * that were blocked from normal delivery via sigprocmask(). The visible set
@@ -1177,6 +1183,7 @@ retry:
          * Re-validate slot after wake.
          */
         uint8_t byte;
+
         /* pipe_rd is O_NONBLOCK, so temporarily make it blocking for the wait
          */
         fcntl(pipe_rd, F_SETFL, 0);
@@ -1355,6 +1362,7 @@ bool timerfd_fdinfo_snapshot(int guest_fd,
         pthread_mutex_unlock(&sfd_lock);
         return false;
     }
+
     /* Fold any pending kqueue fires into expirations before exporting, matching
      * what timerfd_read does. Without this, fdinfo lags by however many ticks
      * were sitting on the kqueue.

@@ -14,7 +14,7 @@
 
 #include "runtime/procemu.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
 #include "syscall/fuse.h"
 #include "syscall/fs.h"
