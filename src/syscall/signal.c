@@ -38,8 +38,20 @@
 #include "syscall/fd.h"   /* signalfd_notify */
 #include "syscall/poll.h" /* wakeup_pipe_signal */
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
+#include "syscall/sigframe-math.h"
 #include "syscall/signal.h"
 #include "syscall/time.h" /* linux_timespec_valid, linux_timespec_to_ns_sat */
+
+/* sigaltstack rejects a stack below LINUX_MINSIGSTKSZ, and that is the only
+ * thing keeping a frame from being placed below the altstack base: the
+ * placement subtracts the frame size from the altstack top. The margin is real
+ * but not large (4688 against 5120 today), and it shrinks every time the frame
+ * grows, so state it rather than leave it to be re-derived. If a future frame
+ * breaks this, raise LINUX_MINSIGSTKSZ with it.
+ */
+_Static_assert(sizeof(linux_rt_sigframe_t) + SIGFRAME_ALIGN - 1 <=
+                   LINUX_MINSIGSTKSZ,
+               "an altstack at the minimum size must still hold a frame");
 
 /* Signal state (module-level, process-wide). */
 static signal_state_t sig_state;
@@ -313,6 +325,7 @@ static _Atomic(guest_t *) attention_guest;
 void signal_init(void)
 {
     memset(&sig_state, 0, sizeof(sig_state));
+
     /* Clear the attention singleton on every init pass. Bootstrap and the
      * fork-child receive path both call this before
      * signal_set_shim_globals_guest publishes the live g; the reset keeps the
@@ -322,6 +335,7 @@ void signal_init(void)
      * thread_interrupt_all instead of a stale parent pointer.
      */
     atomic_store_explicit(&attention_guest, NULL, memory_order_release);
+
     /* Altstack is now per-thread (in thread_entry_t), initialized to SS_DISABLE
      * by thread_register_main() and thread_alloc().
      */
@@ -472,6 +486,7 @@ void signal_queue_info(int signum,
     refresh_pending_hint_locked();
     pthread_mutex_unlock(&sig_lock);
     signalfd_notify(signum);
+
     /* Same shim-globals attention raise as signal_queue: force the fast path
      * off only when the queued signal can reach signal_deliver.
      */
@@ -599,6 +614,7 @@ bool signal_attention_needed(void)
         atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
     if (hint != 0 && thread_signal_deliverable(hint))
         return true;
+
     /* Active guest itimers: even if no signal is queued YET, the timer can fire
      * at any moment, and signal_check_timer needs an HVC #5 epilogue to notice
      * it. Keep attention raised while any timer is armed.
@@ -717,6 +733,7 @@ void signal_set_state(const signal_state_t *state)
         return;
     pthread_mutex_lock(&sig_lock);
     sig_state = *state;
+
     /* Restore per-thread state from deserialized signal state (fork child).
      * POSIX: fork preserves blocked mask, altstack, and on_altstack.
      */
@@ -736,6 +753,7 @@ size_t signal_peek_signalfd(uint64_t mask,
                             size_t max)
 {
     size_t total = 0;
+
     /* Per-set RT read cursor so a peek does not re-report the same queued
      * instance.
      */
@@ -757,6 +775,7 @@ size_t signal_peek_signalfd(uint64_t mask,
     for (size_t s = 0; s < nsets && total < max; s++) {
         signal_pending_t *sp = sets[s];
         memset(rt_offset, 0, sizeof(rt_offset));
+
         /* signum runs 1..LINUX_NSIG inclusive (64 is the highest valid RT
          * signal on aarch64 Linux). Bare-musl applications can target SIGRTMAX
          * directly, so the inclusive bound matters even though glibc reserves
@@ -844,6 +863,7 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected,
             if (sp->rt_queue[idx] <= 0)
                 break;
             const signal_rt_info_t *head = &sp->rt_info[idx][sp->rt_head[idx]];
+
             /* Compare field by field; signal_rt_info_t has padding between
              * si_int and si_ptr that memcmp would treat as significant.
              */
@@ -1163,6 +1183,7 @@ int64_t signal_rt_sigaction(guest_t *g,
         return -LINUX_EINVAL;
     if (signum < 1 || signum > LINUX_NSIG)
         return -LINUX_EINVAL;
+
     /* Linux allows querying (oldact != NULL, act == NULL) for SIGKILL/SIGSTOP
      * but rejects installing a handler for them.
      */
@@ -1272,6 +1293,7 @@ int64_t signal_rt_sigprocmask(guest_t *g,
             return -LINUX_EINVAL;
         }
         new_mask &= ~unmaskable;
+
         /* Atomic store: thread_signal_deliverable reads this field lock-free
          * via __atomic_load_n. Without atomic stores, the concurrent read is a
          * C data race (UB).
@@ -1415,6 +1437,7 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
                 __atomic_load_n(thread_blocked_ptr(), __ATOMIC_ACQUIRE);
             signal_pending_t *tp =
                 current_thread ? &current_thread->tpending : NULL;
+
             /* Private set first, matching signal_deliver()'s dequeue order: a
              * thread-directed signal is already bound here and needs no claim.
              */
@@ -1425,6 +1448,7 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
                     sig_state.shared.pending & ~now_blocked);
                 if (shared_sig) {
                     wake_sig = shared_sig;
+
                     /* Without a thread to bind it to there is only one vCPU to
                      * race with, so leave the signal shared.
                      */
@@ -1441,8 +1465,9 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
                 .tv_sec = 0,
                 .tv_nsec = SIGSUSPEND_CHUNK_NS,
             };
-            /* A host EINTR just means recheck sooner; the loop condition
-             * above is the only thing that decides when to stop.
+
+            /* A host EINTR just means recheck sooner; the loop condition above
+             * is the only thing that decides when to stop.
              */
             nanosleep(&req, NULL);
         }
@@ -1457,8 +1482,8 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
             *thread_saved_blocked_ptr() = saved_blocked;
             *thread_saved_valid_ptr() = true;
         } else {
-            /* Left the loop without a signal (exit_group). No handler will
-             * run, so nothing would restore the mask: put it back here.
+            /* Left the loop without a signal (exit_group). No handler will run,
+             * so nothing would restore the mask: put it back here.
              * signal_pending() and thread_signal_deliverable() read this field
              * lock-free, so store it the same way rt_sigprocmask does.
              */
@@ -1484,6 +1509,7 @@ int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva, uint64_t sigsetsize)
         return -LINUX_EFAULT;
 
     pthread_mutex_lock(&sig_lock);
+
     /* Return all pending signals (matching Linux kernel do_sigpending): the
      * calling thread's private set unioned with the shared set. In practice
      * unblocked signals are delivered before sigpending can observe them, but
@@ -1558,14 +1584,14 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
     if (guest_read_small(g, set_gva, &mask, sizeof(mask)) < 0)
         return -LINUX_EFAULT;
 
-    /* SIGKILL and SIGSTOP cannot be caught or waited for. Remove them from
-     * the wait mask silently, matching Linux do_sigtimedwait behavior.
+    /* SIGKILL and SIGSTOP cannot be caught or waited for. Remove them from the
+     * wait mask silently, matching Linux do_sigtimedwait behavior.
      */
     uint64_t unmaskable = sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP);
     mask &= ~unmaskable;
 
-    /* Determine deadline: NULL timeout_gva means block indefinitely.
-     * Zero timespec means poll once.
+    /* Determine deadline: NULL timeout_gva means block indefinitely. Zero
+     * timespec means poll once.
      */
     bool has_timeout = (timeout_gva != 0);
     int64_t remaining_ns = 0;
@@ -1613,7 +1639,7 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
          * Mirror signal_pending_interruption()'s disposition filter: SIG_IGN
          * signals and signals whose default disposition is ignore, stop, or
          * continue are silently discarded by signal_deliver and must NOT
-         * interrupt the wait.  Only a signal with a real handler, or a SIG_DFL
+         * interrupt the wait. Only a signal with a real handler, or a SIG_DFL
          * TERM/CORE disposition, justifies waking the caller with -EINTR.
          */
         pthread_mutex_lock(&sig_lock);
@@ -1688,6 +1714,16 @@ int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva)
         } else {
             if (ss.ss_size < LINUX_MINSIGSTKSZ)
                 return -LINUX_ENOMEM;
+
+            /* Reject a stack whose extent wraps: delivery computes the top as
+             * altstack_sp + altstack_size, and a wrapping pair yields a low
+             * address unrelated to the stack the guest described. Stricter than
+             * Linux, whose do_sigaltstack checks only the minimum size; this is
+             * what makes the placement floor unable to reject a delivery the
+             * pre-proof code would have accepted.
+             */
+            if (ss.ss_sp > UINT64_MAX - ss.ss_size)
+                return -LINUX_EINVAL;
             t->altstack_sp = ss.ss_sp;
             t->altstack_flags = 0;
             t->altstack_size = ss.ss_size;
@@ -1876,6 +1912,7 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     frame.info.si_signo = signum;
     if (pending_fault.valid) {
         frame.info.si_code = pending_fault.si_code;
+
         /* si_addr overlaps si_pid/si_uid at offset 16 in the siginfo union. On
          * aarch64-linux, si_addr is a 64-bit pointer occupying both int32_t
          * fields. Write it via memcpy to avoid strict aliasing.
@@ -1957,20 +1994,25 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         use_altstack = true;
     }
 
-    /* Guard against underflow: if signal_sp is too small to hold the frame, the
-     * subtraction wraps to a huge address. guest_write_small would catch it,
-     * but report the problem early with a diagnostic.
+    /* Proved in src/syscall/sigframe-math.h: on success the frame is 16-byte
+     * aligned, sits wholly below signal_sp without the subtraction wrapping,
+     * and stays at or above the floor. The floor is the altstack base when
+     * running on one, the bound signal_sp alone cannot express; on the normal
+     * stack it is 0 and only the fits-below-SP bound applies.
      */
-    if (signal_sp < sizeof(frame)) {
+    uint64_t frame_sp;
+    if (!sigframe_base(signal_sp, sizeof(frame),
+                       use_altstack && thr ? thr->altstack_sp : 0, &frame_sp)) {
         log_error(
-            "signal_deliver: SP too low for frame "
-            "(signal_sp=0x%llx signum=%d)",
-            (unsigned long long) signal_sp, signum);
+            "signal_deliver: no room for frame "
+            "(signal_sp=0x%llx floor=0x%llx signum=%d)",
+            (unsigned long long) signal_sp,
+            (unsigned long long) (use_altstack && thr ? thr->altstack_sp : 0),
+            signum);
         *exit_code = 128 + signum;
         pthread_mutex_unlock(&sig_lock);
         return -1;
     }
-    uint64_t frame_sp = (signal_sp - sizeof(frame)) & ~15ULL;
 
     /* Push the SROP cookie for validation on rt_sigreturn. If nesting exceeds
      * MAX_NESTED_SIGNALS, skip the cookie entirely (set uc_flags=0) so
@@ -2111,14 +2153,16 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
     }
 }
 
-/* Select, dequeue, and act on one pending signal. Returns
- * SIGNAL_DELIVER_DISCARDED when the signal was consumed without the guest
- * observing it, so the caller can move on to the next one.
+/* Select, dequeue, and act on one pending signal.
+ *
+ * Returns SIGNAL_DELIVER_DISCARDED when the signal was consumed without the
+ * guest observing it, so the caller can move on to the next one.
  */
 static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 {
     pthread_mutex_lock(&sig_lock);
     uint64_t *blocked = thread_blocked_ptr();
+
     /* Consider this thread's private (thread-directed) set plus the shared
      * (process-directed) set. Linux dequeue_signal() drains task->pending
      * before signal->shared_pending, so for a given signum the private instance
@@ -2158,6 +2202,7 @@ static int signal_deliver_one(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
         src->std_info_valid[signum - 1] = false;
         src->pending &= ~sig_bit(signum);
     }
+
     /* A directed dequeue cleared a bit that only this thread's set held, so the
      * global hint must be recomputed from the surviving pending state.
      */
@@ -2259,6 +2304,7 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
     /* Restore SP, PC, PSTATE */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, frame.uc.uc_mcontext.sp);
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, restored_pc);
+
     /* Sanitize PSTATE: preserve EL0-safe bits, clear everything else. Bit
      * fields preserved (matching Linux kernel's valid_user_regs):
      *   [31:28] NZCV:   condition flags

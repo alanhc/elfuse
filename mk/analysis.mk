@@ -2,7 +2,7 @@
 
 .PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
         verify-gva verify-cmsg verify-fuse verify-stack verify-sockaddr \
-        verify-netlink \
+        verify-netlink verify-sigframe \
         check-contracts verify-mutants infer-uninit
 
 CLANG_TIDY ?= clang-tidy
@@ -192,6 +192,14 @@ VERIFY_NETLINK_SCAN := src/syscall/netlink-math.h
 VERIFY_NETLINK_CLAIM := for ANY netlink message bytes a guest can send
 VERIFY_NETLINK_UNPROVED := the walk loops and attribute copies stay test-covered
 
+VERIFY_SIGFRAME_SRC  := src/syscall/sigframe-math.h
+VERIFY_SIGFRAME_FCTS := sigframe_base
+VERIFY_SIGFRAME_MIN_GOALS ?= 15
+VERIFY_SIGFRAME_MODEL := typed
+VERIFY_SIGFRAME_SCAN := src/syscall/sigframe-math.h
+VERIFY_SIGFRAME_CLAIM := for ANY interrupted stack pointer and frame size
+VERIFY_SIGFRAME_UNPROVED := the frame field layout is not covered at all yet
+
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
 verify_empty :=
@@ -298,6 +306,17 @@ verify-netlink: SCAN := $(VERIFY_NETLINK_SCAN)
 verify-netlink: CLAIM := $(VERIFY_NETLINK_CLAIM)
 verify-netlink: UNPROVED := $(VERIFY_NETLINK_UNPROVED)
 
+## Prove the signal frame lands aligned and below the interrupted stack pointer
+verify-sigframe: NAME := sigframe
+verify-sigframe: SRC := $(VERIFY_SIGFRAME_SRC)
+verify-sigframe: FCTS := $(VERIFY_SIGFRAME_FCTS)
+verify-sigframe: FCT_ARG := $(call commafy,$(VERIFY_SIGFRAME_FCTS))
+verify-sigframe: MIN_GOALS := $(VERIFY_SIGFRAME_MIN_GOALS)
+verify-sigframe: MODEL := $(VERIFY_SIGFRAME_MODEL)
+verify-sigframe: SCAN := $(VERIFY_SIGFRAME_SCAN)
+verify-sigframe: CLAIM := $(VERIFY_SIGFRAME_CLAIM)
+verify-sigframe: UNPROVED := $(VERIFY_SIGFRAME_UNPROVED)
+
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
 # what gets proved.
@@ -307,7 +326,7 @@ verify-netlink: UNPROVED := $(VERIFY_NETLINK_UNPROVED)
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
 verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack \
-    verify-sockaddr verify-netlink: | $(BUILD_DIR)
+    verify-sockaddr verify-netlink verify-sigframe: | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -345,7 +364,7 @@ verify-mutants:
 
 ## Run every Frama-C proof
 verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse verify-stack \
-        verify-sockaddr verify-netlink
+        verify-sockaddr verify-netlink verify-sigframe
 
 ## Rebuild with the gva-math.h precondition checks live, then run the suite
 #
