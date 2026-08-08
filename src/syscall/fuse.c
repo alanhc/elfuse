@@ -249,7 +249,6 @@ typedef struct {
     bool init_done;
     int notify_wr;
     uint32_t max_write;
-    uint16_t max_pages;
     uint64_t next_unique;
     fuse_request_t requests[FUSE_MAX_PENDING];
     fuse_request_t *queue_head;
@@ -1466,7 +1465,6 @@ int fuse_proc_open(int linux_flags)
             pthread_cond_init(&slot->init_cond, NULL);
             slot->notify_wr = -1;
             slot->max_write = 64 * 1024;
-            slot->max_pages = 16;
             slot->next_unique = 1;
 
             /* memset above leaves node_ref_hash at all-zero, which collides
@@ -2599,12 +2597,25 @@ int64_t fuse_dev_write(guest_t *g,
                 req->error = -LINUX_EPROTO;
                 session->daemon_dead = true;
             } else {
-                uint32_t neg_write =
-                    init_out.max_write ? init_out.max_write : 65536;
-                session->max_write =
-                    (uint32_t) fuse_clamp_negotiated_write(neg_write);
-                session->max_pages =
-                    init_out.max_pages ? init_out.max_pages : 16;
+                uint64_t neg_write = fuse_clamp_negotiated_write(
+                    init_out.max_write ? init_out.max_write : 65536);
+
+                /* A daemon that accepted FUSE_MAX_PAGES also stated the largest
+                 * request it will take, in pages, and the two numbers need not
+                 * agree: max_write bounds a WRITE payload, max_pages bounds any
+                 * request. Sizing a READ from max_write alone would send frames
+                 * the daemon told us it would refuse. Only a daemon that echoed
+                 * the flag has stated anything here; without it max_pages is a
+                 * reserved field whose zero would otherwise read as a one-page
+                 * limit.
+                 */
+                if ((init_out.flags & FUSE_MAX_PAGES) && init_out.max_pages) {
+                    uint64_t page_cap =
+                        (uint64_t) init_out.max_pages * GUEST_PAGE_SIZE;
+                    if (page_cap < neg_write)
+                        neg_write = page_cap;
+                }
+                session->max_write = (uint32_t) neg_write;
                 session->init_done = true;
             }
         } else if (hdr.error < 0) {
