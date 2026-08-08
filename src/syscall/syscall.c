@@ -46,6 +46,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
 #include "syscall/exec.h"
 #include "syscall/fd.h"
@@ -577,7 +578,15 @@ SC_LOCKED(sc_brk,      sys_brk(g, x0))
 SC_LOCKED(sc_munmap,   sys_munmap(g, x0, x1))
 SC_LOCKED(sc_mprotect, sys_mprotect(g, x0, x1, (int) x2))
 SC_LOCKED(sc_madvise,  sys_madvise(g, x0, x1, (int) x2))
-SC_LOCKED(sc_msync,    sys_msync(g, x0, x1, (int) x2))
+
+/* sys_msync manages mmap_lock itself rather than through SC_LOCKED: it holds
+ * the lock for every guest-memory access (the coverage check, the diff pass,
+ * the cross-region refresh pass, same as before), but defers the actual
+ * fsync(2) calls to after release, on duped fds. See the comment in sys_msync
+ * for why fsync alone, and nothing that touches guest memory, is safe to move
+ * outside the lock.
+ */
+SC_FORWARD(sc_msync,   sys_msync(g, x0, x1, (int) x2))
 SC_LOCKED(sc_shmat,    sys_shmat(g, (int) x0, x1, (int) x2))
 
 /* Constant stubs. */
@@ -2177,6 +2186,7 @@ static int64_t sc_execveat(guest_t *g,
         char pathname[LINUX_PATH_MAX];
         if (guest_read_str(g, x1, pathname, sizeof(pathname)) < 0)
             return -LINUX_EFAULT;
+
         /* Translate like every other *at handler: under a casefold sysroot a
          * guest-created entry exists on disk only under its escaped spelling,
          * so handing the raw guest bytes to the host cannot resolve it (and
@@ -2192,6 +2202,7 @@ static int64_t sc_execveat(guest_t *g,
         host_fd_ref_t dir_ref;
         if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
             return -LINUX_EBADF;
+
         /* O_CLOEXEC: the descriptor is closed a few lines below, but a
          * concurrent execve on another vCPU thread inside that window would
          * otherwise leak it into the new image. A shm redirect leaf forces

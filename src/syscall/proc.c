@@ -42,6 +42,8 @@
 
 #include "runtime/futex.h"
 
+#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/net.h"
 #include "syscall/proc-identity.h"
@@ -241,10 +243,48 @@ static void proc_init_child_entry(proc_entry_t *entry,
 
 static proc_entry_t *proc_find_free_entry(void)
 {
+    /* Scanned in full, not short-circuited on the first free slot: this is
+     * called once per fork, already dwarfed by posix_spawn and the guest memory
+     * IPC transfer that admission does around it, so the extra comparisons are
+     * free. In exchange the same pass answers "is every entry idle right now",
+     * which is what lets a table grown for a historical burst of concurrent
+     * children shrink back down once none of them are left, instead of taxing
+     * every future host_pid/guest_pid scan at the high-water capacity forever.
+     */
+    proc_entry_t *free_entry = NULL;
+    bool any_live = false;
     for (size_t i = 0; i < proc_table_capacity; i++) {
-        if (!proc_table[i].active && !proc_table[i].reserved)
-            return &proc_table[i];
+        /* host_reap_pending can be true on an entry that is otherwise idle:
+         * proc_process_exit() sets it while publishing an early-seen exit to
+         * the lifecycle registry, and sys_wait4 can go on to clear active
+         * without clearing it, leaving proc_deferred_reap_poll() as the only
+         * thing that still needs this slot (it scans by host_reap_pending
+         * alone, not active). Shrinking the table out from under a pending
+         * deferred reap would silently strand that host zombie until process
+         * exit.
+         */
+        if (proc_table[i].active || proc_table[i].reserved ||
+            proc_table[i].host_reap_pending)
+            any_live = true;
+        else if (!free_entry)
+            free_entry = &proc_table[i];
     }
+
+    if (!any_live && proc_table_capacity > PROC_TABLE_INITIAL_CAPACITY) {
+        /* No entry is active or reserved, so nothing anywhere holds a pointer
+         * into this table (the invariant this file documents at its top: no
+         * pointer survives unlocking, and every caller here holds pid_lock).
+         * Safe to drop the grown array and reuse the small static buffer,
+         * exactly as proc_init() does at startup.
+         */
+        free(proc_table);
+        proc_table = proc_table_initial;
+        proc_table_capacity = PROC_TABLE_INITIAL_CAPACITY;
+        memset(proc_table_initial, 0, sizeof(proc_table_initial));
+        return &proc_table_initial[0];
+    }
+    if (free_entry)
+        return free_entry;
 
     if (proc_table_capacity > (size_t) INT_MAX / 2)
         return NULL;
@@ -265,6 +305,30 @@ static proc_entry_t *proc_find_host_entry(pid_t host_pid)
 {
     for (size_t i = 0; i < proc_table_capacity; i++) {
         if (proc_table[i].active && proc_table[i].host_pid == host_pid)
+            return &proc_table[i];
+    }
+    return NULL;
+}
+
+/* The entry for exactly this (host_pid, guest_pid) pair.
+ *
+ * Every caller that releases pid_lock across a host wait4 needs this rather
+ * than proc_find_host_entry: the host OS can reuse a pid the moment wait4 reaps
+ * it, so a second guest fork admitted on another thread during that unlocked
+ * window can land an unrelated child in the table under the exact same
+ * host_pid. Two active entries then share that host_pid, and a lookup that
+ * matches on host_pid alone returns whichever sits at the lower index.
+ * Comparing guest_pid after the fact does not save it: when the impostor comes
+ * first, the check rejects it and the real entry is never reached, so the
+ * caller silently skips work it had to do. Matching on both in one scan finds
+ * the intended entry wherever it sits.
+ */
+static proc_entry_t *proc_find_host_guest_entry(pid_t host_pid,
+                                                int64_t guest_pid_val)
+{
+    for (size_t i = 0; i < proc_table_capacity; i++) {
+        if (proc_table[i].active && proc_table[i].host_pid == host_pid &&
+            proc_table[i].guest_pid == guest_pid_val)
             return &proc_table[i];
     }
     return NULL;
@@ -491,8 +555,8 @@ void proc_mark_child_exited(pid_t host_pid, int status)
     }
 
     pthread_mutex_lock(&pid_lock);
-    entry = proc_find_host_entry(host_pid);
-    if (entry && entry->guest_pid == gpid) {
+    entry = proc_find_host_guest_entry(host_pid, gpid);
+    if (entry) {
         entry->exited = true;
         entry->exit_status = status;
         entry->rusage_accounted = true;
@@ -983,12 +1047,12 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
     pthread_mutex_lock(&pid_lock);
     proc_entry_t *entry = proc_find_guest_entry(source->guest_pid);
     if (entry && entry->host_waitable) {
-        /* proc_process_exit() publishes the status and raises SIGCHLD while
-         * the host process is still tearing down, so wait4 reports "running"
-         * for a moment after the guest was told the child is gone -- a skew
-         * Linux never has. Copy the status across so a WNOHANG poll from the
-         * handler cannot miss it; proc_deferred_reap_poll() does the host
-         * reap later so nothing blocks here.
+        /* proc_process_exit() publishes the status and raises SIGCHLD while the
+         * host process is still tearing down, so wait4 reports "running" for a
+         * moment after the guest was told the child is gone, a skew Linux
+         * never has. Copy the status across so a WNOHANG poll from the handler
+         * cannot miss it; proc_deferred_reap_poll() does the host reap later so
+         * nothing blocks here.
          */
         if (source->exited && !entry->exited) {
             entry->exited = true;
@@ -1941,19 +2005,36 @@ int write_rusage_to_guest(guest_t *g, uint64_t gva, const struct rusage *ru)
     return guest_write_small(g, gva, &lru, sizeof(lru));
 }
 
-/* Deactivate the wait4 process-table slot iff it still holds @host_pid.
- * sys_wait4 releases pid_lock across the host wait4 call, so another reaper
- * thread may have recycled the slot in the meantime; the @host_pid re-check
- * guards against clobbering an unrelated child that took the slot. pid_lock
- * must not be held.
+/* Deactivate the wait4 process-table entry for @host_pid, iff one still exists
+ * AND still belongs to @expect_guest_pid. Looks the entry up by host_pid rather
+ * than taking a slot index: callers release pid_lock across the host wait4
+ * call, and proc_table itself can be freed and replaced with the small static
+ * initial buffer in that window (proc_find_free_entry shrinks it back once
+ * every entry is idle, which a sibling reaper finishing during this call's own
+ * unlocked wait4 can trigger). A slot index captured before the unlock is not
+ * just possibly stale, as the host_pid re-check already accounted for: it can
+ * be out of bounds for the table proc_table now points to. Looking up by
+ * host_pid sidesteps that regardless of how proc_table_capacity has moved.
+ *
+ * host_pid alone is not enough to identify the right entry, though: the host OS
+ * can reuse a pid number the moment wait4 reaps it, so a second guest fork
+ * admitted on another thread during this same unlocked window can land a brand
+ * new, unrelated child in a table slot under the exact pid this call is trying
+ * to deactivate. Hence the lookup on the pair, whose guest_pid half is what the
+ * caller captured from the SAME entry before releasing the lock; see
+ * proc_find_host_guest_entry for why the pair has to be one scan rather than a
+ * check bolted onto a host_pid hit.
  */
-static void proc_deactivate_slot_if_matches(int slot, pid_t host_pid)
+static void proc_deactivate_slot_if_matches(pid_t host_pid,
+                                            int64_t expect_guest_pid)
 {
     int64_t guest_pid = -1;
     pthread_mutex_lock(&pid_lock);
-    if (proc_table[slot].active && proc_table[slot].host_pid == host_pid) {
-        guest_pid = proc_table[slot].guest_pid;
-        proc_table[slot].active = false;
+    proc_entry_t *entry =
+        proc_find_host_guest_entry(host_pid, expect_guest_pid);
+    if (entry) {
+        guest_pid = entry->guest_pid;
+        entry->active = false;
     }
     pthread_mutex_unlock(&pid_lock);
     if (guest_pid > 0)
@@ -2050,12 +2131,12 @@ void proc_autoreap_exited_children(void)
         if (ret == host_pid) {
             proc_children_cpu_add(&ru);
             proc_pidfd_notify_exit(guest_pid);
-            proc_deactivate_slot_if_matches((int) i, host_pid);
+            proc_deactivate_slot_if_matches(host_pid, guest_pid);
         } else if (ret < 0 && errno == ECHILD) {
             /* A concurrent consuming wait won the host reap. The disposition
              * still makes this child non-waitable to subsequent guest waits.
              */
-            proc_deactivate_slot_if_matches((int) i, host_pid);
+            proc_deactivate_slot_if_matches(host_pid, guest_pid);
         }
     }
 
@@ -2126,7 +2207,14 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
             pthread_mutex_lock(&pid_lock);
             if (ret == host_pid) {
                 proc_children_cpu_add(&ru);
-                proc_entry_t *entry = proc_find_host_entry(host_pid);
+
+                /* Paired lookup: the host OS can reuse host_pid the moment
+                 * wait4 reaps it, so a second guest fork admitted on another
+                 * thread during this unlocked window could otherwise match an
+                 * unrelated child that landed under this same host_pid.
+                 */
+                proc_entry_t *entry =
+                    proc_find_host_guest_entry(host_pid, guest_pid);
                 if (entry)
                     entry->active = false;
                 pthread_mutex_unlock(&pid_lock);
@@ -2135,7 +2223,8 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
             } else if (ret == 0) {
                 still_active = true;
             } else {
-                proc_entry_t *entry = proc_find_host_entry(host_pid);
+                proc_entry_t *entry =
+                    proc_find_host_guest_entry(host_pid, guest_pid);
                 if (entry)
                     entry->active = false;
             }
@@ -2166,6 +2255,7 @@ static void proc_deferred_reap_poll(void)
         if (!proc_table[i].host_reap_pending)
             continue;
         pid_t host_pid = proc_table[i].host_pid;
+        int64_t guest_pid = proc_table[i].guest_pid;
         if (host_pid <= 0) {
             proc_table[i].host_reap_pending = false;
             continue;
@@ -2174,11 +2264,19 @@ static void proc_deferred_reap_poll(void)
         int st;
         pid_t r = wait4(host_pid, &st, WNOHANG, NULL);
         pthread_mutex_lock(&pid_lock);
+
         /* Only clear the flag once the zombie is gone (r > 0) or the child is
-         * no longer ours to reap (r < 0, typically ECHILD).
+         * no longer ours to reap (r < 0, typically ECHILD). The guest_pid check
+         * guards against host_pid reuse: the host OS can hand this exact pid to
+         * a brand new process the instant wait4 above reaps it, and a second
+         * guest fork admitted on another thread during this unlocked window
+         * could land that new child in slot i under the same host_pid. Clearing
+         * host_reap_pending for it instead of (or in addition to) the original
+         * entry would strand a real pending zombie.
          */
         if (r != 0 && i < proc_table_capacity &&
-            proc_table[i].host_pid == host_pid)
+            proc_table[i].host_pid == host_pid &&
+            proc_table[i].guest_pid == guest_pid)
             proc_table[i].host_reap_pending = false;
     }
     pthread_mutex_unlock(&pid_lock);
@@ -2278,7 +2376,6 @@ int64_t sys_wait4(guest_t *g,
 
                 pid_t host_pid = proc_table[i].host_pid;
                 int64_t gpid = proc_table[i].guest_pid;
-                int slot = (int) i;
                 pthread_mutex_unlock(&pid_lock);
 
                 int status;
@@ -2303,16 +2400,16 @@ int64_t sys_wait4(guest_t *g,
                                               sizeof(linux_status)) < 0) {
                             /* Child already reaped. Match Linux: return EFAULT
                              */
-                            proc_deactivate_slot_if_matches(slot, host_pid);
+                            proc_deactivate_slot_if_matches(host_pid, gpid);
                             return -LINUX_EFAULT;
                         }
                     }
                     if (rusage_gva &&
                         write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                        proc_deactivate_slot_if_matches(slot, host_pid);
+                        proc_deactivate_slot_if_matches(host_pid, gpid);
                         return -LINUX_EFAULT;
                     }
-                    proc_deactivate_slot_if_matches(slot, host_pid);
+                    proc_deactivate_slot_if_matches(host_pid, gpid);
                     return gpid;
                 }
                 /* ret == 0 (not exited) or ret < 0 (error): try next */
@@ -2402,7 +2499,6 @@ int64_t sys_wait4(guest_t *g,
 
             pid_t host_pid = proc_table[i].host_pid;
             int64_t gpid = proc_table[i].guest_pid;
-            int slot = (int) i;
             pthread_mutex_unlock(&pid_lock);
 
             int status;
@@ -2443,17 +2539,17 @@ int64_t sys_wait4(guest_t *g,
                     int32_t linux_status = status;
                     if (guest_write_small(g, status_gva, &linux_status,
                                           sizeof(linux_status)) < 0) {
-                        proc_deactivate_slot_if_matches(slot, host_pid);
+                        proc_deactivate_slot_if_matches(host_pid, gpid);
                         return -LINUX_EFAULT;
                     }
                 }
                 if (rusage_gva &&
                     write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                    proc_deactivate_slot_if_matches(slot, host_pid);
+                    proc_deactivate_slot_if_matches(host_pid, gpid);
                     return -LINUX_EFAULT;
                 }
                 /* Re-validate slot: another thread may have reaped it */
-                proc_deactivate_slot_if_matches(slot, host_pid);
+                proc_deactivate_slot_if_matches(host_pid, gpid);
                 return gpid;
             } else if (ret == 0) {
                 return 0; /* WNOHANG */
@@ -2617,13 +2713,27 @@ int64_t sys_waitid(guest_t *g,
                  * status/rusage in the guest process table so Linux WNOWAIT
                  * remains repeatable and a later consuming wait can account and
                  * remove it exactly once.
+                 *
+                 * Looked up by host_pid rather than indexed by the stale i:
+                 * pid_lock was released across the wait4 above, during which
+                 * proc_table can be freed and reassigned to the small initial
+                 * static buffer if every entry went idle in the meantime,
+                 * making a raw index captured before the unlock potentially out
+                 * of bounds for the table it now points to (see
+                 * proc_deactivate_slot_if_matches for the same hazard, found
+                 * and fixed there first). The entry_gpid half of the lookup
+                 * guards that function's other hazard: the host OS can reuse
+                 * host_pid the moment wait4 reaps it, so a second guest fork
+                 * admitted on another thread during this unlocked window can
+                 * land an unrelated child under this exact host_pid.
                  */
-                if (proc_table[i].active &&
-                    proc_table[i].host_pid == host_pid) {
-                    proc_table[i].exited = true;
-                    proc_table[i].exit_status = status;
-                    proc_table[i].rusage = ru;
-                    proc_table[i].rusage_valid = true;
+                proc_entry_t *reaped =
+                    proc_find_host_guest_entry(host_pid, entry_gpid);
+                if (reaped) {
+                    reaped->exited = true;
+                    reaped->exit_status = status;
+                    reaped->rusage = ru;
+                    reaped->rusage_valid = true;
                 }
             }
 
@@ -2659,16 +2769,26 @@ int64_t sys_waitid(guest_t *g,
                 }
             }
 
-            /* Keep the table entry when WNOWAIT is set. Re-validate slot after
-             * re-locking (another thread may have reused it while the wait loop
-             * released the lock for waitpid).
+            /* Keep the table entry when WNOWAIT is set. Looked up by host_pid
+             * (ret) rather than indexed by i for the same reason as the
+             * reap-preservation block above: this path is reachable after the
+             * else-arm's unlock/relock around wait4, where a stale index can be
+             * out of bounds for a proc_table shrunk in the interim. The
+             * "already reaped" arm above also reaches here with ret set to that
+             * entry's host_pid, so the lookup is correct for both arms that
+             * fall through to this point. The entry_gpid half of the lookup
+             * guards the same host_pid-reuse hazard as the reap-preservation
+             * block above.
              */
             int64_t consumed_gpid = -1;
-            if (!(options & LINUX_WNOWAIT) && proc_table[i].active &&
-                proc_table[i].host_pid == ret) {
-                consumed_gpid = proc_table[i].guest_pid;
-                proc_account_entry_locked(&proc_table[i]);
-                proc_table[i].active = false;
+            if (!(options & LINUX_WNOWAIT)) {
+                proc_entry_t *consumed =
+                    proc_find_host_guest_entry(ret, entry_gpid);
+                if (consumed) {
+                    consumed_gpid = consumed->guest_pid;
+                    proc_account_entry_locked(consumed);
+                    consumed->active = false;
+                }
             }
 
             pthread_mutex_unlock(&pid_lock);

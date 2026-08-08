@@ -11,8 +11,8 @@
  *
  * Split out of guest.c because guest.c cannot be given to Frama-C at all: it
  * includes sys/sysctl.h and Hypervisor.framework, which the analyzer's libc
- * does not model. These functions need nothing but stdint.h, so `make
- * verify-gva` proves this header directly.
+ * does not model. These functions need nothing but stdint.h, so make verify-gva
+ * proves this header directly.
  *
  * static inline rather than a separate translation unit on purpose:
  * gva_translate_perm runs on every guest pointer access, and
@@ -27,6 +27,52 @@
 #pragma once
 
 #include <stdint.h>
+
+/* Call-site precondition checks, off by default.
+ *
+ * guest.c cannot be given to Frama-C, so nothing checks that its call sites
+ * honor the requires clauses below; they are reviewed by eye. Building with
+ * -DELFUSE_CONTRACT_ASSERT (see make check-contracts) turns the expressible
+ * ones into runtime checks so the existing suite exercises them.
+ *
+ * Only five of the nine requires clauses have a C expression. The four pointer
+ * ones do not: assert(p != NULL) is strictly weaker than \valid(p), and
+ * assert(a != b) misses overlapping distinct pointers into one object, which is
+ * exactly the drift worth catching. Those four stay review-only, which is the
+ * ceiling on what this closes.
+ *
+ * The checks call the *_args_ok predicates below rather than restating the
+ * conditions inline. A restated condition can drift weaker than the clause it
+ * mirrors with nothing to notice; those predicates carry <==> contracts, so a
+ * weakened one fails make verify-gva.
+ *
+ * verify-gva runs with -DELFUSE_CONTRACT_ASSERT so the prover sees these calls
+ * too, and must discharge each assert from the requires clause it mirrors. That
+ * extends the guarantee from the predicate bodies to the wiring: a check handed
+ * permuted arguments, or pointed at the wrong predicate, fails the proof rather
+ * than surfacing later as a spurious abort. It does NOT catch a call passing a
+ * constant that satisfies the predicate instead of the real argument, since
+ * that is still derivable. tests/test-gva-contracts.c covers that from the
+ * other side by checking each conjunct actually rejects.
+ *
+ * Off by default because the tree has no NDEBUG release split and this sits on
+ * the hot guest_read / guest_write path (see the static inline note above).
+ */
+#ifdef ELFUSE_CONTRACT_ASSERT
+#include <stdlib.h>
+
+/* Deliberately not assert(). assert.h re-reads NDEBUG at include time, so
+ * routing through it would need NDEBUG undefined here, and that both enables
+ * every unrelated assert in the including translation unit and leaves NDEBUG
+ * cleared for whatever that unit includes next. Calling abort() directly cannot
+ * be switched off by a caller's -DNDEBUG, which is the property this build mode
+ * needs, and it fails with SIGABRT specifically, so tests/test-gva-contracts.c
+ * can require that exact signal rather than accepting any crash as a rejection.
+ */
+#define GVA_CONTRACT_ASSERT(cond) ((cond) ? (void) 0 : abort())
+#else
+#define GVA_CONTRACT_ASSERT(cond) ((void) 0)
+#endif
 
 /* Output-address field of a page-table descriptor (bits [47:12]). */
 #define GVA_PT_ADDR_MASK 0xFFFFFFFFF000ULL
@@ -78,6 +124,23 @@ static inline int gva_pt_table_offset(uint64_t desc,
     return 1;
 }
 
+/* The expressible half of gva_leaf_target's precondition, as one predicate. The
+ * <==> is what makes it usable as a runtime check: an implementation that
+ * dropped a conjunct would still be implied by the requires clauses, so a
+ * one-directional contract would not catch the weakening, but <==> does.
+ */
+/*@
+  assigns \nothing;
+  ensures \result == 0 || \result == 1;
+  ensures \result != 0 <==> (0 < granule <= GVA_PT_ADDR_MASK &&
+                             ipa <= GVA_PT_ADDR_MASK);
+ */
+static inline int gva_leaf_target_args_ok(uint64_t granule, uint64_t ipa)
+{
+    return granule > 0 && granule <= GVA_PT_ADDR_MASK &&
+           ipa <= GVA_PT_ADDR_MASK;
+}
+
 /* Guest physical address and remaining-bytes-in-granule for a leaf descriptor.
  *
  * chunk is what stops the copy loops from spinning: it is at least 1 for any
@@ -107,6 +170,8 @@ static inline int gva_leaf_target(uint64_t ipa,
                                   uint64_t *gpa,
                                   uint64_t *chunk)
 {
+    GVA_CONTRACT_ASSERT(gva_leaf_target_args_ok(granule, ipa));
+
     if (ipa < base)
         return 0;
 
@@ -114,6 +179,28 @@ static inline int gva_leaf_target(uint64_t ipa,
     *gpa = (ipa - base) + offset;
     *chunk = granule - offset;
     return 1;
+}
+
+/* gva_chunk_clamp's precondition, as one predicate. All three of its clauses
+ * are expressible, so unlike gva_leaf_target this covers the whole contract.
+ *
+ * The parameter list deliberately matches gva_chunk_clamp's exactly, including
+ * limit before total. Five same-typed uint64_t parameters give no type-checking
+ * against a permuted call, so the two lists agreeing is the only thing making a
+ * swap visible by eye.
+ */
+/*@
+  assigns \nothing;
+  ensures \result == 0 || \result == 1;
+  ensures \result != 0 <==> (chunk >= 1 && gpa < region_end && total < limit);
+ */
+static inline int gva_chunk_clamp_args_ok(uint64_t chunk,
+                                          uint64_t gpa,
+                                          uint64_t region_end,
+                                          uint64_t limit,
+                                          uint64_t total)
+{
+    return chunk >= 1 && gpa < region_end && total < limit;
 }
 
 /* Bytes copyable in one step: the smallest of what the descriptor grants, what
@@ -144,6 +231,9 @@ static inline uint64_t gva_chunk_clamp(uint64_t chunk,
                                        uint64_t limit,
                                        uint64_t total)
 {
+    GVA_CONTRACT_ASSERT(
+        gva_chunk_clamp_args_ok(chunk, gpa, region_end, limit, total));
+
     if (chunk > region_end - gpa)
         chunk = region_end - gpa;
     if (chunk > limit - total)

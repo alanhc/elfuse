@@ -25,7 +25,7 @@
 #include "utils.h"
 
 #include "core/shim-globals.h"
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
 #include "syscall/sys.h"
@@ -38,6 +38,7 @@ static int cached_ngroups = -1;
 static const linux_utsname_t cached_uname = {
     .sysname = "Linux",
     .nodename = "elfuse",
+
     /* Kernel version: match the lima aarch64 VM kernel to avoid version-gated
      * feature detection mismatches in userspace.
      */
@@ -416,6 +417,7 @@ int64_t sys_sched_setparam(guest_t *g, int pid, uint64_t param_gva)
         return -LINUX_EFAULT;
     if (!proc_pid_alive(pid))
         return -LINUX_ESRCH;
+
     /* Current policy is SCHED_OTHER, so only priority 0 is valid. Any other
      * value mirrors the kernel's EINVAL for non-RT priority changes.
      */
@@ -464,6 +466,7 @@ int64_t sys_sched_rr_get_interval(guest_t *g, int pid, uint64_t ts_gva)
         return -LINUX_ESRCH;
     if (ts_gva == 0)
         return -LINUX_EFAULT;
+
     /* Linux's fair_sched_class.get_rr_interval returns a CFS-derived slice for
      * SCHED_OTHER tasks whenever the runqueue carries load. Reporting 100 ms
      * (the sched_rr_timeslice default and a typical CFS quantum) gives querying

@@ -47,7 +47,7 @@
 #include "debug/log.h"
 
 #include "runtime/thread.h"
-#include "syscall/abi.h" /* linux_user_pt_regs_t, LINUX_* errno */
+#include "syscall/linux-wire.h" /* linux_user_pt_regs_t, LINUX_* errno */
 
 /* Constants. */
 

@@ -32,16 +32,9 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
+#include "syscall/linux-limits.h"
 #include "runtime/thread.h"
-
-/* Named constants */
-
-/* Linux PATH_MAX (4096): used for path buffer sizing in syscall handlers.
- * Literal 4096 in core/guest.c and core/stack.c means actual page size, not
- * this.
- */
-#define LINUX_PATH_MAX 4096
 
 typedef int guest_fd_t;
 typedef int host_fd_t;

@@ -19,7 +19,7 @@
 
 #include "core/vdso.h"
 #include "runtime/thread.h" /* current_thread, guest_tid */
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h" /* proc_exit_group_requested, proc_get_pid */
 #include "syscall/signal.h"
@@ -45,6 +45,7 @@
  * per-thread CPU time without sampling the whole process.
  */
 #define LINUX_CPUCLOCK_PERTHREAD_MASK 4
+
 /* Linux encodes the dynamic-pid clock as ((~pid) << 3) | type. Decoding is
  * ~clockid >> 3, but >> on a signed negative value is implementation-defined.
  * The complement of a negative value (high bit set) is non-negative, so apply ~
@@ -371,6 +372,7 @@ int64_t sys_clock_nanosleep(guest_t *g,
 
     if (flags & ~TIMER_ABSTIME)
         return -LINUX_EINVAL;
+
     /* Linux's hrtimer_nanosleep_clockid validates the timespec via
      * timespec64_valid_strict() (kernel/time/hrtimer.c) before deciding whether
      * the absolute deadline has expired. Negative tv_sec is rejected with
@@ -460,8 +462,7 @@ int64_t sys_gettimeofday(guest_t *g, uint64_t tv_gva, uint64_t tz_gva)
     return 0;
 }
 
-/* Linux struct tms: four clock_t fields (long on LP64) counting USER_HZ
- * ticks.
+/* Linux struct tms: four clock_t fields (long on LP64) counting USER_HZ ticks.
  */
 typedef struct {
     int64_t tms_utime;
@@ -496,13 +497,13 @@ int64_t sys_times(guest_t *g, uint64_t buf_gva)
     /* Linux permits a NULL buffer: only the return value (elapsed ticks) is
      * wanted. cutime/cstime come from the proc-layer accumulator fed at each
      * guest-child reap, not from RUSAGE_CHILDREN: the emulator also waits on
-     * helper subprocesses (rosettad translate, sysroot tooling) whose CPU
-     * would otherwise masquerade as guest child time.
+     * helper subprocesses (rosettad translate, sysroot tooling) whose CPU would
+     * otherwise masquerade as guest child time.
      */
     if (buf_gva) {
-        /* getrusage(RUSAGE_SELF) aggregates the whole emulator process --
-         * every host thread plus page-table, syscall-servicing, and Rosetta
-         * translation overhead -- not just the guest task's own execution, so
+        /* getrusage(RUSAGE_SELF) aggregates the whole emulator process: every
+         * host thread plus page-table, syscall-servicing, and Rosetta
+         * translation overhead, not just the guest task's own execution, so
          * utime/stime over-report relative to what a real guest kernel would
          * charge. Unavoidable given this design (there is no per-guest-thread
          * host accounting to draw from instead).
@@ -545,6 +546,7 @@ int64_t sys_setitimer(guest_t *g, int which, uint64_t new_gva, uint64_t old_gva)
     if (new_gva) {
         if (guest_read_small(g, new_gva, &lnew, sizeof(lnew)) < 0)
             return -LINUX_EFAULT;
+
         /* Linux rejects tv_usec outside [0, 999999] AND negative tv_sec for
          * both value and interval. Accepting a negative tv_sec would cast
          * through (long) below and arm an expired timer instead of returning

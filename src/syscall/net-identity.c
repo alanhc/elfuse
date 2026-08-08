@@ -14,7 +14,7 @@
 #include <ifaddrs.h>
 #include <sys/socket.h>
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/net-identity.h"
 #include "utils.h"
 

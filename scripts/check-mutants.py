@@ -1,0 +1,842 @@
+#!/usr/bin/env python3
+"""Assert that each proof target actually rejects a known-broken source.
+
+"PROVED N of N" is not evidence on its own. check-wp-result.py's MIN_GOALS floor
+catches a gutted body or a dropped contract, and check-acsl-coverage.py catches a
+contracted helper left out of the proof set, but neither shows that the clauses a
+target does carry are load-bearing. Establishing that by hand, editing a body and
+watching the target fail, left nothing behind for the next contract change.
+
+Each entry below is a mutation that MUST make its target fail. The mutation is
+applied to a COPY of the source under build/mutants and the target is re-run
+against that copy through VERIFY_<TARGET>_SRC, so a mutation run never edits the
+tree. That is deliberate: doing this by hand with cp-and-restore left a mutated
+source on disk more than once during development.
+
+A mutation counts as caught only when a goal goes UNPROVED. Tripping the
+MIN_GOALS floor does not count: the floor sits at exactly the baseline count for
+every target, so removing any obligation fails it even when the code is correct,
+and scoring that as caught would credit the gate for rejecting nothing.
+
+The recipe runs check-acsl-coverage.py against SCAN, which stays the pristine
+tree rather than the mutated copy. That is the right choice, but it means the
+four entries below that mutate a contract are not coverage-checked.
+
+Scoping a run to a changed diff uses the compiler's own -MM to find each
+target's full include closure, not the hand-maintained VERIFY_*_SCAN list:
+a proved header gaining an include is exactly the kind of change nobody
+remembers to mirror into SCAN, and -MM cannot drift from the preprocessor
+that actually feeds Frama-C.
+
+Runs inherit the proof's own per-goal prover timeout, and lowering it for
+mutation runs is unsound however tempting the speedup looks. A broken contract
+does not get refuted; the goal simply becomes unprovable and the prover grinds
+until the budget expires, so "caught" is reported as a timeout. A goal that is
+merely hard but still true times out the same way. The two are indistinguishable
+by verdict, so a shorter budget silently converts a genuine MISS into a "caught"
+and hides exactly the gap this file exists to find. Proving the unmutated file
+at the shorter budget does not rescue the argument: it shows the budget suits
+correct code, not that it suits weakly-broken code. Measured, the cut was worth
+about 40 percent of the wall time; parallelism buys most of that back soundly.
+
+Mutations are (old, new) string pairs rather than patch files. A patch carries
+context lines that rot when anything nearby moves; a distinctive snippet either
+still matches or fails loudly as STALE, which is the report you want. "old" must
+appear exactly once, so a snippet that becomes ambiguous is also reported rather
+than silently mutating the wrong site.
+
+Usage:
+    check-mutants.py [--target NAME] [--list]
+"""
+
+import argparse
+import concurrent.futures
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+BUILD = ROOT / "build" / "mutants"
+# The recipe writes $(BUILD_DIR)/verify-$(NAME).log, and NAME is overridden per
+# run to keep concurrent mutations off a shared log. That path must exist first:
+# a failed redirect makes the recipe exit non-zero, which would otherwise be
+# scored as the proof rejecting the mutation.
+LOGS = ROOT / "build" / "verify-mutants"
+
+# (target, source, function, description, old, new).
+#
+# "function" names the proved function the mutation breaks; it is what the
+# coverage summary at the end counts, not decoration.
+MUTATIONS = [
+    # ---- verify-cmsg -------------------------------------------------------
+    (
+        "cmsg",
+        "src/syscall/cmsg-math.h",
+        "cmsg_entry_bounds",
+        "drop the minimum-length guard (payload length underflows)",
+        "    if (cmsg_len < CMSG_LINUX_HDR_BYTES)\n        return 0;\n",
+        "",
+    ),
+    (
+        "cmsg",
+        "src/syscall/cmsg-math.h",
+        "cmsg_entry_bounds",
+        "drop the fits-in-buffer guard (payload runs past the control buffer)",
+        "    if (cmsg_len > ctl_len - pos)\n        return 0;\n",
+        "",
+    ),
+    (
+        "cmsg",
+        "src/syscall/cmsg-math.h",
+        "cmsg_entry_bounds",
+        "align up by ALIGN rather than ALIGN-1 (overshoots by one word)",
+        "    uint64_t advance = cmsg_len + (CMSG_LINUX_ALIGN - 1);",
+        "    uint64_t advance = cmsg_len + CMSG_LINUX_ALIGN;",
+    ),
+    (
+        "cmsg",
+        "src/syscall/cmsg-math.h",
+        "cmsg_entry_bounds",
+        "drop the align-up entirely (walks to a misaligned next header)",
+        "    uint64_t advance = cmsg_len + (CMSG_LINUX_ALIGN - 1);\n"
+        "    advance -= advance % CMSG_LINUX_ALIGN;\n"
+        "    *next_pos = pos + advance;",
+        "    *next_pos = pos + cmsg_len;",
+    ),
+    # ---- verify-fuse -------------------------------------------------------
+    (
+        "fuse",
+        "src/syscall/fuse-math.h",
+        "fuse_reply_extent",
+        "drop the header-size guard (reply length underflows)",
+        "    if (hdr_len < FUSE_OUT_HDR_BYTES || hdr_len > count)",
+        "    if (hdr_len > count)",
+    ),
+    (
+        "fuse",
+        "src/syscall/fuse-math.h",
+        "fuse_reply_extent",
+        "drop the fits-the-write guard (copy runs past the frame)",
+        "    if (hdr_len < FUSE_OUT_HDR_BYTES || hdr_len > count)",
+        "    if (hdr_len < FUSE_OUT_HDR_BYTES)",
+    ),
+    (
+        "fuse",
+        "src/syscall/fuse-math.h",
+        "fuse_frame_count_ok",
+        "drop the frame ceiling (unbounded daemon allocation)",
+        "    return count >= FUSE_OUT_HDR_BYTES && count <= FUSE_FRAME_CAP;",
+        "    return count >= FUSE_OUT_HDR_BYTES;",
+    ),
+    (
+        "fuse",
+        "src/syscall/fuse-math.h",
+        "fuse_clamp_negotiated_write",
+        "make the negotiation clamp a no-op",
+        "    if (requested > FUSE_MAX_NEGOTIATED_WRITE)\n"
+        "        return FUSE_MAX_NEGOTIATED_WRITE;\n"
+        "    return requested;",
+        "    return requested;",
+    ),
+    (
+        "fuse",
+        "src/syscall/fuse-math.h",
+        "fuse_clamp_negotiated_write",
+        "remove the header slack (a legal max_write no longer leaves room)",
+        "#define FUSE_MAX_NEGOTIATED_WRITE (FUSE_FRAME_CAP - 256)",
+        "#define FUSE_MAX_NEGOTIATED_WRITE FUSE_FRAME_CAP",
+    ),
+    # ---- verify-gva --------------------------------------------------------
+    (
+        "gva",
+        "src/core/gva-math.h",
+        "gva_leaf_target_args_ok",
+        "predicate drops the granule upper bound",
+        "    return granule > 0 && granule <= GVA_PT_ADDR_MASK &&\n"
+        "           ipa <= GVA_PT_ADDR_MASK;",
+        "    return granule > 0 && ipa <= GVA_PT_ADDR_MASK;",
+    ),
+    (
+        "gva",
+        "src/core/gva-math.h",
+        "gva_leaf_target_args_ok",
+        "predicate drops the ipa bound",
+        "    return granule > 0 && granule <= GVA_PT_ADDR_MASK &&\n"
+        "           ipa <= GVA_PT_ADDR_MASK;",
+        "    return granule > 0 && granule <= GVA_PT_ADDR_MASK;",
+    ),
+    (
+        "gva",
+        "src/core/gva-math.h",
+        "gva_chunk_clamp_args_ok",
+        "predicate drops the total < limit conjunct",
+        "    return chunk >= 1 && gpa < region_end && total < limit;",
+        "    return chunk >= 1 && gpa < region_end;",
+    ),
+    (
+        "gva",
+        "src/core/gva-math.h",
+        "gva_chunk_clamp_args_ok",
+        "predicate accepts everything",
+        "    return chunk >= 1 && gpa < region_end && total < limit;",
+        "    return 1;",
+    ),
+    (
+        "gva",
+        "src/core/gva-math.h",
+        "gva_chunk_clamp",
+        "call site permutes limit and total",
+        "        gva_chunk_clamp_args_ok(chunk, gpa, region_end, limit, total));",
+        "        gva_chunk_clamp_args_ok(chunk, gpa, region_end, total, limit));",
+    ),
+    (
+        "gva",
+        "src/core/gva-math.h",
+        "gva_leaf_target",
+        "call site permutes granule and ipa",
+        "    GVA_CONTRACT_ASSERT(gva_leaf_target_args_ok(granule, ipa));",
+        "    GVA_CONTRACT_ASSERT(gva_leaf_target_args_ok(ipa, granule));",
+    ),
+    # ---- verify-stack ------------------------------------------------------
+    (
+        "stack",
+        "src/core/stack-math.h",
+        "stack_take",
+        "drop the floor check (descent leaves the stack region)",
+        "    if (bytes > *ptr - floor)\n        return 0;\n\n    *ptr -= bytes;",
+        "    *ptr -= bytes;",
+    ),
+    (
+        "stack",
+        "src/core/stack-math.h",
+        "stack_take",
+        "move before refusing (partial move on the reject path)",
+        "    if (bytes > *ptr - floor)\n        return 0;\n",
+        "    *ptr -= bytes;\n    if (bytes > *ptr - floor)\n        return 0;\n",
+    ),
+    (
+        "stack",
+        "src/core/stack-math.h",
+        "stack_align_down",
+        "round up instead of down",
+        "    return sp - sp % STACK_ALIGN;",
+        "    return sp + sp % STACK_ALIGN;",
+    ),
+    (
+        "stack",
+        "src/core/stack-math.h",
+        "stack_pushed_words",
+        "drop the alignment padding word",
+        "    return entries + entries % 2;",
+        "    return entries;",
+    ),
+    (
+        "stack",
+        "src/core/stack-math.h",
+        "stack_final_sp",
+        "drop the underflow guard (SP lands below the region)",
+        "    if (bytes > base - floor)\n        return 0;\n\n    *sp = base - bytes;",
+        "    *sp = base - bytes;",
+    ),
+    # ---- verify-sockaddr ---------------------------------------------------
+    (
+        "sockaddr",
+        "src/syscall/sockaddr-math.h",
+        "sockaddr_payload_len",
+        "drop the destination clamp (copy overruns the destination)",
+        "    if (payload > room)\n        payload = room;\n",
+        "",
+    ),
+    (
+        "sockaddr",
+        "src/syscall/sockaddr-math.h",
+        "sockaddr_len_ok",
+        "accept addresses too short to hold a family",
+        "    return len >= SOCKADDR_FAMILY_BYTES;",
+        "    return 1;",
+    ),
+    (
+        "sockaddr",
+        "src/syscall/sockaddr-math.h",
+        "sockaddr_payload_len",
+        "return no payload at all",
+        "    return payload;",
+        "    return 0;",
+    ),
+    (
+        "sockaddr",
+        "src/syscall/sockaddr-math.h",
+        "sockaddr_payload_len",
+        "drop the source-length precondition",
+        "  requires src_len >= SOCKADDR_FAMILY_BYTES;\n",
+        "",
+    ),
+    # ---- verify-netlink ----------------------------------------------------
+    (
+        "netlink",
+        "src/syscall/netlink-math.h",
+        "netlink_rta_bounds",
+        "drop the minimum-length guard (payload length underflows)",
+        "    if (rta_len < RTA_HDRLEN || rta_len > total - off)",
+        "    if (rta_len > total - off)",
+    ),
+    (
+        "netlink",
+        "src/syscall/netlink-math.h",
+        "netlink_rta_bounds",
+        "drop the fits-the-message guard (attribute runs past the message)",
+        "    if (rta_len < RTA_HDRLEN || rta_len > total - off)",
+        "    if (rta_len < RTA_HDRLEN)",
+    ),
+    (
+        "netlink",
+        "src/syscall/netlink-math.h",
+        "netlink_msg_span",
+        "drop the header-length guard (span can be shorter than a header)",
+        "    if (nlmsg_len < NLMSG_HDRLEN)\n        return 0;\n\n",
+        "",
+    ),
+    (
+        "netlink",
+        "src/syscall/netlink-math.h",
+        "netlink_align_up",
+        "round down instead of up (the walk stops advancing)",
+        "    uint64_t padded = len + (NETLINK_ALIGNTO - 1);",
+        "    uint64_t padded = len;",
+    ),
+    # ---- verify-sigframe ---------------------------------------------------
+    (
+        "sigframe",
+        "src/syscall/sigframe-math.h",
+        "sigframe_base",
+        "drop the underflow guard (frame base wraps to a huge address)",
+        "    if (frame_bytes > sp)\n        return 0;\n",
+        "",
+    ),
+    (
+        "sigframe",
+        "src/syscall/sigframe-math.h",
+        "sigframe_base",
+        "drop the floor check (frame lands below the alternate stack)",
+        "    if (candidate < floor)\n        return 0;\n",
+        "",
+    ),
+    (
+        "sigframe",
+        "src/syscall/sigframe-math.h",
+        "sigframe_base",
+        "skip the align-down (handler runs on a misaligned stack)",
+        "    candidate -= candidate % SIGFRAME_ALIGN;\n",
+        "",
+    ),
+    (
+        "sigframe",
+        "src/syscall/sigframe-math.h",
+        "sigframe_base",
+        "refuse a frame that exactly reaches the floor (off-by-one rejection)",
+        "    if (candidate < floor)",
+        "    if (candidate <= floor)",
+    ),
+    (
+        "sigframe",
+        "src/syscall/sigframe-math.h",
+        "sigframe_base",
+        "place the frame one aligned slot lower than it must be",
+        "    *base = candidate;",
+        "    *base = candidate - floor >= SIGFRAME_ALIGN ? candidate - SIGFRAME_ALIGN\n                                                  : candidate;",
+    ),
+    (
+        "sigframe",
+        "src/syscall/sigframe-math.h",
+        "sigframe_base",
+        "place the frame at the floor rather than below sp",
+        "    *base = candidate;",
+        "    *base = floor - floor % SIGFRAME_ALIGN;",
+    ),
+    # ---- verify-elf --------------------------------------------------------
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_phdr_fetch",
+        "drop the tail bound (reads a header past the end of the table)",
+        "    if (off > buflen || buflen - off < sizeof(*out))",
+        "    if (off > buflen)",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_segment_extent",
+        "drop the guest_size clamp (segment maps outside the slab)",
+        "    if (memsz > guest_size || gpa > guest_size - memsz)",
+        "    if (memsz > guest_size)",
+    ),
+    # ---- verify-rsp --------------------------------------------------------
+    #
+    # hex_nibble lives in src/utils.h, which verify-rsp includes rather than
+    # analyzes, so the historical "gut hex_nibble" mutation cannot be expressed
+    # here: this harness mutates a target's own source. Mutating an included
+    # header would need the copy to shadow the original ahead of -Isrc on the
+    # include path, which the shared recipe has no hook for.
+    (
+        "rsp",
+        "src/debug/gdbstub-rsp.c",
+        "gdb_hex_pair",
+        "drop the low-nibble validation",
+        "    int l = hex_nibble((unsigned char) lo);\n    if (l < 0)\n        return 0;\n",
+        "    int l = hex_nibble((unsigned char) lo);\n",
+    ),
+    (
+        "rsp",
+        "src/debug/gdbstub-rsp.c",
+        "gdb_hex_decode",
+        "drop the high-digit check (low digit read before rejecting)",
+        "        int hi = hex_nibble((unsigned char) src[i * 2]);\n"
+        "        if (hi < 0)\n            return -1;\n",
+        "        int hi = hex_nibble((unsigned char) src[i * 2]);\n",
+    ),
+    (
+        "rsp",
+        "src/debug/gdbstub-rsp.c",
+        "gdb_hex_decode",
+        "off-by-one on the low digit (reads past the pair)",
+        "        int lo = hex_nibble((unsigned char) src[i * 2 + 1]);",
+        "        int lo = hex_nibble((unsigned char) src[i * 2 + 2]);",
+    ),
+    (
+        "rsp",
+        "src/debug/gdbstub-rsp.c",
+        "rsp_checksum",
+        "read the plain char without the unsigned cast",
+        "        sum += (uint8_t) data[i];",
+        "        sum += (unsigned int) data[i];",
+    ),
+]
+
+
+def analysis_mk():
+    """mk/analysis.mk with make line continuations joined."""
+    return re.sub(r"\\\n", " ", (ROOT / "mk" / "analysis.mk").read_text())
+
+
+# Changing any of these can change a verdict for every target, so a run that
+# sees one move must not skip anything. mk/toolchain.mk sets CC, which
+# check-char-signedness.py compiles with, and the top-level Makefile is what
+# pulls in both it and mk/analysis.mk to build the "make verify-<target>" a
+# mutation is judged by; the individual VERIFY_*_SRC/_SCAN/
+# _FCTS lines in mk/analysis.mk are covered separately by target_inputs()
+# below, but everything else in that file (the shared recipe, MIN_GOALS,
+# FRAMAC_TIMEOUT) is not, so the whole file still belongs here.
+#
+# .github/workflows/main.yml belongs here for the same reason even though it
+# never touches a proof: it is what decides, per CI matrix leg, which target
+# --target names and whether --changed-since runs at all. A change there
+# that breaks the invocation (a mistyped target, a dropped matrix entry, a
+# MUTANT_TARGET that stops reaching the script) would otherwise verify
+# against whatever proof sources the same PR happens to touch, which is
+# nothing when the PR only edits CI. --target already narrows a full-set
+# fallback to one shard's own mutations (see the --changed-since block
+# below), so this costs each of the nine shards its own subset, not all 40
+# apiece.
+HARNESS_FILES = {
+    "scripts/check-mutants.py",
+    "scripts/check-wp-result.py",
+    "scripts/check-acsl-coverage.py",
+    "scripts/check-char-signedness.py",
+    "mk/analysis.mk",
+    "mk/toolchain.mk",
+    "Makefile",
+    ".github/workflows/main.yml",
+}
+
+
+def include_closure(cc, src, workdir):
+    """Files @src pulls in transitively, per the compiler, not per SCAN.
+
+    VERIFY_<T>_SCAN is a hand-maintained guess at this, kept in step by
+    whoever adds a header, which is exactly the kind of thing that goes stale
+    silently: a proved header gains an include, nobody updates SCAN, and a
+    mutation touching only the new file is skipped without a diagnostic. -MM
+    asks the same preprocessor that stands between the source and the proof,
+    so the two cannot drift apart from each other.
+
+    Returns None, not a partial answer, when the scan itself cannot be
+    trusted. {src} alone would be a silent narrowing indistinguishable from a
+    correct closure with no includes, which is exactly the failure mode this
+    function exists to close for SCAN; failing quietly here would just move
+    the bug rather than fix it. The caller treats None as grounds to run the
+    full mutation set, same as an unresolvable --changed-since ref.
+    """
+    out = workdir / "closure.d"
+    try:
+        proc = subprocess.run(
+            cc
+            + [
+                "-I",
+                str(ROOT / "src"),
+                "-I",
+                str(ROOT / "build"),
+                "-MM",
+                "-MG",
+                "-MF",
+                str(out),
+                str(ROOT / src),
+            ],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        # cc itself does not exist or is not executable. A more certain
+        # "cannot trust this scan" signal than a non-zero exit, and it must
+        # fail the same way: return None rather than let the exception
+        # propagate and crash the whole run instead of falling back.
+        return None
+    if proc.returncode != 0 or not out.exists():
+        return None
+    text = out.read_text().replace("\\\n", " ")
+    if ":" not in text:
+        # Malformed -MM output. Same reasoning as a non-zero exit: an empty
+        # dependency list here would look identical to "genuinely no
+        # includes", so it cannot be told apart from data and must not be
+        # trusted as one.
+        return None
+    deps = text.split(":", 1)[1].split()
+    rooted = set()
+    for dep in deps:
+        p = pathlib.Path(dep)
+        rooted.add(str(p.relative_to(ROOT)) if p.is_absolute() else dep)
+    rooted.add(src)
+    return rooted
+
+
+def target_inputs(cc):
+    """{target: {files whose change can alter that target's verdict}} from the
+    compiler's own view of what each proved source includes, or None if any
+    target's closure could not be trusted.
+
+    Returning None for the whole map rather than {src} for the one broken
+    target is deliberate: a caller that gets a partial map back has no way to
+    know which entries are real and which are silently degraded, so the only
+    honest signal is "scope is unknown, verify everything."
+    """
+    out = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        workdir = pathlib.Path(tmp)
+        for target, src in target_sources().items():
+            closure = include_closure(cc, src, workdir)
+            if closure is None:
+                return None
+            out[target] = closure
+    return out
+
+
+def target_sources():
+    """VERIFY_<T>_SRC for every target, as {target: path}."""
+    return {
+        m.group(1).lower(): m.group(2)
+        for m in re.finditer(
+            r"^VERIFY_([A-Z]+)_SRC\s*:=\s*(\S+)", analysis_mk(), re.MULTILINE
+        )
+    }
+
+
+def proved_functions():
+    """Every function named in a VERIFY_*_FCTS list, as {target: [names]}."""
+    text = analysis_mk()
+    shared = re.search(r"^VERIFY_UTILS_FCTS\s*:=\s*(.*)$", text, re.MULTILINE)
+    utils = shared.group(1) if shared else ""
+    out = {}
+    for m in re.finditer(r"^VERIFY_([A-Z]+)_FCTS\s*:=\s*(.*)$", text, re.MULTILINE):
+        name = m.group(1).lower()
+        if name == "utils":
+            continue
+        fcts = m.group(2).replace("$(VERIFY_UTILS_FCTS)", utils)
+        out[name] = [f for f in fcts.split() if not f.startswith("$")]
+    return out
+
+
+# check-wp-result.py's vocabulary for a run that produced no usable verdict, as
+# opposed to one where the prover genuinely could not discharge a goal. These
+# mean the harness broke, not that the proof rejected the mutation.
+INFRA_MARKERS = (
+    "frama-c rejected the input",  # User Error: the mutant does not parse
+    "its own summary is not trusted",  # frama-c crashed
+    "emitted no result",  # frama-c never ran
+)
+
+
+def run_target(target, source_copy, name):
+    """Run verify-<target> against @source_copy. Returns (ok, output)."""
+    var = f"VERIFY_{target.upper()}_SRC"
+    proc = subprocess.run(
+        ["make", f"verify-{target}", f"{var}={source_copy}", f"NAME={name}"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return proc.returncode == 0, proc.stdout
+
+
+def check_baseline(target, src):
+    """An UNMUTATED copy must still prove through the same path.
+
+    Without this control every infrastructure failure (a bad make override, a
+    log path that cannot be written, a missing include) makes the target exit
+    non-zero and reads as "the mutation was caught". That is not hypothetical:
+    an earlier version of this script wrote its logs to a directory that did not
+    exist, and reported all 27 mutations caught while proving nothing at all.
+    """
+    work = BUILD / f"baseline-{target}"
+    work.mkdir(parents=True, exist_ok=True)
+    copy = work / pathlib.Path(src).name
+    copy.write_text((ROOT / src).read_text())
+    ok, _out = run_target(target, copy, f"mutants/baseline-{target}")
+    return ok
+
+
+def run_mutation(idx, mutation):
+    """Apply one mutation to a copy and return (status, detail)."""
+    target, src, _function, _desc, old, new = mutation
+    original = (ROOT / src).read_text()
+    hits = original.count(old)
+    if hits != 1:
+        return "STALE", f"snippet appears {hits} times, expected exactly 1"
+
+    work = BUILD / f"{idx:02d}-{target}"
+    work.mkdir(parents=True, exist_ok=True)
+    copy = work / pathlib.Path(src).name
+    copy.write_text(original.replace(old, new, 1))
+
+    # NAME picks the log path, so each mutation gets its own. Concurrent
+    # mutations of one target would otherwise clobber a shared log, and a
+    # clobbered log makes the target FAIL, which reads as "caught".
+    ok, out = run_target(target, copy, f"mutants/{target}-mut{idx:02d}")
+    if ok:
+        return "MISSED", "the target still passed"
+
+    # A non-zero exit is not evidence on its own. It is equally what a crashed
+    # prover, an unparsable mutant, or a broken override produces, and scoring
+    # those as "caught" is how a harness reports success while checking nothing.
+    # Require the verdict to name a reason the gate is supposed to give.
+    for marker in INFRA_MARKERS:
+        if marker in out:
+            return "INFRA", f"target failed without a verdict ({marker})"
+    # Proof-level rejection means a goal went unproved. Tripping the MIN_GOALS
+    # floor is NOT that: the floor sits at exactly the baseline count for every
+    # target, so removing any obligation fails it even when the code is correct
+    # and every remaining goal still proves. Deleting a documented-redundant
+    # ensures clause does exactly that, which would score as "caught" while
+    # nothing was rejected.
+    if "open: " in out:
+        return "caught", ""
+    if "obligations generated" in out:
+        return "FLOOR", "only the MIN_GOALS floor fired; no goal went unproved"
+    return "INFRA", "target failed but printed no recognizable verdict"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--target", help="run only mutations for this target")
+    ap.add_argument(
+        "--list", action="store_true", help="list mutations without running them"
+    )
+    # Each mutation is an independent Frama-C run against its own copy, so they
+    # parallelize cleanly. Serial, the full set runs longer than the whole rest
+    # of "make verify", which is how a gate stops being run.
+    # Scope to what a change could actually have broken. A mutation only tests
+    # its own target's source, so on a branch that does not touch that source
+    # the verdict is whatever it already was on the base. The full set still
+    # runs wherever the base is built, which is where the guarantee lives; this
+    # only keeps a per-PR run proportional to the diff.
+    ap.add_argument(
+        "--changed-since",
+        metavar="REF",
+        help="only run mutations whose target source differs from REF",
+    )
+    ap.add_argument(
+        "--jobs",
+        type=int,
+        default=max(1, os.cpu_count() or 2),
+        help="mutations to run concurrently (default: one per core)",
+    )
+    # Only used to compute --changed-since's include closure; the mutation
+    # runs themselves go through "make", which resolves CC on its own. Split
+    # rather than exec directly, since CC is routinely a wrapper or carries
+    # flags ("ccache clang", "cc -DTEST").
+    ap.add_argument(
+        "--cc", default="cc", help="compiler for --changed-since's include scan"
+    )
+    args = ap.parse_args()
+    cc = shlex.split(args.cc) or ["cc"]
+
+    # ThreadPoolExecutor raises on max_workers < 1, which would surface as a
+    # traceback after the argument was already accepted. Reject it here.
+    if args.jobs < 1:
+        print(f"--jobs must be at least 1, got {args.jobs}", file=sys.stderr)
+        return 2
+
+    # Number by position in MUTATIONS, not in the filtered list, so a mutation
+    # keeps the same log name whether or not --target was used.
+    numbered = list(enumerate(MUTATIONS, 1))
+    selected_pairs = [
+        (i, m) for i, m in numbered if not args.target or m[0] == args.target
+    ]
+    selected = [m for _i, m in selected_pairs]
+
+    if args.changed_since:
+        # Two dots, not three. Three-dot asks git for the merge base, which a
+        # CI shallow clone does not have, and this only ever wanted "which
+        # proved sources differ between these two trees" anyway.
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", args.changed_since, "HEAD"],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if diff.returncode != 0:
+            # Run everything instead of stopping. Scoping is an optimization,
+            # so when it cannot tell what is safe to skip the answer is to do
+            # all of it. Failing the gate here, or skipping silently, both turn
+            # a speed-up into a correctness problem.
+            detail = diff.stderr.strip().splitlines()
+            print(
+                f"  cannot diff against {args.changed_since}, running the full "
+                f"set ({detail[0] if detail else 'no detail'})"
+            )
+        else:
+            touched = set(diff.stdout.split())
+            if touched & HARNESS_FILES:
+                print("  harness or proof config changed; running the full set")
+                touched = None
+            else:
+                inputs = target_inputs(cc)
+                if inputs is None:
+                    # The compiler's include scan itself is what could not be
+                    # trusted, not the diff. Same rule as everywhere else in
+                    # this block: an unknown scope means verify everything.
+                    print(
+                        "  cannot determine proof-input closures, running the "
+                        "full set"
+                    )
+                    touched = None
+                else:
+                    kept = [
+                        (i, m)
+                        for i, m in selected_pairs
+                        if inputs.get(m[0], {m[1]}) & touched
+                    ]
+            skipped = 0 if touched is None else len(selected_pairs) - len(kept)
+            if touched is not None and skipped:
+                print(
+                    f"  skipping {skipped} mutation(s): target source unchanged "
+                    f"since {args.changed_since}"
+                )
+            if touched is not None:
+                selected_pairs, selected = kept, [m for _i, m in kept]
+            if not selected:
+                print("  no proved source changed; nothing to re-verify")
+                return 0
+    if not selected:
+        print(f"no mutations for target {args.target!r}", file=sys.stderr)
+        return 2
+
+    if args.list:
+        for target, _src, function, desc, _old, _new in selected:
+            print(f"  verify-{target:<9} {function:<28} {desc}")
+        return 0
+
+    # A mutation must name its target's own source. Naming an included header
+    # instead silently analyzes the wrong file: the run still produces a
+    # verdict, and the verdict means nothing.
+    sources = target_sources()
+    misdirected = {
+        f"verify-{target}: mutates {src}, but VERIFY_{target.upper()}_SRC is "
+        f"{sources.get(target, '<unknown>')}"
+        for target, src, *_rest in selected
+        if sources.get(target) != src
+    }
+    if misdirected:
+        print(
+            "  mutations naming a file their target does not analyze:", file=sys.stderr
+        )
+        for line in sorted(misdirected):
+            print(f"    {line}", file=sys.stderr)
+        return 2
+
+    shutil.rmtree(BUILD, ignore_errors=True)
+    # Clear the logs too, not just the copies: CI uploads this directory as the
+    # artifact a human reads to see WHY something was caught, and a survivor
+    # from an earlier run is indistinguishable from this run's output.
+    shutil.rmtree(LOGS, ignore_errors=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
+
+    # Control first, and through the same executor the mutations use: a false
+    # "caught" caused by concurrency would otherwise slip past a serial
+    # baseline.
+    targets = sorted({m[0] for m in selected})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        oks = list(pool.map(check_baseline, targets, [sources[t] for t in targets]))
+    broken = [t for t, ok in zip(targets, oks) if not ok]
+    if broken:
+        print(
+            "  SETUP FAILED: unmutated sources do not prove for: "
+            + ", ".join(f"verify-{t}" for t in broken),
+            file=sys.stderr,
+        )
+        print(
+            "  Mutation results would be meaningless; fix the harness first.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # map hands back results in table order however the mutations interleave,
+    # so a run stays diffable against the previous one.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        results = list(
+            pool.map(run_mutation, [i for i, _m in selected_pairs], selected)
+        )
+
+    failures = []
+    for mutation, (status, detail) in zip(selected, results):
+        target, _src, function, desc = mutation[:4]
+        suffix = f"  ({detail})" if detail else ""
+        print(f"  {status:<7} verify-{target:<9} {function:<28} {desc}{suffix}")
+        if status != "caught":
+            failures.append((target, function, desc, status, detail))
+
+    # Coverage: which proved functions have no mutation at all. Reported rather
+    # than enforced, so the gap is visible instead of assumed closed.
+    covered = {(m[0], m[2]) for m in MUTATIONS}
+    uncovered = [
+        f"verify-{target}:{function}"
+        for target, fcts in sorted(proved_functions().items())
+        for function in sorted(set(fcts))
+        if (target, function) not in covered
+    ]
+
+    print(f"\n  {len(selected)} mutations, {len(selected) - len(failures)} caught")
+    if uncovered:
+        print(f"  {len(uncovered)} proved function(s) with no mutation yet:")
+        for name in uncovered:
+            print(f"    {name}")
+
+    if failures:
+        print("\n  NOT CAUGHT:", file=sys.stderr)
+        for target, function, desc, status, detail in failures:
+            print(
+                f"    verify-{target} {function}: {desc} [{status}] {detail}",
+                file=sys.stderr,
+            )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -24,7 +24,7 @@
 
 #include "core/shim-globals.h"
 #include "runtime/procemu.h"
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
 #include "syscall/internal.h"
 #include "syscall/poll.h"
@@ -117,6 +117,7 @@ static inline void fd_init_entry(int fd,
     fd_table[fd].dir = NULL;
     fd_table[fd].proc_path[0] = '\0';
     fd_table[fd].seals = 0;
+
     /* Cache whether a host read/write can block so the fast-path and slow-path
      * readers can decide whether to divert into the interruptible wait without
      * re-stating on every call. Only regular-file and stdio slots pay an fstat
@@ -127,6 +128,7 @@ static inline void fd_init_entry(int fd,
     fd_table[fd].fasync_owner = 0;
     sock_opt_clear(&fd_table[fd]);
     fd_table[fd].cleanup = cleanup;
+
     /* Start conservative. Callers that set linux_flags after allocation
      * republish the readable-urandom state once the access mode is known.
      */
@@ -210,6 +212,7 @@ void fdtable_init(void)
                                 .host_fd = STDERR_FILENO,
                                 .ofd_id = fd_next_ofd_id++,
                                 .generation = fd_next_generation++};
+
     /* The compound literals above zero can_block; recover the real value so a
      * terminal stdin still routes reads through the interruptible wait.
      */
@@ -341,6 +344,7 @@ int fd_alloc_from(int minfd,
 {
     pthread_mutex_lock(&fd_lock);
     int fd = fd_alloc_locked(minfd, type, host_fd, cleanup);
+
     /* Capture the freshly-stamped generation inside the allocating critical
      * section. Callers (dup) later revalidate it under fd_lock to prove the
      * slot still holds this allocation and was not closed+reopened in the
@@ -360,6 +364,7 @@ int fd_alloc_from_relaxed(int minfd,
 {
     if (!thread_is_single_active())
         return fd_alloc_from(minfd, type, host_fd, cleanup, out_gen);
+
     /* Single active thread: no sibling can race the slot, so the unlocked
      * generation read is safe.
      */
@@ -428,6 +433,7 @@ int fd_alloc_at(int fd,
     pthread_mutex_lock(&fd_lock);
     if (fd_table[fd].type != FD_CLOSED) {
         old = fd_table[fd];
+
         /* dup2/dup3 over an open slot retires the old open file description at
          * this fd number without routing through fd_mark_closed_unlocked, so
          * clear its epoll registrations here too (see epoll_note_fd_closed).
@@ -713,8 +719,8 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
      */
     proc_pty_close_keepalive(snap->host_fd);
 
-    /* Mirror for the slave side: the master reports a hangup once the guest
-     * has closed every slave it held, which only this accounting can see --
+    /* Mirror for the slave side: the master reports a hangup once the guest has
+     * closed every slave it held, which only this accounting can see --
      * elfuse's own keepalive slave stays open. No-op for other fds.
      */
     proc_pty_slave_fd_closed(snap->host_fd);

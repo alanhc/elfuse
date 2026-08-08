@@ -37,7 +37,7 @@
 #include "runtime/fork-state.h"
 #include "runtime/futex.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
 #include "syscall/internal.h"
 #include "syscall/mem.h"

@@ -6,7 +6,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Declarations for brk, mmap, munmap, mprotect, mremap, madvise, msync. All
- * sys_xxx functions assume mmap_lock is held by the caller.
+ * sys_xxx functions assume mmap_lock is held by the caller, except sys_msync,
+ * which is dispatched unlocked (SC_FORWARD, not SC_LOCKED) and manages
+ * mmap_lock itself so it can defer fsync(2) until after releasing it.
  */
 
 #pragma once

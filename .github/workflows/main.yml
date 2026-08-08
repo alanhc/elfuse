@@ -6,6 +6,9 @@
 #   tidy-macos    : clang-tidy via `make lint`
 #   verify        : Frama-C WP proofs of the attacker-facing arithmetic via
 #                   `make verify`; gating, not advisory
+#   verify-mutants: shows each proof rejects a known-broken source, one job
+#                   per proof target so the 40-mutation set runs as nine
+#                   parallel shards instead of one long serial job
 #   scan-macos    : LLVM scan-build via `make analyze`
 #   infer-macos   : Facebook Infer capture + analyze over the full build
 #   runtime-macos : HVF runtime tests on self-hosted Apple Silicon,
@@ -113,6 +116,15 @@ jobs:
         # writing to a throwaway path is enough to exercise validate_wrappers().
         if: ${{ !cancelled() }}
         run: python3 scripts/gen-syscall-dispatch.py --output "$RUNNER_TEMP/dispatch.h"
+
+      - name: Mutation matrix consistency
+        # verify-mutants (the Frama-C job below) hand-lists the same proof
+        # targets mk/analysis.mk defines, sharded one job per target. A
+        # target present in one but not the other silently drops that
+        # target's mutation coverage from CI with no error, so catch the
+        # drift here instead.
+        if: ${{ !cancelled() }}
+        run: python3 scripts/check-mutant-matrix-sync.py
 
   # Build verification on macOS Apple Silicon (no HVF runtime tests).
   # Hosted runners don't expose Hypervisor.framework, so this job stops at
@@ -311,6 +323,159 @@ jobs:
           name: verify-logs
           path: build/verify-*.log
           if-no-files-found: warn
+
+  # Shows each Frama-C proof target rejects a known-broken source. Split from
+  # the "verify" job (needs: verify, so a broken proof fails fast without
+  # spending nine runners on mutating it) and sharded one job per proof
+  # target: a caught mutation grinds against every unprovable goal until
+  # FRAMAC_TIMEOUT, so the 40-mutation set run as one job is minutes where
+  # "make verify" is seconds. Sharding trades that for nine runners in
+  # parallel, each bounded by its own target's mutation count instead of the
+  # whole set's.
+  #
+  # The matrix list is VERIFY_<T>_SRC's targets from mk/analysis.mk, hand-kept
+  # in step: a target missing here silently drops its mutation coverage from
+  # CI with no error, so add new proof targets to both places.
+  verify-mutants:
+    name: Mutation gate (${{ matrix.target }})
+    needs: verify
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - cmsg
+          - elf
+          - fuse
+          - gva
+          - netlink
+          - rsp
+          - sigframe
+          - sockaddr
+          - stack
+    env:
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      BREW_PKGS: opam gmp pkg-config graphviz llvm@17 zlib
+      OPAMCONFIRMLEVEL: unsafe-yes
+      # Deliberately far below the verify job's 120, and the single biggest
+      # term in this job's runtime. A mutation is caught by leaving a goal
+      # open, and an open goal is one both provers spend the whole timeout
+      # failing to discharge, so every caught mutation costs two full
+      # timeouts per goal. The verify job wants headroom because one
+      # [Timeout] there is a false proof regression; here the pressure runs
+      # the other way.
+      #
+      # Cutting it does not weaken the verdict, because check-mutants.py
+      # proves an UNMUTATED copy of each source through this same path
+      # first (check_baseline). A value too tight to prove real code fails
+      # that control loudly instead of silently scoring mutations as caught.
+      # The margin is wide: all nine targets together discharge 392
+      # obligations in 31s locally, the slowest single target in 9s.
+      FRAMAC_TIMEOUT: 45
+      FRAMAC_VERSION: "31.0"
+      ALT_ERGO_VERSION: 2.6.3
+      Z3_VERSION: 4.16.0
+      OPAMROOT: ${{ github.workspace }}/.opam
+      OPAM_SWITCH: frama-c-elfuse
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
+
+      - name: Install Homebrew packages
+        # shellcheck disable=SC2086 -- BREW_PKGS is a space-separated list.
+        run: |
+          set -euo pipefail
+          brew install --quiet $BREW_PKGS
+
+      # Same cache key as the verify job's opam switch, so this restores the
+      # switch that job already built instead of rebuilding it nine times.
+      - name: Cache opam switch
+        id: opam-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.OPAMROOT }}
+          key: opam-${{ runner.os }}-${{ runner.arch }}-frama-c${{ env.FRAMAC_VERSION }}-ae${{ env.ALT_ERGO_VERSION }}-z3${{ env.Z3_VERSION }}
+
+      - name: Install Frama-C, Alt-Ergo, Z3
+        if: steps.opam-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          opam init -y --bare --disable-sandboxing
+          opam switch create "$OPAM_SWITCH" 4.14.1
+          eval "$(opam env --switch="$OPAM_SWITCH")"
+          opam install -y \
+            frama-c.$FRAMAC_VERSION \
+            alt-ergo.$ALT_ERGO_VERSION \
+            z3.$Z3_VERSION
+
+      - name: Prove the gate bites (make verify-mutants)
+        # why3 config detect is required here too: it writes ~/.why3.conf,
+        # which lives outside OPAMROOT and so is absent on a cache hit even
+        # though the verify job already ran this once on its own runner.
+        #
+        # MUTANT_JOBS is set explicitly for the same reason as before
+        # sharding: this runner has few enough cores that the script's
+        # one-per-core default lands near serial.
+        run: |
+          set -euo pipefail
+          eval "$(opam env --switch="$OPAM_SWITCH")"
+          why3 config detect
+          # On a pull request, re-verify only the targets whose source the
+          # branch actually touches; a target it does not touch has the verdict
+          # the base already established. A push to the base runs the full set,
+          # so the guarantee is never weaker than the branch it merges into.
+          # The checkout is shallow, so the base commit has to be fetched
+          # before it can be diffed against. If that does not work the script
+          # says so and runs the full set, which is the safe direction for an
+          # optimization.
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -n "$base" ] && git fetch --no-tags --depth=1 origin "$base"; then
+            make verify-mutants MUTANT_JOBS=4 MUTANT_TARGET=${{ matrix.target }} MUTANT_SINCE="$base"
+          else
+            make verify-mutants MUTANT_JOBS=4 MUTANT_TARGET=${{ matrix.target }}
+          fi
+
+      - name: Upload prover log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verify-mutants-logs-${{ matrix.target }}
+          path: build/verify-mutants/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  # One stable check name covering the whole mutation matrix, so branch
+  # protection has something to require. The matrix leg names carry the target
+  # in them ("Mutation gate (fuse)"), which means every added proof target
+  # would otherwise need its own branch-protection entry, and a target added
+  # without that entry would be unenforced from the day it landed.
+  #
+  # needs.<matrix job>.result is the aggregate over all legs, so this passes
+  # only when every one of them did. if: always() is what makes it run at all
+  # when a leg fails; without it this job would be skipped, and a skipped
+  # required check does not block a merge. A skipped matrix (verify failed
+  # upstream) reports "skipped" here too, which the equality test rejects.
+  verify-mutants-gate:
+    name: Mutation gate
+    needs: verify-mutants
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix leg to have passed
+        run: |
+          set -euo pipefail
+          result='${{ needs.verify-mutants.result }}'
+          echo "mutation matrix: $result"
+          [ "$result" = success ] || exit 1
 
   # LLVM scan-build via `make analyze`. Runs in parallel with build/tidy.
   # Advisory: scan-build's Make target does not pass --status-bugs, so

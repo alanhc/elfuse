@@ -13,7 +13,7 @@
 #include "hvutil.h"
 
 #include "core/guest.h"
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/signal.h"
 
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
@@ -57,6 +57,7 @@ typedef struct {
     uint64_t rosetta_entry;
     uint64_t kbuf_gpa;
     uint64_t ttbr1;
+
     /* Clone TID-sync state for the fork path. glibc's fork wrapper passes
      * CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID so the child writes its new TID
      * into the TCB and clears it on exit. The posix_spawn child has no access
@@ -66,6 +67,7 @@ typedef struct {
      */
     uint64_t clone_flags;
     uint64_t ctid_gva;
+
     /* Nonzero when the shm fd sent below is an independent fclonefileat clone
      * (not the parent's live fd). Only then may the child map it MAP_SHARED and
      * retain it for its own nested CoW fork; the live-fd fallback must stay
@@ -73,8 +75,9 @@ typedef struct {
      */
     uint32_t shm_is_clone;
     uint32_t _pad2;
-    /* Guest-visible NOFILE state is separate from the host capacity reserved
-     * by elfuse. The child restores this after installing inherited FDs so
+
+    /* Guest-visible NOFILE state is separate from the host capacity reserved by
+     * elfuse. The child restores this after installing inherited FDs so
      * descriptors above a subsequently lowered soft limit survive fork.
      */
     uint64_t nofile_cur;
@@ -85,6 +88,7 @@ typedef struct {
     uint64_t elr_el1, sp_el0;
     uint64_t spsr_el1, vbar_el1;
     uint64_t ttbr0_el1;
+
     /* TTBR1_EL1 is zero for aarch64 guests and carries the rosetta kbuf
      * page-table root for is_rosetta guests. The parent captures the live
      * sysreg so a forked child resumes with the same TTBR1 the parent had after

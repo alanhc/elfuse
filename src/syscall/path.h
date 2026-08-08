@@ -24,12 +24,22 @@ typedef enum {
     PATH_TR_CREATE_PARENTS = 1u << 2,
 } path_translate_flags_t;
 
+/* AT_SYMLINK_NOFOLLOW, already extracted by the caller as a plain int/bool,
+ * translated to the matching PATH_TR flag. Callers pass either a raw "flags &
+ * LINUX_AT_SYMLINK_NOFOLLOW" or an already-named nofollow bool.
+ */
+static inline path_translate_flags_t path_tr_nofollow(int nofollow)
+{
+    return nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE;
+}
+
 typedef struct {
     const char *guest_path;
     const char *intercept_path;
     const char *host_path;
     int proc_resolved;
     bool fuse_path;
+
     /* Path was rewritten into the /dev/shm host backing dir. Follow-capable
      * callers must force nofollow; see dev_shm_resolve_path() in procemu.c.
      */
@@ -65,9 +75,11 @@ static inline int path_translation_at_flags(const path_translation_t *tx,
 bool path_prefix_match(const char *path, const char *prefix, size_t plen);
 
 /* Advance *pathp to the next '/'-separated component, skipping empty segments
- * from repeated slashes. Returns true with the component (not NUL-terminated)
- * reported through comp and len, leaving *pathp at its end; returns false once
- * only slashes or the terminating NUL remain.
+ * from repeated slashes.
+ *
+ * Returns true with the component (not NUL-terminated) reported through comp
+ * and len, leaving *pathp at its end; returns false once only slashes or the
+ * terminating NUL remain.
  *
  * Inline beside path_component_copy, its usual companion, so a leaf module can
  * walk a path without linking the rest of the translation layer.
@@ -94,10 +106,12 @@ static inline bool path_next_component(const char **pathp,
 }
 
 /* Copy a counted component (not NUL-terminated, as path_next_component reports)
- * into dst and NUL-terminate it. Returns 0, or -1 with errno set to
- * ENAMETOOLONG when the component does not fit. dst is typically a NAME_MAX+1
- * buffer, so this also unifies the "len > NAME_MAX" and "len >= sizeof(dst)"
- * bound checks the callers used to spell inconsistently.
+ * into dst and NUL-terminate it.
+ *
+ * Returns 0, or -1 with errno set to ENAMETOOLONG when the component does not
+ * fit. dst is typically a NAME_MAX+1 buffer, so this also unifies the "len >
+ * NAME_MAX" and "len >= sizeof(dst)" bound checks the callers used to spell
+ * inconsistently.
  */
 static inline int path_component_copy(char *dst,
                                       size_t dstsz,
@@ -120,6 +134,7 @@ int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,
                       path_translation_t *tx);
+
 /* Longest symlink chain a resolution may follow before reporting ELOOP, as
  * Linux does (include/linux/namei.h). Shared so the path layer and the sysroot
  * resolvers cannot disagree about when a chain has gone on too long.
@@ -155,10 +170,10 @@ int path_host_to_guest(const char *host_path, char *out, size_t outsz);
 /* True when the directory behind @host_dirfd is one whose entries elfuse may
  * have stored escaped: a folding sysroot is configured and the directory's
  * canonical host path lies under it. One answer per directory read, not per
- * entry: the answer is a property of the directory, and F_GETPATH is a
- * syscall. When the fd's path cannot be read the answer is false: decoding is
- * a claim that elfuse wrote the name, so it needs the directory proven inside
- * the sysroot, or a foreign escape-shaped entry decodes into a phantom name no
+ * entry: the answer is a property of the directory, and F_GETPATH is a syscall.
+ * When the fd's path cannot be read the answer is false: decoding is a claim
+ * that elfuse wrote the name, so it needs the directory proven inside the
+ * sysroot, or a foreign escape-shaped entry decodes into a phantom name no
  * lookup can resolve. The directory-unlinked-while-open failure lists nothing
  * either way, and the residual cost of failing closed, a live in-sysroot
  * directory that lost its path showing stored spellings, at least shows names
@@ -169,9 +184,9 @@ bool path_dirent_dir_holds_escapes(host_fd_t host_dirfd);
 /* Decode one on-disk entry name to the guest-visible spelling.
  * @dir_holds_escapes is the caller's per-directory answer from
  * path_dirent_dir_holds_escapes(); when false every name means itself.
- * Returns 0, or -1 with errno set: ENAMETOOLONG for a host name no guest
- * dirent or event buffer could carry, which is the one failure a caller with
- * real arguments sees; a missing argument is EINVAL.
+ * Returns 0, or -1 with errno set: ENAMETOOLONG for a host name no guest dirent
+ * or event buffer could carry, which is the one failure a caller with real
+ * arguments sees; a missing argument is EINVAL.
  */
 int path_translate_dirent_name(bool dir_holds_escapes,
                                const char *host_name,
@@ -205,6 +220,7 @@ int path_openat2_resolved_within_root(guest_fd_t dirfd,
                                       const char *path,
                                       uint64_t oflags,
                                       bool in_root);
+
 /* Returns 1 if resolving path against dirfd would cross a mount boundary from
  * the guest's perspective, 0 if it stays inside the same logical filesystem,
  * and -1 with errno set on dirfd lookup failures. Mount classes are: regular
@@ -219,11 +235,10 @@ int path_openat2_resolved_within_root(guest_fd_t dirfd,
  * on every non-error return so the caller can re-run the check against the
  * actually opened fd via path_openat2_check_fd_xdev. The post-open check is
  * what closes the symlink bypass for callers that do not also set
- * RESOLVE_NO_SYMLINKS: the precheck's fstatat walk probes each component by
- * its stored spelling, and on a case-fold sysroot that spelling can change
- * between the precheck and the open, so the kernel may follow a link the
- * walker did not, and only F_GETPATH on the resulting fd reveals the real
- * landing site.
+ * RESOLVE_NO_SYMLINKS: the precheck's fstatat walk probes each component by its
+ * stored spelling, and on a case-fold sysroot that spelling can change between
+ * the precheck and the open, so the kernel may follow a link the walker did
+ * not, and only F_GETPATH on the resulting fd reveals the real landing site.
  *
  * Known gaps (best-effort by design):
  * - path_host_to_guest strips the configured sysroot prefix with

@@ -12,7 +12,7 @@
 
 #include "syscall/proc.h"
 #include "syscall/proc-identity.h"
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 
 /* Mock shim_globals_publish_pgsid to avoid linking the entire guest shim
  * subsystem

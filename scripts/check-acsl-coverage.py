@@ -55,8 +55,8 @@ DEFINITION = re.compile(
 )
 
 
-def contracted_definitions(path):
-    """Contracted function names in @path, plus contracts not attributable to one.
+def contracted_definitions(text):
+    """Contracted function names in @text, plus contracts not attributable to one.
 
     Returns (names, unattributed). Anything this cannot identify goes into
     `unattributed` and fails the run rather than being skipped: silently
@@ -65,9 +65,6 @@ def contracted_definitions(path):
     directive or an ordinary comment between the annotation and the function is
     enough to defeat a regex, so those are stepped over explicitly.
     """
-    with open(path, encoding="utf-8") as handle:
-        text = handle.read()
-
     names, unattributed = [], []
     for block in ACSL_BLOCK.finditer(text):
         raw = block.group(0)
@@ -109,6 +106,112 @@ def contracted_definitions(path):
     return names, unattributed
 
 
+# The gcc_x86_64 data model is a sound stand-in for arm64 macOS on every
+# property these proofs use EXCEPT plain-char signedness (see the table in
+# mk/analysis.mk). What keeps the results signedness-independent is that no
+# proved function reads a plain char without an explicit (unsigned char) or
+# (uint8_t) cast first.
+#
+# This regex is the cheap half and it names the offending function, which is
+# what makes a failure actionable. It cannot see a char reached through a
+# typedef or a macro; check-char-signedness.py settles that half with the
+# compiler, which resolves both, and "make verify" runs it. The four below
+# predate the invariant and satisfy it by casting at every use, so they are
+# listed and hand-audited rather than rewritten.
+CHAR_PARAM_ALLOWLIST = {
+    "gdb_hex_pair",
+    "gdb_hex_decode",
+    "gdb_parse_hex",
+    "rsp_checksum",
+}
+
+# A char parameter, with its signedness qualifier if it has one. Matching the
+# qualifier as part of the pattern rather than as a lookbehind is what makes
+# this tolerant of "unsigned  char" and of a qualifier split across lines; a
+# fixed-width lookbehind cannot express either.
+CHAR_PARAM = re.compile(r"\b(?:(signed|unsigned)\s+)?char\b")
+
+# DEFINITION anchors ^ at position 0 because its caller matches it against a
+# slice starting at the function. Searching a whole file needs the same pattern
+# with MULTILINE so ^ means start-of-line.
+DEFINITION_ANYWHERE = re.compile(DEFINITION.pattern, DEFINITION.flags | re.MULTILINE)
+
+
+def blank_comments_and_literals(text):
+    """Replace comments and string/char literals with spaces, same length.
+
+    A char scan over raw source trips on the word "char" in prose and on a
+    literal like \'c\'. Blanking them keeps every offset intact so the
+    definition regex still matches at the same places.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        two = text[i : i + 2]
+        if two == "/*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+        elif two == "//":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+        elif text[i] in "\"'":
+            quote, j = text[i], i + 1
+            while j < n and text[j] != quote:
+                j += 2 if text[j] == "\\" else 1
+            j = min(j + 1, n)
+        else:
+            out.append(text[i])
+            i += 1
+            continue
+        out.append(" " * (j - i))
+        i = j
+    return "".join(out)
+
+
+def plain_char_params(text, proved):
+    """Proved functions in @text that name a plain char.
+
+    Scans the whole definition, parameters and body, not just the parameter
+    list: a plain char local or return type is exactly as signedness-dependent
+    as a parameter, and scanning only the signature would let one through.
+
+    Names the offending function, which is what makes a failure actionable, and
+    misses a char behind a typedef or a macro. check-char-signedness.py covers
+    that blind spot with the compiler; the two run together under "make verify"
+    and neither replaces the other.
+    """
+    clean = blank_comments_and_literals(text)
+    offenders = []
+    for match in DEFINITION_ANYWHERE.finditer(clean):
+        name = match.group("name")
+        if name not in proved or name in CHAR_PARAM_ALLOWLIST:
+            continue
+        # Brace-match from the opening brace to get the whole definition.
+        depth, j, end = 0, match.end() - 1, -1
+        while j < len(clean):
+            if clean[j] == "{":
+                depth += 1
+            elif clean[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+            j += 1
+        if end < 0:
+            # Brace matching runs on unpreprocessed source, so a definition
+            # whose #if branches open braces unevenly never balances. Scanning
+            # to end of file would blame this function for every char after it,
+            # and failing the build would reject perfectly good code, so narrow
+            # to the signature and let check-char-signedness.py cover the body:
+            # it compiles the real thing and misses none of this.
+            end = match.end() - 1
+        if any(
+            m.group(1) is None
+            for m in CHAR_PARAM.finditer(clean[match.start() : end + 1])
+        ):
+            offenders.append(name)
+    return offenders
+
+
 def first_line(text):
     """First non-empty line of @text, for an error message."""
     for line in text.splitlines():
@@ -129,11 +232,28 @@ def main():
     args = parser.parse_args()
 
     proved = set(args.fcts.split())
-    missing, unattributed = [], []
+    missing, unattributed, char_params = [], [], []
     for path in args.files:
-        names, strays = contracted_definitions(path)
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        names, strays = contracted_definitions(text)
         missing += [(path, n) for n in names if n not in proved]
         unattributed += [(path, s) for s in strays]
+        char_params += [(path, n) for n in plain_char_params(text, proved)]
+
+    if char_params:
+        sys.stderr.write(
+            "  plain char: %d proved function(s) take a plain char\n" % len(char_params)
+        )
+        for path, name in char_params:
+            sys.stderr.write("    %s: %s\n" % (path, name))
+        sys.stderr.write(
+            "  The data model gcc_x86_64 makes plain char SIGNED; arm64 macOS\n"
+            "  makes it unsigned. Read the char through an explicit\n"
+            "  (unsigned char) or (uint8_t) cast, or add the function to\n"
+            "  CHAR_PARAM_ALLOWLIST once you have checked every use casts.\n"
+        )
+        return 1
 
     if unattributed:
         sys.stderr.write(

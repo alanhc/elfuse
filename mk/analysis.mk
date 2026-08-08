@@ -1,7 +1,10 @@
 # Static analysis and formatting
 
 .PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
-        verify-gva infer-uninit
+        verify-gva verify-cmsg verify-fuse verify-stack verify-sockaddr \
+        verify-netlink verify-sigframe \
+        check-contracts verify-mutants check-char-signedness \
+        infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -36,11 +39,17 @@ lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 # elf_segment_extent(..., &x, &x) would invalidate the proof with no diagnostic.
 #
 # That caveat is general, and it bites hardest for gva-math.h: guest.c cannot be
-# given to Frama-C at all, so NOTHING checks that its call sites honor the eight
-# `requires` clauses there. check-acsl-coverage.py closes the other direction
-# (a contract assumed because its function was left out of -wp-fct); it says
-# nothing about preconditions at call sites. Those are reviewed by hand, and
-# gva_contiguous_avail additionally guards itself at runtime.
+# given to Frama-C at all, so nothing here checks that its call sites honor the
+# nine "requires" clauses there. check-acsl-coverage.py closes the other
+# direction (a contract assumed because its function was left out of -wp-fct);
+# it says nothing about preconditions at call sites.
+#
+# "make check-contracts" narrows that gap from the runtime side: it rebuilds
+# with -DELFUSE_CONTRACT_ASSERT so the five expressible clauses are checked on
+# every call the suite makes. The four pointer clauses (\valid x3, \separated)
+# have no C expression and stay review-only. The checks call the *_args_ok
+# predicates in gva-math.h, whose <==> contracts are proved here, so a check
+# that drifted weaker than the clause it mirrors fails verify-gva.
 #
 # Install: opam install frama-c, then why3 config detect (without the latter WP
 # aborts with "Prover not found" instead of reporting unproved goals).
@@ -62,12 +71,17 @@ lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 #   plain char signedness    unsigned      signed       see below
 #
 # Plain-char signedness is the one mismatch, and the RSP proof DOES cover
-# functions taking plain char (gdb_hex_pair, gdb_hex_decode, rsp_checksum).
-# What keeps the result signedness-independent is not their parameter types but
-# that every use of a char value goes through an explicit (unsigned char) or
-# (uint8_t) cast before it is compared or accumulated. That is the invariant to
-# preserve: no proved function may read a plain char without such a cast. Prove
-# one that does, and supply a custom machdep rather than extending this list.
+# functions taking plain char: gdb_hex_pair, gdb_hex_decode, gdb_parse_hex and
+# rsp_checksum. What keeps the result signedness-independent is not their
+# parameter types but that every use of a char value goes through an explicit
+# (unsigned char) or (uint8_t) cast before it is compared or accumulated. That
+# is the invariant to preserve: no proved function may read a plain char
+# without such a cast.
+#
+# check-acsl-coverage.py enforces the part a regex can, and its
+# CHAR_PARAM_ALLOWLIST carries the rest of the reasoning: a proved function
+# that takes a plain char at all must be listed there, so a new one cannot be
+# added silently.
 FRAMAC ?= frama-c
 FRAMAC_DATA_MODEL ?= gcc_x86_64
 FRAMAC_TIMEOUT ?= 30
@@ -75,8 +89,13 @@ FRAMAC_TIMEOUT ?= 30
 # The analyzer parses against Frama-C's own modeled libc headers, never the
 # host's. -print-share-path runs at recipe time rather than through $(shell) so
 # a make invocation with no frama-c installed does not pay for it.
+
+# Per-target preprocessor defines, empty for every target that does not set one.
+CPP_DEFS :=
+
 FRAMAC_CPP_ARGS = -nostdinc \
-    -isystem $$($(FRAMAC) -print-share-path)/libc -Isrc -I$(BUILD_DIR)
+    -isystem $$($(FRAMAC) -print-share-path)/libc -Isrc -I$(BUILD_DIR) \
+    $(CPP_DEFS)
 
 # One proof per attacker-facing parser. Each is declared by a single
 # verify_target call below; the recipe itself lives in one place.
@@ -107,8 +126,9 @@ VERIFY_ELF_UNPROVED := the pread/malloc I/O around them stays test-covered
 
 VERIFY_GVA_SRC   := src/core/gva-math.h
 VERIFY_GVA_FCTS  := gva_pt_table_offset gva_leaf_target gva_chunk_clamp \
-                    gva_span_ok
-VERIFY_GVA_MIN_GOALS ?= 40
+                    gva_span_ok gva_leaf_target_args_ok \
+                    gva_chunk_clamp_args_ok
+VERIFY_GVA_MIN_GOALS ?= 66
 VERIFY_GVA_MODEL := typed
 VERIFY_GVA_SCAN  := src/core/gva-math.h
 VERIFY_GVA_CLAIM := for ANY guest address, length, and page-table content
@@ -131,6 +151,56 @@ VERIFY_RSP_SCAN  := src/debug/gdbstub-rsp.c src/utils.h
 VERIFY_RSP_CLAIM := for ANY packet bytes a GDB remote can send
 VERIFY_RSP_UNPROVED := the socket I/O and framing loop stay test-covered
 
+VERIFY_CMSG_SRC  := src/syscall/cmsg-math.h
+VERIFY_CMSG_FCTS := cmsg_entry_bounds
+VERIFY_CMSG_MIN_GOALS ?= 17
+VERIFY_CMSG_MODEL := typed
+VERIFY_CMSG_SCAN := src/syscall/cmsg-math.h
+VERIFY_CMSG_CLAIM := for ANY control-message bytes a guest can supply
+VERIFY_CMSG_UNPROVED := the walk loop and the host cmsg build stay test-covered
+
+VERIFY_FUSE_SRC  := src/syscall/fuse-math.h
+VERIFY_FUSE_FCTS := fuse_frame_count_ok fuse_reply_extent \
+                    fuse_clamp_negotiated_write
+VERIFY_FUSE_MIN_GOALS ?= 27
+VERIFY_FUSE_MODEL := typed
+VERIFY_FUSE_SCAN := src/syscall/fuse-math.h
+VERIFY_FUSE_CLAIM := for ANY reply frame a guest FUSE daemon can write
+VERIFY_FUSE_UNPROVED := the per-opcode payload extents stay test-covered
+
+VERIFY_STACK_SRC  := src/core/stack-math.h
+VERIFY_STACK_FCTS := stack_take stack_align_down stack_pushed_words \
+                    stack_final_sp
+VERIFY_STACK_MIN_GOALS ?= 36
+VERIFY_STACK_MODEL := typed
+VERIFY_STACK_SCAN := src/core/stack-math.h
+VERIFY_STACK_CLAIM := for ANY argv, envp, and auxv set a guest can present
+VERIFY_STACK_UNPROVED := the string writes and push loop stay test-covered
+
+VERIFY_SOCKADDR_SRC  := src/syscall/sockaddr-math.h
+VERIFY_SOCKADDR_FCTS := sockaddr_len_ok sockaddr_payload_len
+VERIFY_SOCKADDR_MIN_GOALS ?= 11
+VERIFY_SOCKADDR_MODEL := typed
+VERIFY_SOCKADDR_SCAN := src/syscall/sockaddr-math.h
+VERIFY_SOCKADDR_CLAIM := for ANY address length a guest or host can present
+VERIFY_SOCKADDR_UNPROVED := the family translation and memcpy stay test-covered
+
+VERIFY_NETLINK_SRC  := src/syscall/netlink-math.h
+VERIFY_NETLINK_FCTS := netlink_align_up netlink_rta_bounds netlink_msg_span
+VERIFY_NETLINK_MIN_GOALS ?= 44
+VERIFY_NETLINK_MODEL := typed
+VERIFY_NETLINK_SCAN := src/syscall/netlink-math.h
+VERIFY_NETLINK_CLAIM := for ANY netlink message bytes a guest can send
+VERIFY_NETLINK_UNPROVED := the walk loops and attribute copies stay test-covered
+
+VERIFY_SIGFRAME_SRC  := src/syscall/sigframe-math.h
+VERIFY_SIGFRAME_FCTS := sigframe_base
+VERIFY_SIGFRAME_MIN_GOALS ?= 15
+VERIFY_SIGFRAME_MODEL := typed
+VERIFY_SIGFRAME_SCAN := src/syscall/sigframe-math.h
+VERIFY_SIGFRAME_CLAIM := for ANY interrupted stack pointer and frame size
+VERIFY_SIGFRAME_UNPROVED := the frame field layout is not covered at all yet
+
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
 verify_empty :=
@@ -145,6 +215,7 @@ commafy = $(subst $(verify_space),$(verify_comma),$(strip $(1)))
 
 ## Prove the ELF parser cannot be driven out of bounds by a crafted binary
 verify-elf: NAME := elf
+verify-elf: TARGET := elf
 verify-elf: SRC := $(VERIFY_ELF_SRC)
 verify-elf: FCTS := $(VERIFY_ELF_FCTS)
 verify-elf: FCT_ARG := $(call commafy,$(VERIFY_ELF_FCTS))
@@ -155,7 +226,14 @@ verify-elf: CLAIM := $(VERIFY_ELF_CLAIM)
 verify-elf: UNPROVED := $(VERIFY_ELF_UNPROVED)
 
 ## Prove guest address translation cannot compute an out-of-bounds window
+# Prove with the call-site checks compiled IN. Without this the prover never
+# sees the GVA_CONTRACT_ASSERT calls, and a check wired to the wrong predicate
+# or handed permuted arguments would show up only as a spurious runtime abort
+# under check-contracts. With it, WP must discharge each assert from the very
+# requires clause it mirrors, so the wiring is machine-checked too.
+verify-gva: CPP_DEFS := -DELFUSE_CONTRACT_ASSERT
 verify-gva: NAME := gva
+verify-gva: TARGET := gva
 verify-gva: SRC := $(VERIFY_GVA_SRC)
 verify-gva: FCTS := $(VERIFY_GVA_FCTS)
 verify-gva: FCT_ARG := $(call commafy,$(VERIFY_GVA_FCTS))
@@ -167,6 +245,7 @@ verify-gva: UNPROVED := $(VERIFY_GVA_UNPROVED)
 
 ## Prove the GDB RSP parser cannot be driven out of bounds by a remote
 verify-rsp: NAME := rsp
+verify-rsp: TARGET := rsp
 verify-rsp: SRC := $(VERIFY_RSP_SRC)
 verify-rsp: FCTS := $(VERIFY_RSP_FCTS)
 verify-rsp: FCT_ARG := $(call commafy,$(VERIFY_RSP_FCTS))
@@ -176,6 +255,83 @@ verify-rsp: SCAN := $(VERIFY_RSP_SCAN)
 verify-rsp: CLAIM := $(VERIFY_RSP_CLAIM)
 verify-rsp: UNPROVED := $(VERIFY_RSP_UNPROVED)
 
+## Prove the control-message walk cannot be driven out of the control buffer
+verify-cmsg: NAME := cmsg
+verify-cmsg: TARGET := cmsg
+verify-cmsg: SRC := $(VERIFY_CMSG_SRC)
+verify-cmsg: FCTS := $(VERIFY_CMSG_FCTS)
+verify-cmsg: FCT_ARG := $(call commafy,$(VERIFY_CMSG_FCTS))
+verify-cmsg: MIN_GOALS := $(VERIFY_CMSG_MIN_GOALS)
+verify-cmsg: MODEL := $(VERIFY_CMSG_MODEL)
+verify-cmsg: SCAN := $(VERIFY_CMSG_SCAN)
+verify-cmsg: CLAIM := $(VERIFY_CMSG_CLAIM)
+verify-cmsg: UNPROVED := $(VERIFY_CMSG_UNPROVED)
+
+## Prove a hostile FUSE daemon cannot drive a reply past its own frame
+verify-fuse: NAME := fuse
+verify-fuse: TARGET := fuse
+verify-fuse: SRC := $(VERIFY_FUSE_SRC)
+verify-fuse: FCTS := $(VERIFY_FUSE_FCTS)
+verify-fuse: FCT_ARG := $(call commafy,$(VERIFY_FUSE_FCTS))
+verify-fuse: MIN_GOALS := $(VERIFY_FUSE_MIN_GOALS)
+verify-fuse: MODEL := $(VERIFY_FUSE_MODEL)
+verify-fuse: SCAN := $(VERIFY_FUSE_SCAN)
+verify-fuse: CLAIM := $(VERIFY_FUSE_CLAIM)
+verify-fuse: UNPROVED := $(VERIFY_FUSE_UNPROVED)
+
+## Prove the initial stack stays in its region and lands SP aligned on argc
+verify-stack: NAME := stack
+verify-stack: TARGET := stack
+verify-stack: SRC := $(VERIFY_STACK_SRC)
+verify-stack: FCTS := $(VERIFY_STACK_FCTS)
+verify-stack: FCT_ARG := $(call commafy,$(VERIFY_STACK_FCTS))
+verify-stack: MIN_GOALS := $(VERIFY_STACK_MIN_GOALS)
+verify-stack: MODEL := $(VERIFY_STACK_MODEL)
+verify-stack: SCAN := $(VERIFY_STACK_SCAN)
+verify-stack: CLAIM := $(VERIFY_STACK_CLAIM)
+verify-stack: UNPROVED := $(VERIFY_STACK_UNPROVED)
+
+## Prove sockaddr reshaping cannot overrun either representation
+verify-sockaddr: NAME := sockaddr
+verify-sockaddr: TARGET := sockaddr
+verify-sockaddr: SRC := $(VERIFY_SOCKADDR_SRC)
+verify-sockaddr: FCTS := $(VERIFY_SOCKADDR_FCTS)
+verify-sockaddr: FCT_ARG := $(call commafy,$(VERIFY_SOCKADDR_FCTS))
+verify-sockaddr: MIN_GOALS := $(VERIFY_SOCKADDR_MIN_GOALS)
+verify-sockaddr: MODEL := $(VERIFY_SOCKADDR_MODEL)
+verify-sockaddr: SCAN := $(VERIFY_SOCKADDR_SCAN)
+verify-sockaddr: CLAIM := $(VERIFY_SOCKADDR_CLAIM)
+verify-sockaddr: UNPROVED := $(VERIFY_SOCKADDR_UNPROVED)
+
+## Prove the netlink TLV walks stay in the message and terminate
+verify-netlink: NAME := netlink
+verify-netlink: TARGET := netlink
+verify-netlink: SRC := $(VERIFY_NETLINK_SRC)
+verify-netlink: FCTS := $(VERIFY_NETLINK_FCTS)
+verify-netlink: FCT_ARG := $(call commafy,$(VERIFY_NETLINK_FCTS))
+verify-netlink: MIN_GOALS := $(VERIFY_NETLINK_MIN_GOALS)
+verify-netlink: MODEL := $(VERIFY_NETLINK_MODEL)
+verify-netlink: SCAN := $(VERIFY_NETLINK_SCAN)
+verify-netlink: CLAIM := $(VERIFY_NETLINK_CLAIM)
+verify-netlink: UNPROVED := $(VERIFY_NETLINK_UNPROVED)
+
+## Prove the signal frame lands aligned and below the interrupted stack pointer
+verify-sigframe: NAME := sigframe
+verify-sigframe: TARGET := sigframe
+verify-sigframe: SRC := $(VERIFY_SIGFRAME_SRC)
+verify-sigframe: FCTS := $(VERIFY_SIGFRAME_FCTS)
+verify-sigframe: FCT_ARG := $(call commafy,$(VERIFY_SIGFRAME_FCTS))
+verify-sigframe: MIN_GOALS := $(VERIFY_SIGFRAME_MIN_GOALS)
+verify-sigframe: MODEL := $(VERIFY_SIGFRAME_MODEL)
+verify-sigframe: SCAN := $(VERIFY_SIGFRAME_SCAN)
+verify-sigframe: CLAIM := $(VERIFY_SIGFRAME_CLAIM)
+verify-sigframe: UNPROVED := $(VERIFY_SIGFRAME_UNPROVED)
+
+# NAME and TARGET look redundant and are not. NAME picks the log path and is
+# overridden per mutation run so concurrent runs do not share a file; TARGET is
+# the target's identity and must stay put, or a mutation run would ask the
+# signedness check about a target that does not exist.
+#
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
 # what gets proved.
@@ -184,7 +340,8 @@ verify-rsp: UNPROVED := $(VERIFY_RSP_UNPROVED)
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-verify-elf verify-rsp verify-gva: | $(BUILD_DIR)
+verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack \
+    verify-sockaddr verify-netlink verify-sigframe: | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -192,6 +349,7 @@ verify-elf verify-rsp verify-gva: | $(BUILD_DIR)
 	}
 	@python3 scripts/check-acsl-coverage.py --target verify-$(NAME) \
 	    --fcts "$(FCTS)" $(SCAN)
+	@python3 scripts/check-char-signedness.py --cc '$(CC)' --target $(TARGET)
 	@echo "  PROVE   $(SRC) (Frama-C WP: weakest-precondition prover)"
 	@echo "          claim: $(CLAIM),"
 	@echo "                 these compute no out-of-bounds access and no overflow"
@@ -209,8 +367,67 @@ verify-elf verify-rsp verify-gva: | $(BUILD_DIR)
 	    --log $(BUILD_DIR)/verify-$(NAME).log --min-goals $(MIN_GOALS) \
 	    --src $(SRC) --unproved "$(UNPROVED)"
 
+## Assert every proof target rejects a known-broken source
+#
+# Complements the other two gates rather than duplicating them: MIN_GOALS
+# catches a gutted body, check-acsl-coverage.py catches a contracted function
+# left out of the proof set, and this catches a contract whose clauses do not
+# actually bite. Mutations run against copies under $(BUILD_DIR)/mutants, so a
+# run never edits the tree.
+# MUTANT_JOBS overrides the script's one-per-core default, which a CI runner
+# with few cores would otherwise resolve to near-serial.
+# MUTANT_SINCE restricts the run to targets whose source differs from that ref,
+# which keeps a per-PR run proportional to the diff. Leave it empty to run the
+# whole set, which is what the base branch needs to do.
+# MUTANT_TARGET restricts the run to one proof target, letting CI shard the
+# full set across parallel jobs instead of one job working through all of it.
+# Leave it empty to run every target in one process, which is what a local
+# "make verify-mutants" wants.
+MUTANT_JOBS ?=
+MUTANT_SINCE ?=
+MUTANT_TARGET ?=
+verify-mutants:
+	@echo "  MUTANT  proof targets against known-broken sources"
+	$(Q)python3 scripts/check-mutants.py --cc '$(CC)' \
+	    $(if $(MUTANT_JOBS),--jobs $(MUTANT_JOBS),) \
+	    $(if $(MUTANT_SINCE),--changed-since $(MUTANT_SINCE),) \
+	    $(if $(MUTANT_TARGET),--target $(MUTANT_TARGET),)
+
+## Show that no proved function depends on plain-char signedness
+#
+# Every verify-* target already runs this for itself, so "make verify" gets it
+# without listing it; this entry point is for checking the whole set at once.
+#
+# The data-model note above says gcc_x86_64 differs from arm64 macOS on plain
+# char signedness, and that the proofs stay sound because no proved function
+# reads a plain char without an explicit cast. check-acsl-coverage.py checks
+# that with a regex, which cannot see a char behind a typedef or a macro. This
+# asks the compiler instead, per proved function and at -O0: identical code
+# under -fsigned-char and -funsigned-char means that function behaves the same
+# either way, which is the invariant rather than a proxy for it.
+check-char-signedness:
+	@echo "  CHARSIGN proof sources under both char signedness settings"
+	$(Q)python3 scripts/check-char-signedness.py --cc '$(CC)'
+
 ## Run every Frama-C proof
-verify: verify-elf verify-gva verify-rsp
+verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse verify-stack \
+        verify-sockaddr verify-netlink verify-sigframe
+
+## Rebuild with the gva-math.h precondition checks live, then run the suite
+#
+# Separate from "make check" rather than folded into it: gva_leaf_target and
+# gva_chunk_clamp sit on the guest_read / guest_write hot path, and the tree has
+# no NDEBUG release split that would compile the checks out again.
+#
+# Builds into its own directory rather than rebuilding in place. Sharing
+# $(BUILD_DIR) would leave instrumented objects behind, and a later "make
+# elfuse" would silently relink them: a default-looking binary carrying the
+# checks on its hot path. A separate tree also means no -B is needed, since it
+# starts empty.
+check-contracts:
+	@echo "  CONTRACT gva-math.h call-site preconditions (5 of 9 clauses)"
+	$(Q)$(MAKE) BUILD_DIR=$(BUILD_DIR)/contracts \
+	    EXTRA_CFLAGS="-DELFUSE_CONTRACT_ASSERT $(EXTRA_CFLAGS)" check
 
 ## Re-run Infer with the uninitialized-value checker that .inferconfig disables
 infer-uninit: | $(BUILD_DIR)

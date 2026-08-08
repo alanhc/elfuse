@@ -34,7 +34,7 @@
 #include "runtime/forkipc.h"
 #include "runtime/futex.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
 #include "syscall/exec.h"
 #include "syscall/fuse.h"
@@ -211,19 +211,19 @@ static int exec_resolve_guest_host_path(const char *guest_path,
 }
 
 /* A translated interpreter path is usable when it is a FUSE temp copy, or when
- * translation rewrote the spelling AND the rewritten file actually exists.
- * The existence probe is what separates a real sysroot hit from an escaped
- * prefix whose loader suffix is absent: without it a differs-but-missing path
- * would be accepted and the /lib/<basename> fallback skipped, so a store-style
+ * translation rewrote the spelling AND the rewritten file actually exists. The
+ * existence probe is what separates a real sysroot hit from an escaped prefix
+ * whose loader suffix is absent: without it a differs-but-missing path would be
+ * accepted and the /lib/<basename> fallback skipped, so a store-style
  * interpreter (e.g. a /nix/.../ld-musl.so.1 that ships the loader under /lib)
  * would fail to launch.
  *
- * A shm redirect is probed without following the leaf, because that is the
- * rule exec_open_image then opens under. access(2) follows, so a symlink in
- * the shm backing directory would answer "usable" for a path the O_NOFOLLOW
- * open refuses with ELOOP, and the fallback that would have found the loader
- * is skipped. Elsewhere following is right: an interpreter is routinely a
- * symlink, as /lib/ld-musl-aarch64.so.1 is on musl images.
+ * A shm redirect is probed without following the leaf, because that is the rule
+ * exec_open_image then opens under. access(2) follows, so a symlink in the shm
+ * backing directory would answer "usable" for a path the O_NOFOLLOW open
+ * refuses with ELOOP, and the fallback that would have found the loader is
+ * skipped. Elsewhere following is right: an interpreter is routinely a symlink,
+ * as /lib/ld-musl-aarch64.so.1 is on musl images.
  */
 static bool exec_translated_usable(const char *host,
                                    const char *guest,
@@ -241,9 +241,9 @@ static bool exec_translated_usable(const char *host,
     return access(host, F_OK) == 0;
 }
 
-/* Resolve PT_INTERP through the same translation as every other guest path,
- * so a sysroot interpreter is found with its stored spelling, containment,
- * and FUSE materialization applied. The bootstrap loader differs: it probes
+/* Resolve PT_INTERP through the same translation as every other guest path, so
+ * a sysroot interpreter is found with its stored spelling, containment, and
+ * FUSE materialization applied. The bootstrap loader differs: it probes
  * elf_resolve_interp's literal spellings first and falls through to
  * path_translate_at only when they miss; see load_interpreter in
  * src/core/bootstrap.c.
@@ -431,9 +431,9 @@ static bool exec_matches_fakeroot_target(const struct stat *st)
  * macOS user (e.g. 501) -- an ID that exists nowhere in the guest's own
  * /etc/passwd. Honouring setuid on such a file would leave the process at an
  * effective ID that is neither root nor its own, failing both `euid == 0`
- * privilege checks and ownership comparisons against guest IDs, and the
- * granted ID would follow whoever happens to own the tree rather than anything
- * the guest chose.
+ * privilege checks and ownership comparisons against guest IDs, and the granted
+ * ID would follow whoever happens to own the tree rather than anything the
+ * guest chose.
  *
  * Accept only root and the caller's own ID, and only when both views of
  * ownership agree on it.
@@ -534,6 +534,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     char path_host_buf[LINUX_PATH_MAX];
     const char *path_host = host_path ? host_path : path;
     bool path_host_temp = false;
+
     /* Whether path_host is a shm redirect leaf (drives O_NOFOLLOW on the exec
      * open). Re-evaluated whenever path_host is repointed to an interpreter.
      */
@@ -624,16 +625,17 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     int shebang_depth = 0;
 
     /* Open the directly-executed file first and bind it to an fd to avoid
-     * TOCTOU. */
+     * TOCTOU.
+     */
     exec_fd = exec_open_image(path_host, path_host_shm);
     if (exec_fd < 0) {
         err = linux_errno();
         goto fail;
     }
 
-    /* Snapshot the directly-executed file's metadata before shebang
-     * resolution overwrites path_host with the interpreter path.  The
-     * setuid/setgid check below needs the *original* file's mode bits.
+    /* Snapshot the directly-executed file's metadata before shebang resolution
+     * overwrites path_host with the interpreter path. The setuid/setgid check
+     * below needs the *original* file's mode bits.
      */
     bool exec_is_script = false;
     struct stat exec_st;
@@ -642,6 +644,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         err = linux_errno();
         goto fail;
     }
+
     /* Judge access by the ownership the guest sees: fs-stat.c reports every
      * guest stat through the virtual chown overlay, so the physical owner would
      * refuse a file the guest's own stat says it may execute. Trusting a
@@ -881,6 +884,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             err = -LINUX_ENOEXEC;
             goto fail;
         }
+
         /* rosetta_finalize pre-opens the x86_64 binary at a guest fd >= 3 past
          * the point of no return, where an EMFILE would be fatal. The guest fd
          * ceiling is far below the host limit, so a guest can fill its table
@@ -997,12 +1001,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         }
 
         /* Bound the interpreter's extent here, the same way the executable's is
-         * bounded above. Without this the only thing that rejects an
-         * over-large interpreter is elf_map_segments_fd, which runs after the
-         * point of no return where the sole remaining option is exit(128). A
-         * guest able to write its own sysroot could kill elfuse on demand by
-         * patching a PT_LOAD in ld-musl; Linux returns ENOEXEC and the caller
-         * survives.
+         * bounded above. Without this the only thing that rejects an over-large
+         * interpreter is elf_map_segments_fd, which runs after the point of no
+         * return where the sole remaining option is exit(128). A guest able to
+         * write its own sysroot could kill elfuse on demand by patching a
+         * PT_LOAD in ld-musl; Linux returns ENOEXEC and the caller survives.
          */
         if (interp_info.load_max > UINT64_MAX - g->interp_base ||
             interp_info.load_max + g->interp_base > g->guest_size) {
@@ -1016,8 +1019,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* Past pre-PNR validation. Fall through to point of no return. The fail
      * label below handles all pre-PNR error paths.
      */
-    /* Commit credentials right before the Point of No Return.
-     * Saved UID/GID are refreshed from the final effective IDs.
+    /* Commit credentials right before the Point of No Return. Saved UID/GID are
+     * refreshed from the final effective IDs.
      *
      * The fakeroot transition lands here, past every failure path, so an exec
      * that never happens leaves the current image unprivileged. It mirrors what
@@ -1156,6 +1159,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * kernel exec failure after its point of no return.
      */
     fork_notify_vfork_exec();
+
     /* Only clear rosetta state when leaving rosetta. For rosetta-to-rosetta
      * exec the placement (rosetta_guest_base, rosetta_va_base, kbuf_gpa, ttbr1)
      * must survive guest_reset so guest_bootstrap_rosetta_post_reset hits
@@ -1485,6 +1489,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     guest_region_add(g, g->shim_base, g->shim_base + shim_size,
                      LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
                      "[shim]");
+
     /* Report PROT_NONE for [shim-data] to match the EL1-only mapping (see
      * matching bootstrap.c registration). EL0 dereferences fault, so user
      * tooling reading /proc/self/maps should see the same access state.
@@ -1498,6 +1503,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                          elf_pf_to_prot(elf_info.segments[i].flags),
                          LINUX_MAP_PRIVATE, elf_info.segments[i].offset, path);
     }
+
     /* interp_resolved was computed before guest_reset so no filesystem lookup
      * is needed after the point of no return.
      */
@@ -1511,6 +1517,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                              interp_display_path);
         }
     }
+
     /* Leave the lowest stack page unmapped so downward overflow faults before
      * corrupting adjacent mappings.
      */
@@ -1541,6 +1548,18 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         sp = build_linux_stack(g, g->stack_top, argc, argv_const, envp_const,
                                &elf_info, elf_load_base, interp_base, exec_vdso,
                                -1 /* no AT_EXECFD */, &auxv);
+
+        /* 0 is build_linux_stack's failure return. Past the point of no return
+         * there is no image to go back to, and programming SP_EL0 from it would
+         * ERET the guest onto a null stack. read_string_array already enforces
+         * the same argc cap upstream, so the live case here is allocation
+         * failure.
+         */
+        if (sp == 0) {
+            log_fatal(
+                "execve failed after point of no return: build_linux_stack");
+            exit(128);
+        }
         g->start_stack = sp;
 
         entry_point = (interp_base != 0) ? (interp_info.entry + interp_base)

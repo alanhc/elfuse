@@ -22,8 +22,9 @@
 
 #include "runtime/procemu.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
+#include "syscall/fuse-math.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
@@ -173,11 +174,9 @@ typedef struct {
     uint16_t padding;
 } fuse_in_header_t;
 
-typedef struct {
-    uint32_t len;
-    int32_t error;
-    uint64_t unique;
-} fuse_out_header_t;
+/* fuse_out_header_t lives in syscall/fuse-math.h, next to the frame arithmetic
+ * proved against it.
+ */
 
 typedef struct {
     uint64_t ino;
@@ -205,20 +204,22 @@ typedef struct {
  * daemon balanced instead of leaking a reference.
  */
 #define FUSE_MAX_NODE_REFS 4096
+
+/* node_ref_hash maps nodeid -> node_refs[] index by open addressing with linear
+ * probing, so a directory walk holding thousands of refs does not pay an O(n)
+ * scan per FUSE_LOOKUP/FORGET. Sized to 2x FUSE_MAX_NODE_REFS to keep the load
+ * factor low enough that probing stays close to O(1) even at capacity.
+ * HASH_EMPTY marks a slot that has never held an entry (probing stops there);
+ * HASH_TOMBSTONE marks one whose entry was since removed (probing must continue
+ * past it, or a lookup could miss an entry placed after the removed one
+ * collided into this slot).
+ */
+#define FUSE_NODE_REF_HASH_SIZE (FUSE_MAX_NODE_REFS * 2)
+#define FUSE_NODE_REF_HASH_EMPTY (-1)
+#define FUSE_NODE_REF_HASH_TOMBSTONE (-2)
 #define FUSE_FAKE_DEV 0xF00D
 
-/* Implementation ceiling for a single FUSE frame (header + payload). The kernel
- * FUSE protocol caps a READ or WRITE payload at FUSE_MAX_PAGES * page_size = ~1
- * MiB by default and up to 4 MiB under recent kernels. The 8 MiB hard cap below
- * leaves headroom for the FUSE header, in-band sub-headers, and any future
- * readahead growth while still bounding the largest single malloc the daemon
- * can force. Daemon-negotiated max_write is clamped to (FUSE_FRAME_CAP
- * - sizeof(fuse_in_header_t) - sizeof(fuse_write_in)) at FUSE_INIT time so the
- * read-reply path cannot negotiate a size larger than fuse_dev_write will
- * accept.
- */
-#define FUSE_FRAME_CAP ((size_t) (8 * 1024 * 1024))
-#define FUSE_MAX_NEGOTIATED_WRITE ((uint32_t) (FUSE_FRAME_CAP - 256))
+/* FUSE_FRAME_CAP and FUSE_MAX_NEGOTIATED_WRITE live in syscall/fuse-math.h. */
 
 typedef struct fuse_request {
     bool used;
@@ -248,7 +249,6 @@ typedef struct {
     bool init_done;
     int notify_wr;
     uint32_t max_write;
-    uint16_t max_pages;
     uint64_t next_unique;
     fuse_request_t requests[FUSE_MAX_PENDING];
     fuse_request_t *queue_head;
@@ -258,6 +258,14 @@ typedef struct {
         uint64_t nodeid;
         uint64_t nlookup;
     } node_refs[FUSE_MAX_NODE_REFS];
+    int32_t node_ref_hash[FUSE_NODE_REF_HASH_SIZE]; /* nodeid -> node_refs[]
+                                                       index
+                                                       */
+    int32_t node_ref_free[FUSE_MAX_NODE_REFS];      /* stack of free node_refs[]
+                                                        indices
+                                                        */
+    int node_ref_free_count;
+    int node_ref_tombstones; /* live entries tracked via node_ref_free_count */
 } fuse_session_t;
 
 typedef struct {
@@ -651,28 +659,126 @@ static fuse_request_t *fuse_alloc_request_locked(fuse_session_t *session)
     return NULL;
 }
 
+/* Fibonacci hashing: multiplying by an odd constant derived from the golden
+ * ratio mixes better than a raw modulo when nodeids arrive in sequential runs,
+ * which is a common daemon allocation pattern.
+ */
+static unsigned fuse_node_ref_hash(uint64_t nodeid)
+{
+    uint64_t h = nodeid * 0x9E3779B97F4A7C15ULL;
+    return (unsigned) (h % FUSE_NODE_REF_HASH_SIZE);
+}
+
+/* node_refs[] index holding @nodeid, or -1 if not present. */
+static int fuse_node_ref_hash_find(fuse_session_t *session, uint64_t nodeid)
+{
+    unsigned start = fuse_node_ref_hash(nodeid);
+    for (unsigned probe = 0; probe < FUSE_NODE_REF_HASH_SIZE; probe++) {
+        unsigned slot = (start + probe) % FUSE_NODE_REF_HASH_SIZE;
+        int32_t idx = session->node_ref_hash[slot];
+        if (idx == FUSE_NODE_REF_HASH_EMPTY)
+            return -1;
+        if (idx != FUSE_NODE_REF_HASH_TOMBSTONE &&
+            session->node_refs[idx].nodeid == nodeid)
+            return idx;
+    }
+    return -1;
+}
+
+/* Makes node_refs[idx] (already holding @nodeid) reachable by hash lookup. */
+static void fuse_node_ref_hash_insert(fuse_session_t *session,
+                                      uint64_t nodeid,
+                                      int idx)
+{
+    unsigned start = fuse_node_ref_hash(nodeid);
+    for (unsigned probe = 0; probe < FUSE_NODE_REF_HASH_SIZE; probe++) {
+        unsigned slot = (start + probe) % FUSE_NODE_REF_HASH_SIZE;
+        int32_t cur = session->node_ref_hash[slot];
+        if (cur == FUSE_NODE_REF_HASH_EMPTY ||
+            cur == FUSE_NODE_REF_HASH_TOMBSTONE) {
+            if (cur == FUSE_NODE_REF_HASH_TOMBSTONE)
+                session->node_ref_tombstones--;
+            session->node_ref_hash[slot] = (int32_t) idx;
+            return;
+        }
+    }
+
+    /* Unreachable: every caller rebuilds first (see fuse_node_ref_hash_rebuild)
+     * whenever live+tombstone occupancy would reach 3/4 of the table, and a
+     * rebuild never holds more than FUSE_MAX_NODE_REFS live entries in a table
+     * sized to 2x that, so a fresh open slot always exists before the probe
+     * sequence wraps all the way around.
+     */
+}
+
+static void fuse_node_ref_hash_remove(fuse_session_t *session, uint64_t nodeid)
+{
+    unsigned start = fuse_node_ref_hash(nodeid);
+    for (unsigned probe = 0; probe < FUSE_NODE_REF_HASH_SIZE; probe++) {
+        unsigned slot = (start + probe) % FUSE_NODE_REF_HASH_SIZE;
+        int32_t idx = session->node_ref_hash[slot];
+        if (idx == FUSE_NODE_REF_HASH_EMPTY)
+            return;
+        if (idx != FUSE_NODE_REF_HASH_TOMBSTONE &&
+            session->node_refs[idx].nodeid == nodeid) {
+            session->node_ref_hash[slot] = FUSE_NODE_REF_HASH_TOMBSTONE;
+            session->node_ref_tombstones++;
+            return;
+        }
+    }
+}
+
+/* Clears every tombstone by rebuilding the table from the live entries in
+ * node_refs[]. Open addressing with tombstones does not free capacity on
+ * removal (a removed slot still blocks probing until overwritten by a fresh
+ * insert landing exactly there), so enough hold/drop churn across different
+ * nodeids fills the table with tombstones even while the live count stays far
+ * below capacity. Without this, fuse_node_ref_hash_insert's probe can exhaust
+ * the whole table and find nowhere to land despite live entries being a small
+ * fraction of it: reproduced with a two-million-op randomized hold/drop/lookup
+ * stress test run outside the tree, which aborted inside a few hundred thousand
+ * operations before this existed.
+ */
+static void fuse_node_ref_hash_rebuild(fuse_session_t *session)
+{
+    for (int i = 0; i < FUSE_NODE_REF_HASH_SIZE; i++)
+        session->node_ref_hash[i] = FUSE_NODE_REF_HASH_EMPTY;
+    session->node_ref_tombstones = 0;
+    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
+        if (session->node_refs[i].used)
+            fuse_node_ref_hash_insert(session, session->node_refs[i].nodeid, i);
+    }
+}
+
 static int fuse_node_ref_hold_locked(fuse_session_t *session,
                                      uint64_t nodeid,
                                      uint64_t nlookup)
 {
     if (nodeid == FUSE_ROOT_ID || nlookup == 0)
         return 0;
-    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
-        if (session->node_refs[i].used &&
-            session->node_refs[i].nodeid == nodeid) {
-            session->node_refs[i].nlookup += nlookup;
-            return 0;
-        }
+    int idx = fuse_node_ref_hash_find(session, nodeid);
+    if (idx >= 0) {
+        session->node_refs[idx].nlookup += nlookup;
+        return 0;
     }
-    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
-        if (!session->node_refs[i].used) {
-            session->node_refs[i].used = true;
-            session->node_refs[i].nodeid = nodeid;
-            session->node_refs[i].nlookup = nlookup;
-            return 0;
-        }
-    }
-    return -LINUX_ENOMEM;
+    if (session->node_ref_free_count == 0)
+        return -LINUX_ENOMEM;
+
+    /* Keep live+tombstone occupancy under 3/4 of the table before adding
+     * another live entry, so fuse_node_ref_hash_insert's probe is always
+     * guaranteed to land on a true empty slot rather than wrapping the whole
+     * table. See fuse_node_ref_hash_rebuild for why this is needed at all
+     * despite live entries alone never reaching capacity.
+     */
+    int live = FUSE_MAX_NODE_REFS - session->node_ref_free_count;
+    if (live + session->node_ref_tombstones >= FUSE_NODE_REF_HASH_SIZE * 3 / 4)
+        fuse_node_ref_hash_rebuild(session);
+    idx = session->node_ref_free[--session->node_ref_free_count];
+    session->node_refs[idx].used = true;
+    session->node_refs[idx].nodeid = nodeid;
+    session->node_refs[idx].nlookup = nlookup;
+    fuse_node_ref_hash_insert(session, nodeid, idx);
+    return 0;
 }
 
 static int fuse_queue_noreply_locked(fuse_session_t *session,
@@ -716,22 +822,29 @@ static int fuse_node_ref_drop_locked(fuse_session_t *session,
 {
     if (nodeid == FUSE_ROOT_ID || nlookup == 0)
         return 0;
-    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
-        if (!session->node_refs[i].used ||
-            session->node_refs[i].nodeid != nodeid)
-            continue;
-        if (nlookup >= session->node_refs[i].nlookup) {
-            nlookup = session->node_refs[i].nlookup;
-            memset(&session->node_refs[i], 0, sizeof(session->node_refs[i]));
-        } else {
-            session->node_refs[i].nlookup -= nlookup;
-        }
-        if (!emit_forget)
-            return 0;
-        fuse_forget_one_t one = {.nodeid = nodeid, .nlookup = nlookup};
-        return fuse_emit_forget_multi_locked(session, &one, 1);
+    int idx = fuse_node_ref_hash_find(session, nodeid);
+    if (idx < 0)
+        return 0;
+    if (nlookup >= session->node_refs[idx].nlookup) {
+        nlookup = session->node_refs[idx].nlookup;
+
+        /* Order matters: fuse_node_ref_hash_remove's probe identifies the right
+         * hash slot by comparing node_refs[idx].nodeid against @nodeid, so it
+         * must run before that field is cleared, or the comparison fails
+         * (unless nodeid happens to be 0) and the hash slot is never
+         * tombstoned, silently corrupting the table for whatever nodeid later
+         * reuses this same node_refs[] index.
+         */
+        fuse_node_ref_hash_remove(session, nodeid);
+        memset(&session->node_refs[idx], 0, sizeof(session->node_refs[idx]));
+        session->node_ref_free[session->node_ref_free_count++] = idx;
+    } else {
+        session->node_refs[idx].nlookup -= nlookup;
     }
-    return 0;
+    if (!emit_forget)
+        return 0;
+    fuse_forget_one_t one = {.nodeid = nodeid, .nlookup = nlookup};
+    return fuse_emit_forget_multi_locked(session, &one, 1);
 }
 
 static int fuse_queue_request_locked(fuse_session_t *session,
@@ -1352,8 +1465,18 @@ int fuse_proc_open(int linux_flags)
             pthread_cond_init(&slot->init_cond, NULL);
             slot->notify_wr = -1;
             slot->max_write = 64 * 1024;
-            slot->max_pages = 16;
             slot->next_unique = 1;
+
+            /* memset above leaves node_ref_hash at all-zero, which collides
+             * with a valid node_refs[] index of 0; every slot must be set to
+             * the empty sentinel explicitly. node_ref_free lists every
+             * node_refs[] slot as available.
+             */
+            for (int j = 0; j < FUSE_NODE_REF_HASH_SIZE; j++)
+                slot->node_ref_hash[j] = FUSE_NODE_REF_HASH_EMPTY;
+            for (int j = 0; j < FUSE_MAX_NODE_REFS; j++)
+                slot->node_ref_free[j] = j;
+            slot->node_ref_free_count = FUSE_MAX_NODE_REFS;
             break;
         }
     }
@@ -2369,15 +2492,11 @@ int64_t fuse_dev_write(guest_t *g,
                        uint64_t buf_gva,
                        uint64_t count)
 {
-    if (count < sizeof(fuse_out_header_t))
-        return -LINUX_EINVAL;
-
-    /* Reject any daemon write that exceeds the implementation hard ceiling. The
-     * same ceiling is applied at FUSE_INIT negotiation, so a daemon cannot
-     * advertise max_write larger than this and then have its reply payload
-     * silently rejected here.
+    /* The same ceiling bounds FUSE_INIT negotiation, so a daemon cannot
+     * advertise a max_write whose replies would then be rejected here; that is
+     * a proved postcondition of fuse_clamp_negotiated_write.
      */
-    if (count > FUSE_FRAME_CAP)
+    if (!fuse_frame_count_ok(count))
         return -LINUX_EINVAL;
 
     uint8_t *buf = malloc((size_t) count);
@@ -2390,7 +2509,13 @@ int64_t fuse_dev_write(guest_t *g,
 
     fuse_out_header_t hdr;
     memcpy(&hdr, buf, sizeof(hdr));
-    if (hdr.len > count || hdr.len < sizeof(hdr)) {
+
+    /* Proved in src/syscall/fuse-math.h: on success the payload at buf +
+     * FUSE_OUT_HDR_BYTES for reply_len bytes lies inside the count bytes read
+     * above.
+     */
+    uint64_t reply_len;
+    if (!fuse_reply_extent(count, hdr.len, &reply_len)) {
         free(buf);
         return -LINUX_EINVAL;
     }
@@ -2430,13 +2555,13 @@ int64_t fuse_dev_write(guest_t *g,
      * negative Linux errno.
      */
     req->error = hdr.error;
-    req->reply_len = hdr.len - sizeof(hdr);
+    req->reply_len = (size_t) reply_len;
     if (req->reply_len) {
         req->reply = malloc(req->reply_len);
         if (!req->reply)
             req->error = -LINUX_ENOMEM;
         else
-            memcpy(req->reply, buf + sizeof(hdr), req->reply_len);
+            memcpy(req->reply, buf + FUSE_OUT_HDR_BYTES, req->reply_len);
     }
 
     if (req->frame && ((fuse_in_header_t *) req->frame)->opcode == FUSE_INIT) {
@@ -2472,13 +2597,25 @@ int64_t fuse_dev_write(guest_t *g,
                 req->error = -LINUX_EPROTO;
                 session->daemon_dead = true;
             } else {
-                uint32_t neg_write =
-                    init_out.max_write ? init_out.max_write : 65536;
-                if (neg_write > FUSE_MAX_NEGOTIATED_WRITE)
-                    neg_write = FUSE_MAX_NEGOTIATED_WRITE;
-                session->max_write = neg_write;
-                session->max_pages =
-                    init_out.max_pages ? init_out.max_pages : 16;
+                uint64_t neg_write = fuse_clamp_negotiated_write(
+                    init_out.max_write ? init_out.max_write : 65536);
+
+                /* A daemon that accepted FUSE_MAX_PAGES also stated the largest
+                 * request it will take, in pages, and the two numbers need not
+                 * agree: max_write bounds a WRITE payload, max_pages bounds any
+                 * request. Sizing a READ from max_write alone would send frames
+                 * the daemon told us it would refuse. Only a daemon that echoed
+                 * the flag has stated anything here; without it max_pages is a
+                 * reserved field whose zero would otherwise read as a one-page
+                 * limit.
+                 */
+                if ((init_out.flags & FUSE_MAX_PAGES) && init_out.max_pages) {
+                    uint64_t page_cap =
+                        (uint64_t) init_out.max_pages * GUEST_PAGE_SIZE;
+                    if (page_cap < neg_write)
+                        neg_write = page_cap;
+                }
+                session->max_write = (uint32_t) neg_write;
                 session->init_done = true;
             }
         } else if (hdr.error < 0) {

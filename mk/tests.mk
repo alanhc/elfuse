@@ -175,6 +175,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-path-matrix
 	@printf "\n$(BLUE)━━━ shebang parser unit test ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-shebang-host
+	@printf "\n$(BLUE)━━━ gva-math.h call-site contract checks ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-gva-contracts
 	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-proctitle-host
 	@printf "\n$(BLUE)━━━ proctitle low-stack regression ━━━$(RESET)\n"
@@ -1486,3 +1488,7 @@ probe-volume-naming: $(BUILD_DIR)/probe-volume-naming
 ## Run shebang parsing unit tests
 test-shebang-host: $(BUILD_DIR)/test-shebang-host
 	$(BUILD_DIR)/test-shebang-host
+
+## Run the gva-math.h call-site precondition checks (skips without the flag)
+test-gva-contracts: $(BUILD_DIR)/test-gva-contracts
+	$(BUILD_DIR)/test-gva-contracts

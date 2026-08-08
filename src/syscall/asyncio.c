@@ -24,7 +24,7 @@
 #include "utils.h"
 
 #include "runtime/thread.h"
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
@@ -182,6 +182,7 @@ void asyncio_disarm(int host_fd)
 {
     if (async_kq < 0)
         return;
+
     /* Issue each delete on its own kevent() call: with a NULL eventlist kevent
      * stops at the first failing change, and ENOENT is expected here (the
      * EVFILT_EXCEPT knote exists only for sockets, and a closed host fd has
@@ -220,6 +221,7 @@ void fasync_owner_set(int guest_fd,
 {
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
         return;
+
     /* Arm/disarm under fd_lock with the live host fd and generation. Doing the
      * kevent registration inside the lock (rather than snapshotting aliases and
      * acting after unlock) closes the close+reuse race: a sibling close cannot
@@ -271,6 +273,7 @@ void asyncio_apply(int guest_fd, uint64_t expect_gen, bool on)
 {
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
         return;
+
     /* Guard on generation, not just (type, host_fd): a close+reopen can reuse
      * the same guest fd number, host fd number, and type, so only the monotonic
      * generation distinguishes the caller's open from a new one. Arm/disarm run

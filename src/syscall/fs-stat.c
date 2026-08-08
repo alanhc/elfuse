@@ -14,7 +14,7 @@
 
 #include "runtime/procemu.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
 #include "syscall/fuse.h"
 #include "syscall/fs.h"
@@ -201,8 +201,7 @@ static int64_t stat_at_path(guest_t *g,
 
     path_translation_t tx;
     if (path_translate_at(dirfd, pathp,
-                          (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW
-                                                              : PATH_TR_NONE,
+                          path_tr_nofollow(flags & LINUX_AT_SYMLINK_NOFOLLOW),
                           &tx) < 0)
         return linux_errno();
 
@@ -370,9 +369,9 @@ static bool statfs_path_is_proc(const char *path)
 }
 
 /* /dev/pts itself and the pty slaves under it. /dev/ptmx is the multiplexer
- * that hands out those slaves; Linux reports devpts for a master fd too.
+ * that hands out those slaves; Linux reports devpts for a master fd too. How
+ * statfs should answer for a path under the virtual devpts mount.
  */
-/* How statfs should answer for a path under the virtual devpts mount. */
 typedef enum {
     DEVPTS_UNRELATED = 0, /* not under /dev/pts; carry on */
     DEVPTS_MOUNT,         /* the mount point or a live slave: synthesize */

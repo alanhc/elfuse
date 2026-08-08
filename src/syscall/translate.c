@@ -12,7 +12,7 @@
 
 #include "utils.h"
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 
 /* Linux errno translation. */
@@ -95,6 +95,7 @@ int64_t linux_errno(void)
     case ENOTSUP:
         return -LINUX_EOPNOTSUPP;
 #endif
+
         /* macOS xattr "attribute not found" lives at 93 (ENOATTR) on modern
          * SDKs; on some versions ENOATTR is a synonym for ENODATA(96). Map both
          * to Linux ENODATA(61) so getxattr/lgetxattr/fgetxattr report missing
@@ -250,6 +251,7 @@ int linux_to_mac_status_flags(int linux_flags)
         mac_flags |= O_NONBLOCK;
     if (linux_flags & LINUX_O_APPEND)
         mac_flags |= O_APPEND;
+
     /* O_ASYNC is deliberately NOT mapped onto the host fd. elfuse delivers
      * SIGIO/SIGURG itself via the kqueue watcher (see asyncio.c); arming host
      * O_ASYNC would let the host raise its own SIGIO at the elfuse process,

@@ -31,10 +31,11 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/io.h" /* io_wait_fd_or_interrupted */
 #include "syscall/net.h"
+#include "syscall/netlink-math.h"
 #include "utils.h"
 #include <poll.h>
 
@@ -45,21 +46,12 @@
 static void netlink_close(int guest_fd);
 
 /* Linux netlink message structures. These structures are defined manually to
- * match the Linux ABI exactly, since macOS has no <linux/netlink.h>.
+ * match the Linux ABI exactly, since macOS has no <linux/netlink.h>. The two
+ * headers the walks step over, nlmsghdr_t and rtattr_t, live in
+ * syscall/netlink-math.h with NLMSG_HDRLEN, RTA_HDRLEN and the arithmetic
+ * verify-netlink proves against them. The reply builders below round with the
+ * same netlink_align_up as the walks, so the two cannot round differently.
  */
-
-/* Netlink message header (struct nlmsghdr) */
-typedef struct {
-    uint32_t nlmsg_len;   /* Length of message including header */
-    uint16_t nlmsg_type;  /* Message type (RTM_*, NLMSG_*) */
-    uint16_t nlmsg_flags; /* Additional flags */
-    uint32_t nlmsg_seq;   /* Sequence number */
-    uint32_t nlmsg_pid;   /* Sending process port ID */
-} nlmsghdr_t;
-
-#define NLMSG_ALIGNTO 4
-#define NLMSG_ALIGN(len) (((len) + NLMSG_ALIGNTO - 1) & ~(NLMSG_ALIGNTO - 1))
-#define NLMSG_HDRLEN ((int) NLMSG_ALIGN(sizeof(nlmsghdr_t)))
 
 /* Netlink message types */
 #define NLMSG_DONE 3
@@ -94,16 +86,6 @@ typedef struct {
     uint8_t ifa_scope;     /* Address scope */
     uint32_t ifa_index;    /* Interface index */
 } ifaddrmsg_t;
-
-/* Routing attribute (struct rtattr) */
-typedef struct {
-    uint16_t rta_len;  /* Length including header */
-    uint16_t rta_type; /* Attribute type */
-} rtattr_t;
-
-#define RTA_ALIGNTO 4
-#define RTA_ALIGN(len) (((len) + RTA_ALIGNTO - 1) & ~(RTA_ALIGNTO - 1))
-#define RTA_HDRLEN ((int) RTA_ALIGN(sizeof(rtattr_t)))
 
 /* IFLA_* attribute types */
 #define IFLA_IFNAME 3
@@ -202,7 +184,7 @@ static size_t nl_put_attr(uint8_t *buf,
                           uint16_t datalen)
 {
     uint16_t total = (uint16_t) (RTA_HDRLEN + datalen);
-    uint16_t aligned = (uint16_t) RTA_ALIGN(total);
+    uint16_t aligned = (uint16_t) netlink_align_up(total);
     if (aligned > max)
         return 0;
     rtattr_t rta = {.rta_len = total, .rta_type = type};
@@ -261,7 +243,7 @@ static int nl_build_getlink(netlink_state_t *ns,
         /* Build message: nlmsghdr + ifinfomsg + attributes. Check minimum space
          * before advancing off.
          */
-        size_t min_msg = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(ifinfomsg_t));
+        size_t min_msg = NLMSG_HDRLEN + netlink_align_up(sizeof(ifinfomsg_t));
         if (off + min_msg > max)
             break;
         size_t msg_start = off;
@@ -274,7 +256,7 @@ static int nl_build_getlink(netlink_state_t *ns,
         ifi.ifi_index = (int32_t) idx;
         ifi.ifi_flags = ifa->ifa_flags;
         memcpy(buf + off, &ifi, sizeof(ifi));
-        off += NLMSG_ALIGN(sizeof(ifi));
+        off += netlink_align_up(sizeof(ifi));
 
         /* IFLA_IFNAME */
         size_t namelen = strlen(ifa->ifa_name) + 1;
@@ -342,7 +324,7 @@ static int nl_build_getaddr(netlink_state_t *ns)
         if (idx == 0)
             continue;
 
-        size_t min_msg = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(ifaddrmsg_t));
+        size_t min_msg = NLMSG_HDRLEN + netlink_align_up(sizeof(ifaddrmsg_t));
         if (off + min_msg > max)
             break;
         size_t msg_start = off;
@@ -381,7 +363,7 @@ static int nl_build_getaddr(netlink_state_t *ns)
         iam.ifa_scope = 0; /* RT_SCOPE_UNIVERSE */
         iam.ifa_index = (uint32_t) idx;
         memcpy(buf + off, &iam, sizeof(iam));
-        off += NLMSG_ALIGN(sizeof(iam));
+        off += netlink_align_up(sizeof(iam));
 
         /* IFA_ADDRESS attribute */
         if (family == AF_INET) {
@@ -510,7 +492,7 @@ static void nl_parse_link_filter(const uint8_t *req,
     name_out[0] = '\0';
     *index_out = 0;
 
-    if (reqlen < (size_t) NLMSG_HDRLEN + sizeof(ifinfomsg_t))
+    if (reqlen < NLMSG_HDRLEN + sizeof(ifinfomsg_t))
         return;
 
     ifinfomsg_t ifi;
@@ -522,21 +504,27 @@ static void nl_parse_link_filter(const uint8_t *req,
     memcpy(&nlmsg_len, req, sizeof(nlmsg_len));
     size_t total = (nlmsg_len < reqlen) ? nlmsg_len : reqlen;
 
-    size_t off = NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(ifinfomsg_t));
+    size_t off = NLMSG_HDRLEN + netlink_align_up(sizeof(ifinfomsg_t));
     while (off + RTA_HDRLEN <= total) {
         rtattr_t rta;
         memcpy(&rta, req + off, sizeof(rta));
-        if (rta.rta_len < RTA_HDRLEN || off + rta.rta_len > total)
+
+        /* Proved in src/syscall/netlink-math.h: on success the payload at off +
+         * RTA_HDRLEN for data_len bytes lies inside total, and next_off is
+         * strictly past off.
+         */
+        uint64_t data_len, next_off;
+        if (!netlink_rta_bounds(off, total, rta.rta_len, &data_len, &next_off))
             break;
         if (rta.rta_type == IFLA_IFNAME) {
-            size_t dlen = rta.rta_len - RTA_HDRLEN;
+            size_t dlen = (size_t) data_len;
             size_t i = 0;
             for (; i < dlen && i + 1 < name_cap && req[off + RTA_HDRLEN + i];
                  i++)
                 name_out[i] = (char) req[off + RTA_HDRLEN + i];
             name_out[i] = '\0';
         }
-        off += RTA_ALIGN(rta.rta_len);
+        off = (size_t) next_off;
     }
 }
 
@@ -569,7 +557,7 @@ static int nl_process_request(netlink_state_t *ns,
         break;
     default:
         /* Unsupported request: return NLMSG_ERROR with EOPNOTSUPP */
-        if ((size_t) NLMSG_HDRLEN + 4 <= NETLINK_BUF_SIZE) {
+        if (NLMSG_HDRLEN + 4 <= NETLINK_BUF_SIZE) {
             size_t off = 0;
             nlmsghdr_t err_hdr = {
                 .nlmsg_len = NLMSG_HDRLEN + 4,
@@ -711,8 +699,8 @@ static int64_t nl_wait_readable_locked(netlink_state_t *ns,
         /* Bounded + interrupt-aware: an untimed poll() here has no re-check
          * point, so a worker parked on an AF_NETLINK socket with no incoming
          * messages is invisible to thread_join_workers' poll cap and touches
-         * guest memory on an eventual delayed return, well after
-         * guest_destroy may have unmapped it.
+         * guest memory on an eventual delayed return, well after guest_destroy
+         * may have unmapped it.
          */
         int64_t wait_rc = io_wait_fd_or_interrupted(rd_fd, POLLIN);
         if (wait_rc < 0)
@@ -736,13 +724,25 @@ static size_t nl_complete_span(const netlink_state_t *ns, size_t to_copy)
 {
     size_t msg_end = 0, pos = ns->buf_pos;
     while (pos < ns->buf_len && (pos - ns->buf_pos + NLMSG_HDRLEN) <= to_copy) {
-        const nlmsghdr_t *hdr = (const nlmsghdr_t *) (ns->buf + pos);
-        if (hdr->nlmsg_len < NLMSG_HDRLEN)
+        /* memcpy rather than a cast: pos is not guaranteed to sit on a message
+         * boundary (see the header), so ns->buf + pos need not be suitably
+         * aligned for nlmsghdr_t.
+         */
+        nlmsghdr_t hdr;
+        memcpy(&hdr, ns->buf + pos, sizeof(hdr));
+
+        /* Proved in src/syscall/netlink-math.h: on success span is strictly
+         * positive, so this loop advances for any header at all. Before the
+         * widening this loop could spin forever on a guest-chosen length; see
+         * the header.
+         */
+        uint64_t span;
+        if (!netlink_msg_span(hdr.nlmsg_len, &span))
             break;
-        size_t msg_bytes = pos - ns->buf_pos + NLMSG_ALIGN(hdr->nlmsg_len);
+        size_t msg_bytes = pos - ns->buf_pos + (size_t) span;
         if (msg_bytes > to_copy)
             break;
-        pos += NLMSG_ALIGN(hdr->nlmsg_len);
+        pos += (size_t) span;
         msg_end = pos - ns->buf_pos;
     }
     return msg_end == 0 ? to_copy : msg_end;

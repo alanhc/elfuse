@@ -29,6 +29,7 @@
 #include "runtime/thread.h"
 
 #include "syscall/abi.h"
+#include "syscall/linux-wire.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
@@ -111,6 +112,7 @@ static void register_runtime_regions(guest_t *g, size_t shim_bin_len)
     guest_region_add(g, g->shim_base, g->shim_base + shim_bin_len,
                      LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
                      "[shim]");
+
     /* shim_data is mapped privileged-only (AP[2:1]=00) in the page tables; the
      * EL1 shim has full RW but EL0 cannot read or write. Report PROT_NONE in
      * /proc/self/maps so guest tooling treats it as inaccessible, matching what
@@ -302,6 +304,7 @@ static bool build_boot_regions(mem_region_t *regions,
      */
     if (!append_boot_region(regions, nregions, g->shim_base,
                             g->shim_base + shim_bin_len, MEM_PERM_RX) ||
+
         /* shim_data is EL1-only: the guest must not directly read or write the
          * identity cache, attention flag, urandom bitmap, or ring, any of which
          * would let it spoof its own syscall results. The EL1 shim itself has
@@ -526,6 +529,7 @@ int guest_bootstrap_prepare(guest_t *g,
         return -1;
     }
     startup_trace_step("guest_build_page_tables", t0);
+
     /* No TLBI request here: the shim's _start does TLBI VMALLE1IS before
      * enabling the MMU (src/core/shim.S), and the per-vCPU accumulator is the
      * wrong place to stage a bring-up flush -- bootstrap may run on a thread
@@ -631,6 +635,7 @@ int guest_bootstrap_prepare(guest_t *g,
     }
     g->start_stack = boot->stack_pointer;
     startup_trace_step("build_linux_stack", t0);
+
     /* rosetta_argv was copied into the guest stack; the host allocation is no
      * longer needed. The strings themselves are constants (ROSETTA_PATH) or
      * owned by the caller (binary_path, guest_argv entries) so freeing just the
@@ -667,6 +672,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
     uint64_t sctlr;
     uint64_t sctlr_with_mmu;
     uint64_t t0;
+
     /* Rosetta needs TTBR1 walks enabled and TBI1=1 so the kbuf window at
      * KBUF_VA_BASE (bits-63-set) resolves and TaggedPointer extraction keeps
      * working. Aarch64 guests stay on the EPD1=1 variant which keeps the upper
@@ -711,6 +717,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
      */
     if (shim_globals_self_test(vcpu) < 0)
         return -1;
+
     /* TPIDR_EL1 -> shim_globals base, CONTEXTIDR_EL1 -> tid (== pid for the
      * initial main thread). gettid fast path reads CONTEXTIDR_EL1 directly.
      */
@@ -730,16 +737,19 @@ int guest_bootstrap_create_vcpu(guest_t *g,
     shim_globals_publish_creds(g, proc_get_uid(), proc_get_euid(),
                                proc_get_gid(), proc_get_egid());
     proc_publish_pgsid_snapshot(g);
+
     /* Pre-fill the entropy ring so the first read(/dev/urandom) from the guest
      * is served by the shim fast path with no cold-start HVC for refill.
      */
     shim_globals_refill_urandom_ring(g);
+
     /* Register the singleton guest pointer so signal_queue and the itimer
      * setters can raise the attention flag without threading g through every
      * call site. signal_init clears this defensively; the first registration
      * must run after both proc_init and shim_globals_init.
      */
     signal_set_shim_globals_guest(g);
+
     /* Same singleton pattern but for the fd-table hooks that update the urandom
      * bitmap. Must run before any FD_URANDOM-typed slot is allocated; bootstrap
      * finishes before any guest syscall runs.
