@@ -3873,16 +3873,61 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
      */
     uint64_t end = off + length;
 
+    /* mmap_lock is dispatched here explicitly (SC_FORWARD, not SC_LOCKED) so
+     * only the plain fsync(2) calls below can run outside it. Everything else
+     * in this function reads or writes guest memory through a host pointer, and
+     * releasing the lock around that is NOT safe the way it is for a duped fd:
+     * a duped fd keeps the FILE alive across a concurrent munmap of the
+     * original mapping, but it does nothing to keep the GUEST MEMORY at that
+     * address attributed to the same region. A concurrent munmap + mmap could
+     * hand the same host VA range to something else entirely while an unlocked
+     * diff-and-write pass is still reading it, corrupting either the file
+     * (writing the new mapping's bytes into the old file) or the new mapping
+     * (writing the old file's bytes into it). A first version of this change
+     * snapshotted guest pointers across the unlock the same way it duped fds,
+     * on the reasoning that resolving host_ptr_for_gpa once under the lock and
+     * using it after release was safe: true for a stable *address*, false for
+     * what that address *means*, which is exactly what a concurrent munmap+mmap
+     * changes. An independent review caught this before it was trusted.
+     *
+     * fsync alone is safe to move outside the lock because everything it would
+     * flush was already written to the backing file's page cache by the
+     * diff-and-write pass above, while still under the lock. fsync just pushes
+     * already-resolved file content to stable storage, the same reasoning
+     * sc_sync_impl (this file, plain sync(2)) already relies on for the exact
+     * same dup-then-release-then-fsync pattern. Only allocated for MS_SYNC:
+     * MS_ASYNC and no-flag calls never fsync, so they must not be able to fail
+     * with ENOMEM over an allocation they do not need: the original code made
+     * no allocation at all for them. Allocated after the coverage check below
+     * and sized to the g->nregions read at that point, which is stable because
+     * mmap_lock is already held by then, unlike a pre-lock read, which a
+     * concurrent mapping could grow before the lock was actually taken.
+     */
+    int *fsync_fds = NULL;
+    int fsync_count = 0;
+
+    pthread_mutex_lock(&mmap_lock);
     uint64_t cursor = off;
     while (cursor < end) {
         const guest_region_t *r = guest_region_find(g, cursor);
-        if (!r || r->start > cursor)
+        if (!r || r->start > cursor) {
+            pthread_mutex_unlock(&mmap_lock);
             return -LINUX_ENOMEM;
+        }
         cursor = r->end < end ? r->end : end;
     }
 
+    if (flags & LINUX_MS_SYNC) {
+        fsync_fds = calloc((size_t) g->nregions, sizeof(*fsync_fds));
+        if (!fsync_fds) {
+            pthread_mutex_unlock(&mmap_lock);
+            return -LINUX_ENOMEM;
+        }
+    }
+
+    int64_t ret = 0;
     for (int i = 0; i < g->nregions; i++) {
-        const guest_region_t *r = &g->regions[i];
+        guest_region_t *r = &g->regions[i];
         if (r->start >= end)
             break;
         if (r->end <= off)
@@ -3904,13 +3949,48 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
         if (!r->overlay_active) {
             int64_t err = sync_shared_aliases_range(g, r->backing_fd,
                                                     file_start, file_end);
-            if (err < 0)
-                return err;
+            if (err < 0) {
+                ret = err;
+                break;
+            }
         }
 
         if (flags & LINUX_MS_SYNC) {
-            if (fsync(r->backing_fd) < 0)
-                return linux_errno();
+            /* Skip if an already-queued fd is the same underlying file: duping
+             * and fsyncing it again would be redundant, and it keeps the fd
+             * burst for one msync bounded by distinct backing files in range
+             * rather than by region count.
+             */
+            bool already_queued = false;
+            for (int k = 0; k < fsync_count; k++) {
+                if (same_backing_file(r->backing_fd, fsync_fds[k])) {
+                    already_queued = true;
+                    break;
+                }
+            }
+            if (!already_queued) {
+                /* F_DUPFD_CLOEXEC, not dup(): a concurrent execve on another
+                 * vCPU thread between this dup and the close below must not
+                 * inherit the backing file into the new image.
+                 */
+                int fd = fcntl(r->backing_fd, F_DUPFD_CLOEXEC, 0);
+                if (fd < 0) {
+                    /* Still holding mmap_lock and r is still valid here, so
+                     * fall back to the direct fsync msync(2) originally did
+                     * rather than failing the whole call: dup/fcntl failure (fd
+                     * exhaustion) is not an errno msync(2) defines, and
+                     * reporting it as one where the data could otherwise have
+                     * been flushed just fine would be a regression from the
+                     * pre-existing behavior.
+                     */
+                    if (fsync(r->backing_fd) < 0) {
+                        ret = linux_errno();
+                        break;
+                    }
+                } else {
+                    fsync_fds[fsync_count++] = fd;
+                }
+            }
         }
 
         for (int j = 0; j < g->nregions; j++) {
@@ -3929,12 +4009,33 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
 
             int64_t refresh_err =
                 refresh_shared_region_range(g, dst, file_start, file_end);
-            if (refresh_err < 0)
-                return refresh_err;
+            if (refresh_err < 0) {
+                ret = refresh_err;
+                break;
+            }
         }
+        if (ret < 0)
+            break;
     }
+    pthread_mutex_unlock(&mmap_lock);
 
-    return 0;
+    /* Every queued fd is fsynced unconditionally, even if a later region's
+     * diff/refresh failed and broke the locked loop early: the original code
+     * fsynced each region inline, immediately after its own diff pass and
+     * before moving on, so an earlier region's data was already durable before
+     * a later region could fail. Skipping the fsync here for an earlier,
+     * already-succeeded region over a later region's unrelated failure would
+     * make that data silently less durable than the original behavior promised.
+     * Only the first failure (diff/refresh or fsync) becomes the reported
+     * error; every fd is still closed regardless.
+     */
+    for (int i = 0; i < fsync_count; i++) {
+        if (fsync(fsync_fds[i]) < 0 && ret == 0)
+            ret = linux_errno();
+        close(fsync_fds[i]);
+    }
+    free(fsync_fds);
+    return ret;
 }
 
 /* See mem.h. Walk regions, convert each MAP_SHARED|MAP_ANONYMOUS region without
