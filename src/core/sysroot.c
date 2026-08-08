@@ -184,11 +184,13 @@ static int spawn_capture_stdout(char *const argv[],
     }
 
     size_t off = 0;
+    bool read_failed = false;
     while (buf && off + 1 < bufsz) {
         ssize_t n = read(pipefd[0], buf + off, bufsz - off - 1);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
+            read_failed = true;
             break;
         }
         if (n == 0)
@@ -204,6 +206,13 @@ static int spawn_capture_stdout(char *const argv[],
         if (errno != EINTR)
             return -1;
     }
+
+    /* A genuine read(2) error (not EOF) means the capture is not just possibly
+     * short but actually unreliable; report it rather than returning success
+     * with a silently truncated buffer.
+     */
+    if (read_failed)
+        return -1;
     if (status_out)
         *status_out = status;
     return 0;
