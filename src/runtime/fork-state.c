@@ -379,8 +379,15 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
 
     for (uint32_t i = 0; i < num_fds; i++) {
         int gfd = fd_entries[i].guest_fd;
-        if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE))
+        if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE)) {
+            /* Every other rejection path in this loop closes the received host
+             * fd before skipping the entry; a malformed guest_fd from a
+             * corrupted fork IPC payload must not be the one path that leaks
+             * it.
+             */
+            close(host_fds[i]);
             continue;
+        }
 
         uint64_t child_ofd = 0;
         for (uint32_t j = 0; j < ofd_maps; j++) {
