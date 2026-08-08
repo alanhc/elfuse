@@ -1,7 +1,7 @@
 # Static analysis and formatting
 
 .PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
-        verify-gva verify-cmsg verify-fuse infer-uninit
+        verify-gva verify-cmsg verify-fuse check-contracts infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -36,11 +36,17 @@ lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 # elf_segment_extent(..., &x, &x) would invalidate the proof with no diagnostic.
 #
 # That caveat is general, and it bites hardest for gva-math.h: guest.c cannot be
-# given to Frama-C at all, so NOTHING checks that its call sites honor the eight
-# `requires` clauses there. check-acsl-coverage.py closes the other direction
-# (a contract assumed because its function was left out of -wp-fct); it says
-# nothing about preconditions at call sites. Those are reviewed by hand, and
-# gva_contiguous_avail additionally guards itself at runtime.
+# given to Frama-C at all, so nothing here checks that its call sites honor the
+# nine `requires` clauses there. check-acsl-coverage.py closes the other
+# direction (a contract assumed because its function was left out of -wp-fct);
+# it says nothing about preconditions at call sites.
+#
+# `make check-contracts` narrows that gap from the runtime side: it rebuilds
+# with -DELFUSE_CONTRACT_ASSERT so the five expressible clauses are checked on
+# every call the suite makes. The four pointer clauses (\valid x3, \separated)
+# have no C expression and stay review-only. The checks call the *_args_ok
+# predicates in gva-math.h, whose <==> contracts are proved here, so a check
+# that drifted weaker than the clause it mirrors fails verify-gva.
 #
 # Install: opam install frama-c, then why3 config detect (without the latter WP
 # aborts with "Prover not found" instead of reporting unproved goals).
@@ -75,8 +81,13 @@ FRAMAC_TIMEOUT ?= 30
 # The analyzer parses against Frama-C's own modeled libc headers, never the
 # host's. -print-share-path runs at recipe time rather than through $(shell) so
 # a make invocation with no frama-c installed does not pay for it.
+
+# Per-target preprocessor defines, empty for every target that does not set one.
+CPP_DEFS :=
+
 FRAMAC_CPP_ARGS = -nostdinc \
-    -isystem $$($(FRAMAC) -print-share-path)/libc -Isrc -I$(BUILD_DIR)
+    -isystem $$($(FRAMAC) -print-share-path)/libc -Isrc -I$(BUILD_DIR) \
+    $(CPP_DEFS)
 
 # One proof per attacker-facing parser. Each is declared by a single
 # verify_target call below; the recipe itself lives in one place.
@@ -107,8 +118,9 @@ VERIFY_ELF_UNPROVED := the pread/malloc I/O around them stays test-covered
 
 VERIFY_GVA_SRC   := src/core/gva-math.h
 VERIFY_GVA_FCTS  := gva_pt_table_offset gva_leaf_target gva_chunk_clamp \
-                    gva_span_ok
-VERIFY_GVA_MIN_GOALS ?= 40
+                    gva_span_ok gva_leaf_target_args_ok \
+                    gva_chunk_clamp_args_ok
+VERIFY_GVA_MIN_GOALS ?= 66
 VERIFY_GVA_MODEL := typed
 VERIFY_GVA_SCAN  := src/core/gva-math.h
 VERIFY_GVA_CLAIM := for ANY guest address, length, and page-table content
@@ -172,6 +184,12 @@ verify-elf: CLAIM := $(VERIFY_ELF_CLAIM)
 verify-elf: UNPROVED := $(VERIFY_ELF_UNPROVED)
 
 ## Prove guest address translation cannot compute an out-of-bounds window
+# Prove with the call-site checks compiled IN. Without this the prover never
+# sees the GVA_CONTRACT_ASSERT calls, and a check wired to the wrong predicate
+# or handed permuted arguments would show up only as a spurious runtime abort
+# under check-contracts. With it, WP must discharge each assert from the very
+# requires clause it mirrors, so the wiring is machine-checked too.
+verify-gva: CPP_DEFS := -DELFUSE_CONTRACT_ASSERT
 verify-gva: NAME := gva
 verify-gva: SRC := $(VERIFY_GVA_SRC)
 verify-gva: FCTS := $(VERIFY_GVA_FCTS)
@@ -250,6 +268,22 @@ verify-elf verify-rsp verify-gva verify-cmsg verify-fuse: | $(BUILD_DIR)
 
 ## Run every Frama-C proof
 verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse
+
+## Rebuild with the gva-math.h precondition checks live, then run the suite
+#
+# Separate from `make check` rather than folded into it: gva_leaf_target and
+# gva_chunk_clamp sit on the guest_read / guest_write hot path, and the tree has
+# no NDEBUG release split that would compile the checks out again.
+#
+# Builds into its own directory rather than rebuilding in place. Sharing
+# $(BUILD_DIR) would leave instrumented objects behind, and a later `make
+# elfuse` would silently relink them: a default-looking binary carrying the
+# checks on its hot path. A separate tree also means no -B is needed, since it
+# starts empty.
+check-contracts:
+	@echo "  CONTRACT gva-math.h call-site preconditions (5 of 9 clauses)"
+	$(Q)$(MAKE) BUILD_DIR=$(BUILD_DIR)/contracts \
+	    EXTRA_CFLAGS="-DELFUSE_CONTRACT_ASSERT $(EXTRA_CFLAGS)" check
 
 ## Re-run Infer with the uninitialized-value checker that .inferconfig disables
 infer-uninit: | $(BUILD_DIR)
