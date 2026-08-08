@@ -1,7 +1,7 @@
 # Static analysis and formatting
 
 .PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
-        verify-gva verify-cmsg infer-uninit
+        verify-gva verify-cmsg verify-fuse infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -139,6 +139,15 @@ VERIFY_CMSG_SCAN := src/syscall/cmsg-math.h
 VERIFY_CMSG_CLAIM := for ANY control-message bytes a guest can supply
 VERIFY_CMSG_UNPROVED := the walk loop and the host cmsg build stay test-covered
 
+VERIFY_FUSE_SRC  := src/syscall/fuse-math.h
+VERIFY_FUSE_FCTS := fuse_frame_count_ok fuse_reply_extent \
+                    fuse_clamp_negotiated_write
+VERIFY_FUSE_MIN_GOALS ?= 27
+VERIFY_FUSE_MODEL := typed
+VERIFY_FUSE_SCAN := src/syscall/fuse-math.h
+VERIFY_FUSE_CLAIM := for ANY reply frame a guest FUSE daemon can write
+VERIFY_FUSE_UNPROVED := the per-opcode payload extents stay test-covered
+
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
 verify_empty :=
@@ -195,6 +204,17 @@ verify-cmsg: SCAN := $(VERIFY_CMSG_SCAN)
 verify-cmsg: CLAIM := $(VERIFY_CMSG_CLAIM)
 verify-cmsg: UNPROVED := $(VERIFY_CMSG_UNPROVED)
 
+## Prove a hostile FUSE daemon cannot drive a reply past its own frame
+verify-fuse: NAME := fuse
+verify-fuse: SRC := $(VERIFY_FUSE_SRC)
+verify-fuse: FCTS := $(VERIFY_FUSE_FCTS)
+verify-fuse: FCT_ARG := $(call commafy,$(VERIFY_FUSE_FCTS))
+verify-fuse: MIN_GOALS := $(VERIFY_FUSE_MIN_GOALS)
+verify-fuse: MODEL := $(VERIFY_FUSE_MODEL)
+verify-fuse: SCAN := $(VERIFY_FUSE_SCAN)
+verify-fuse: CLAIM := $(VERIFY_FUSE_CLAIM)
+verify-fuse: UNPROVED := $(VERIFY_FUSE_UNPROVED)
+
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
 # what gets proved.
@@ -203,7 +223,7 @@ verify-cmsg: UNPROVED := $(VERIFY_CMSG_UNPROVED)
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-verify-elf verify-rsp verify-gva verify-cmsg: | $(BUILD_DIR)
+verify-elf verify-rsp verify-gva verify-cmsg verify-fuse: | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -229,7 +249,7 @@ verify-elf verify-rsp verify-gva verify-cmsg: | $(BUILD_DIR)
 	    --src $(SRC) --unproved "$(UNPROVED)"
 
 ## Run every Frama-C proof
-verify: verify-elf verify-gva verify-rsp verify-cmsg
+verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse
 
 ## Re-run Infer with the uninitialized-value checker that .inferconfig disables
 infer-uninit: | $(BUILD_DIR)

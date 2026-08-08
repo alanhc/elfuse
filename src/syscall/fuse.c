@@ -24,6 +24,7 @@
 
 #include "syscall/abi.h"
 #include "syscall/asyncio.h"
+#include "syscall/fuse-math.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
@@ -173,11 +174,9 @@ typedef struct {
     uint16_t padding;
 } fuse_in_header_t;
 
-typedef struct {
-    uint32_t len;
-    int32_t error;
-    uint64_t unique;
-} fuse_out_header_t;
+/* fuse_out_header_t lives in syscall/fuse-math.h, next to the frame arithmetic
+ * proved against it.
+ */
 
 typedef struct {
     uint64_t ino;
@@ -207,18 +206,7 @@ typedef struct {
 #define FUSE_MAX_NODE_REFS 4096
 #define FUSE_FAKE_DEV 0xF00D
 
-/* Implementation ceiling for a single FUSE frame (header + payload). The kernel
- * FUSE protocol caps a READ or WRITE payload at FUSE_MAX_PAGES * page_size = ~1
- * MiB by default and up to 4 MiB under recent kernels. The 8 MiB hard cap below
- * leaves headroom for the FUSE header, in-band sub-headers, and any future
- * readahead growth while still bounding the largest single malloc the daemon
- * can force. Daemon-negotiated max_write is clamped to (FUSE_FRAME_CAP
- * - sizeof(fuse_in_header_t) - sizeof(fuse_write_in)) at FUSE_INIT time so the
- * read-reply path cannot negotiate a size larger than fuse_dev_write will
- * accept.
- */
-#define FUSE_FRAME_CAP ((size_t) (8 * 1024 * 1024))
-#define FUSE_MAX_NEGOTIATED_WRITE ((uint32_t) (FUSE_FRAME_CAP - 256))
+/* FUSE_FRAME_CAP and FUSE_MAX_NEGOTIATED_WRITE live in syscall/fuse-math.h. */
 
 typedef struct fuse_request {
     bool used;
@@ -2369,15 +2357,11 @@ int64_t fuse_dev_write(guest_t *g,
                        uint64_t buf_gva,
                        uint64_t count)
 {
-    if (count < sizeof(fuse_out_header_t))
-        return -LINUX_EINVAL;
-
-    /* Reject any daemon write that exceeds the implementation hard ceiling. The
-     * same ceiling is applied at FUSE_INIT negotiation, so a daemon cannot
-     * advertise max_write larger than this and then have its reply payload
-     * silently rejected here.
+    /* The same ceiling bounds FUSE_INIT negotiation, so a daemon cannot
+     * advertise a max_write whose replies would then be rejected here; that is
+     * a proved postcondition of fuse_clamp_negotiated_write.
      */
-    if (count > FUSE_FRAME_CAP)
+    if (!fuse_frame_count_ok(count))
         return -LINUX_EINVAL;
 
     uint8_t *buf = malloc((size_t) count);
@@ -2390,7 +2374,13 @@ int64_t fuse_dev_write(guest_t *g,
 
     fuse_out_header_t hdr;
     memcpy(&hdr, buf, sizeof(hdr));
-    if (hdr.len > count || hdr.len < sizeof(hdr)) {
+
+    /* Proved in src/syscall/fuse-math.h: on success the payload at buf +
+     * FUSE_OUT_HDR_BYTES for reply_len bytes lies inside the count bytes read
+     * above.
+     */
+    uint64_t reply_len;
+    if (!fuse_reply_extent(count, hdr.len, &reply_len)) {
         free(buf);
         return -LINUX_EINVAL;
     }
@@ -2430,13 +2420,13 @@ int64_t fuse_dev_write(guest_t *g,
      * negative Linux errno.
      */
     req->error = hdr.error;
-    req->reply_len = hdr.len - sizeof(hdr);
+    req->reply_len = (size_t) reply_len;
     if (req->reply_len) {
         req->reply = malloc(req->reply_len);
         if (!req->reply)
             req->error = -LINUX_ENOMEM;
         else
-            memcpy(req->reply, buf + sizeof(hdr), req->reply_len);
+            memcpy(req->reply, buf + FUSE_OUT_HDR_BYTES, req->reply_len);
     }
 
     if (req->frame && ((fuse_in_header_t *) req->frame)->opcode == FUSE_INIT) {
@@ -2474,9 +2464,8 @@ int64_t fuse_dev_write(guest_t *g,
             } else {
                 uint32_t neg_write =
                     init_out.max_write ? init_out.max_write : 65536;
-                if (neg_write > FUSE_MAX_NEGOTIATED_WRITE)
-                    neg_write = FUSE_MAX_NEGOTIATED_WRITE;
-                session->max_write = neg_write;
+                session->max_write =
+                    (uint32_t) fuse_clamp_negotiated_write(neg_write);
                 session->max_pages =
                     init_out.max_pages ? init_out.max_pages : 16;
                 session->init_done = true;
