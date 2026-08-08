@@ -493,7 +493,7 @@ int64_t sys_openat_path(guest_t *g,
     int flags = translate_open_flags(linux_flags);
     if (!tx.fuse_path && tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD &&
         pathp[0] != '/' && !proc_get_sysroot()) {
-        int host_fd = openat(AT_FDCWD, pathp, flags, mode);
+        int host_fd = openat(AT_FDCWD, tx.host_path, flags, mode);
         if (host_fd < 0)
             return linux_errno();
 
