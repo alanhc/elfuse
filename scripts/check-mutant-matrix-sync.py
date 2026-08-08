@@ -5,7 +5,7 @@
 target names mk/analysis.mk's VERIFY_<T>_SRC entries define, so the mutation
 gate can shard one job per target. The workflow's own comment admits the
 failure mode: a target missing from the YAML matrix silently drops that
-target's mutation coverage from CI, with no error -- the run still reports
+target's mutation coverage from CI, with no error. The run still reports
 green, having simply never mutated that target. Nothing else checks the two
 lists stay in sync.
 
@@ -47,12 +47,32 @@ def workflow_matrix_targets():
     if not m:
         print(
             "  could not find verify-mutants' matrix.target list in "
-            ".github/workflows/main.yml -- the job may have been renamed or "
+            ".github/workflows/main.yml. The job may have been renamed or "
             "restructured; update this script's regex to match",
             file=sys.stderr,
         )
         return None
-    return set(re.findall(r"^          - (\S+)$", m.group(1), re.MULTILINE))
+
+    targets = re.findall(r"^          - (\S+)$", m.group(1), re.MULTILINE)
+    # Kept as a list until duplicates are checked: converting straight to a
+    # set here would make two matrix entries for the same target compare as
+    # "in sync" with mk/analysis.mk's single entry, silently accepting a
+    # hand-edit that doubles that target's mutation-gate job (and CI cost)
+    # rather than flagging it.
+    seen, dupes = set(), set()
+    for t in targets:
+        (dupes if t in seen else seen).add(t)
+    if dupes:
+        print(
+            "  duplicate target(s) in verify-mutants' matrix.target list "
+            "in .github/workflows/main.yml. Each duplicate runs the same "
+            "target's mutation gate as a second, redundant CI job:",
+            file=sys.stderr,
+        )
+        for t in sorted(dupes):
+            print(f"    {t}", file=sys.stderr)
+        return None
+    return seen
 
 
 def main():
@@ -74,7 +94,7 @@ def main():
     if missing_from_ci:
         print(
             "  proof target(s) in mk/analysis.mk with no verify-mutants CI "
-            "matrix entry -- their mutation coverage silently does not run "
+            "matrix entry, so their mutation coverage silently does not run "
             "in CI:",
             file=sys.stderr,
         )
@@ -83,7 +103,7 @@ def main():
     if extra_in_ci:
         print(
             "  verify-mutants CI matrix entries with no matching "
-            "VERIFY_<T>_SRC in mk/analysis.mk -- likely a stale or "
+            "VERIFY_<T>_SRC in mk/analysis.mk, likely a stale or "
             "misspelled target:",
             file=sys.stderr,
         )
