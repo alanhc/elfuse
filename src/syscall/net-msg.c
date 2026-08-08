@@ -19,6 +19,7 @@
 
 #include "utils.h"
 
+#include "syscall/cmsg-math.h"
 #include "syscall/internal.h"
 #include "syscall/io.h"
 #include "syscall/net.h"
@@ -110,11 +111,13 @@ static void recvmsg_close_host_rights(const void *data_src, size_t data_len)
         close(fds[i]);
 }
 
-/* Wire size of a Linux SCM_CREDENTIALS control message: cmsghdr (16) + ucred,
- * rounded up to the 8-byte cmsg alignment.
+/* Wire size of a Linux SCM_CREDENTIALS control message: cmsghdr plus ucred,
+ * rounded up to the cmsg alignment.
  */
-#define SCM_CRED_CMSG_SPACE \
-    (((size_t) (16 + sizeof(linux_ucred_t)) + 7) & ~(size_t) 7)
+#define SCM_CRED_CMSG_SPACE                                     \
+    (((size_t) (CMSG_LINUX_HDR_BYTES + sizeof(linux_ucred_t)) + \
+      (CMSG_LINUX_ALIGN - 1)) &                                 \
+     ~(size_t) (CMSG_LINUX_ALIGN - 1))
 
 /* Pack an SCM_CREDENTIALS control message carrying this process's identity into
  * dst, which must have room for SCM_CRED_CMSG_SPACE bytes. Zero-fills the
@@ -128,14 +131,14 @@ static void build_scm_cred_cmsg(uint8_t *dst)
         .uid = proc_get_uid(),
         .gid = proc_get_gid(),
     };
-    uint64_t cred_cmsg_len = 16 + sizeof(cred);
+    uint64_t cred_cmsg_len = CMSG_LINUX_HDR_BYTES + sizeof(cred);
     int32_t cred_level = 1; /* SOL_SOCKET */
     int32_t cred_type = LINUX_SCM_CREDENTIALS;
     memset(dst, 0, SCM_CRED_CMSG_SPACE);
     memcpy(dst, &cred_cmsg_len, 8);
     memcpy(dst + 8, &cred_level, 4);
     memcpy(dst + 12, &cred_type, 4);
-    memcpy(dst + 16, &cred, sizeof(cred));
+    memcpy(dst + CMSG_LINUX_HDR_BYTES, &cred, sizeof(cred));
 }
 
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
@@ -261,12 +264,16 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
     socklen_t ctrl_len = 0;
 
     if (lmsg.msg_control && lmsg.msg_controllen > 0) {
-        size_t clen = lmsg.msg_controllen;
-        if (clen > 65536) {
+        /* Bound msg_controllen before narrowing it. CMSG_LINUX_CTL_MAX is the
+         * precondition cmsg_entry_bounds is proved under, so this check is what
+         * makes that proof apply to the walk below.
+         */
+        if (lmsg.msg_controllen > CMSG_LINUX_CTL_MAX) {
             host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
+        size_t clen = (size_t) lmsg.msg_controllen;
         if (clen > sizeof(linux_ctrl_stack)) {
             linux_ctrl_heap = malloc(clen);
             mac_ctrl_heap = malloc(clen);
@@ -289,23 +296,25 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
             return -LINUX_EFAULT;
         }
 
-        size_t lpos = 0;
+        uint64_t lpos = 0;
         size_t mpos = 0;
         uint64_t lctl_len = lmsg.msg_controllen;
 
-        while (lpos + 16 <= lctl_len) {
+        while (lpos + CMSG_LINUX_HDR_BYTES <= lctl_len) {
             uint64_t lcmsg_len;
             int32_t lcmsg_level, lcmsg_type;
             memcpy(&lcmsg_len, linux_ctrl + lpos, 8);
             memcpy(&lcmsg_level, linux_ctrl + lpos + 8, 4);
             memcpy(&lcmsg_type, linux_ctrl + lpos + 12, 4);
 
-            if (lcmsg_len < 16)
+            /* Proved in src/syscall/cmsg-math.h: on success the ldata_len
+             * payload bytes at lpos + CMSG_LINUX_HDR_BYTES lie inside
+             * linux_ctrl, and next_lpos is strictly past lpos.
+             */
+            uint64_t ldata_len, next_lpos;
+            if (!cmsg_entry_bounds(lpos, lctl_len, lcmsg_len, &ldata_len,
+                                   &next_lpos))
                 break;
-            if (lcmsg_len > lctl_len - lpos)
-                break;
-            size_t ldata_len = (size_t) (lcmsg_len - 16);
-            size_t next_lpos = lpos + (size_t) ((lcmsg_len + 7) & ~7ULL);
 
             if (lcmsg_level == 1 && lcmsg_type == LINUX_SCM_CREDENTIALS) {
                 lpos = next_lpos;
@@ -334,7 +343,8 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
             cmsg->cmsg_len = CMSG_LEN(ldata_len);
             cmsg->cmsg_level = mac_level;
             cmsg->cmsg_type = mac_type;
-            memcpy(CMSG_DATA(cmsg), linux_ctrl + lpos + 16, ldata_len);
+            memcpy(CMSG_DATA(cmsg), linux_ctrl + lpos + CMSG_LINUX_HDR_BYTES,
+                   ldata_len);
 
             if (mac_level == SOL_SOCKET && mac_type == SCM_RIGHTS) {
                 int *fds = (int *) CMSG_DATA(cmsg);
@@ -516,8 +526,8 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     struct sockaddr_storage mac_sa;
     socklen_t sa_len = sizeof(mac_sa);
 
-    if (lmsg.msg_controllen > 65536)
-        lmsg.msg_controllen = 65536;
+    if (lmsg.msg_controllen > CMSG_LINUX_CTL_MAX)
+        lmsg.msg_controllen = CMSG_LINUX_CTL_MAX;
 
     uint8_t mac_ctrl_stack[256];
     uint8_t *mac_ctrl = mac_ctrl_stack;
@@ -649,12 +659,22 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
             if (cmsg->cmsg_len < CMSG_LEN(0))
                 continue;
             size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
-            if (data_len > lctrl_size - 16) {
+            if (data_len > lctrl_size - CMSG_LINUX_HDR_BYTES) {
                 ctrl_truncated = 1;
                 break;
             }
-            uint64_t lcmsg_len = 16 + data_len;
-            size_t lcmsg_space = (size_t) ((lcmsg_len + 7) & ~7ULL);
+            uint64_t lcmsg_len = CMSG_LINUX_HDR_BYTES + data_len;
+
+            /* Same align-up as cmsg_entry_bounds, in the same subtract-the-
+             * remainder form. This direction builds the buffer rather than
+             * walking a guest-supplied one, so it is not covered by
+             * verify-cmsg; keeping the spelling identical avoids the two
+             * directions drifting apart.
+             */
+            size_t lcmsg_space =
+                (size_t) (lcmsg_len + (CMSG_LINUX_ALIGN - 1) -
+                          (lcmsg_len + (CMSG_LINUX_ALIGN - 1)) %
+                              CMSG_LINUX_ALIGN);
 
             if (lpos + lcmsg_space > lctrl_size ||
                 lpos + lcmsg_space > lmsg.msg_controllen) {
@@ -723,7 +743,8 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
             memcpy(linux_ctrl + lpos, &lcmsg_len, 8);
             memcpy(linux_ctrl + lpos + 8, &llevel, 4);
             memcpy(linux_ctrl + lpos + 12, &ltype, 4);
-            memcpy(linux_ctrl + lpos + 16, data_src, data_len);
+            memcpy(linux_ctrl + lpos + CMSG_LINUX_HDR_BYTES, data_src,
+                   data_len);
             free(data_copy_heap);
 
             lpos += lcmsg_space;
@@ -1077,12 +1098,13 @@ int64_t sys_recvmmsg(guest_t *g,
         if (write_linux_mmsghdr_len(g, hdr_gva, msg_len) < 0)
             return received > 0 ? (int64_t) received : -LINUX_EFAULT;
         received++;
-        /* A zero-length message ends the batch. On a connection-oriented
-         * socket it is EOF; the macOS SEQPACKET-over-DGRAM substitute reports
-         * that EOF only once (then EAGAIN), so a further blocking iteration
-         * would hang waiting for a persistent EOF that never arrives. Stop
-         * here, matching the vlen==1 fast path -- recvmmsg may return fewer
-         * than vlen messages and callers loop for more.
+
+        /* A zero-length message ends the batch. On a connection-oriented socket
+         * it is EOF; the macOS SEQPACKET-over-DGRAM substitute reports that EOF
+         * only once (then EAGAIN), so a further blocking iteration would hang
+         * waiting for a persistent EOF that never arrives. Stop here, matching
+         * the vlen==1 fast path: recvmmsg may return fewer than vlen messages
+         * and callers loop for more.
          */
         if (ret == 0)
             break;

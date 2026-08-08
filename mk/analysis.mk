@@ -1,7 +1,7 @@
 # Static analysis and formatting
 
 .PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
-        verify-gva infer-uninit
+        verify-gva verify-cmsg infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -131,6 +131,14 @@ VERIFY_RSP_SCAN  := src/debug/gdbstub-rsp.c src/utils.h
 VERIFY_RSP_CLAIM := for ANY packet bytes a GDB remote can send
 VERIFY_RSP_UNPROVED := the socket I/O and framing loop stay test-covered
 
+VERIFY_CMSG_SRC  := src/syscall/cmsg-math.h
+VERIFY_CMSG_FCTS := cmsg_entry_bounds
+VERIFY_CMSG_MIN_GOALS ?= 17
+VERIFY_CMSG_MODEL := typed
+VERIFY_CMSG_SCAN := src/syscall/cmsg-math.h
+VERIFY_CMSG_CLAIM := for ANY control-message bytes a guest can supply
+VERIFY_CMSG_UNPROVED := the walk loop and the host cmsg build stay test-covered
+
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
 verify_empty :=
@@ -176,6 +184,17 @@ verify-rsp: SCAN := $(VERIFY_RSP_SCAN)
 verify-rsp: CLAIM := $(VERIFY_RSP_CLAIM)
 verify-rsp: UNPROVED := $(VERIFY_RSP_UNPROVED)
 
+## Prove the control-message walk cannot be driven out of the control buffer
+verify-cmsg: NAME := cmsg
+verify-cmsg: SRC := $(VERIFY_CMSG_SRC)
+verify-cmsg: FCTS := $(VERIFY_CMSG_FCTS)
+verify-cmsg: FCT_ARG := $(call commafy,$(VERIFY_CMSG_FCTS))
+verify-cmsg: MIN_GOALS := $(VERIFY_CMSG_MIN_GOALS)
+verify-cmsg: MODEL := $(VERIFY_CMSG_MODEL)
+verify-cmsg: SCAN := $(VERIFY_CMSG_SCAN)
+verify-cmsg: CLAIM := $(VERIFY_CMSG_CLAIM)
+verify-cmsg: UNPROVED := $(VERIFY_CMSG_UNPROVED)
+
 # One recipe, shared by every verify-* target above. Listing several targets on
 # one rule gives each of them this recipe; the target-specific variables select
 # what gets proved.
@@ -184,7 +203,7 @@ verify-rsp: UNPROVED := $(VERIFY_RSP_UNPROVED)
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-verify-elf verify-rsp verify-gva: | $(BUILD_DIR)
+verify-elf verify-rsp verify-gva verify-cmsg: | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -210,7 +229,7 @@ verify-elf verify-rsp verify-gva: | $(BUILD_DIR)
 	    --src $(SRC) --unproved "$(UNPROVED)"
 
 ## Run every Frama-C proof
-verify: verify-elf verify-gva verify-rsp
+verify: verify-elf verify-gva verify-rsp verify-cmsg
 
 ## Re-run Infer with the uninitialized-value checker that .inferconfig disables
 infer-uninit: | $(BUILD_DIR)
