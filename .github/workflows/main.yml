@@ -359,7 +359,21 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: 1
       BREW_PKGS: opam gmp pkg-config graphviz llvm@17 zlib
       OPAMCONFIRMLEVEL: unsafe-yes
-      FRAMAC_TIMEOUT: 120
+      # Deliberately far below the verify job's 120, and the single biggest
+      # term in this job's runtime. A mutation is caught by leaving a goal
+      # open, and an open goal is one both provers spend the whole timeout
+      # failing to discharge, so every caught mutation costs two full
+      # timeouts per goal. The verify job wants headroom because one
+      # [Timeout] there is a false proof regression; here the pressure runs
+      # the other way.
+      #
+      # Cutting it does not weaken the verdict, because check-mutants.py
+      # proves an UNMUTATED copy of each source through this same path
+      # first (check_baseline). A value too tight to prove real code fails
+      # that control loudly instead of silently scoring mutations as caught.
+      # The margin is wide: all nine targets together discharge 392
+      # obligations in 31s locally, the slowest single target in 9s.
+      FRAMAC_TIMEOUT: 45
       FRAMAC_VERSION: "31.0"
       ALT_ERGO_VERSION: 2.6.3
       Z3_VERSION: 4.16.0
