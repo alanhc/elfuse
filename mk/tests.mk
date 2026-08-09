@@ -334,10 +334,12 @@ test-sysroot-symlink-escape: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-esc
 	tmpdir=$$(mktemp -d); \
 	secret_dir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmpdir" "$$secret_dir"' EXIT; \
-	mkdir -p "$$tmpdir/d1"; \
+	mkdir -p "$$tmpdir/d1" "$$tmpdir/d2"; \
 	printf 'inside-sysroot\n' > "$$tmpdir/d1/normal.txt"; \
 	printf 'SECRET-HOST-FILE\n' > "$$secret_dir/secret.txt"; \
 	ln -sf "$$secret_dir/secret.txt" "$$tmpdir/d1/abs-link"; \
+	ln -sf "$$secret_dir/secret.txt" "$$tmpdir/d2/abs-link"; \
+	ln -sf "../d2/abs-link" "$$tmpdir/d1/chain-link"; \
 	depth=$$(printf '%s' "$$tmpdir/d1" | tr -cd '/' | wc -c | tr -d ' '); \
 	relback=""; i=0; \
 	while [ "$$i" -lt "$$depth" ]; do relback="../$$relback"; i=$$((i + 1)); done; \
@@ -530,6 +532,10 @@ test-sysroot-symlink-target: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-tar
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$tmpdir/host-downloads"; \
+	ln -s "$$HOME" "$$tmpdir/host-home-link"; \
+	mkdir -p "$$tmpdir/home/muplar"; \
+	ln -s "$$tmpdir/host-downloads" "$$tmpdir/home/muplar/Download"; \
 	had_target=0; [ -e "/symlink-target" ] && had_target=1; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" \
 	    $(BUILD_DIR)/test-sysroot-symlink-target; \

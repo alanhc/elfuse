@@ -38,6 +38,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -120,6 +121,36 @@ int main(void)
     EXPECT_TRUE(link_to(path, "abs-escaped") == 0, "symlink");
     TEST("  and reads through to it");
     EXPECT_TRUE(reads("abs-escaped", "escaped") == 0, "content");
+
+    TEST("a staged host symlink is followed");
+    EXPECT_TRUE(stat("/host-home-link", &st) == 0 && S_ISDIR(st.st_mode),
+                "stat follows host link");
+    TEST("a staged host symlink with trailing slash is followed");
+    EXPECT_TRUE(stat("/host-home-link/", &st) == 0 && S_ISDIR(st.st_mode),
+                "stat follows host link as a directory");
+    TEST("a staged host symlink opens as a directory");
+    {
+        int f = open("/host-home-link/", O_RDONLY | O_DIRECTORY);
+        if (f >= 0) {
+            close(f);
+            PASS();
+        } else {
+            FAIL("open follows host link as a directory");
+        }
+    }
+    TEST("a relative staged host symlink opens as a directory");
+    {
+        DIR *dir;
+        if (chdir("/home/muplar") < 0) {
+            FAIL("chdir /home/muplar");
+        } else if ((dir = opendir("Download/")) != NULL) {
+            closedir(dir);
+            PASS();
+        } else {
+            FAIL("opendir follows relative host link as a directory");
+        }
+        EXPECT_TRUE(chdir("/") == 0, "restore cwd");
+    }
 
     /* readlink reports the disk. A relative target is stored verbatim, so
      * the guest's own bytes come back; an absolute one was rewritten at

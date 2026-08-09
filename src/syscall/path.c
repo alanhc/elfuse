@@ -265,12 +265,16 @@ int path_translate_at(guest_fd_t dirfd,
         return 0;
     }
 
+    unsigned int lookup_flags = flags;
+    if (path_has_trailing_slash(tx->guest_path))
+        lookup_flags &= ~PATH_TR_NOFOLLOW;
+
     errno = 0;
-    if (flags & PATH_TR_CREATE) {
+    if (lookup_flags & PATH_TR_CREATE) {
         tx->host_path = path_resolve_sysroot_create_path(
             tx->guest_path, tx->host_buf, sizeof(tx->host_buf),
-            (flags & PATH_TR_CREATE_PARENTS) != 0);
-    } else if (flags & PATH_TR_NOFOLLOW) {
+            (lookup_flags & PATH_TR_CREATE_PARENTS) != 0);
+    } else if (lookup_flags & PATH_TR_NOFOLLOW) {
         tx->host_path = path_resolve_sysroot_nofollow_path(
             tx->guest_path, tx->host_buf, sizeof(tx->host_buf));
     } else {
@@ -297,8 +301,9 @@ int path_translate_at(guest_fd_t dirfd,
     char relative_host[LINUX_PATH_MAX];
     if (tx->host_path && tx->guest_path[0] != '/' && proc_get_sysroot()) {
         int recheck = path_check_relative_sysroot_containment(
-            dirfd, tx->guest_path, flags, &relative_in_sysroot, relative_abs,
-            sizeof(relative_abs), relative_host, sizeof(relative_host));
+            dirfd, tx->guest_path, lookup_flags, &relative_in_sysroot,
+            relative_abs, sizeof(relative_abs), relative_host,
+            sizeof(relative_host));
         if (recheck < 0) {
             tx->host_path = NULL;
             if (errno == 0)
@@ -342,7 +347,8 @@ int path_translate_at(guest_fd_t dirfd,
          * unconditionally would hand the link's stored target bytes to the host
          * kernel, which cannot spell them.
          */
-        bool follow_final = !(flags & (PATH_TR_NOFOLLOW | PATH_TR_CREATE));
+        bool follow_final =
+            !(lookup_flags & (PATH_TR_NOFOLLOW | PATH_TR_CREATE));
         host_fd_ref_t ref;
         casefold_walk_t walk;
         casefold_verdict_t verdict;
@@ -1299,6 +1305,128 @@ static int dirfd_reconstruct_abs_path(guest_fd_t dirfd,
     return 0;
 }
 
+static int dirfd_realpath_relative(guest_fd_t dirfd,
+                                   const char *path,
+                                   char *out,
+                                   size_t outsz)
+{
+    char base[LINUX_PATH_MAX];
+    char joined[LINUX_PATH_MAX];
+
+    if (path_openat2_dirfd_host_path(dirfd, base, sizeof(base)) < 0)
+        return -1;
+    int n = snprintf(joined, sizeof(joined), "%s/%s", base, path);
+    if (n < 0 || (size_t) n >= sizeof(joined)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (!realpath(joined, out))
+        return -1;
+    if (strlen(out) >= outsz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int dirfd_symlink_chain_reaches_absolute_target(guest_fd_t dirfd,
+                                                       const char *path)
+{
+    host_fd_ref_t ref;
+    if (host_dirfd_ref_open(dirfd, &ref) < 0) {
+        errno = EBADF;
+        return -1;
+    }
+
+    host_fd_t current_fd = ref.fd;
+    bool current_owned = false;
+    const char *scan = path;
+    char pending[LINUX_PATH_MAX];
+    const char *comp;
+    size_t len;
+    int symlink_count = 0;
+    int rc = 0;
+
+    while (path_next_component(&scan, &comp, &len)) {
+        char name[NAME_MAX + 1];
+        struct stat st;
+
+        if (path_component_copy(name, sizeof(name), comp, len) < 0) {
+            rc = -1;
+            goto out;
+        }
+        if (!strcmp(name, "."))
+            continue;
+        if (!strcmp(name, "..")) {
+            host_fd_t parent_fd =
+                openat(current_fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (parent_fd < 0) {
+                rc = -1;
+                goto out;
+            }
+            if (current_owned)
+                close(current_fd);
+            current_fd = parent_fd;
+            current_owned = true;
+            continue;
+        }
+
+        if (fstatat(current_fd, name, &st, AT_SYMLINK_NOFOLLOW) < 0) {
+            rc = -1;
+            goto out;
+        }
+        if (S_ISLNK(st.st_mode)) {
+            char target[LINUX_PATH_MAX];
+            ssize_t n =
+                readlinkat(current_fd, name, target, sizeof(target) - 1);
+            if (n < 0) {
+                rc = -1;
+                goto out;
+            }
+            if (++symlink_count > MAXSYMLINKS) {
+                errno = ELOOP;
+                rc = -1;
+                goto out;
+            }
+            if (n > 0 && target[0] == '/') {
+                rc = 1;
+                goto out;
+            }
+            target[n] = '\0';
+
+            const char *rest = scan;
+            while (*rest == '/')
+                rest++;
+            if (path_splice_link_target(NULL, 0, target, rest, pending,
+                                        sizeof(pending)) < 0) {
+                rc = -1;
+                goto out;
+            }
+            scan = pending;
+            continue;
+        }
+
+        if (!S_ISDIR(st.st_mode))
+            break;
+        host_fd_t next_fd =
+            openat(current_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (next_fd < 0) {
+            rc = -1;
+            goto out;
+        }
+        if (current_owned)
+            close(current_fd);
+        current_fd = next_fd;
+        current_owned = true;
+    }
+
+out:
+    if (current_owned)
+        close(current_fd);
+    host_fd_ref_close(&ref);
+    return rc;
+}
+
 /* Returns 1 when the reconstruction climbed the guest root, so the caller opens
  * the resolved absolute host path instead of walking from dirfd; 0 when the
  * walk stays beneath it; or -1 with errno set. @in_sysroot reports whether the
@@ -1355,6 +1483,15 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
     } else {
         checked =
             path_resolve_sysroot_path(abs_path, host_buf, sizeof(host_buf));
+    }
+
+    char fallback_buf[LINUX_PATH_MAX];
+    if (!checked && errno == ELOOP && !(flags & PATH_TR_CREATE) &&
+        dirfd_symlink_chain_reaches_absolute_target(dirfd, path) > 0) {
+        if (dirfd_realpath_relative(dirfd, path, fallback_buf,
+                                    sizeof(fallback_buf)) == 0) {
+            checked = fallback_buf;
+        }
     }
 
     if (!checked)
