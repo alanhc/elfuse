@@ -1545,9 +1545,14 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         uint64_t exec_vdso = vdso_build(g);
         exec_republish_shim_globals_or_die(vcpu, g, verbose);
 
+        /* AT_EXECFN gets the same guest-visible spelling published to
+         * /proc/self/exe below, so the two surfaces agree on what this process
+         * is. Passing path rather than argv_const[0] also matches Linux for
+         * execve(path, ["altname"], ...), where the kernel reports path.
+         */
         sp = build_linux_stack(g, g->stack_top, argc, argv_const, envp_const,
                                &elf_info, elf_load_base, interp_base, exec_vdso,
-                               -1 /* no AT_EXECFD */, &auxv);
+                               -1 /* no AT_EXECFD */, path, &auxv);
 
         /* 0 is build_linux_stack's failure return. Past the point of no return
          * there is no image to go back to, and programming SP_EL0 from it would

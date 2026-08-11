@@ -54,6 +54,11 @@ typedef struct {
  * ET_EXEC). interp_base is the load base of the dynamic linker (0 if statically
  * linked). vdso_base is the guest address of the vDSO ELF image (0 if no vDSO).
  * execfd is the pre-opened binary fd for binfmt_misc (AT_EXECFD); -1 if none.
+ * execfn is the guest path handed to execve, reported as AT_EXECFN. Linux takes
+ * that string from the execve filename rather than from argv[0], and the two
+ * differ whenever the caller passed an alternate argv[0] or the kernel
+ * prepended a binfmt_misc interpreter, so callers pass it explicitly instead of
+ * leaving it to be inferred from argv's shape. NULL falls back to argv[0].
  * If auxv_out is non-NULL, it receives the exact auxv words written to guest
  * memory, in the same order exposed by /proc/self/auxv.
  * Returns the initial SP (stack pointer) to pass to the guest.
@@ -68,4 +73,5 @@ uint64_t build_linux_stack(guest_t *g,
                            uint64_t interp_base,
                            uint64_t vdso_base,
                            int execfd,
+                           const char *execfn,
                            linux_stack_auxv_t *auxv_out);
