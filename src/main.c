@@ -104,29 +104,6 @@ static void free_guest_argv(const char **guest_argv, int guest_argc)
     free((void *) guest_argv);
 }
 
-/* Releases the host state main() owns: the sysroot mount, the host cwd, and the
- * heap copies of argv. The guest itself belongs to elfuse_launch, which
- * destroys it on every exit path, so nothing here touches HVF or guest memory.
- * This must still run after a bring-up whose HVF teardown guest_destroy
- * deferred to process exit, because process exit reclaims neither the sysroot
- * mount nor the FUSE-materialized temp ELF.
- */
-static void cleanup_main_resources(sysroot_mount_t *sysroot_mount,
-                                   const char *host_cwd,
-                                   const char **guest_argv,
-                                   int guest_argc,
-                                   char *elf_path,
-                                   char *sysroot_path)
-{
-    rosettad_clear_binary_path();
-    if (host_cwd && host_cwd[0] != '\0' && chdir(host_cwd) < 0)
-        (void) chdir("/");
-    sysroot_cleanup_mount(sysroot_mount);
-    free_guest_argv(guest_argv, guest_argc);
-    free((void *) elf_path);
-    free((void *) sysroot_path);
-}
-
 /* The infra-reserve layout invariants documented in guest.h are derived from
  * raw offset constants, so a future edit that grows the pool by shifting one
  * offset without the others would silently overlap two regions. Enforce them at
@@ -260,6 +237,22 @@ int main(int argc, char **argv)
     bool gdb_stop_on_entry = false;
     bool fakeroot = false;
     int arg_start = 1;
+    /* Everything the shared cleanup label reads is declared and initialized
+     * here, above the option loop, so any later error path can `goto cleanup`:
+     * a goto that skipped an initializer would leave the unwind reading
+     * indeterminate state. Zero state makes every cleanup step a no-op.
+     */
+    char *elf_path = NULL;
+    char *sysroot_path = NULL;
+    const char **guest_argv = NULL;
+    int guest_argc = 0;
+    sysroot_mount_t sysroot_mount;
+    char host_cwd[LINUX_PATH_MAX];
+    char elf_host_path[LINUX_PATH_MAX];
+    bool elf_host_temp = false;
+    bool have_host_cwd = (getcwd(host_cwd, sizeof(host_cwd)) != NULL);
+    int exit_code = 1;
+    memset(&sysroot_mount, 0, sizeof(sysroot_mount));
 
     /* 'elfuse rosettad translate <in> <out>' runs the real Apple rosettad
      * binary inside an elfuse guest to materialise an AOT translation. The
@@ -325,7 +318,7 @@ int main(int argc, char **argv)
     }
 
     if (host_dc_zva_assert() < 0)
-        return 1;
+        goto cleanup;
 
     /* Parse elfuse options until the first guest argv element. */
     while (arg_start < argc && argv[arg_start][0] == '-') {
@@ -346,7 +339,7 @@ int main(int argc, char **argv)
             if (parse_int_arg(argv[arg_start + 1], 0, INT_MAX, &fork_child_fd) <
                 0) {
                 log_error("invalid fork child fd: %s", argv[arg_start + 1]);
-                return 1;
+                goto cleanup;
             }
             arg_start += 2;
         } else if (!strcmp(argv[arg_start], "--vfork-notify-fd") &&
@@ -354,7 +347,7 @@ int main(int argc, char **argv)
             if (parse_int_arg(argv[arg_start + 1], 0, INT_MAX,
                               &vfork_notify_fd) < 0) {
                 log_error("invalid vfork notify fd: %s", argv[arg_start + 1]);
-                return 1;
+                goto cleanup;
             }
             arg_start += 2;
         } else if (!strcmp(argv[arg_start], "--sysroot") &&
@@ -374,7 +367,7 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[arg_start], "--gdb") && arg_start + 1 < argc) {
             if (parse_int_arg(argv[arg_start + 1], 1, 65535, &gdb_port) < 0) {
                 log_error("invalid GDB port: %s", argv[arg_start + 1]);
-                return 1;
+                goto cleanup;
             }
             if (!verbose)
                 log_set_level(LOG_INFO);
@@ -388,14 +381,14 @@ int main(int argc, char **argv)
         } else {
             log_error("unknown option: %s", argv[arg_start]);
             log_error(ELFUSE_USAGE);
-            return 1;
+            goto cleanup;
         }
     }
 
     if (sysroot && create_sysroot) {
         log_error(
             "use either --sysroot PATH or --create-sysroot PATH, not both");
-        return 1;
+        goto cleanup;
     }
 
     /* ELFUSE_NO_ROSETTA=1 mirrors --no-rosetta for environments where passing
@@ -436,7 +429,7 @@ int main(int argc, char **argv)
             "ELFUSE_FAKEROOT_EXEC must be an absolute path shorter than %d "
             "bytes",
             LINUX_PATH_MAX);
-        return 1;
+        goto cleanup;
     }
 
     /* Top-level processes establish the capacity; fork helpers normally inherit
@@ -445,14 +438,14 @@ int main(int argc, char **argv)
      * internal host reserve.
      */
     if (host_nofile_ensure_capacity() < 0)
-        return 1;
+        goto cleanup;
 
     /* Block the vCPU-preemption signals and start the sigwait thread before any
      * vCPU thread exists, so both the normal path and the fork-child path below
      * inherit the block on every thread they spawn.
      */
     if (proc_preempt_init() < 0)
-        return 1;
+        goto cleanup;
 
     /* Fork-child mode: receive VM state over IPC and run */
     if (fork_child_fd >= 0)
@@ -461,17 +454,16 @@ int main(int argc, char **argv)
 
     if (arg_start >= argc) {
         log_error(ELFUSE_USAGE);
-        return 1;
+        goto cleanup;
     }
 
     /* Copy elf_path and guest_argv to heap because the original argv string
      * data lives in a contiguous stack region that elfuse clobbers below for
      * the process title (PostgreSQL/nginx argv-clobber technique).
      */
-    char *elf_path = strdup(argv[arg_start]);
+    elf_path = strdup(argv[arg_start]);
     bool have_sysroot = (sysroot != NULL || create_sysroot != NULL);
     const char *sysroot_src = create_sysroot ? create_sysroot : sysroot;
-    char *sysroot_path = NULL;
     if (have_sysroot) {
         sysroot_path = (char *) calloc(LINUX_PATH_MAX, 1);
         if (sysroot_path) {
@@ -480,32 +472,22 @@ int main(int argc, char **argv)
             if (src_len >= LINUX_PATH_MAX) {
                 log_error("sysroot path too long (%zu bytes, max %d): %s",
                           src_len, LINUX_PATH_MAX - 1, sysroot_src);
-                free(elf_path);
-                free(sysroot_path);
-                return 1;
+                goto cleanup;
             }
         }
     }
     sysroot = sysroot_path;
-    int guest_argc = argc - arg_start;
-    const char **guest_argv =
-        (const char **) calloc((size_t) guest_argc, sizeof(char *));
-    sysroot_mount_t sysroot_mount;
-    char host_cwd[LINUX_PATH_MAX];
-    char elf_host_path[LINUX_PATH_MAX];
-    bool elf_host_temp = false;
-    bool have_host_cwd = (getcwd(host_cwd, sizeof(host_cwd)) != NULL);
-    int exit_code;
-    memset(&sysroot_mount, 0, sizeof(sysroot_mount));
+    guest_argc = argc - arg_start;
+    guest_argv = (const char **) calloc((size_t) guest_argc, sizeof(char *));
     if (!elf_path || (have_sysroot && !sysroot_path) || !guest_argv) {
         log_error("out of memory");
-        goto fail;
+        goto cleanup;
     }
     for (int i = 0; i < guest_argc; i++) {
         guest_argv[i] = strdup(argv[arg_start + i]);
         if (!guest_argv[i]) {
             log_error("out of memory");
-            goto fail;
+            goto cleanup;
         }
     }
 
@@ -513,20 +495,20 @@ int main(int argc, char **argv)
         if (sysroot_create_mount(sysroot_path, &sysroot_mount) < 0) {
             log_error("failed to provision case-sensitive sysroot at %s: %s",
                       sysroot_path, strerror(errno));
-            goto fail;
+            goto cleanup;
         }
         size_t mounted_len = str_copy_trunc(
             sysroot_path, sysroot_mount.mount_path, LINUX_PATH_MAX);
         if (mounted_len >= LINUX_PATH_MAX) {
             log_error("mounted sysroot path too long: %s",
                       sysroot_mount.mount_path);
-            goto fail;
+            goto cleanup;
         }
         sysroot = sysroot_path;
     }
 
     if (have_sysroot && sysroot_validate_case_sensitivity(sysroot) < 0)
-        goto fail;
+        goto cleanup;
 
     proc_set_sysroot(sysroot);
 
@@ -538,7 +520,7 @@ int main(int argc, char **argv)
                                         &elf_host_temp) < 0) {
             log_error("failed to resolve ELF path %s: %s", elf_path,
                       strerror(errno));
-            goto fail;
+            goto cleanup;
         }
 
         /* Check if the file starts with "#!" */
@@ -553,7 +535,7 @@ int main(int argc, char **argv)
 
         if (rc < 0) {
             log_error("empty or invalid shebang interpreter in %s", elf_path);
-            goto fail;
+            goto cleanup;
         }
 
         /* The current path is a script. Bound the resolution chain only once a
@@ -565,7 +547,7 @@ int main(int argc, char **argv)
                 "too many levels of shebang recursion (max %d) "
                 "resolving %s",
                 ELF_SHEBANG_MAX_DEPTH, argv[arg_start]);
-            goto fail;
+            goto cleanup;
         }
         shebang_depth++;
 
@@ -577,14 +559,14 @@ int main(int argc, char **argv)
             (const char **) calloc((size_t) new_argc, sizeof(char *));
         if (!new_argv) {
             log_error("out of memory");
-            goto fail;
+            goto cleanup;
         }
 
         new_argv[0] = strdup(interp);
         if (!new_argv[0]) {
             log_error("out of memory");
             free((void *) new_argv);
-            goto fail;
+            goto cleanup;
         }
         if (has_arg) {
             new_argv[1] = strdup(arg);
@@ -592,7 +574,7 @@ int main(int argc, char **argv)
                 log_error("out of memory");
                 free((void *) new_argv[0]);
                 free((void *) new_argv);
-                goto fail;
+                goto cleanup;
             }
         }
 
@@ -609,7 +591,7 @@ int main(int argc, char **argv)
         char *new_elf_path = strdup(interp);
         if (!new_elf_path) {
             log_error("out of memory");
-            goto fail;
+            goto cleanup;
         }
         free(elf_path);
         elf_path = new_elf_path;
@@ -626,7 +608,7 @@ int main(int argc, char **argv)
         if (guest_bootstrap_probe_elf(elf_host_path, &probe_info) == 0 &&
             probe_info.e_machine == EM_X86_64) {
             log_error(LAUNCH_GDB_X86_64_MSG);
-            goto fail;
+            goto cleanup;
         }
     }
 
@@ -639,7 +621,7 @@ int main(int argc, char **argv)
 
     /* Hand the bring-up, run loop, and guest teardown to elfuse_launch. main()
      * retains ownership of the original argv (proctitle above), the sysroot
-     * mount (detached in cleanup_main_resources after the guest exits so the
+     * mount (detached at the cleanup label after the guest exits so the
      * mount stays live for the whole run), host cwd, and the heap elf_path /
      * sysroot_path / guest_argv copies.
      */
@@ -659,17 +641,24 @@ int main(int argc, char **argv)
      */
     elf_host_temp = false;
     exit_code = elfuse_launch(&largs);
-    goto cleanup;
 
-fail:
-    exit_code = 1;
 cleanup:
-    /* Single unwind for every exit past the heap-copy allocations: frees the
+    /* Single unwind for every exit past the state block above: frees the
      * caller-owned heap copies, detaches the sysroot mount, restores the host
-     * cwd, and drops a still-owned FUSE-materialized temp ELF.
+     * cwd, and drops a still-owned FUSE-materialized temp ELF. This must run
+     * even after a bring-up whose HVF teardown guest_destroy deferred to
+     * process exit, because process exit reclaims neither the sysroot mount
+     * nor the temp ELF. The guest itself belongs to elfuse_launch, which
+     * destroys it on every exit path, so nothing here touches HVF or guest
+     * memory.
      */
-    cleanup_main_resources(&sysroot_mount, have_host_cwd ? host_cwd : NULL,
-                           guest_argv, guest_argc, elf_path, sysroot_path);
+    rosettad_clear_binary_path();
+    if (have_host_cwd && host_cwd[0] != '\0' && chdir(host_cwd) < 0)
+        (void) chdir("/");
+    sysroot_cleanup_mount(&sysroot_mount);
+    free_guest_argv(guest_argv, guest_argc);
+    free(elf_path);
+    free(sysroot_path);
     if (elf_host_temp)
         unlink(elf_host_path);
 
