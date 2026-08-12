@@ -140,6 +140,7 @@ uint64_t build_linux_stack(guest_t *g,
                            uint64_t interp_base,
                            uint64_t vdso_base,
                            int execfd,
+                           const char *execfn,
                            linux_stack_auxv_t *auxv_out)
 {
     /* Linux initial stack layout (growing from high to low):
@@ -218,6 +219,31 @@ uint64_t build_linux_stack(guest_t *g,
     uint64_t platform_ptr = str_ptr;
     str_err |= write_str(g, platform_ptr, "aarch64");
 
+    /* AT_EXECFN: the filename handed to execve, copied onto the stack as its
+     * own string exactly as fs/binfmt_elf.c does.
+     *
+     * The kernel takes this from bprm->filename, not from argv[0], and the two
+     * diverge in two ways elfuse reproduces: execve(path, "altname", ...)
+     * reports path, and under binfmt_misc the interpreter rosetta.c prepends to
+     * argv is not the program the guest asked to run. Taking the string from
+     * the caller rather than from an argv index keeps that contract out of the
+     * argv layout, which differs between the native and rosetta forms and is
+     * free to change again (see the preserving-form note in rosetta.c).
+     *
+     * Guests that identify themselves through auxv rather than argv[0] depend
+     * on getting this right: rust-coreutils dispatches its multi-call applet
+     * from AT_EXECFN, so a leaked interpreter path makes every applet abort
+     * with "unknown program 'rosetta'".
+     */
+    uint64_t execfn_ptr = 0;
+    if (execfn) {
+        size_t execfn_len = strlen(execfn) + 1;
+        if (!stack_take(&str_ptr, stack_floor, execfn_len))
+            return 0;
+        execfn_ptr = str_ptr;
+        str_err |= write_str(g, execfn_ptr, execfn);
+    }
+
     /* Dynamically allocate pointer arrays to avoid stack buffer overflow with
      * large argument or environment lists. calloc(0, ...) is
      * implementation-defined, so always allocate at least one slot. The extra
@@ -251,8 +277,11 @@ uint64_t build_linux_stack(guest_t *g,
         str_err |= write_str(g, str_ptr, argv[i]);
     }
 
-    /* AT_EXECFN: pointer to argv[0] string (write it near the top) */
-    uint64_t execfn_ptr = (argc > 0) ? arg_ptrs[0] : 0;
+    /* Callers with no filename to report keep the historical argv[0] spelling
+     * rather than an AT_EXECFN of 0, which no Linux process ever sees.
+     */
+    if (!execfn_ptr && argc > 0)
+        execfn_ptr = arg_ptrs[0];
 
     /* Phase 2: Build the structured part of the stack. Align str_ptr down to 16
      * bytes first.

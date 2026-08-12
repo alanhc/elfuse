@@ -978,7 +978,10 @@ How it works:
 2. The interpreter is loaded as `ET_DYN` at `g->interp_base` (computed
    dynamically: 60 GiB for 36-bit IPA, 1020 GiB for 40-bit IPA).
 3. `build_linux_stack()` passes `AT_BASE` (interpreter load address) and
-   `AT_EXECFN` (`argv[0]`) in the auxiliary vector.
+   `AT_EXECFN` (the execve filename, supplied by the caller) in the auxiliary
+   vector. Linux takes `AT_EXECFN` from `bprm->filename`, so it stays the
+   program the guest asked for even when `argv[0]` is an alternate name or the
+   rosetta binfmt_misc argv prepends the translator.
 4. The entry point becomes `interp_entry + load_base`; the dynamic linker
    takes over from there.
 5. Guest absolute paths reach the host through `path_translate_at()`

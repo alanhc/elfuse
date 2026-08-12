@@ -627,7 +627,7 @@ int guest_bootstrap_prepare(guest_t *g,
     boot->stack_pointer = build_linux_stack(
         g, g->stack_top, stack_argc, stack_argv, (const char **) environ,
         stack_elf, stack_elf_load_base, stack_interp_base, native_vdso,
-        rosetta_execfd, &auxv);
+        rosetta_execfd, elf_guest_path, &auxv);
     if (boot->stack_pointer == 0) {
         log_error("failed to build initial stack");
         free(rosetta_argv);
@@ -881,9 +881,10 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
 
     uint64_t native_vdso = vdso_build(g);
     linux_stack_auxv_t auxv;
-    uint64_t sp = build_linux_stack(g, g->stack_top, rosetta_argc, rosetta_argv,
-                                    (const char **) environ, &rr.rosetta_info,
-                                    0, 0, native_vdso, rosetta_execfd, &auxv);
+    uint64_t sp =
+        build_linux_stack(g, g->stack_top, rosetta_argc, rosetta_argv,
+                          (const char **) environ, &rr.rosetta_info, 0, 0,
+                          native_vdso, rosetta_execfd, elf_guest_path, &auxv);
     free(rosetta_argv);
     if (sp == 0) {
         log_error("build_linux_stack failed during exec re-bootstrap");
