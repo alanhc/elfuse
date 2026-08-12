@@ -739,9 +739,15 @@ static bool is_guest_system_path(const char *path)
     if (!path || path[0] != '/')
         return false;
 
-    /* Check prefix patterns (path/...) and exact root matches (path) */
+    /* Check prefix patterns (path/...) and exact root matches (path)
+     *
+     * /run is guest-only runtime state with no host counterpart, so a fallback
+     * there can only find something unrelated. Listing it keeps an absent /run
+     * path on the sysroot spelling, where the caller's own syscall reports the
+     * ENOENT the guest is owed.
+     */
     static const char *const dirs[] = {
-        "/usr/", "/bin/",  "/sbin/", "/lib/",  "/lib64/",
+        "/usr/", "/bin/",  "/sbin/", "/lib/",  "/lib64/", "/run/",
         "/opt/", "/boot/", "/srv/",  "/root/", "/home/",
     };
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
