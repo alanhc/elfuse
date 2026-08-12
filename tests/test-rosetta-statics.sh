@@ -54,7 +54,12 @@ total=0
 # Run a binary, check exit code and (optionally) stdout regex.
 # Args: <label> <expected-stdout-regex|""> <expected-exit-code> <binary> [args...]
 # An empty regex skips the stdout check.
-run_check()
+#
+# Not named run_check: tests/lib/test-runner.sh, pulled in by report.sh
+# above, exports a run_check taking <tool> <pattern> and resolving the tool
+# through test_tool_path, which cannot serve the absolute binary paths and
+# expected exit codes used here.
+run_static_check()
 {
     local label="$1" expected_re="$2" expected_rc="$3"
     shift 3
@@ -123,9 +128,9 @@ printf 'rosetta:   %s\n\n' "$ROSETTA_PATH"
 
 # Simple stdout-producing applets. true/false return immediately; the
 # empty regex skips the stdout check.
-run_check "echo" "^hello rosetta$" 0 "${STATICBIN}/echo" "hello rosetta"
-run_check "true" "" 0 "${STATICBIN}/true"
-run_check "false" "" 1 "${STATICBIN}/false"
+run_static_check "echo" "^hello rosetta$" 0 "${STATICBIN}/echo" "hello rosetta"
+run_static_check "true" "" 0 "${STATICBIN}/true"
+run_static_check "false" "" 1 "${STATICBIN}/false"
 
 # env propagation: the host shell's environ reaches the rosetta guest's
 # printenv via execve auxiliary vector + ELF entry. env -i isolates the
@@ -146,20 +151,20 @@ fi
 
 # Busybox expr returns 1 when the arithmetic result is zero (POSIX), and
 # 0 otherwise. expr-zero deliberately exercises the 0-result path.
-run_check "expr-zero" "^0$" 1 "${STATICBIN}/expr" "1" "-" "1"
-run_check "expr-mul" "^42$" 0 "${STATICBIN}/expr" "6" "*" "7"
+run_static_check "expr-zero" "^0$" 1 "${STATICBIN}/expr" "1" "-" "1"
+run_static_check "expr-mul" "^42$" 0 "${STATICBIN}/expr" "6" "*" "7"
 
 # argv passing through the binfmt-misc convention (rosetta strips its own
 # argv[0] and exposes argv[1..] to the guest).
-run_check "basename" "^rosetta$" 0 "${STATICBIN}/basename" "/some/path/rosetta"
-run_check "dirname" "^/a/b$" 0 "${STATICBIN}/dirname" "/a/b/c"
+run_static_check "basename" "^rosetta$" 0 "${STATICBIN}/basename" "/some/path/rosetta"
+run_static_check "dirname" "^/a/b$" 0 "${STATICBIN}/dirname" "/a/b/c"
 
 # Filesystem read: stat the rosetta binary itself, prove that openat
 # against a real host path works.
-run_check "stat-self" "regular file" 0 "${STATICBIN}/stat" "$ROSETTA_PATH"
+run_static_check "stat-self" "regular file" 0 "${STATICBIN}/stat" "$ROSETTA_PATH"
 
 # Compute-heavy: factor a small number through libc / busybox arith.
-run_check "factor" "^60: 2 2 3 5$" 0 "${STATICBIN}/factor" "60"
+run_static_check "factor" "^60: 2 2 3 5$" 0 "${STATICBIN}/factor" "60"
 
 # seq writes one integer per line. Build the expected joined output and
 # match against the captured stdout via the helper.
@@ -176,19 +181,19 @@ fi
 # Hash families exercise libc memcpy and per-byte loops.
 input_tmp="${SHORTDIR}/input"
 echo -n "rosetta" > "$input_tmp"
-run_check "sha256sum" "^[0-9a-f]{64}  " 0 \
+run_static_check "sha256sum" "^[0-9a-f]{64}  " 0 \
     "${STATICBIN}/sha256sum" "$input_tmp"
-run_check "md5sum" "^[0-9a-f]{32}  " 0 \
+run_static_check "md5sum" "^[0-9a-f]{32}  " 0 \
     "${STATICBIN}/md5sum" "$input_tmp"
 
 # Date + uname use clock_gettime and uname syscalls; their guest-side ABI
 # translation (translate_clockid, sys_uname) covers a different surface.
-run_check "uname-m" "^x86_64$" 0 "${STATICBIN}/uname" "-m"
+run_static_check "uname-m" "^x86_64$" 0 "${STATICBIN}/uname" "-m"
 # Busybox 'arch' applet (separate dispatch from uname -m) confirms the
 # rosetta-translated guest reports its actual ISA via the dedicated
 # applet entry-point. Both forms must agree.
-run_check "arch" "^x86_64$" 0 "${STATICBIN}/busybox" "arch"
-run_check "busybox-arch-subcommand" "^x86_64$" 0 \
+run_static_check "arch" "^x86_64$" 0 "${STATICBIN}/busybox" "arch"
+run_static_check "busybox-arch-subcommand" "^x86_64$" 0 \
     "${STATICBIN}/busybox" "arch"
 
 # date: TZ propagates the same way as ELFUSE_PROBE above (wrap elfuse,
@@ -205,8 +210,8 @@ else
 fi
 
 # id / nproc hit getuid + sysconf; nproc returns the host cpu count.
-run_check "id-u" "^0$|^[0-9]+$" 0 "${STATICBIN}/id" "-u"
-run_check "nproc" "^[1-9][0-9]*$" 0 "${STATICBIN}/nproc"
+run_static_check "id-u" "^0$|^[0-9]+$" 0 "${STATICBIN}/id" "-u"
+run_static_check "nproc" "^[1-9][0-9]*$" 0 "${STATICBIN}/nproc"
 
 # ---------------------------------------------------------------------------
 # Mid-process execve into x86_64 (rosetta re-bootstrap).
