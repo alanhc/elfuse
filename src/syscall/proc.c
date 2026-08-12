@@ -50,8 +50,8 @@
 #include "syscall/proc.h"
 #include "syscall/proc-pidfd.h"
 #include "syscall/proc-state.h"
-#include "syscall/poll.h"
 #include "syscall/signal.h"
+#include "syscall/wakeup-pipe.h"
 
 #include "debug/crashreport.h"
 #include "debug/gdbstub.h"

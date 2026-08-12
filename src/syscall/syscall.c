@@ -59,6 +59,7 @@
 #include "syscall/net.h"
 #include "syscall/net-sockopt.h"
 #include "syscall/poll.h"
+#include "syscall/wakeup-pipe.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/proc-pidfd.h"

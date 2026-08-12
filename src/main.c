@@ -42,6 +42,7 @@
 #include "syscall/fuse.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
+#include "syscall/wakeup-pipe.h"
 
 #include "debug/log.h"
 #include "debug/syscall-hist.h"

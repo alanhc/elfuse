@@ -46,8 +46,8 @@
 #include "utils.h"
 #include "runtime/futex.h"  /* futex_interrupt_request */
 #include "runtime/thread.h" /* thread_destroy_all_vcpus */
-#include "syscall/poll.h"   /* wakeup_pipe_signal */
 #include "syscall/proc.h"   /* proc_request_exit_group */
+#include "syscall/wakeup-pipe.h"
 
 /* Per-vCPU pending TLBI request. Zero-initialized in every host pthread by
  * virtue of TLS default-zeroing, which maps to TLBI_NONE.

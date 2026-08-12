@@ -42,12 +42,12 @@
 #include "syscall/chown-overlay.h"
 #include "syscall/internal.h"
 #include "syscall/mem.h"
-#include "syscall/net.h"  /* absock namespace IPC state */
-#include "syscall/poll.h" /* wakeup_pipe_signal */
+#include "syscall/net.h" /* absock namespace IPC state */
 #include "syscall/proc.h"
 #include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
 #include "syscall/sys.h"
+#include "syscall/wakeup-pipe.h"
 
 #include "debug/log.h"
 #include "debug/syscall-hist.h"

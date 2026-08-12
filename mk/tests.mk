@@ -33,6 +33,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-absock-names test-absock-cleanup \
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
+        test-wakeup-pipe-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
@@ -165,7 +166,7 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-teardown-live-vcpu-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
-        test-dynamic-array-host test-string-builder-host)
+        test-dynamic-array-host test-string-builder-host test-wakeup-pipe-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -182,6 +183,7 @@ $(call run-host-unit,test-casefold-walk-host,case-exact path resolution unit tes
 $(call run-host-unit,test-absock-names-host,absock derived-name unit test)
 $(call run-host-unit,test-dynamic-array-host,dynamic array unit test)
 $(call run-host-unit,test-string-builder-host,string builder unit test)
+$(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)
@@ -1460,6 +1462,12 @@ test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host
 ## Run the absock derived-name unit test natively on the host
 test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 	$(BUILD_DIR)/test-absock-names-host
+
+# Wakeup pipe concurrency unit test. Only a -fsanitize=thread build carries a
+# race detector, so check-sanitizer is where this lane has its full weight.
+## Run the wakeup pipe concurrency unit test natively on the host
+test-wakeup-pipe-host: $(BUILD_DIR)/test-wakeup-pipe-host
+	$(BUILD_DIR)/test-wakeup-pipe-host
 
 # Volume naming probe
 ## Report how the filesystem treats filenames (regenerates docs/filenames.md tables)

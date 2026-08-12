@@ -47,9 +47,9 @@
 #include "syscall/net.h"
 #include "syscall/net-identity.h"
 #include "syscall/net-sockopt.h"
-#include "syscall/poll.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
+#include "syscall/wakeup-pipe.h"
 
 #define URANDOM_CACHE_SIZE 4096
 
