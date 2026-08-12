@@ -814,14 +814,12 @@ static int proc_parse_fd_index(const char *path,
                                size_t prefix_len,
                                int errno_on_invalid)
 {
-    char *endp;
-    long n = strtol(path + prefix_len, &endp, 10);
-    if (endp == path + prefix_len || *endp != '\0' || n < 0 ||
-        n >= FD_TABLE_SIZE) {
+    int n = path_parse_proc_name(path + prefix_len);
+    if (n < 0 || n >= FD_TABLE_SIZE) {
         errno = errno_on_invalid;
         return -1;
     }
-    return (int) n;
+    return n;
 }
 
 /* Map a guest /dev/shm/<name> path to its host backing path, and gate the name.

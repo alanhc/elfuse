@@ -268,3 +268,29 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
  * symlink-driven crossings that the string-only precheck misses by design.
  */
 int path_openat2_check_fd_xdev(int guest_fd, int start_class);
+
+/* Parse a numeric procfs component the way Linux's name_to_int() does: decimal
+ * digits only, so no sign, no leading whitespace, and no leading zero unless
+ * the name is "0" itself. The kernel runs both the pid and the fd component
+ * through it, so both get the same rules here. strtol() accepts all three
+ * spellings, which made "/proc/self/fd/+3", "/proc/self/fd/03", "/proc/self/fd/
+ * 3" and the matching pid forms resolve here while Linux reports ENOENT for
+ * each.
+ *
+ * Returns the value, or -1 when the name is not that shape. The caller applies
+ * its own upper bound and errno.
+ */
+int path_parse_proc_name(const char *name);
+
+/* An owned dup of the descriptor an absolute fd magic link names
+ * ("/proc/self/fd/<n>", the own-pid spelling, "/dev/fd/<n>", "/dev/std*"), or
+ * -1 when the path is not that shape or its descriptor is not backed by a plain
+ * host object. The caller closes it.
+ *
+ * Metadata syscalls should act on this rather than on the translated pathname.
+ * Linux resolves the magic link inside the syscall, so nothing can redirect it;
+ * resolving to a pathname and operating on it a moment later can land on a
+ * different inode if the file is renamed, or unlinked and recreated, in
+ * between.
+ */
+int path_fd_magiclink_dup(const char *path);
