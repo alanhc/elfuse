@@ -35,6 +35,7 @@ SRCS := \
     runtime/forkipc.c \
     runtime/fork-state.c \
     runtime/procemu.c \
+    runtime/procemu-pty.c \
     runtime/proctitle.c \
     syscall/syscall.c \
     syscall/fdtable.c \
@@ -197,10 +198,10 @@ $(BUILD_DIR)/test-teardown-live-vcpu-host: \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(HVF_LDFLAGS)
 
-## Build the gva-math.h contract-check host test (native macOS binary)
-# Header-only: gva-math.h is static inline, so the test links nothing from the
-# project. It skips unless the build defines ELFUSE_CONTRACT_ASSERT, which is
-# what "make check-contracts" does.
+## Build the proved/gva.h contract-check host test (native macOS binary)
+# Header-only: proved/gva.h is static inline, so the test links nothing
+# from the project. It skips unless the build defines ELFUSE_CONTRACT_ASSERT,
+# which is what "make check-contracts" does.
 $(BUILD_DIR)/test-gva-contracts: $(BUILD_DIR)/test-gva-contracts.o \
 		| $(BUILD_DIR)
 	@echo "  LD      $@"
