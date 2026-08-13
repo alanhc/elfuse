@@ -230,6 +230,12 @@ typedef struct {
                         * identity-mapped regions; differs for high-VA guest
                         * mappings whose VA and GPA diverge.
                         */
+    uint64_t vma_id;   /* Stable logical-VMA lineage. Tracker splits and
+                        * mremap moves preserve it; compatible same-generation
+                        * mappings may share it when the tracker coalesces
+                        * them. Unlike inherited_at_fork, this ID remains
+                        * meaningful across subsequent forks.
+                        */
     int prot;          /* LINUX_PROT_* flags */
     int flags;         /* LINUX_MAP_* flags (for /proc/self/maps display) */
     uint64_t offset;   /* File offset (for /proc/self/maps display) */
@@ -242,6 +248,11 @@ typedef struct {
                         * later PROT_WRITE request against it with EACCES,
                         * matching a real kernel's VMA max_prot tracking.
                         */
+    bool inherited_at_fork; /* Region existed at the most recent fork
+                             * snapshot. Used by synthetic smaps to report
+                             * only VMAs that can participate in that fork's
+                             * CoW snapshot as Shared_Dirty.
+                             */
     bool overlay_active; /* Region has a live host MAP_FIXED|MAP_SHARED overlay
                           * of backing_fd at host_base+start. The kernel's page
                           * cache keeps it coherent with the file and with peer
@@ -503,7 +514,8 @@ typedef struct {
 
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
-    int nregions; /* Number of active regions */
+    int nregions;         /* Number of active regions */
+    uint64_t next_vma_id; /* Last logical-VMA lineage ID allocated. */
     /* Sticky flag set when guest_region_set_prot could not honor a request
      * because the region table was full. After this point the tracker no longer
      * faithfully reflects PTE state, so the mprotect fast path must fall back
@@ -1176,7 +1188,9 @@ int guest_region_add_ex_gpa(guest_t *g,
                             int backing_fd);
 
 /* Like guest_region_add_ex, but consumes owned_backing_fd on success or
- * failure.
+ * failure. inherited_at_fork identifies bytes copied from the latest fork
+ * snapshot. vma_id preserves logical-VMA provenance across tracker splits and
+ * mremap moves; pass 0 for a new VMA.
  */
 int guest_region_add_ex_owned(guest_t *g,
                               uint64_t start,
@@ -1185,7 +1199,9 @@ int guest_region_add_ex_owned(guest_t *g,
                               int flags,
                               uint64_t offset,
                               const char *name,
-                              int owned_backing_fd);
+                              int owned_backing_fd,
+                              bool inherited_at_fork,
+                              uint64_t vma_id);
 int guest_region_add_ex_owned_gpa(guest_t *g,
                                   uint64_t start,
                                   uint64_t end,
@@ -1194,7 +1210,14 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   int flags,
                                   uint64_t offset,
                                   const char *name,
-                                  int owned_backing_fd);
+                                  int owned_backing_fd,
+                                  bool inherited_at_fork,
+                                  uint64_t vma_id);
+
+/* Re-seed the logical-VMA allocator from a restored region snapshot. Fork IPC
+ * restores regions by value, so next_vma_id must be advanced past every
+ * serialized lineage before child-private mappings are added. */
+void guest_reseed_next_vma_id(guest_t *g);
 
 /* Add a preannounced region that appears in /proc/self/maps only. These entries
  * are kept separate from regions[] so they do not cause -EEXIST on guest
@@ -1214,10 +1237,29 @@ int guest_preannounce(guest_t *g,
                       uint64_t offset,
                       const char *name);
 
-/* Remove all region coverage in [start, end). Regions fully contained are
- * deleted; partially overlapping regions are trimmed or split.
+/* Reserve any backing fd needed by an interior split in [start, end).
+ * The reservation must be consumed by guest_region_remove_reserved().
+ * Returns 0 on success, -1 when the backing fd cannot be duplicated.
  */
-void guest_region_remove(guest_t *g, uint64_t start, uint64_t end);
+int guest_region_remove_prepare(guest_t *g,
+                                uint64_t start,
+                                uint64_t end,
+                                int *reserved_backing_fd);
+
+/* Remove all region coverage in [start, end). Regions fully contained are
+ * deleted; partially overlapping regions are trimmed or split. Any required
+ * backing fd is reserved before the first metadata mutation.
+ */
+int guest_region_remove(guest_t *g, uint64_t start, uint64_t end);
+
+/* Commit a removal using a backing fd reserved by
+ * guest_region_remove_prepare(). Ownership of reserved_backing_fd is consumed
+ * even when this call does not need an interior split.
+ */
+int guest_region_remove_reserved(guest_t *g,
+                                 uint64_t start,
+                                 uint64_t end,
+                                 int reserved_backing_fd);
 
 /* Find the region containing addr.
  *

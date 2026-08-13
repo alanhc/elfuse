@@ -1891,15 +1891,18 @@ int guest_get_used_regions(const guest_t *g,
 
 /* Semantic region tracking.
  *
- * Check whether two adjacent regions can be merged. They must be contiguous in
- * address space, have identical protection/flags/name, and have contiguous file
- * offsets (so the merged region still represents valid mapping). For anonymous
- * regions the offset is meaningless (always 0, but may become non-zero after
- * split/trim), so the contiguity check is skipped. Without this, adjacent
- * anonymous mmaps (common in megablock-style allocators) each create separate
- * entries that exhaust the region table.
+ * Check whether two adjacent regions have merge-compatible layouts. An actual
+ * merge additionally requires a shared vma_id; a new same-generation mapping
+ * may adopt its compatible neighbor's ID below. Regions must be contiguous in
+ * address space, have identical protection/flags/name, and have contiguous
+ * file offsets (so the merged region still represents valid mapping). For
+ * anonymous regions the offset is meaningless (always 0, but may become
+ * non-zero after split/trim), so the contiguity check is skipped. Without this,
+ * adjacent anonymous mmaps (common in megablock-style allocators) each create
+ * separate entries that exhaust the region table.
  */
-static bool regions_mergeable(const guest_region_t *a, const guest_region_t *b)
+static bool regions_mergeable_layout(const guest_region_t *a,
+                                     const guest_region_t *b)
 {
     if (a->end != b->start)
         return false;
@@ -1921,6 +1924,8 @@ static bool regions_mergeable(const guest_region_t *a, const guest_region_t *b)
         return false;
     if (a->backing_ro != b->backing_ro)
         return false;
+    if (a->inherited_at_fork != b->inherited_at_fork)
+        return false;
     if (a->overlay_active || b->overlay_active)
         return false;
     if (strcmp(a->name, b->name) != 0)
@@ -1933,6 +1938,11 @@ static bool regions_mergeable(const guest_region_t *a, const guest_region_t *b)
     if ((a->flags & LINUX_MAP_ANONYMOUS) && (b->flags & LINUX_MAP_ANONYMOUS))
         return true;
     return a->offset + (a->end - a->start) == b->offset;
+}
+
+static bool regions_mergeable(const guest_region_t *a, const guest_region_t *b)
+{
+    return a->vma_id == b->vma_id && regions_mergeable_layout(a, b);
 }
 
 /* First region whose start is >= start. regions[] is sorted by start. */
@@ -2032,7 +2042,8 @@ int guest_region_add_ex(guest_t *g,
     }
 
     return guest_region_add_ex_owned_gpa(g, start, end, start, prot, flags,
-                                         offset, name, owned_backing_fd);
+                                         offset, name, owned_backing_fd, false,
+                                         0);
 }
 
 int guest_region_add_ex_gpa(guest_t *g,
@@ -2053,7 +2064,41 @@ int guest_region_add_ex_gpa(guest_t *g,
     }
 
     return guest_region_add_ex_owned_gpa(g, start, end, gpa_base, prot, flags,
-                                         offset, name, owned_backing_fd);
+                                         offset, name, owned_backing_fd, false,
+                                         0);
+}
+
+static uint64_t allocate_vma_id(guest_t *g)
+{
+    uint64_t candidate = g->next_vma_id;
+
+    for (;;) {
+        candidate++;
+        if (candidate == 0)
+            candidate = 1;
+
+        bool in_use = false;
+        for (int i = 0; i < g->nregions; i++) {
+            if (g->regions[i].vma_id == candidate) {
+                in_use = true;
+                break;
+            }
+        }
+        if (!in_use) {
+            g->next_vma_id = candidate;
+            return candidate;
+        }
+    }
+}
+
+void guest_reseed_next_vma_id(guest_t *g)
+{
+    uint64_t max_id = g->next_vma_id;
+    for (int i = 0; i < g->nregions; i++) {
+        if (g->regions[i].vma_id > max_id)
+            max_id = g->regions[i].vma_id;
+    }
+    g->next_vma_id = max_id;
 }
 
 int guest_region_add_ex_owned(guest_t *g,
@@ -2063,10 +2108,13 @@ int guest_region_add_ex_owned(guest_t *g,
                               int flags,
                               uint64_t offset,
                               const char *name,
-                              int owned_backing_fd)
+                              int owned_backing_fd,
+                              bool inherited_at_fork,
+                              uint64_t vma_id)
 {
     return guest_region_add_ex_owned_gpa(g, start, end, start, prot, flags,
-                                         offset, name, owned_backing_fd);
+                                         offset, name, owned_backing_fd,
+                                         inherited_at_fork, vma_id);
 }
 
 int guest_region_add_ex_owned_gpa(guest_t *g,
@@ -2077,7 +2125,9 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   int flags,
                                   uint64_t offset,
                                   const char *name,
-                                  int owned_backing_fd)
+                                  int owned_backing_fd,
+                                  bool inherited_at_fork,
+                                  uint64_t vma_id)
 {
     if (g->nregions >= GUEST_MAX_REGIONS) {
         log_error(
@@ -2090,6 +2140,12 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
         return -1;
     }
 
+    bool new_vma = !vma_id;
+    if (new_vma)
+        vma_id = allocate_vma_id(g);
+    else if (vma_id > g->next_vma_id)
+        g->next_vma_id = vma_id;
+
     /* Find insertion point (keep sorted by start address). */
     int i = region_lower_bound_start(g, start);
     memmove(&g->regions[i + 1], &g->regions[i],
@@ -2099,13 +2155,15 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     r->start = start;
     r->end = end;
     r->gpa_base = gpa_base;
+    r->vma_id = vma_id;
     r->prot = prot;
     r->flags = flags;
     r->offset = offset;
     r->backing_fd = owned_backing_fd;
-    r->shared = (flags & 0x01) != 0;      /* LINUX_MAP_SHARED = 0x01 */
-    r->noreserve = (flags & 0x4000) != 0; /* LINUX_MAP_NORESERVE = 0x4000 */
+    r->shared = (flags & LINUX_MAP_SHARED) != 0;
+    r->noreserve = (flags & LINUX_MAP_NORESERVE) != 0;
     r->backing_ro = false;
+    r->inherited_at_fork = inherited_at_fork;
     guest_region_clear_overlay(r);
     if (name) {
         str_copy_trunc(r->name, name, sizeof(r->name));
@@ -2113,6 +2171,20 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
         r->name[0] = '\0';
     }
     g->nregions++;
+
+    /* Preserve the historical coalescing of compatible same-generation
+     * anonymous mmap calls: Linux may merge those into one VMA and the region
+     * tracker relies on that to stay below GUEST_MAX_REGIONS. Never adopt a
+     * neighbor's lineage across an inherited/private boundary, which is the
+     * provenance distinction find_mremap_source() must retain after fork.
+     */
+    if (new_vma) {
+        if (i > 0 && regions_mergeable_layout(&g->regions[i - 1], r))
+            r->vma_id = g->regions[i - 1].vma_id;
+        else if (i + 1 < g->nregions &&
+                 regions_mergeable_layout(r, &g->regions[i + 1]))
+            r->vma_id = g->regions[i + 1].vma_id;
+    }
 
     /* Try to merge with adjacent regions to reduce table pressure. Merge right
      * first, then left (order matters: right merge does not change the index of
@@ -2156,10 +2228,44 @@ int guest_preannounce(guest_t *g,
     return 0;
 }
 
-void guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
+int guest_region_remove_prepare(guest_t *g,
+                                uint64_t start,
+                                uint64_t end,
+                                int *reserved_backing_fd)
 {
+    if (!reserved_backing_fd)
+        return -1;
+    *reserved_backing_fd = -1;
     if (end <= start)
-        return;
+        return 0;
+
+    int first = guest_region_first_end_above(g, start);
+    for (int i = first; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= end)
+            break;
+        if (r->start < start && r->end > end) {
+            /* A full table follows the existing stale-tracker fallback and
+             * does not publish a right-hand record, so no fd is required. */
+            if (g->nregions >= GUEST_MAX_REGIONS || r->backing_fd < 0)
+                return 0;
+            *reserved_backing_fd = dup(r->backing_fd);
+            return *reserved_backing_fd >= 0 ? 0 : -1;
+        }
+    }
+    return 0;
+}
+
+int guest_region_remove_reserved(guest_t *g,
+                                 uint64_t start,
+                                 uint64_t end,
+                                 int reserved_backing_fd)
+{
+    if (end <= start) {
+        if (reserved_backing_fd >= 0)
+            close(reserved_backing_fd);
+        return 0;
+    }
 
     /* In-place compaction: 'out' is the next output slot, 'in' is the next
      * input slot. Since the prefix [0, first) is untouched (it sorts strictly
@@ -2219,18 +2325,16 @@ void guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
                 right.gpa_base += trimmed;
                 right.start = end;
                 if (orig.backing_fd >= 0) {
-                    right.backing_fd = dup(orig.backing_fd);
-                    if (right.backing_fd < 0)
-                        log_error(
-                            "guest: dup() failed for region split "
-                            "backing fd %d: %s",
-                            orig.backing_fd, strerror(errno));
+                    right.backing_fd = reserved_backing_fd;
+                    reserved_backing_fd = -1;
                 }
                 guest_region_clip_overlay(&right);
                 g->regions[out + 1] = right;
 
                 g->nregions = out + 2 + suffix_count;
-                return;
+                if (reserved_backing_fd >= 0)
+                    close(reserved_backing_fd);
+                return 0;
             }
         }
 
@@ -2268,6 +2372,17 @@ void guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
         memmove(&g->regions[out], &g->regions[in],
                 tail * sizeof(guest_region_t));
     g->nregions = out + tail;
+    if (reserved_backing_fd >= 0)
+        close(reserved_backing_fd);
+    return 0;
+}
+
+int guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
+{
+    int reserved_backing_fd = -1;
+    if (guest_region_remove_prepare(g, start, end, &reserved_backing_fd) < 0)
+        return -1;
+    return guest_region_remove_reserved(g, start, end, reserved_backing_fd);
 }
 
 const guest_region_t *guest_region_find(const guest_t *g, uint64_t addr)

@@ -10,11 +10,17 @@
  * (caller falls through to real syscall).
  */
 
-/*
- * Maximum /proc/self/maps entries. Array is sized to this; loop bounds use
- * MAPS_ENTRY_MAX - 1 to leave room for safe increment.
+/* Initial capacity for the transient /proc/self/maps and /proc/self/smaps VMA
+ * snapshot. The region tracker documents that coalescing leaves typical
+ * workloads at roughly 50 tracked regions (see core/guest.h), so 64 avoids an
+ * immediate growth in that case. The array grows as needed while mmap_lock is
+ * held; keep a hard ceiling tied to the guest's region tables so maps/smaps
+ * can enumerate every tracked VMA while keeping transient snapshot memory
+ * bounded.
  */
-#define MAPS_ENTRY_MAX 256
+#define MAPS_ENTRY_INITIAL_CAP 64
+#define MAPS_ENTRY_MAX \
+    (GUEST_MAX_REGIONS + GUEST_MAX_PREANNOUNCED * (GUEST_MAX_REGIONS + 1))
 
 /* Bound the transient host-PID snapshot used by /proc/net enumeration. This is
  * an output-work limit, not the dynamically growing lifecycle-table cap.
@@ -53,6 +59,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 
+#include "string-builder.h"
 #include "utils.h"
 
 #include "debug/log.h"
@@ -97,58 +104,180 @@ typedef struct {
     uint64_t start, end;
     int prot, flags;
     uint64_t offset;
+    bool inherited_at_fork;
     char name[64];
+    /* Preserve the producer order for equal-start entries when qsort() is
+     * used below. Existing snapshots placed equal-start entries after one
+     * another in append order, and keeping that order avoids changing the
+     * handling of malformed/overlapping shadow metadata. */
+    size_t order;
 } maps_entry_t;
 
-static void maps_entry_insert(maps_entry_t *entries,
-                              int *nentries,
-                              uint64_t start,
-                              uint64_t end,
-                              int prot,
-                              int flags,
-                              uint64_t offset,
-                              const char *name)
+/* A growable VMA snapshot. The generated facade keeps element-size and
+ * allocation bookkeeping in the generic array implementation. */
+DYNAMIC_ARRAY_DEFINE(maps_entries, maps_entry_t)
+
+/* Round a VMA endpoint up to the 4 KiB granularity exposed by procfs without
+ * allowing the addition to wrap. There is no representable page-aligned
+ * endpoint above UINT64_MAX - 0xFFF, so saturate to UINT64_MAX and let the
+ * caller's normal end <= start validation handle an empty interval.
+ */
+static uint64_t maps_align_up_page(uint64_t value)
 {
-    if (*nentries >= MAPS_ENTRY_MAX || end <= start)
-        return;
-
-    int i = *nentries;
-    while (i > 0 && entries[i - 1].start > start) {
-        entries[i] = entries[i - 1];
-        i--;
-    }
-
-    maps_entry_t *e = &entries[i];
-    e->start = start;
-    e->end = end;
-    e->prot = prot;
-    e->flags = flags;
-    e->offset = offset;
-    if (name && name[0])
-        str_copy_trunc(e->name, name, sizeof(e->name));
-    else
-        e->name[0] = '\0';
-    (*nentries)++;
+    const uint64_t mask = 0xFFFULL;
+    if (value > UINT64_MAX - mask)
+        return UINT64_MAX;
+    return (value + mask) & ~mask;
 }
 
-static void maps_entries_merge_adjacent(maps_entry_t *entries, int *nentries)
+/* Translate a shadow VMA's cursor into its file offset. A wrapped offset would
+ * produce a syntactically valid but semantically wrong maps entry, so surface
+ * the overflow to the intercepted open instead.
+ */
+static int maps_shadow_offset(const guest_region_t *shadow,
+                              uint64_t shadow_start,
+                              uint64_t cursor,
+                              uint64_t *offset_out)
 {
-    if (*nentries <= 1)
+    uint64_t delta = cursor - shadow_start;
+    if (delta > UINT64_MAX - shadow->offset) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *offset_out = shadow->offset + delta;
+    return 0;
+}
+
+static int maps_entries_append_entry(maps_entries_t *entries,
+                                     uint64_t start,
+                                     uint64_t end,
+                                     int prot,
+                                     int flags,
+                                     uint64_t offset,
+                                     const char *name,
+                                     bool inherited_at_fork)
+{
+    if (end <= start)
+        return 0;
+    if (maps_entries_count(entries) >= MAPS_ENTRY_MAX) {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (maps_entries_count(entries) == 0 &&
+        maps_entries_reserve(entries, MAPS_ENTRY_INITIAL_CAP) < 0)
+        return -1;
+
+    maps_entry_t value = {
+        .start = start,
+        .end = end,
+        .prot = prot,
+        .flags = flags,
+        .offset = offset,
+        .inherited_at_fork = inherited_at_fork,
+        .order = maps_entries_count(entries),
+    };
+    if (name && name[0])
+        str_copy_trunc(value.name, name, sizeof(value.name));
+    else
+        value.name[0] = '\0';
+
+    return maps_entries_append_value(entries, value);
+}
+
+/* The live-region and shadow-gap producers are each ordered, but their
+ * outputs interleave. Append both streams while holding mmap_lock and sort
+ * once after all gaps have been generated. This avoids shifting an already
+ * populated array for every split shadow gap (the old insertion path was
+ * quadratic for fragmented snapshots). */
+static int maps_entries_compare_start(const void *lhs, const void *rhs)
+{
+    const maps_entry_t *a = lhs;
+    const maps_entry_t *b = rhs;
+    if (a->start < b->start)
+        return -1;
+    if (a->start > b->start)
+        return 1;
+    if (a->order < b->order)
+        return -1;
+    if (a->order > b->order)
+        return 1;
+    return 0;
+}
+
+static void maps_entries_merge_adjacent(maps_entries_t *entries)
+{
+    size_t count = maps_entries_count(entries);
+    if (count <= 1)
         return;
 
-    int out = 0;
-    for (int i = 1; i < *nentries; i++) {
-        if (entries[i].start == entries[out].end &&
-            entries[i].prot == entries[out].prot &&
-            entries[i].flags == entries[out].flags &&
-            entries[i].offset == entries[out].offset &&
-            strcmp(entries[i].name, entries[out].name) == 0) {
-            entries[out].end = entries[i].end;
+    size_t out = 0;
+    for (size_t i = 1; i < count; i++) {
+        maps_entry_t *current = maps_entries_at(entries, i);
+        maps_entry_t *previous = maps_entries_at(entries, out);
+        if (current->start == previous->end &&
+            current->prot == previous->prot &&
+            current->flags == previous->flags &&
+            current->offset == previous->offset &&
+            current->inherited_at_fork == previous->inherited_at_fork &&
+            strcmp(current->name, previous->name) == 0) {
+            previous->end = current->end;
             continue;
         }
-        entries[++out] = entries[i];
+        ++out;
+        if (out != i)
+            *maps_entries_at(entries, out) = *current;
     }
-    *nentries = out + 1;
+    (void) maps_entries_resize(entries, out + 1);
+}
+
+/* Add only the portions of a preannounced interval not covered by live VMAs.
+ * A shadow VMA must never overlap a realized VMA: strict smaps consumers treat
+ * overlapping headers as a malformed snapshot. Both inputs are page-rounded
+ * because that is the granularity exposed by /proc/self/maps. */
+static int maps_entries_append_shadow_gaps(maps_entries_t *entries,
+                                           const guest_region_t *shadow,
+                                           const guest_region_t *live_regions,
+                                           int nlive)
+{
+    uint64_t shadow_start = shadow->start & ~0xFFFULL;
+    uint64_t shadow_end = maps_align_up_page(shadow->end);
+    if (shadow_end <= shadow_start)
+        return 0;
+
+    uint64_t cursor = shadow_start;
+    for (int i = 0; i < nlive && cursor < shadow_end; i++) {
+        uint64_t live_start = live_regions[i].start & ~0xFFFULL;
+        uint64_t live_end = maps_align_up_page(live_regions[i].end);
+        if (live_end <= live_start || live_end <= cursor)
+            continue;
+        if (live_start >= shadow_end)
+            break;
+
+        if (live_start > cursor) {
+            uint64_t gap_end =
+                live_start < shadow_end ? live_start : shadow_end;
+            uint64_t offset;
+            if (maps_shadow_offset(shadow, shadow_start, cursor, &offset) < 0)
+                return -1;
+            if (maps_entries_append_entry(
+                    entries, cursor, gap_end, shadow->prot, shadow->flags,
+                    offset, shadow->name, shadow->inherited_at_fork) < 0)
+                return -1;
+        }
+        if (live_end > cursor)
+            cursor = live_end;
+    }
+
+    if (cursor < shadow_end) {
+        uint64_t offset;
+        if (maps_shadow_offset(shadow, shadow_start, cursor, &offset) < 0)
+            return -1;
+        if (maps_entries_append_entry(entries, cursor, shadow_end, shadow->prot,
+                                      shadow->flags, offset, shadow->name,
+                                      shadow->inherited_at_fork) < 0)
+            return -1;
+    }
+    return 0;
 }
 
 /* Synthetic /sys/devices/system/cpu directory backing store. Populated lazily
@@ -448,7 +577,8 @@ static void proc_tmpdir_cleanup(void)
 
     /* Remove known files inside <tmpdir>/<pid>/ and <tmpdir>/ */
     char path[256];
-    const char *files[] = {"stat", "status", "cmdline", "maps", "exe", NULL};
+    const char *files[] = {"stat",  "status", "cmdline", "maps",
+                           "smaps", "exe",    NULL};
     char piddir[160];
 
     /* Reconstruct pid subdir by scanning for the first numeric entry */
@@ -1234,6 +1364,7 @@ static const char *ensure_proc_tmpdir(const guest_t *g)
     populate_proc_snapshot(g, piddir, "status", "/proc/self/status");
     populate_proc_snapshot(g, piddir, "cmdline", "/proc/self/cmdline");
     populate_proc_snapshot(g, piddir, "maps", "/proc/self/maps");
+    populate_proc_snapshot(g, piddir, "smaps", "/proc/self/smaps");
 
     /* Create task subdirectory for /proc/self/task enumeration */
     char taskdir[128];
@@ -3043,145 +3174,306 @@ static int pty_open_master(int linux_flags)
     return master;
 }
 
-/* Emit /proc/self/maps into a synthetic fd. Merges contiguous regions[] runs
- * that came from one mmap, then folds in preannounced[] shadow entries whose
- * advertised interval is not yet fully covered by live regions.
+/* Build the VMA list shared by /proc/self/maps and /proc/self/smaps. Merges
+ * contiguous regions[] runs that came from one mmap, then folds in the
+ * uncovered pieces of preannounced[] shadow entries around live coverage.
+ * Producers append entries while the lock is held; one sort/merge pass puts
+ * the interleaved live and shadow streams back into VMA order.
  *
- * Returns a host fd, or -1 on error. Split out of proc_intercept_open to keep
- * that dispatcher readable.
+ * The region and preannounced arrays are mutable from guest mmap/mprotect/
+ * munmap operations. Snapshot and merge while mmap_lock is held, then release
+ * it before formatting output so readers never observe a torn VMA or metadata
+ * record and output generation does not block page-table mutations.
+ */
+static int proc_build_maps_entries(const guest_t *g,
+                                   maps_entries_t *entries_out)
+{
+    if (!g || !entries_out) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    maps_entries_t entries = {0};
+    int result = -1;
+    int saved_errno = 0;
+
+    pthread_mutex_lock(&mmap_lock);
+
+    /* Convert regions[] to maps entries. regions[] is already sorted by start
+     * address. The MAP_SHARED/MAP_ANONYMOUS/MAP_NORESERVE bits are preserved
+     * in r->flags, which is the single source of truth for the proc snapshot.
+     */
+    int nregions = g->nregions;
+    if (nregions < 0)
+        nregions = 0;
+    if (nregions > GUEST_MAX_REGIONS)
+        nregions = GUEST_MAX_REGIONS;
+    for (int i = 0; i < nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        uint64_t start = r->start & ~0xFFFULL;
+        uint64_t end = maps_align_up_page(r->end);
+        size_t count = maps_entries_count(&entries);
+        maps_entry_t *last =
+            count > 0 ? maps_entries_at(&entries, count - 1) : NULL;
+        if (last != NULL && last->end == start && last->prot == r->prot &&
+            last->flags == r->flags && last->offset == r->offset &&
+            last->inherited_at_fork == r->inherited_at_fork &&
+            !strcmp(last->name, r->name)) {
+            last->end = end;
+            continue;
+        }
+        if (maps_entries_append_entry(&entries, start, end, r->prot, r->flags,
+                                      r->offset, r->name,
+                                      r->inherited_at_fork) < 0)
+            goto out_unlock;
+    }
+
+    /* Add only uncovered portions of each preannounced interval. Keeping the
+     * shadow VMA whole when a live mapping realizes its middle produces
+     * overlapping maps/smaps headers; subtract every covered live interval
+     * instead, preserving any reserved-but-not-realized gaps. */
+    int npreannounced = g->npreannounced;
+    if (npreannounced < 0)
+        npreannounced = 0;
+    if (npreannounced > GUEST_MAX_PREANNOUNCED)
+        npreannounced = GUEST_MAX_PREANNOUNCED;
+    for (int i = 0; i < npreannounced; i++) {
+        const guest_region_t *r = &g->preannounced[i];
+        if (maps_entries_append_shadow_gaps(&entries, r, g->regions, nregions) <
+            0)
+            goto out_unlock;
+    }
+    if (maps_entries_count(&entries) > 1)
+        qsort(maps_entries_data(&entries), maps_entries_count(&entries),
+              sizeof(maps_entry_t), maps_entries_compare_start);
+    maps_entries_merge_adjacent(&entries);
+    result = (int) maps_entries_count(&entries);
+
+out_unlock:
+    saved_errno = errno;
+    pthread_mutex_unlock(&mmap_lock);
+    if (result < 0) {
+        maps_entries_destroy(&entries);
+        errno = saved_errno;
+        return -1;
+    }
+    *entries_out = entries;
+    return (int) maps_entries_count(&entries);
+}
+
+/* Format the common VMA header. The maps and smaps header must stay byte-for-
+ * byte compatible so consumers can use either file interchangeably.
+ */
+static int proc_format_maps_header(const maps_entry_t *e,
+                                   char *header,
+                                   size_t headersz)
+{
+    char perms[5];
+    perms[0] = (e->prot & LINUX_PROT_READ) ? 'r' : '-';
+    perms[1] = (e->prot & LINUX_PROT_WRITE) ? 'w' : '-';
+    perms[2] = (e->prot & LINUX_PROT_EXEC) ? 'x' : '-';
+    perms[3] = (e->flags & LINUX_MAP_SHARED) ? 's' : 'p';
+    perms[4] = '\0';
+
+    int header_len =
+        snprintf(header, headersz, "%llx-%llx %s %08llx 00:00 0",
+                 (unsigned long long) e->start, (unsigned long long) e->end,
+                 perms, (unsigned long long) e->offset);
+    if (header_len < 0)
+        return -1;
+    if ((size_t) header_len >= headersz)
+        header_len = (int) headersz - 1;
+
+    if (e->name[0]) {
+        while (header_len < MAPS_NAME_COLUMN &&
+               (size_t) header_len < headersz - 1)
+            header[header_len++] = ' ';
+        int n = snprintf(header + header_len, headersz - (size_t) header_len,
+                         "%s", e->name);
+        if (n > 0) {
+            if ((size_t) n >= headersz - (size_t) header_len)
+                n = (int) (headersz - (size_t) header_len - 1);
+            header_len += n;
+        }
+    } else if ((size_t) header_len < headersz - 1) {
+        header[header_len++] = ' ';
+    }
+    header[header_len] = '\0';
+    return header_len;
+}
+
+/* Release the resources shared by maps/smaps output without hiding the errno
+ * from the operation that produced result.
+ */
+static int proc_finish_maps_output(int result,
+                                   maps_entries_t *entries,
+                                   string_builder_t *builder)
+{
+    int saved_errno = errno;
+    maps_entries_destroy(entries);
+    string_builder_destroy(builder);
+    errno = saved_errno;
+    return result;
+}
+
+/* Emit /proc/self/maps into a synthetic fd. Addresses are page-aligned and
+ * output matches the Linux maps header format.
  */
 static int proc_open_self_maps(const guest_t *g)
 {
-    /* Heap-allocated: guest threads run on host pthreads whose stacks do not
-     * comfortably hold a 16KiB frame.
-     */
-    const size_t bufsz = 16384;
-    char *buf = malloc(bufsz);
-    if (!buf)
+    maps_entries_t entries = {0};
+    int nentries = proc_build_maps_entries(g, &entries);
+    if (nentries < 0)
         return -1;
-    int off = 0;
 
-    /* Build a flat array of (va_start, va_end, prot, flags, offset, name) from
-     * regions[] plus /proc/self/maps-only preannounced[] entries.
-     * preannounced[] is intentionally NOT consulted by mmap conflict detection,
-     * so advertise-only Rosetta/JIT regions do not trip MAP_FIXED_NOREPLACE
-     * with -EEXIST.
-     *
-     * entries is heap-allocated: MAPS_ENTRY_MAX * sizeof(maps_entry_t) is
-     * ~24KiB, too large for a guest-thread pthread stack.
-     */
-    maps_entry_t *entries = calloc(MAPS_ENTRY_MAX, sizeof(*entries));
-    if (!entries) {
-        free(buf);
-        return -1;
-    }
-    int nentries = 0;
-
-    /* Convert regions[] to maps entries. regions[] is already sorted by start
-     * address; merge contiguous runs that came from one mmap.
-     */
-    for (int i = 0; i < g->nregions && nentries < MAPS_ENTRY_MAX; i++) {
-        const guest_region_t *r = &g->regions[i];
-        uint64_t start = r->start & ~0xFFFULL;
-        uint64_t end = (r->end + 0xFFF) & ~0xFFFULL;
-
-        if (nentries > 0 && entries[nentries - 1].end == start &&
-            entries[nentries - 1].prot == r->prot &&
-            entries[nentries - 1].flags == r->flags &&
-            entries[nentries - 1].offset == r->offset &&
-            !strcmp(entries[nentries - 1].name, r->name)) {
-            entries[nentries - 1].end = end;
-            continue;
-        }
-        maps_entry_insert(entries, &nentries, start, end, r->prot, r->flags,
-                          r->offset, r->name);
-    }
-
-    /* Add preannounced entries only while they still have an uncovered tail.
-     * Once the union of live regions covers the full advertised interval,
-     * suppress the shadow entry so /proc/self/maps shows only the realized
-     * split VMAs. A partial union must stay visible because some
-     * reserved-but-not-realized span remains to advertise.
-     */
-    for (int i = 0; i < g->npreannounced && nentries < MAPS_ENTRY_MAX; i++) {
-        const guest_region_t *r = &g->preannounced[i];
-        bool shadowed = false;
-        uint64_t covered_end = r->start;
-
-        for (int j = 0; j < g->nregions; j++) {
-            const guest_region_t *live = &g->regions[j];
-
-            if (live->end <= covered_end)
-                continue;
-            if (live->start > covered_end)
-                break;
-
-            covered_end = live->end;
-            if (covered_end >= r->end) {
-                shadowed = true;
-                break;
-            }
-        }
-
-        if (shadowed)
-            continue;
-
-        maps_entry_insert(entries, &nentries, r->start & ~0xFFFULL,
-                          (r->end + 0xFFFULL) & ~0xFFFULL, r->prot, r->flags,
-                          r->offset, r->name);
-    }
-    maps_entries_merge_adjacent(entries, &nentries);
+    string_builder_t builder = {0};
+    size_t initial_capacity = (size_t) nentries * 256;
+    int result = -1;
+    if (string_builder_init(&builder, initial_capacity) < 0)
+        goto out;
 
     /* Emit lines after merging so buffer accounting is centralized. */
-    for (int i = 0; i < nentries && off < (int) bufsz - 256; i++) {
-        const maps_entry_t *e = &entries[i];
-        char perms[5];
-        perms[0] = (e->prot & 0x1) ? 'r' : '-';
-        perms[1] = (e->prot & 0x2) ? 'w' : '-';
-        perms[2] = (e->prot & 0x4) ? 'x' : '-';
-        perms[3] = (e->flags & 0x01) ? 's' : 'p';
-        perms[4] = '\0';
-
-        /* Format matches real Linux /proc/<pid>/maps exactly:
-         *   %lx-%lx %s %08lx %02x:%02x %lu  <padding>  %s\n
-         * Verified against strace in a real Lima VZ VM.
-         */
+    for (int i = 0; i < nentries; i++) {
+        const maps_entry_t *e = maps_entries_at_const(&entries, (size_t) i);
         char line[256];
-        int lineoff =
-            snprintf(line, sizeof(line), "%llx-%llx %s %08llx 00:00 0",
-                     (unsigned long long) e->start, (unsigned long long) e->end,
-                     perms, (unsigned long long) e->offset);
-
-        /* Cap lineoff to buffer size (snprintf may return more than available
-         * on truncation)
-         */
-        if (lineoff >= (int) sizeof(line))
-            lineoff = (int) sizeof(line) - 1;
-        if (e->name[0]) {
-            while (lineoff < MAPS_NAME_COLUMN &&
-                   lineoff < (int) sizeof(line) - 1)
-                line[lineoff++] = ' ';
-            int n =
-                snprintf(line + lineoff, sizeof(line) - lineoff, "%s", e->name);
-            if (n > 0)
-                lineoff += n;
-            if (lineoff >= (int) sizeof(line))
-                lineoff = (int) sizeof(line) - 1;
-        } else if (lineoff < (int) sizeof(line) - 1) {
-            line[lineoff++] = ' ';
-        }
-        int wrote = snprintf(buf + off, bufsz - off, "%.*s\n", lineoff, line);
-        if (wrote > 0 && off + wrote < (int) bufsz)
-            off += wrote;
-        else
-            break; /* Stop before truncating a maps line. */
+        int line_len = proc_format_maps_header(e, line, sizeof(line));
+        if (line_len < 0 ||
+            string_builder_appendf(&builder, "%.*s\n", line_len, line) < 0)
+            goto out;
     }
 
-    log_debug("/proc/self/maps (%d bytes):\n%.*s", off, off, buf);
-    int fd = proc_synthetic_fd(buf, off);
-    free(entries);
-    free(buf);
-    return fd;
+    log_debug("/proc/self/maps (%zu bytes):\n%.*s",
+              string_builder_length(&builder),
+              (int) string_builder_length(&builder),
+              string_builder_data_const(&builder)
+                  ? string_builder_data_const(&builder)
+                  : "");
+    result = proc_synthetic_fd(string_builder_data_const(&builder)
+                                   ? string_builder_data_const(&builder)
+                                   : "",
+                               string_builder_length(&builder));
+
+out:
+    return proc_finish_maps_output(result, &entries, &builder);
+}
+
+/* Emit a Linux-shaped /proc/self/smaps approximation. The runtime tracks
+ * guest VMAs and logical fork snapshots, but it cannot observe kernel page
+ * residency or dirty bits on the host. Writable private anonymous VMAs that
+ * were present in the most recent fork snapshot report their full VMA size as
+ * Shared_Dirty, Rss, Pss, and Pss_Dirty; keeping those counters aligned avoids
+ * a self-contradictory snapshot while retaining a coarse fork-compatibility
+ * signal. Newly-created VMAs are excluded. All other fields that require
+ * kernel page accounting are stable zeroes.
+ */
+static int proc_open_self_smaps(const guest_t *g)
+{
+    maps_entries_t entries = {0};
+    int nentries = proc_build_maps_entries(g, &entries);
+    if (nentries < 0)
+        return -1;
+
+    string_builder_t builder = {0};
+    size_t initial_capacity = (size_t) nentries * 768;
+    int result = -1;
+    if (string_builder_init(&builder, initial_capacity) < 0)
+        goto out;
+
+    for (int i = 0; i < nentries; i++) {
+        const maps_entry_t *e = maps_entries_at_const(&entries, (size_t) i);
+        char header[256];
+        int header_len = proc_format_maps_header(e, header, sizeof(header));
+        if (header_len < 0)
+            goto out;
+
+        uint64_t size_kb = (e->end - e->start) / 1024;
+        bool anonymous = (e->flags & LINUX_MAP_ANONYMOUS) != 0;
+        bool shared = (e->flags & LINUX_MAP_SHARED) != 0;
+        bool noreserve = (e->flags & LINUX_MAP_NORESERVE) != 0;
+        bool private_anon =
+            (e->flags & LINUX_MAP_PRIVATE) && anonymous && !shared;
+        bool logical_shared_dirty = e->inherited_at_fork && private_anon &&
+                                    (e->prot & LINUX_PROT_WRITE);
+        uint64_t shared_dirty_kb = logical_shared_dirty ? size_kb : 0;
+        uint64_t rss_kb = shared_dirty_kb;
+        uint64_t pss_kb = shared_dirty_kb;
+        uint64_t pss_dirty_kb = shared_dirty_kb;
+
+        /* Linux writes a separating space after VmFlags:, even when no
+         * evidence-based flags are available (for example a PROT_NONE VMA).
+         * Start with that space so the empty form is exactly "VmFlags: \n".
+         */
+        char vmflags[64] = {' '};
+        size_t vmflags_len = 1;
+#define APPEND_VMFLAG(flag)                                  \
+    do {                                                     \
+        const char *token = (flag);                          \
+        size_t token_len = strlen(token);                    \
+        if (vmflags_len + token_len + 1 < sizeof(vmflags)) { \
+            if (vmflags_len > 1)                             \
+                vmflags[vmflags_len++] = ' ';                \
+            memcpy(vmflags + vmflags_len, token, token_len); \
+            vmflags_len += token_len;                        \
+        }                                                    \
+    } while (0)
+        /* Only flags directly evidenced by the tracked VMA are reported. In
+         * particular, do not invent Linux max-permission/accounting flags
+         * (mr/mw/me/ac/sd/etc.) that the emulator cannot observe.
+         */
+        if (e->prot & LINUX_PROT_READ)
+            APPEND_VMFLAG("rd");
+        if (e->prot & LINUX_PROT_WRITE)
+            APPEND_VMFLAG("wr");
+        if (e->prot & LINUX_PROT_EXEC)
+            APPEND_VMFLAG("ex");
+        if (shared)
+            APPEND_VMFLAG("sh");
+        if (noreserve)
+            APPEND_VMFLAG("nr");
+#undef APPEND_VMFLAG
+        vmflags[vmflags_len] = '\0';
+
+        if (string_builder_appendf(
+                &builder,
+                "%.*s\n"
+                "Size: %llu kB\n"
+                "KernelPageSize: 4 kB\n"
+                "MMUPageSize: 4 kB\n"
+                "Rss: %llu kB\n"
+                "Pss: %llu kB\n"
+                "Pss_Dirty: %llu kB\n"
+                "Shared_Clean: 0 kB\n"
+                "Shared_Dirty: %llu kB\n"
+                "Private_Clean: 0 kB\n"
+                "Private_Dirty: 0 kB\n"
+                "Referenced: 0 kB\n"
+                "Anonymous: 0 kB\n"
+                "KSM: 0 kB\n"
+                "LazyFree: 0 kB\n"
+                "AnonHugePages: 0 kB\n"
+                "ShmemPmdMapped: 0 kB\n"
+                "FilePmdMapped: 0 kB\n"
+                "Shared_Hugetlb: 0 kB\n"
+                "Private_Hugetlb: 0 kB\n"
+                "Swap: 0 kB\n"
+                "SwapPss: 0 kB\n"
+                "Locked: 0 kB\n"
+                "THPeligible: 0\n"
+                "VmFlags:%s\n",
+                header_len, header, (unsigned long long) size_kb,
+                (unsigned long long) rss_kb, (unsigned long long) pss_kb,
+                (unsigned long long) pss_dirty_kb,
+                (unsigned long long) shared_dirty_kb, vmflags) < 0)
+            goto out;
+    }
+
+    result = proc_synthetic_fd(string_builder_data_const(&builder)
+                                   ? string_builder_data_const(&builder)
+                                   : "",
+                               string_builder_length(&builder));
+
+out:
+    return proc_finish_maps_output(result, &entries, &builder);
 }
 
 /* Emit /proc/meminfo from host sysctl (HW_MEMSIZE) plus mach vm_statistics64,
@@ -3789,6 +4081,12 @@ int proc_intercept_open(const guest_t *g,
      */
     if (!strcmp(path, "/proc/self/maps"))
         return proc_open_self_maps(g);
+
+    /* /proc/self/smaps -> Linux-shaped VMA blocks with tracked VMA metadata
+     * and the coarse fork Shared_Dirty/Rss/Pss/Pss_Dirty compatibility signal.
+     */
+    if (!strcmp(path, "/proc/self/smaps"))
+        return proc_open_self_smaps(g);
 
     /* /proc/uptime -> synthetic uptime in seconds. Uses sysctl(KERN_BOOTTIME),
      * same as sys_sysinfo() in syscall/sys.c. Idle time is 0 (no meaningful
@@ -4403,6 +4701,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
         "/proc/self/status",
         "/proc/self/cmdline",
         "/proc/self/maps",
+        "/proc/self/smaps",
         "/proc/self/exe",
         "/proc/self/environ",
         "/proc/self/auxv",

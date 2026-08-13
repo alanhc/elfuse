@@ -1,5 +1,12 @@
 # Test targets
 
+# Keep the mremap descriptor-exhaustion regression at elfuse's documented host
+# minimum. The guest probe consumes the remaining host reserve after startup
+# and verifies that its filler failure is descriptor-driven. The manifest
+# annotation, Make recipe, and shell runners all derive this value from
+# src/elfuse-limits.h.
+ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
+
 .PHONY: test-hello test-all check check-syscall-coverage test-gdbstub test-coreutils test-busybox \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
@@ -14,6 +21,9 @@
         test-sysroot-tmp-remove test-sysroot-host-fallback test-sysroot-case-exact \
         test-sysroot-create-paths test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
+        test-dynamic-array-host test-string-builder-host \
+        test-config \
+        test-mremap-tail-emfile \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
@@ -40,6 +50,16 @@
 test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@printf "$(BLUE)▸ Running$(RESET) test-hello\n"
 	$(ELFUSE_BIN) $(TEST_DIR)/test-hello
+
+## Verify test-config.sh keeps its CLI mode separate from sourced mode
+test-config:
+	@bash tests/test-config-cli.sh
+
+## Run the libc-based file-backed region removal EMFILE regression probe
+test-mremap-tail-emfile: $(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile
+	@printf "$(BLUE)▸ Running$(RESET) test-mremap-tail-emfile\n"
+	(ulimit -n $(ELFUSE_HOST_NOFILE_MIN) && \
+		$(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile)
 
 ## Verify dispatch.tbl coverage of the kernel-supported syscall set
 check-syscall-coverage:
@@ -144,7 +164,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-teardown-live-vcpu-host test-casefold-host \
-        test-casefold-walk-host test-absock-names-host)
+        test-casefold-walk-host test-absock-names-host \
+        test-dynamic-array-host test-string-builder-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -159,6 +180,8 @@ $(call run-host-unit,test-teardown-live-vcpu-host,teardown live-worker accountin
 $(call run-host-unit,test-casefold-host,filename codec unit test)
 $(call run-host-unit,test-casefold-walk-host,case-exact path resolution unit test)
 $(call run-host-unit,test-absock-names-host,absock derived-name unit test)
+$(call run-host-unit,test-dynamic-array-host,dynamic array unit test)
+$(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)
@@ -172,7 +195,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage test-config \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
@@ -1401,6 +1424,16 @@ test-rwx: $(BUILD_DIR)/test-rwx
 ## Run the fork IPC protocol identity unit test
 test-fork-ipc-protocol-host: $(BUILD_DIR)/test-fork-ipc-protocol-host
 	$(BUILD_DIR)/test-fork-ipc-protocol-host
+
+# String builder unit test
+## Run the growable string builder host unit test
+test-string-builder-host: $(BUILD_DIR)/test-string-builder-host
+	$(BUILD_DIR)/test-string-builder-host
+
+# Generic dynamic array unit test
+## Run the raw/typed dynamic array host unit test
+test-dynamic-array-host: $(BUILD_DIR)/test-dynamic-array-host
+	$(BUILD_DIR)/test-dynamic-array-host
 
 # vCPU run-loop hook API regression
 ## Run the vCPU run-loop hook API unit test

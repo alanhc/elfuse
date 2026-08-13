@@ -32,6 +32,14 @@ MODE="${1:?Usage: $0 <elfuse-aarch64|qemu-aarch64|elfuse-x86_64|all>}"
 # Tool paths.
 ELFUSE="${ELFUSE:-${REPO_ROOT}/build/elfuse}"
 
+# shellcheck source=tests/test-config.sh
+source "${REPO_ROOT}/tests/test-config.sh"
+
+# The mremap EMFILE case uses the minimum host limit only to satisfy elfuse's
+# startup check; its guest-side probe consumes the remaining host reserve and
+# verifies that the filler failure is descriptor-driven before asserting the
+# mremap ENOMEM path.
+
 # Default fixture paths. Each variable points at the actual directory (or file
 # for busybox); no implicit /bin suffix is appended.
 : "${GUEST_TEST_BINARIES:=${REPO_ROOT}/build}"
@@ -151,7 +159,17 @@ run_elfuse()
             "${FIXTURES}/aarch64-musl/dyn-bin"/*) args+=(--sysroot "$GUEST_SYSROOT") ;;
         esac
     fi
-    timeout 30 "$ELFUSE" ${args[@]+"${args[@]}"} "$@" 2> /dev/null
+    local host_nofile
+    host_nofile=$(elfuse_test_host_nofile \
+        "${REPO_ROOT}/tests/manifest.txt" "$first") || return 1
+    if [ -n "$host_nofile" ]; then
+        (
+            ulimit -n "$host_nofile" || exit 1
+            timeout 30 "$ELFUSE" ${args[@]+"${args[@]}"} "$@" 2> /dev/null
+        )
+    else
+        timeout 30 "$ELFUSE" ${args[@]+"${args[@]}"} "$@" 2> /dev/null
+    fi
 }
 
 # 'timeout' cannot wrap a shell function, so this runner inlines the path
@@ -243,10 +261,10 @@ unstage_sysroot_fixtures()
 
 # Generic test helpers.
 
-# The qemu reference lane now runs every matrix test against the real Alpine
-# linux-virt kernel, so QEMU_SKIP is empty. Add a test's name here only if it
-# asserts elfuse-specific behavior a real kernel does not honor; it still runs
-# in elfuse-aarch64 mode and in 'make check'.
+# The qemu reference lane runs the portable matrix tests against the real
+# Alpine linux-virt kernel. Add a test's name here only if it asserts
+# elfuse-specific behavior a real kernel does not honor; it still runs in
+# elfuse-aarch64 mode and in 'make check'.
 #
 # The two oom_adj/oom_score_adj sendfile-and-copy_file_range-interception
 # subtests that used to make test-io-opt diverge here were split out into
@@ -274,6 +292,7 @@ QEMU_SKIP="
     test-fork-synthetic-fd
     test-mmap-hint
     test-msync
+    test-mremap-tail-emfile
     test-credentials
     test-credentials-fakeroot
     test-fakeroot-exec
@@ -286,6 +305,7 @@ QEMU_SKIP="
     test-fd-family
     test-scm-creds
     test-proc-fidelity
+    test-proc-smap
 "
 # test-session: getpgid/getsid/setsid assume the test is its own session and
 #   process-group leader, true when elfuse launches it directly but not when
@@ -327,6 +347,10 @@ QEMU_SKIP="
 # test-mmap-hint / test-msync: pin mmap addresses against elfuse's own
 #   deterministic placement heuristics (2 MiB-aligned hint fallback, a fixed
 #   neighbor address); a real kernel's allocator places mappings differently.
+# test-mremap-tail-emfile: fills the guest FD table, consumes elfuse's host
+#   descriptor reserve with file-backed fillers, and verifies that the filler
+#   failure is descriptor-driven before asserting the mremap ENOMEM path; real
+#   Linux has neither emulated table nor reserve.
 # test-credentials: pins elfuse's restricted "fakeroot" setuid/capset/
 #   getgroups model (deliberately narrower than real root); the qemu
 #   reference lane runs as genuine root, which has unrestricted privilege.
@@ -362,6 +386,10 @@ QEMU_SKIP="
 #   under elfuse, while a real kernel allows the open and only rejects the
 #   write -- a genuine behavioral difference worth reviewing on its own,
 #   not just an environment artifact.
+# test-proc-smap: validates elfuse's synthetic smaps VMA snapshot, including
+#   per-VMA Shared_Dirty inheritance and exclusion of post-fork VMAs. Real
+#   Linux smaps exposes kernel-owned VMA/page accounting instead, so this is
+#   intentionally not a reference-kernel invariant.
 
 # Tests that only run under qemu. A test belongs here when it needs a writable,
 # byte-exact root: the elfuse lane runs without a sysroot, and the macOS root is
@@ -608,7 +636,9 @@ test_pipe()
 # fast-path suite -- test-shim-* and test-shim-cred-race, which probe elfuse's
 # own shim_data block and identity cache -- test-mremap-infra, which guards
 # elfuse's guest-IPA infra reserve, and test-oom-proc, documented in its own
-# header). There is no "core" vs "extended" split here; everything below runs
+# header). test-mremap-tail-emfile is listed here as an elfuse-lane regression
+# and marked QEMU_SKIP because its host-reserve assertion has no Linux analogue.
+# There is no "core" vs "extended" split here; everything below runs
 # in both elfuse-aarch64 and qemu-aarch64 modes, and genuine, understood
 # divergences from the qemu reference kernel are called out via QEMU_SKIP with
 # a comment rather than silently dropped from this list.
@@ -705,6 +735,7 @@ run_unit_tests()
     test_rc "$runner" "test-procfs-exec" 0 "$bindir/test-procfs-exec"
     test_rc "$runner" "test-proc-limits" 0 "$bindir/test-proc-limits"
     test_rc "$runner" "test-proc-fidelity" 0 "$bindir/test-proc-fidelity"
+    test_rc "$runner" "test-proc-smap" 0 "$bindir/test-proc-smap"
 
     printf "\nNetwork\n"
     test_check "$runner" "test-net" "0 failed" "$bindir/test-net"
@@ -749,6 +780,8 @@ run_unit_tests()
 
     printf "\nmremap\n"
     test_rc "$runner" "test-mremap" 0 "$bindir/test-mremap"
+    test_rc "$runner" "test-mremap-tail-emfile" 0 \
+        "$bindir/test-mremap-tail-emfile"
 
     printf "\nmsync MAP_SHARED\n"
     test_rc "$runner" "test-msync" 0 "$bindir/test-msync"
@@ -1314,7 +1347,7 @@ run_suite()
 # observed counts diverge. apple-unknown is the fallback row for SoC strings the
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|241|0"
+    "elfuse-aarch64|242|0"
     "qemu-aarch64|224|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
