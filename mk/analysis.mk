@@ -97,6 +97,15 @@ FRAMAC ?= frama-c
 FRAMAC_DATA_MODEL ?= gcc_x86_64
 FRAMAC_TIMEOUT ?= 30
 
+# Provers, tried in order until one discharges the goal. Both are listed
+# because each closes goals the other does not, so dropping either loses
+# proofs. A run that only has to establish that some goal FAILS does not need
+# the second opinion, and pays the full timeout twice per unprovable goal
+# without it. Nothing in the tree narrows it: the mutation gate was tried on
+# one prover and is unsound that way, because its baseline only shows the
+# ORIGINAL goals discharge with the kept prover.
+FRAMAC_PROVERS ?= alt-ergo,z3
+
 # The analyzer parses against Frama-C's own modeled libc headers, never the
 # host's. -print-share-path runs at recipe time rather than through $(shell) so
 # a make invocation with no frama-c installed does not pay for it.
@@ -364,7 +373,7 @@ $(VERIFY_RULES): | $(BUILD_DIR)
 	    -cpp-extra-args="$(FRAMAC_CPP_ARGS)" \
 	    $(SRC) -wp -wp-rte -wp-model $(MODEL) \
 	    -wp-fct $(FCT_ARG) \
-	    -wp-prover alt-ergo,z3 -wp-timeout $(FRAMAC_TIMEOUT) \
+	    -wp-prover $(FRAMAC_PROVERS) -wp-timeout $(FRAMAC_TIMEOUT) \
 	    > $(BUILD_DIR)/verify-$(NAME).log 2>&1; \
 	python3 scripts/check-wp-result.py --status $$? \
 	    --log $(BUILD_DIR)/verify-$(NAME).log --min-goals $(MIN_GOALS) \
@@ -412,8 +421,30 @@ check-char-signedness:
 	@echo "  CHARSIGN proof sources under both char signedness settings"
 	$(Q)python3 scripts/check-char-signedness.py --cc '$(CC)'
 
+# Proof jobs. Each verify-* target is one frama-c process writing its own log
+# and sharing nothing with the others, so the only thing serializing them was
+# make itself.
+VERIFY_JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+
 ## Run every Frama-C proof
-verify: $(VERIFY_RULES)
+#
+# Recursive rather than a prerequisite list, so a plain "make verify" gets the
+# parallelism instead of only the invocations that remember -j. The leading '+'
+# is what keeps this expanding under -n: make looks for a literal $(MAKE) in the
+# unexpanded recipe line to decide that, and marks the line as still-runs.
+#
+# The -j is added only when the caller did not bring one. A forced -j in a
+# submake makes it drop the inherited jobserver and start that many processes
+# regardless of the outer limit, so "make -j2 verify" would run VERIFY_JOBS of
+# them. Passing nothing lets the jobserver do its job.
+#
+# "make -j1 verify" is serial under GNU make 4.x, which keeps -j1 in MAKEFLAGS
+# for the filter below to find. Apple's /usr/bin/make is 3.81 and records
+# nothing for -j1, so there it reads as a plain invocation and parallelizes;
+# VERIFY_JOBS=1 asks for serial in a way both understand.
+verify:
+	+@$(MAKE) --no-print-directory \
+	    $(if $(filter -j%,$(MAKEFLAGS)),,-j$(VERIFY_JOBS)) $(VERIFY_RULES)
 
 ## Rebuild with the proved/gva.h precondition checks live, then run the suite
 #

@@ -62,7 +62,9 @@ def proof_sources():
 
     srcs = {
         m.group(1).lower(): m.group(2).strip()
-        for m in re.finditer(r"^VERIFY_([A-Z0-9_]+)_SRC\s*:=\s*(\S+)", text, re.MULTILINE)
+        for m in re.finditer(
+            r"^VERIFY_([A-Z0-9_]+)_SRC\s*:=\s*(\S+)", text, re.MULTILINE
+        )
     }
     out = {}
     for m in re.finditer(r"^VERIFY_([A-Z0-9_]+)_FCTS\s*:=\s*(.*)$", text, re.MULTILINE):

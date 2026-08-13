@@ -1004,11 +1004,54 @@ INFRA_MARKERS = (
 )
 
 
-def run_target(target, source_copy, name):
+# Mutations run against the same prover set as the proofs, deliberately.
+#
+# Narrowing to one prover was tried and is unsound for the reason the timeout
+# shortcut is: the baseline only shows that the ORIGINAL goals discharge with
+# that prover, and a mutation does not fail a goal, it replaces it. The
+# replacement can be true but awkward, provable by the dropped prover and not
+# by the kept one, and that scores as caught while the contract rejected
+# nothing. It is the same trap in a different variable, and the baseline cannot
+# see it either.
+
+
+# ACSL lives in comments, so a mutation that edits a contract cannot be told
+# from one that edits a body by looking at the function name. These markers can.
+ACSL_MARKERS = ("ensures", "requires", "assigns", "@")
+
+
+def mutation_scope(function, old, new):
+    """The single function worth proving for this mutation, or None for all.
+
+    WP proves each function against its callees' CONTRACTS, never their bodies,
+    so editing a body can only move that one function's goals. Editing a
+    contract moves its callers' goals too, and the caller is not named anywhere
+    in the entry, so those run at full scope.
+    """
+    if any(m in old or m in new for m in ACSL_MARKERS):
+        return None
+    return function
+
+
+def run_target(target, source_copy, name, fct=None):
     """Run verify-<target> against @source_copy. Returns (ok, output)."""
     var = f"VERIFY_{target.upper()}_SRC"
+    args = [
+        "make",
+        f"verify-{target}",
+        f"{var}={source_copy}",
+        f"NAME={name}",
+    ]
+
+    # Narrowing the proof set also drops the goal count below the target's
+    # floor, so the floor has to come down with it. The unrestricted baseline
+    # keeps the real floor, and any run that fails to catch its mutation is
+    # repeated at full scope before the verdict stands, so nothing rests on the
+    # narrowed run alone.
+    if fct:
+        args += [f"FCT_ARG={fct}", "MIN_GOALS=1"]
     proc = subprocess.run(
-        ["make", f"verify-{target}", f"{var}={source_copy}", f"NAME={name}"],
+        args,
         cwd=ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -1050,7 +1093,15 @@ def run_mutation(idx, mutation):
     # NAME picks the log path, so each mutation gets its own. Concurrent
     # mutations of one target would otherwise clobber a shared log, and a
     # clobbered log makes the target FAIL, which reads as "caught".
-    ok, out = run_target(target, copy, f"mutants/{target}-mut{idx:02d}")
+    # Prove only what this mutation can have moved. A caught mutation is the
+    # common case and is where the time goes, so the narrow run carries it; a
+    # run that does NOT catch is repeated over the whole target before it is
+    # allowed to read as MISSED, which is what keeps the narrowing from turning
+    # a real gap into a pass.
+    scope = mutation_scope(_function, old, new)
+    ok, out = run_target(target, copy, f"mutants/{target}-mut{idx:02d}", scope)
+    if ok and scope:
+        ok, out = run_target(target, copy, f"mutants/{target}-mut{idx:02d}")
     if ok:
         return "MISSED", "the target still passed"
 

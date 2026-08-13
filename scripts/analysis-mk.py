@@ -34,8 +34,7 @@ def target_sources():
     """
     return {
         m.group(1).lower(): m.group(2)
-        for m in re.finditer(r"^VERIFY_([A-Z0-9_]+)_SRC\s*:=\s*(\S+)", text(),
-                             re.M)
+        for m in re.finditer(r"^VERIFY_([A-Z0-9_]+)_SRC\s*:=\s*(\S+)", text(), re.M)
     }
 
 
