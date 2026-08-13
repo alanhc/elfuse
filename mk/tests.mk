@@ -33,6 +33,7 @@
         test-sysroot-pathmax test-sysroot-corpus \
         test-sysroot-name-soak check-soak \
         check-name-caseexact test-sysroot-path-matrix \
+        test-usage-synopsis \
         probe-volume-naming perf
 
 ## Build and run the assembly hello world test
@@ -179,6 +180,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	$(call run-lane,test-sysroot-pathmax,guest paths at the host path ceiling)
 	$(call run-lane,test-sysroot-corpus,frozen on-disk spelling corpus)
 	$(call run-lane,test-sysroot-path-matrix,addressing modes agree across the path matrix)
+	$(call run-lane,test-usage-synopsis,usage synopsis renderings)
 	$(call run-lane,test-shebang-host,shebang parser unit test)
 	$(call run-lane,test-gva-contracts,gva-math.h call-site contract checks)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
@@ -985,6 +987,10 @@ test-sysroot-procfs-exec: $(ELFUSE_BIN) $(BUILD_DIR)/test-procfs-exec
 
 test-timeout-disable: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@$(ELFUSE_BIN) --timeout 0 $(TEST_DIR)/test-hello > /dev/null
+
+## Check the --help and argument-error usage synopses against each other
+test-usage-synopsis: $(ELFUSE_BIN)
+	@bash tests/test-usage-synopsis.sh $(ELFUSE_BIN)
 
 ## Run GDB stub integration tests (LLDB <-> elfuse gdbstub)
 test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello
