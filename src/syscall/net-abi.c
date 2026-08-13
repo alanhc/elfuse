@@ -13,7 +13,7 @@
 
 #include "syscall/net.h"
 #include "syscall/net-abi.h"
-#include "syscall/sockaddr-math.h"
+#include "proved/sockaddr.h"
 
 int socket_small_int_normalize(int level, int optname, int value)
 {
@@ -220,8 +220,8 @@ int linux_to_mac_sockaddr(const void *linux_sa,
     mac_sa->ss_len = (uint8_t) linux_len;
     mac_sa->ss_family = (uint8_t) mac_family;
 
-    /* Proved in src/syscall/sockaddr-math.h: the copy below stays inside both
-     * the source length and this destination.
+    /* Proved in src/proved/sockaddr.h: the copy below stays inside both the
+     * source length and this destination.
      */
     uint32_t data_len =
         (uint32_t) sockaddr_payload_len(linux_len, sizeof(*mac_sa));

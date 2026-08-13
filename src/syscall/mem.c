@@ -23,6 +23,8 @@
 #include "debug/log.h"
 #include "utils.h"
 
+#include "proved/align.h"
+
 #include "runtime/thread.h"
 #include "syscall/linux-wire.h"
 #include "syscall/fuse.h"
@@ -598,7 +600,9 @@ static uint64_t find_free_gap_inner(const guest_t *g,
      * segment, which reduces segment-table fragmentation for memfd-style
      * allocation patterns.
      */
-    uint64_t gap_start = ALIGN_UP(min_addr, align);
+    uint64_t gap_start;
+    if (!align_up_ok(min_addr, align, &gap_start))
+        return UINT64_MAX;
 
     /* Skip the prefix of regions entirely below gap_start in O(log n). After a
      * successful allocation the gap hint advances near or past the existing
@@ -607,7 +611,7 @@ static uint64_t find_free_gap_inner(const guest_t *g,
      */
     for (int i = guest_region_first_end_above(g, gap_start); i < g->nregions;
          i++) {
-        /* A region can still slip below gap_start after the ALIGN_UP advance
+        /* A region can still slip below gap_start after the align_up_ok advance
          * below skips past a smaller adjacent region; keep the cheap guard.
          */
         if (g->regions[i].end <= gap_start)
@@ -625,18 +629,22 @@ static uint64_t find_free_gap_inner(const guest_t *g,
          * contain entries beyond max_addr that could push gap_start past the
          * valid range.
          */
-        if (gap_start <= max_addr && length <= max_addr - gap_start &&
+        if (window_fits(gap_start, length, max_addr) &&
             g->regions[i].start >= gap_start + length)
             return gap_start;
 
         /* Region overlaps; advance past it and round to the next aligned
          * boundary so the caller's alignment promise holds across allocations.
+         * A round-up that would leave the address space ends the search: with
+         * ALIGN_UP's wrap the walk would resume below the regions it already
+         * passed and hand back a gap that overlaps one of them.
          */
-        gap_start = ALIGN_UP(g->regions[i].end, align);
+        if (!align_up_ok(g->regions[i].end, align, &gap_start))
+            return UINT64_MAX;
     }
 
     /* Check trailing space after all regions */
-    if (gap_start <= max_addr && length <= max_addr - gap_start)
+    if (window_fits(gap_start, length, max_addr))
         return gap_start;
     return UINT64_MAX; /* No suitable gap found */
 }

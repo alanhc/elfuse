@@ -65,6 +65,11 @@
  * about, that its loop terminates and that its own bound check still rejects
  * the next position. Removing one drops the goal count below MIN_GOALS, so the
  * gate still notices if they go missing.
+ *
+ * The reject path leaves both outputs alone, stated as a postcondition because
+ * "assigns" permits writing them: without it a conforming implementation could
+ * scribble on them before returning 0, and a caller reading them on the failure
+ * path would be relying on the body rather than the contract.
  */
 /*@
   requires ctl_len <= CMSG_LINUX_CTL_MAX;
@@ -85,6 +90,8 @@
             *next_pos == pos + (cmsg_len + (CMSG_LINUX_ALIGN - 1))
                              - (cmsg_len + (CMSG_LINUX_ALIGN - 1))
                                  % CMSG_LINUX_ALIGN;
+  ensures \result == 0 ==> *data_len == \old(*data_len);
+  ensures \result == 0 ==> *next_pos == \old(*next_pos);
  */
 static inline int cmsg_entry_bounds(uint64_t pos,
                                     uint64_t ctl_len,
@@ -103,7 +110,7 @@ static inline int cmsg_entry_bounds(uint64_t pos,
      * usual "(len + 7) & ~7": the compiler emits the same instruction, but the
      * prover would first have to establish that the mask is one less than a
      * power of two, and leaves the two next_pos bounds open when it cannot.
-     * Same reason src/core/gva-math.h uses "% granule".
+     * Same reason src/proved/gva.h uses "% granule".
      */
     uint64_t advance = cmsg_len + (CMSG_LINUX_ALIGN - 1);
     advance -= advance % CMSG_LINUX_ALIGN;

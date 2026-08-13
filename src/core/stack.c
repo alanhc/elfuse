@@ -16,7 +16,7 @@
 #include <unistd.h>
 #include <sys/random.h>
 
-#include "core/stack-math.h"
+#include "proved/stack.h"
 #include "core/stack.h"
 #include "debug/log.h"
 #include "syscall/linux-wire.h" /* GUEST_UID, GUEST_GID */

@@ -22,6 +22,8 @@
 
 #include "utils.h"
 
+#include "proved/fdset.h"
+
 #include "core/shim-globals.h"
 #include "runtime/procemu.h"
 #include "syscall/linux-wire.h"
@@ -61,14 +63,34 @@ void fd_set_rlimit_nofile(int cur)
 #define FD_BITMAP_WORDS (FD_TABLE_SIZE / 64)
 static uint64_t fd_free_bitmap[FD_BITMAP_WORDS];
 
+/* fd_bitmap_find_free leans on fdset_slot for both halves of its bound: that a
+ * rejected minfd is one this table has no slot for, and that an accepted one
+ * yields a word inside fd_free_bitmap. Neither holds if the proved bound and
+ * this table stop describing the same range.
+ */
+_Static_assert(FDSET_MAX_FDS == FD_TABLE_SIZE,
+               "the proved fd bound must be this table's bound");
+_Static_assert(FD_BITMAP_WORDS == FDSET_MAX_WORDS,
+               "the free-fd bitmap and the proved split must span the same "
+               "number of words");
+
+/* Callers own the range check: fd_bitmap_find_free hands back a bounded fd,
+ * fd_mark_closed_unlocked's caller checks, and fdtable_init passes literals.
+ * Checking here instead would guard the bitmap word while leaving the
+ * fd_table[fd] write in fd_init_entry, one line later, just as exposed.
+ *
+ * Same shift and mask as the shim's inline bitmap test (see shim.S), and
+ * unsigned for the same reason: on a signed fd the compiler has to bias the
+ * value before dividing, for a negative case the callers rule out.
+ */
 static inline void fd_bitmap_set_free(int fd)
 {
-    fd_free_bitmap[fd / 64] |= BIT64(fd % 64);
+    fd_free_bitmap[(unsigned) fd >> 6] |= BIT64((unsigned) fd & 63);
 }
 
 static inline void fd_bitmap_set_used(int fd)
 {
-    fd_free_bitmap[fd / 64] &= ~BIT64(fd % 64);
+    fd_free_bitmap[(unsigned) fd >> 6] &= ~BIT64((unsigned) fd & 63);
 }
 
 /* A host read/write blocks only on non-regular, non-directory fds (pipe,
@@ -164,23 +186,26 @@ static int fd_bitmap_find_free(int minfd)
 {
     if (minfd < 0)
         minfd = 0;
-    if (minfd >= FD_TABLE_SIZE)
+
+    /* A guest chooses minfd through fcntl(F_DUPFD), which forwards the argument
+     * having rejected only negatives, so this rejection is a real case and not
+     * a restatement of something already checked. It is also what puts word
+     * inside fd_free_bitmap.
+     */
+    uint64_t word, bit;
+    if (!fdset_slot(minfd, &word, &bit))
         return -1;
-    int word = minfd / 64, bit = minfd % 64;
 
-    /* Check the partial first word (mask out bits below minfd) */
-    uint64_t masked = fd_free_bitmap[word] & (~0ULL << bit);
-    if (masked) {
-        int fd = word * 64 + bit_ctz64(masked);
-        return (fd < FD_TABLE_SIZE) ? fd : -1;
-    }
-
-    /* Check remaining full words */
-    for (word++; word < FD_BITMAP_WORDS; word++) {
-        if (fd_free_bitmap[word]) {
-            int fd = word * 64 + bit_ctz64(fd_free_bitmap[word]);
-            return (fd < FD_TABLE_SIZE) ? fd : -1;
-        }
+    /* Bits below minfd drop out of the first word; every later word is whole.
+     * A word index under FD_BITMAP_WORDS and a bit index under 64 put the
+     * result below FD_TABLE_SIZE, so no ceiling is needed on the way out.
+     */
+    for (uint64_t mask = ~0ULL << bit; word < FD_BITMAP_WORDS;
+         word++, mask = ~0ULL) {
+        uint64_t free_bits = fd_free_bitmap[word] & mask;
+        if (free_bits)
+            return (int) (word * FDSET_BITS_PER_WORD +
+                          (uint64_t) bit_ctz64(free_bits));
     }
     return -1;
 }
@@ -477,10 +502,13 @@ int fd_alloc_at_relaxed(int fd,
     return fd;
 }
 
-/* Internal: mark fd closed with fd_lock already held. Clear host_fd and dir
- * BEFORE marking the slot free in the bitmap. Otherwise another thread could
- * fd_alloc() this slot, populate it with a new host_fd/dir, and then the
- * current stale writes would corrupt the new entry.
+/* Internal: mark fd closed with fd_lock already held. Requires
+ * 0 <= fd < FD_TABLE_SIZE; it indexes fd_table and the free bitmap without
+ * rechecking, so a caller that has not established that corrupts both.
+ *
+ * Clear host_fd and dir BEFORE marking the slot free in the bitmap. Otherwise
+ * another thread could fd_alloc() this slot, populate it with a new
+ * host_fd/dir, and then the current stale writes would corrupt the new entry.
  */
 void fd_mark_closed_unlocked(int fd)
 {

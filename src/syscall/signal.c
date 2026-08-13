@@ -37,7 +37,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/fd.h"   /* signalfd_notify */
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
-#include "syscall/sigframe-math.h"
+#include "proved/sigframe.h"
 #include "syscall/signal.h"
 #include "syscall/time.h" /* linux_timespec_valid, linux_timespec_to_ns_sat */
 #include "syscall/wakeup-pipe.h"
@@ -1994,11 +1994,11 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         use_altstack = true;
     }
 
-    /* Proved in src/syscall/sigframe-math.h: on success the frame is 16-byte
-     * aligned, sits wholly below signal_sp without the subtraction wrapping,
-     * and stays at or above the floor. The floor is the altstack base when
-     * running on one, the bound signal_sp alone cannot express; on the normal
-     * stack it is 0 and only the fits-below-SP bound applies.
+    /* Proved in src/proved/sigframe.h: on success the frame is 16-byte aligned,
+     * sits wholly below signal_sp without the subtraction wrapping, and stays
+     * at or above the floor. The floor is the altstack base when running on
+     * one, the bound signal_sp alone cannot express; on the normal stack it is
+     * 0 and only the fits-below-SP bound applies.
      */
     uint64_t frame_sp;
     if (!sigframe_base(signal_sp, sizeof(frame),

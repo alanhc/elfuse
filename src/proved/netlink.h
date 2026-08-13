@@ -64,7 +64,7 @@ _Static_assert(NLMSG_HDRLEN % NETLINK_ALIGNTO == 0,
  * Written as subtract-the-remainder rather than "(len + 3) & ~3": the compiler
  * emits the same instruction, and the prover reasons about the arithmetic form
  * without first establishing that the mask is one less than a power of two.
- * Same reason src/core/gva-math.h uses "% granule".
+ * Same reason src/proved/gva.h uses "% granule".
  */
 /*@
   requires len <= NETLINK_LEN_MAX;

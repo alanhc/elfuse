@@ -22,6 +22,9 @@
 
 #include "utils.h"
 
+#include "proved/fdset.h"
+#include "proved/timespec.h"
+
 #include "debug/log.h"
 
 #include "runtime/futex.h"
@@ -34,6 +37,16 @@
 #include "syscall/signal.h"
 #include "syscall/time.h" /* linux_timespec_valid */
 #include "syscall/wakeup-pipe.h"
+
+/* The proof in proved/fdset.h bounds nfds by FDSET_MAX_FDS and sizes the
+ * bitmask buffers below from FDSET_MAX_WORDS. That is only the right bound if
+ * it is also the fd table's: pselect6 used to reject on the host's FD_SETSIZE
+ * instead, two constants that are both 1024 on macOS but are not the same
+ * constant, so a host with a larger FD_SETSIZE would have read guest bytes past
+ * three stack arrays.
+ */
+_Static_assert(FDSET_MAX_FDS == FD_TABLE_SIZE,
+               "the accepted nfds bound must be the fd table's size");
 
 /* polling/select. */
 
@@ -73,6 +86,7 @@ int64_t sys_ppoll(guest_t *g,
     struct pollfd host_fds[256];
     host_fd_ref_t host_refs[256];
     bool need_pollnval[256] = {false};
+
     /* Generation pinned per entry in the same fd_lock window as its host fd.
      * The pty hangup checks below re-resolve the guest fd, so each needs a
      * witness that the slot still holds the very file this poll resolved; 0
@@ -145,13 +159,12 @@ int64_t sys_ppoll(guest_t *g,
             host_fd_refs_close(host_refs, nfds);
             return -LINUX_EINVAL;
         }
-        /* Guard against overflow: tv_sec * 1000 can exceed INT64_MAX */
-        int64_t ms64;
-        if (lts.tv_sec > INT64_MAX / 1000)
-            ms64 = INT64_MAX;
-        else
-            ms64 = lts.tv_sec * (int64_t) 1000 + lts.tv_nsec / 1000000;
-        timeout_ms = (ms64 > INT_MAX) ? INT_MAX : (int) ms64;
+
+        /* Rounds the sub-millisecond remainder up: truncating turned a 500 us
+         * ppoll into poll(0), which returns immediately, so a guest waiting in
+         * sub-millisecond ppoll spun instead of sleeping.
+         */
+        timeout_ms = timespec_to_poll_ms(lts.tv_sec, lts.tv_nsec);
     }
 
     /* Atomically install signal mask for the duration of the poll */
@@ -305,7 +318,8 @@ int64_t sys_pselect6(guest_t *g,
      * it. The sixth argument is a pointer to a struct:
      *   { const sigset_t *ss; size_t ss_len; }
      */
-    if (nfds < 0 || nfds > FD_SETSIZE)
+    uint64_t nfds_words_u;
+    if (!fdset_words(nfds, &nfds_words_u))
         return -LINUX_EINVAL;
 
     if (nfds == 0 && readfds_gva == 0 && writefds_gva == 0 &&
@@ -336,18 +350,19 @@ int64_t sys_pselect6(guest_t *g,
     if (exceptfds_gva)
         except_setp = &except_set;
 
-    int max_host_fd = -1, nfds_words = (nfds + 63) / 64;
+    int max_host_fd = -1, nfds_words = (int) nfds_words_u;
     pselect_req_t reqs_stack[64];
     pselect_req_t *reqs = reqs_stack;
     pselect_req_t *reqs_heap = NULL;
     int req_count = 0;
 
     /* Translate fd_sets from guest. Linux fd_set uses unsigned long bitmask.
-     * FD_TABLE_SIZE=1024 -> max 16 uint64_t words (128 bytes).
+     * fdset_words proved nfds_words <= FDSET_MAX_WORDS, so bitmask_bytes below
+     * cannot exceed what these three buffers hold.
      */
     if (readfds_gva || writefds_gva || exceptfds_gva) {
-        uint64_t rbits_buf[FD_TABLE_SIZE / 64], wbits_buf[FD_TABLE_SIZE / 64];
-        uint64_t ebits_buf[FD_TABLE_SIZE / 64];
+        uint64_t rbits_buf[FDSET_MAX_WORDS], wbits_buf[FDSET_MAX_WORDS];
+        uint64_t ebits_buf[FDSET_MAX_WORDS];
         uint64_t *rbits = NULL;
         uint64_t *wbits = NULL;
         uint64_t *ebits = NULL;
@@ -394,8 +409,20 @@ int64_t sys_pselect6(guest_t *g,
                                  (ebits ? ebits[word] : 0);
             while (requested) {
                 int bit_index = bit_ctz64(requested);
-                int i = word * 64 + bit_index;
+                uint64_t fd_index;
                 uint64_t bit = BIT64(bit_index);
+
+                /* Bits above nfds in the last word are the guest's to set and
+                 * Linux ignores them (fs/select.c bounds its per-word loop by
+                 * n). Honoring them polled an fd the caller never asked about,
+                 * and returned EBADF when it was not open.
+                 */
+                if (!fdset_fd_index(nfds, (uint64_t) word, (uint64_t) bit_index,
+                                    &fd_index)) {
+                    requested &= requested - 1;
+                    continue;
+                }
+                int i = (int) fd_index;
                 host_fd_ref_t ref = {.fd = -1, .owned = false};
                 if (host_fd_ref_open_io(i, &ref) < 0)
                     goto pselect_badf;
@@ -552,13 +579,8 @@ pselect_retry:
             }
 
             const struct timespec *wait_ts = has_timeout ? &ts : &poll_ts;
-            int64_t ms64;
-            if (wait_ts->tv_sec > INT64_MAX / 1000)
-                ms64 = INT64_MAX;
-            else
-                ms64 = wait_ts->tv_sec * (int64_t) 1000 +
-                       (wait_ts->tv_nsec + 999999) / 1000000;
-            int timeout_ms = (ms64 > INT_MAX) ? INT_MAX : (int) ms64;
+            int timeout_ms =
+                timespec_to_poll_ms(wait_ts->tv_sec, wait_ts->tv_nsec);
 
             ret = poll(poll_fds, (nfds_t) poll_count, timeout_ms);
             if (ret >= 0) {
@@ -614,8 +636,8 @@ pselect_retry:
 
     /* Write back result fd_sets (zero then set bits for matching fds) */
     if (readfds_gva || writefds_gva || exceptfds_gva) {
-        uint64_t rbits_buf[FD_TABLE_SIZE / 64], wbits_buf[FD_TABLE_SIZE / 64];
-        uint64_t ebits_buf[FD_TABLE_SIZE / 64];
+        uint64_t rbits_buf[FDSET_MAX_WORDS], wbits_buf[FDSET_MAX_WORDS];
+        uint64_t ebits_buf[FDSET_MAX_WORDS];
         uint64_t *rbits = NULL;
         uint64_t *wbits = NULL;
         uint64_t *ebits = NULL;
@@ -1251,9 +1273,9 @@ out:
  * which holds fd_lock and then takes inst->lock. So candidates are snapshotted
  * under the reg lock in bounded batches and tested once it is dropped.
  *
- * Returns the number of guest fds written to out_gfds, capped at max.
- * out_gens receives the registration generation each hit was tested against, so
- * the caller can re-verify it under inst->lock before acting: a sibling can
+ * Returns the number of guest fds written to out_gfds, capped at max. out_gens
+ * receives the registration generation each hit was tested against, so the
+ * caller can re-verify it under inst->lock before acting: a sibling can
  * EPOLL_CTL_DEL and re-ADD the same fd number while the lock is dropped, and
  * stamping the hangup then would attach it to the new registration's data.
  */
@@ -1289,6 +1311,7 @@ static int epoll_collect_hung_up(epoll_instance_t *inst,
             if (inst->regs[gfd].oneshot_armed || !inst->regs[gfd].pty_master)
                 continue;
             cand_gfds[ncand] = gfd;
+
             /* Carry the generation the registration pinned at ADD/MOD, so a
              * close+reopen into the same fd number cannot be mistaken for the
              * registered master.
@@ -1518,6 +1541,7 @@ int64_t sys_epoll_pwait(guest_t *g,
      */
     for (int i = 0; i < nhup; i++) {
         int gfd = hup_gfds[i];
+
         /* Re-check under the lock: the collector tested unlocked, so a
          * concurrent epoll_ctl or close hook may have retired the entry since.
          * The generation match is what rejects a DEL + re-ADD of the same fd

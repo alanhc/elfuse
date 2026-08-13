@@ -32,6 +32,9 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include "proved/iov.h"
+#include "proved/timespec.h"
+
 #include "syscall/linux-wire.h"
 #include "syscall/linux-limits.h"
 #include "runtime/thread.h"
@@ -424,7 +427,9 @@ static inline int64_t host_fd_ref_open_io(guest_fd_t guest_fd,
  * written together with a fresh generation, so the generation alone pins the
  * identity of the file behind ref->fd.
  *
- * *out_gen is 0 on failure. Returns 0 on success, -LINUX_EBADF otherwise.
+ * *out_gen is 0 on failure.
+ *
+ * Returns 0 on success, -LINUX_EBADF otherwise.
  */
 static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
                                               host_fd_ref_t *ref,
@@ -462,12 +467,52 @@ static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
     return 0;
 }
 
+/* A guest timeout above this many seconds means "wait indefinitely", and the
+ * wait paths spell indefinite as timeout_ms = -1. The comparison is strict, so
+ * this exact value is still converted; the cutoff carries no meaning of its own
+ * beyond being far past any real timeout, and one second either side of it is
+ * equally unreachable. Both callers spelled it strictly before this helper
+ * existed, and moving the boundary would change what they return.
+ *
+ * That -1 is load-bearing, not a rounding convenience. sys_epoll_pwait reads
+ * timeout_ms < 0 as has_timeout = false, which selects the 200 ms re-arm loop
+ * that re-checks exit_group, futex interrupts, pending signals and pty hangup
+ * between kevent calls. The epoll path registers no wakeup-pipe fd, so that
+ * loop is its ONLY interruption mechanism: converting a huge timeout into a
+ * finite one instead parks the thread in a single uninterruptible kevent, and a
+ * sibling exit_group can no longer wake it.
+ *
+ * 2000000 seconds is about 23 days, comfortably past any real timeout and short
+ * of the arithmetic limits.
+ */
+#define SYSCALL_TIMEOUT_FOREVER_SEC 2000000LL
+
+/* Guest timespec to a poll(2)/kevent millisecond timeout, mapping an
+ * effectively-infinite request onto the -1 that selects the interruptible path.
+ * Two callers need exactly this (epoll_pwait2 and recvmmsg); ppoll and pselect6
+ * do not, because neither ever spelled a timespec as indefinite.
+ */
+static inline int syscall_timeout_ms_or_forever(int64_t sec, int64_t nsec)
+{
+    if (sec > SYSCALL_TIMEOUT_FOREVER_SEC)
+        return -1;
+    return timespec_to_poll_ms(sec, nsec);
+}
+
 /* iov limits shared between readv/writev/preadv/pwritev and sendmsg/recvmsg.
  * SYSCALL_IOV_MAX matches the Linux UIO_MAXIOV cap; SYSCALL_IOV_STACK_MAX keeps
  * the typical case on the call-site stack.
+ *
+ * The cap is stated twice because the proved copy in proved/iov.h cannot
+ * include this header (Frama-C's libc does not model the macOS uio headers it
+ * pulls in). The assertion below is what keeps the two from drifting: a proof
+ * about a 1024 cap says nothing about a 2048 one.
  */
 #define SYSCALL_IOV_MAX 1024
 #define SYSCALL_IOV_STACK_MAX 64
+
+_Static_assert(SYSCALL_IOV_MAX == IOV_COUNT_MAX,
+               "the iovcnt cap the code enforces must be the one proved");
 
 /* Resolved host iov vector backed by an inline stack buffer with a heap
  * fallback for large iovcnt. Pair host_iov_prepare with host_iov_free.

@@ -35,7 +35,7 @@
 #include "syscall/internal.h"
 #include "syscall/io.h" /* io_wait_fd_or_interrupted */
 #include "syscall/net.h"
-#include "syscall/netlink-math.h"
+#include "proved/netlink.h"
 #include "utils.h"
 #include <poll.h>
 
@@ -48,7 +48,7 @@ static void netlink_close(int guest_fd);
 /* Linux netlink message structures. These structures are defined manually to
  * match the Linux ABI exactly, since macOS has no <linux/netlink.h>. The two
  * headers the walks step over, nlmsghdr_t and rtattr_t, live in
- * syscall/netlink-math.h with NLMSG_HDRLEN, RTA_HDRLEN and the arithmetic
+ * proved/netlink.h with NLMSG_HDRLEN, RTA_HDRLEN and the arithmetic
  * verify-netlink proves against them. The reply builders below round with the
  * same netlink_align_up as the walks, so the two cannot round differently.
  */
@@ -509,7 +509,7 @@ static void nl_parse_link_filter(const uint8_t *req,
         rtattr_t rta;
         memcpy(&rta, req + off, sizeof(rta));
 
-        /* Proved in src/syscall/netlink-math.h: on success the payload at off +
+        /* Proved in src/proved/netlink.h: on success the payload at off +
          * RTA_HDRLEN for data_len bytes lies inside total, and next_off is
          * strictly past off.
          */
@@ -731,10 +731,9 @@ static size_t nl_complete_span(const netlink_state_t *ns, size_t to_copy)
         nlmsghdr_t hdr;
         memcpy(&hdr, ns->buf + pos, sizeof(hdr));
 
-        /* Proved in src/syscall/netlink-math.h: on success span is strictly
-         * positive, so this loop advances for any header at all. Before the
-         * widening this loop could spin forever on a guest-chosen length; see
-         * the header.
+        /* Proved in src/proved/netlink.h: on success span is strictly positive,
+         * so this loop advances for any header at all. Before the widening this
+         * loop could spin forever on a guest-chosen length; see the header.
          */
         uint64_t span;
         if (!netlink_msg_span(hdr.nlmsg_len, &span))

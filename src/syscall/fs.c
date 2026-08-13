@@ -24,6 +24,17 @@
 #include "debug/log.h"
 #include "utils.h"
 
+#include "proved/dirent.h"
+
+/* dirent_record_bounds' precondition is name_len <= DIRENT64_NAME_MAX, and the
+ * translation buffer below is sized from the host's NAME_MAX. proved/dirent.h
+ * deliberately does not take that constant from limits.h, since the 255 it
+ * states is the guest's limit; this ties the two so a host with a larger
+ * NAME_MAX cannot slip a filename past the proof and overrun entry_buf.
+ */
+_Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
+               "the dirent name bound must match the proved one");
+
 #include "core/shim-globals.h" /* shim_globals_mark_urandom_fd */
 
 #include "runtime/procemu.h"
@@ -965,6 +976,7 @@ static int duplicate_guest_fd(int src_fd,
      * race and leak the slave fd. No-op when the source has no keepalive.
      */
     proc_pty_dup_keepalive_locked(src_snap.host_fd, new_host_fd);
+
     /* Same reasoning for the slave side: the alias is a live reference to the
      * pty and must be on the books before the guest fd is published, or the
      * source's close will retire the only counted reference.
@@ -1628,12 +1640,17 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     size_t guest_pos = 0;
     struct dirent *de;
 
-    /* Temp buffer for dirent serialization. Max dirent64 is 280 bytes (19-byte
-     * header + NAME_MAX=255 + null + padding to 8). Using a stack buffer avoids
-     * guest_ptr boundary issues: guest_write() handles 2MiB block crossings
-     * that raw memcpy into guest_ptr() cannot.
+    /* Temp buffer for dirent serialization. dirent_record_bounds proves every
+     * record it accepts fits DIRENT64_MAX_RECLEN, so nothing below re-checks
+     * the extent. Using a stack buffer avoids guest_ptr boundary issues:
+     * guest_write() handles 2MiB block crossings that raw memcpy into
+     * guest_ptr() cannot.
+     *
+     * guest_pos <= count holds on every iteration, which is what lets the call
+     * below meet its precondition: it starts at 0 and only advances by a reclen
+     * the same call proved fits in count - guest_pos.
      */
-    uint8_t entry_buf[280];
+    uint8_t entry_buf[DIRENT64_MAX_RECLEN];
 
     /* One answer per call, not per entry: which side of the sysroot boundary
      * the stream reads from is a property of the directory.
@@ -1682,11 +1699,14 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
             goto out;
         }
 
-        size_t name_len = strlen(guest_name);
-        /* Linux dirent64: 19-byte header + name + null, padded to 8 */
-        size_t reclen = (19 + name_len + 1 + 7) & ~7ULL;
+        /* path_translate_dirent_name wrote into a NAME_MAX + 1 buffer, so the
+         * length is within dirent_record_bounds' precondition.
+         */
+        uint64_t name_len = strlen(guest_name);
+        uint64_t reclen, pad_start;
 
-        if (guest_pos + reclen > count) {
+        if (!dirent_record_bounds(name_len, guest_pos, count, &reclen,
+                                  &pad_start)) {
             /* Entry does not fit; rewind so next call gets it */
             seekdir(dir, saved_pos);
             break;
@@ -1702,8 +1722,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
          * guest_write() which handles 2MiB block boundary crossings.
          */
         memcpy(entry_buf, &lde, sizeof(lde));
-        memcpy(entry_buf + 19, guest_name, name_len + 1);
-        size_t pad_start = 19 + name_len + 1;
+        memcpy(entry_buf + DIRENT64_HDR_BYTES, guest_name, name_len + 1);
         if (pad_start < reclen)
             memset(entry_buf + pad_start, 0, reclen - pad_start);
 

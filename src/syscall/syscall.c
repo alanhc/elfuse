@@ -66,6 +66,8 @@
 #include "syscall/signal.h"
 #include "syscall/sys.h"
 #include "syscall/sysvipc.h"
+#include "proved/timespec.h"
+
 #include "syscall/time.h"
 
 #include "core/shim-globals.h"
@@ -2126,9 +2128,16 @@ static int64_t sc_epoll_pwait2(guest_t *g,
         linux_timespec_t ts;
         if (guest_read_small(g, x3, &ts, sizeof(ts)) < 0)
             return -LINUX_EFAULT;
-        timeout_ms = (ts.tv_sec > 2000000)
-                         ? -1
-                         : (int) (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+
+        /* Same conversion as ppoll and pselect6, for the same three reasons: a
+         * sub-millisecond timeout must not truncate to a spin, a negative field
+         * must be EINVAL rather than a negative timeout the wait path reads
+         * back as "no timeout", and a huge tv_sec must clamp rather than become
+         * an infinite wait.
+         */
+        if (!linux_timespec_valid(&ts))
+            return -LINUX_EINVAL;
+        timeout_ms = syscall_timeout_ms_or_forever(ts.tv_sec, ts.tv_nsec);
     }
     return sys_epoll_pwait(g, (int) x0, x1, (int) x2, timeout_ms, x4);
 }

@@ -40,7 +40,7 @@
 #include <unistd.h>
 
 #include "core/guest.h"
-#include "core/gva-math.h"
+#include "proved/gva.h"
 #include "core/startup-trace.h"
 #include "debug/log.h"
 #include "utils.h"

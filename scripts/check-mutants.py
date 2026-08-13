@@ -61,6 +61,22 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+# scripts/ filenames are kebab-case per CLAUDE.md, which no plain "import"
+# statement can name, so the shared reader is loaded by path. The alternative
+# was an underscore in the filename, which the tree does not use anywhere.
+def _load_analysis_mk():
+    import importlib.util
+
+    path = pathlib.Path(__file__).resolve().parent / "analysis-mk.py"
+    spec = importlib.util.spec_from_file_location("analysis_mk", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+analysis_mk_table = _load_analysis_mk()
 BUILD = ROOT / "build" / "mutants"
 # The recipe writes $(BUILD_DIR)/verify-$(NAME).log, and NAME is overridden per
 # run to keep concurrent mutations off a shared log. That path must exist first:
@@ -73,10 +89,47 @@ LOGS = ROOT / "build" / "verify-mutants"
 # "function" names the proved function the mutation breaks; it is what the
 # coverage summary at the end counts, not decoration.
 MUTATIONS = [
+    # ---- verify-align ------------------------------------------------------
+    (
+        "align",
+        "src/proved/align.h",
+        "align_up_ok",
+        "drop the overflow guard (the top multiple wraps to a lower address)",
+        "        if (k >= UINT64_MAX / align)\n            return 0;\n",
+        "",
+    ),
+    (
+        "align",
+        "src/proved/align.h",
+        "align_up_ok",
+        "round down instead of up (the result can sit below the input)",
+        "    if (k * align != x) {\n"
+        "        if (k >= UINT64_MAX / align)\n"
+        "            return 0;\n"
+        "        k++;\n"
+        "    }\n",
+        "",
+    ),
+    (
+        "align",
+        "src/proved/align.h",
+        "window_fits",
+        "test the sum instead of the difference (the sum wraps first)",
+        "    return start <= limit && length <= limit - start;",
+        "    return start + length <= limit;",
+    ),
+    (
+        "align",
+        "src/proved/align.h",
+        "window_fits",
+        "accept a window that overruns the limit by one",
+        "    return start <= limit && length <= limit - start;",
+        "    return start <= limit && length <= limit - start + 1;",
+    ),
     # ---- verify-cmsg -------------------------------------------------------
     (
         "cmsg",
-        "src/syscall/cmsg-math.h",
+        "src/proved/cmsg.h",
         "cmsg_entry_bounds",
         "drop the minimum-length guard (payload length underflows)",
         "    if (cmsg_len < CMSG_LINUX_HDR_BYTES)\n        return 0;\n",
@@ -84,7 +137,7 @@ MUTATIONS = [
     ),
     (
         "cmsg",
-        "src/syscall/cmsg-math.h",
+        "src/proved/cmsg.h",
         "cmsg_entry_bounds",
         "drop the fits-in-buffer guard (payload runs past the control buffer)",
         "    if (cmsg_len > ctl_len - pos)\n        return 0;\n",
@@ -92,7 +145,7 @@ MUTATIONS = [
     ),
     (
         "cmsg",
-        "src/syscall/cmsg-math.h",
+        "src/proved/cmsg.h",
         "cmsg_entry_bounds",
         "align up by ALIGN rather than ALIGN-1 (overshoots by one word)",
         "    uint64_t advance = cmsg_len + (CMSG_LINUX_ALIGN - 1);",
@@ -100,7 +153,7 @@ MUTATIONS = [
     ),
     (
         "cmsg",
-        "src/syscall/cmsg-math.h",
+        "src/proved/cmsg.h",
         "cmsg_entry_bounds",
         "drop the align-up entirely (walks to a misaligned next header)",
         "    uint64_t advance = cmsg_len + (CMSG_LINUX_ALIGN - 1);\n"
@@ -108,10 +161,47 @@ MUTATIONS = [
         "    *next_pos = pos + advance;",
         "    *next_pos = pos + cmsg_len;",
     ),
+    (
+        "cmsg",
+        "src/proved/cmsg.h",
+        "cmsg_entry_bounds",
+        "scribble on the outputs before rejecting the entry",
+        "    if (cmsg_len < CMSG_LINUX_HDR_BYTES)\n        return 0;\n",
+        "    if (cmsg_len < CMSG_LINUX_HDR_BYTES) {\n"
+        "        *data_len = 1;\n"
+        "        return 0;\n"
+        "    }\n",
+    ),
+    (
+        "fdset",
+        "src/proved/fdset.h",
+        "fdset_slot",
+        "drop the upper bound (the split indexes past the bitmap)",
+        "    if (fd < 0 || fd >= FDSET_MAX_FDS)\n        return 0;",
+        "    if (fd < 0)\n        return 0;",
+    ),
+    (
+        "fdset",
+        "src/proved/fdset.h",
+        "fdset_slot",
+        "accept the fd one past the table (off-by-one on the bound)",
+        "    if (fd < 0 || fd >= FDSET_MAX_FDS)",
+        "    if (fd < 0 || fd > FDSET_MAX_FDS)",
+    ),
+    (
+        "fdset",
+        "src/proved/fdset.h",
+        "fdset_slot",
+        "swap word and bit (the split no longer reconstructs the fd)",
+        "    *word = (uint64_t) fd / FDSET_BITS_PER_WORD;\n"
+        "    *bit = (uint64_t) fd % FDSET_BITS_PER_WORD;",
+        "    *word = (uint64_t) fd % FDSET_BITS_PER_WORD;\n"
+        "    *bit = (uint64_t) fd / FDSET_BITS_PER_WORD;",
+    ),
     # ---- verify-fuse -------------------------------------------------------
     (
         "fuse",
-        "src/syscall/fuse-math.h",
+        "src/proved/fuse.h",
         "fuse_reply_extent",
         "drop the header-size guard (reply length underflows)",
         "    if (hdr_len < FUSE_OUT_HDR_BYTES || hdr_len > count)",
@@ -119,7 +209,7 @@ MUTATIONS = [
     ),
     (
         "fuse",
-        "src/syscall/fuse-math.h",
+        "src/proved/fuse.h",
         "fuse_reply_extent",
         "drop the fits-the-write guard (copy runs past the frame)",
         "    if (hdr_len < FUSE_OUT_HDR_BYTES || hdr_len > count)",
@@ -127,7 +217,7 @@ MUTATIONS = [
     ),
     (
         "fuse",
-        "src/syscall/fuse-math.h",
+        "src/proved/fuse.h",
         "fuse_frame_count_ok",
         "drop the frame ceiling (unbounded daemon allocation)",
         "    return count >= FUSE_OUT_HDR_BYTES && count <= FUSE_FRAME_CAP;",
@@ -135,7 +225,7 @@ MUTATIONS = [
     ),
     (
         "fuse",
-        "src/syscall/fuse-math.h",
+        "src/proved/fuse.h",
         "fuse_clamp_negotiated_write",
         "make the negotiation clamp a no-op",
         "    if (requested > FUSE_MAX_NEGOTIATED_WRITE)\n"
@@ -145,7 +235,7 @@ MUTATIONS = [
     ),
     (
         "fuse",
-        "src/syscall/fuse-math.h",
+        "src/proved/fuse.h",
         "fuse_clamp_negotiated_write",
         "remove the header slack (a legal max_write no longer leaves room)",
         "#define FUSE_MAX_NEGOTIATED_WRITE (FUSE_FRAME_CAP - 256)",
@@ -154,7 +244,7 @@ MUTATIONS = [
     # ---- verify-gva --------------------------------------------------------
     (
         "gva",
-        "src/core/gva-math.h",
+        "src/proved/gva.h",
         "gva_leaf_target_args_ok",
         "predicate drops the granule upper bound",
         "    return granule > 0 && granule <= GVA_PT_ADDR_MASK &&\n"
@@ -163,7 +253,7 @@ MUTATIONS = [
     ),
     (
         "gva",
-        "src/core/gva-math.h",
+        "src/proved/gva.h",
         "gva_leaf_target_args_ok",
         "predicate drops the ipa bound",
         "    return granule > 0 && granule <= GVA_PT_ADDR_MASK &&\n"
@@ -172,7 +262,7 @@ MUTATIONS = [
     ),
     (
         "gva",
-        "src/core/gva-math.h",
+        "src/proved/gva.h",
         "gva_chunk_clamp_args_ok",
         "predicate drops the total < limit conjunct",
         "    return chunk >= 1 && gpa < region_end && total < limit;",
@@ -180,7 +270,7 @@ MUTATIONS = [
     ),
     (
         "gva",
-        "src/core/gva-math.h",
+        "src/proved/gva.h",
         "gva_chunk_clamp_args_ok",
         "predicate accepts everything",
         "    return chunk >= 1 && gpa < region_end && total < limit;",
@@ -188,7 +278,7 @@ MUTATIONS = [
     ),
     (
         "gva",
-        "src/core/gva-math.h",
+        "src/proved/gva.h",
         "gva_chunk_clamp",
         "call site permutes limit and total",
         "        gva_chunk_clamp_args_ok(chunk, gpa, region_end, limit, total));",
@@ -196,7 +286,7 @@ MUTATIONS = [
     ),
     (
         "gva",
-        "src/core/gva-math.h",
+        "src/proved/gva.h",
         "gva_leaf_target",
         "call site permutes granule and ipa",
         "    GVA_CONTRACT_ASSERT(gva_leaf_target_args_ok(granule, ipa));",
@@ -205,7 +295,7 @@ MUTATIONS = [
     # ---- verify-stack ------------------------------------------------------
     (
         "stack",
-        "src/core/stack-math.h",
+        "src/proved/stack.h",
         "stack_take",
         "drop the floor check (descent leaves the stack region)",
         "    if (bytes > *ptr - floor)\n        return 0;\n\n    *ptr -= bytes;",
@@ -213,7 +303,7 @@ MUTATIONS = [
     ),
     (
         "stack",
-        "src/core/stack-math.h",
+        "src/proved/stack.h",
         "stack_take",
         "move before refusing (partial move on the reject path)",
         "    if (bytes > *ptr - floor)\n        return 0;\n",
@@ -221,7 +311,7 @@ MUTATIONS = [
     ),
     (
         "stack",
-        "src/core/stack-math.h",
+        "src/proved/stack.h",
         "stack_align_down",
         "round up instead of down",
         "    return sp - sp % STACK_ALIGN;",
@@ -229,7 +319,7 @@ MUTATIONS = [
     ),
     (
         "stack",
-        "src/core/stack-math.h",
+        "src/proved/stack.h",
         "stack_pushed_words",
         "drop the alignment padding word",
         "    return entries + entries % 2;",
@@ -237,7 +327,7 @@ MUTATIONS = [
     ),
     (
         "stack",
-        "src/core/stack-math.h",
+        "src/proved/stack.h",
         "stack_final_sp",
         "drop the underflow guard (SP lands below the region)",
         "    if (bytes > base - floor)\n        return 0;\n\n    *sp = base - bytes;",
@@ -246,7 +336,7 @@ MUTATIONS = [
     # ---- verify-sockaddr ---------------------------------------------------
     (
         "sockaddr",
-        "src/syscall/sockaddr-math.h",
+        "src/proved/sockaddr.h",
         "sockaddr_payload_len",
         "drop the destination clamp (copy overruns the destination)",
         "    if (payload > room)\n        payload = room;\n",
@@ -254,7 +344,7 @@ MUTATIONS = [
     ),
     (
         "sockaddr",
-        "src/syscall/sockaddr-math.h",
+        "src/proved/sockaddr.h",
         "sockaddr_len_ok",
         "accept addresses too short to hold a family",
         "    return len >= SOCKADDR_FAMILY_BYTES;",
@@ -262,7 +352,7 @@ MUTATIONS = [
     ),
     (
         "sockaddr",
-        "src/syscall/sockaddr-math.h",
+        "src/proved/sockaddr.h",
         "sockaddr_payload_len",
         "return no payload at all",
         "    return payload;",
@@ -270,16 +360,27 @@ MUTATIONS = [
     ),
     (
         "sockaddr",
-        "src/syscall/sockaddr-math.h",
+        "src/proved/sockaddr.h",
         "sockaddr_payload_len",
         "drop the source-length precondition",
         "  requires src_len >= SOCKADDR_FAMILY_BYTES;\n",
         "",
     ),
+    (
+        "fuse",
+        "src/proved/fuse.h",
+        "fuse_reply_extent",
+        "write the reply length before rejecting the header",
+        "    if (hdr_len < FUSE_OUT_HDR_BYTES || hdr_len > count)\n        return 0;",
+        "    if (hdr_len < FUSE_OUT_HDR_BYTES || hdr_len > count) {\n"
+        "        *reply_len = hdr_len;\n"
+        "        return 0;\n"
+        "    }",
+    ),
     # ---- verify-netlink ----------------------------------------------------
     (
         "netlink",
-        "src/syscall/netlink-math.h",
+        "src/proved/netlink.h",
         "netlink_rta_bounds",
         "drop the minimum-length guard (payload length underflows)",
         "    if (rta_len < RTA_HDRLEN || rta_len > total - off)",
@@ -287,7 +388,7 @@ MUTATIONS = [
     ),
     (
         "netlink",
-        "src/syscall/netlink-math.h",
+        "src/proved/netlink.h",
         "netlink_rta_bounds",
         "drop the fits-the-message guard (attribute runs past the message)",
         "    if (rta_len < RTA_HDRLEN || rta_len > total - off)",
@@ -295,7 +396,7 @@ MUTATIONS = [
     ),
     (
         "netlink",
-        "src/syscall/netlink-math.h",
+        "src/proved/netlink.h",
         "netlink_msg_span",
         "drop the header-length guard (span can be shorter than a header)",
         "    if (nlmsg_len < NLMSG_HDRLEN)\n        return 0;\n\n",
@@ -303,7 +404,7 @@ MUTATIONS = [
     ),
     (
         "netlink",
-        "src/syscall/netlink-math.h",
+        "src/proved/netlink.h",
         "netlink_align_up",
         "round down instead of up (the walk stops advancing)",
         "    uint64_t padded = len + (NETLINK_ALIGNTO - 1);",
@@ -312,7 +413,7 @@ MUTATIONS = [
     # ---- verify-sigframe ---------------------------------------------------
     (
         "sigframe",
-        "src/syscall/sigframe-math.h",
+        "src/proved/sigframe.h",
         "sigframe_base",
         "drop the underflow guard (frame base wraps to a huge address)",
         "    if (frame_bytes > sp)\n        return 0;\n",
@@ -320,7 +421,7 @@ MUTATIONS = [
     ),
     (
         "sigframe",
-        "src/syscall/sigframe-math.h",
+        "src/proved/sigframe.h",
         "sigframe_base",
         "drop the floor check (frame lands below the alternate stack)",
         "    if (candidate < floor)\n        return 0;\n",
@@ -328,7 +429,7 @@ MUTATIONS = [
     ),
     (
         "sigframe",
-        "src/syscall/sigframe-math.h",
+        "src/proved/sigframe.h",
         "sigframe_base",
         "skip the align-down (handler runs on a misaligned stack)",
         "    candidate -= candidate % SIGFRAME_ALIGN;\n",
@@ -336,7 +437,7 @@ MUTATIONS = [
     ),
     (
         "sigframe",
-        "src/syscall/sigframe-math.h",
+        "src/proved/sigframe.h",
         "sigframe_base",
         "refuse a frame that exactly reaches the floor (off-by-one rejection)",
         "    if (candidate < floor)",
@@ -344,7 +445,7 @@ MUTATIONS = [
     ),
     (
         "sigframe",
-        "src/syscall/sigframe-math.h",
+        "src/proved/sigframe.h",
         "sigframe_base",
         "place the frame one aligned slot lower than it must be",
         "    *base = candidate;",
@@ -352,7 +453,7 @@ MUTATIONS = [
     ),
     (
         "sigframe",
-        "src/syscall/sigframe-math.h",
+        "src/proved/sigframe.h",
         "sigframe_base",
         "place the frame at the floor rather than below sp",
         "    *base = candidate;",
@@ -374,6 +475,66 @@ MUTATIONS = [
         "drop the guest_size clamp (segment maps outside the slab)",
         "    if (memsz > guest_size || gpa > guest_size - memsz)",
         "    if (memsz > guest_size)",
+    ),
+    (
+        "gva",
+        "src/proved/gva.h",
+        "gva_pt_table_offset",
+        "write the offset before rejecting a descriptor below the base",
+        "    uint64_t ipa = desc & GVA_PT_ADDR_MASK;\n    if (ipa < base)\n        return 0;",
+        "    uint64_t ipa = desc & GVA_PT_ADDR_MASK;\n    if (ipa < base) {\n"
+        "        *off = ipa;\n        return 0;\n    }",
+    ),
+    (
+        "gva",
+        "src/proved/gva.h",
+        "gva_pt_table_offset",
+        "write the offset before rejecting a table that runs past the slab",
+        "    uint64_t candidate = ipa - base;\n    if (guest_size < GVA_PT_TABLE_BYTES ||",
+        "    uint64_t candidate = ipa - base;\n    *off = candidate;\n"
+        "    if (guest_size < GVA_PT_TABLE_BYTES ||",
+    ),
+    (
+        "gva",
+        "src/proved/gva.h",
+        "gva_leaf_target",
+        "scribble on both outputs before rejecting an IPA below the base",
+        "    if (ipa < base)\n        return 0;\n\n    uint64_t offset = gva % granule;",
+        "    if (ipa < base) {\n        *gpa = 0;\n        *chunk = 1;\n"
+        "        return 0;\n    }\n\n    uint64_t offset = gva % granule;",
+    ),
+    # ---- verify-pathdepth --------------------------------------------------
+    (
+        "pathdepth",
+        "src/proved/pathdepth.h",
+        "path_depth_pop",
+        "drop the root floor (the depth wraps and indexes marks[] wild)",
+        "    if (depth == 0)\n        return 0;\n",
+        "",
+    ),
+    (
+        "pathdepth",
+        "src/proved/pathdepth.h",
+        "path_depth_pop",
+        "pop at the root too (a .. at / escapes one level)",
+        "    if (depth == 0)",
+        "    if (depth == UINT64_MAX)",
+    ),
+    (
+        "pathdepth",
+        "src/proved/pathdepth.h",
+        "path_depth_push",
+        "drop the capacity check (the next mark write leaves the array)",
+        "    if (depth >= cap)\n        return 0;\n",
+        "",
+    ),
+    (
+        "pathdepth",
+        "src/proved/pathdepth.h",
+        "path_depth_push",
+        "accept a push at capacity (off-by-one past the mark array)",
+        "    if (depth >= cap)",
+        "    if (depth > cap)",
     ),
     # ---- verify-rsp --------------------------------------------------------
     #
@@ -415,6 +576,269 @@ MUTATIONS = [
         "        sum += (uint8_t) data[i];",
         "        sum += (unsigned int) data[i];",
     ),
+    # ---- verify-elf: the three helpers that had no mutation ----------------
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_add_no_wrap",
+        "drop the overflow guard (the sum wraps and is reported as valid)",
+        "    if (a > UINT64_MAX - b)\n        return 0;\n",
+        "",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_phdr_gpa_in_segment",
+        "drop the fits-the-segment guard (the table runs past p_filesz)",
+        "    if (rel > p_filesz || p_filesz - rel < total)\n        return 0;",
+        "    if (rel > p_filesz)\n        return 0;",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_phdr_gpa_in_segment",
+        "drop the below-segment guard (the relative offset underflows)",
+        "    if (phoff < p_offset)\n        return 0;\n",
+        "",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_phdr_table_bytes",
+        "accept an entry stride below the header size (entries overlap)",
+        "    if (phnum == 0 || phentsize < sizeof(elf64_phdr_t))",
+        "    if (phnum == 0)",
+    ),
+    (
+        "elf",
+        "src/core/elf.c",
+        "elf_phdr_table_bytes",
+        "drop the table ceiling (phnum * phentsize is unbounded)",
+        "    if (bytes > ELF_PHDR_TABLE_MAX)\n        return 0;\n",
+        "",
+    ),
+    (
+        "gva",
+        "src/proved/gva.h",
+        "gva_span_ok",
+        "accept a zero-length span (callers treat the result as non-empty)",
+        "    if (len == 0)\n        return 0;\n",
+        "",
+    ),
+    (
+        "gva",
+        "src/proved/gva.h",
+        "gva_span_ok",
+        "reject a span that exactly reaches the end of the address space",
+        "    return gva <= UINT64_MAX - len;",
+        "    return gva < UINT64_MAX - len;",
+    ),
+    (
+        "rsp",
+        "src/debug/gdbstub-rsp.c",
+        "gdb_parse_hex",
+        "advance two characters per digit (steps over the NUL terminator)",
+        "        val = val * 16u + (uint64_t) d;\n        p++;",
+        "        val = val * 16u + (uint64_t) d;\n        p += 2;",
+    ),
+    # ---- verify-dirent -----------------------------------------------------
+    (
+        "dirent",
+        "src/proved/dirent.h",
+        "dirent_reclen",
+        "drop the align-up (records stop landing 8-byte aligned)",
+        "    uint64_t padded = DIRENT64_HDR_BYTES + name_len + 1 + (DIRENT64_ALIGN - 1);",
+        "    uint64_t padded = DIRENT64_HDR_BYTES + name_len + 1;",
+    ),
+    (
+        "dirent",
+        "src/proved/dirent.h",
+        "dirent_reclen",
+        "forget the NUL byte (a NAME_MAX name loses its terminator)",
+        "    uint64_t padded = DIRENT64_HDR_BYTES + name_len + 1 + (DIRENT64_ALIGN - 1);",
+        "    uint64_t padded = DIRENT64_HDR_BYTES + name_len + (DIRENT64_ALIGN - 1);",
+    ),
+    (
+        "dirent",
+        "src/proved/dirent.h",
+        "dirent_record_bounds",
+        "drop the fits-the-buffer guard (record runs past the guest count)",
+        "    if (len > count - pos)\n        return 0;\n\n",
+        "",
+    ),
+    (
+        "dirent",
+        "src/proved/dirent.h",
+        "dirent_record_bounds",
+        "accept a record that overruns by one (off-by-one fit test)",
+        "    if (len > count - pos)",
+        "    if (len > count - pos + 1)",
+    ),
+    (
+        "dirent",
+        "src/proved/dirent.h",
+        "dirent_record_bounds",
+        "start the padding one byte early (memset clobbers the NUL)",
+        "    *pad_start = DIRENT64_HDR_BYTES + name_len + 1;",
+        "    *pad_start = DIRENT64_HDR_BYTES + name_len;",
+    ),
+    # ---- verify-iov --------------------------------------------------------
+    (
+        "iov",
+        "src/proved/iov.h",
+        "iov_total_add",
+        "test the sum after adding rather than before (the add wraps first)",
+        "    if (len > IOV_TOTAL_MAX - total)",
+        "    if (total + len > IOV_TOTAL_MAX)",
+    ),
+    (
+        "iov",
+        "src/proved/iov.h",
+        "iov_total_add",
+        "drop the overflow guard entirely",
+        "    if (len > IOV_TOTAL_MAX - total)\n        return 0;\n\n",
+        "",
+    ),
+    (
+        "iov",
+        "src/proved/iov.h",
+        "iov_count_ok",
+        "accept iovcnt 0 (an empty vector reaches the per-entry loop)",
+        "    return iovcnt >= 1 && iovcnt <= IOV_COUNT_MAX;",
+        "    return iovcnt >= 0 && iovcnt <= IOV_COUNT_MAX;",
+    ),
+    (
+        "iov",
+        "src/proved/iov.h",
+        "iov_count_ok",
+        "reject iovcnt at the cap (off-by-one rejection)",
+        "    return iovcnt >= 1 && iovcnt <= IOV_COUNT_MAX;",
+        "    return iovcnt >= 1 && iovcnt < IOV_COUNT_MAX;",
+    ),
+    # ---- verify-fdset ------------------------------------------------------
+    (
+        "fdset",
+        "src/proved/fdset.h",
+        "fdset_words",
+        "round the word count down (the last partial word is never read)",
+        "    *words =\n"
+        "        ((uint64_t) nfds + (FDSET_BITS_PER_WORD - 1)) / FDSET_BITS_PER_WORD;",
+        "    *words = (uint64_t) nfds / FDSET_BITS_PER_WORD;",
+    ),
+    (
+        "fdset",
+        "src/proved/fdset.h",
+        "fdset_words",
+        "drop the upper bound on nfds (the read extent leaves the buffers)",
+        "    if (nfds < 0 || nfds > FDSET_MAX_FDS)",
+        "    if (nfds < 0)",
+    ),
+    (
+        "fdset",
+        "src/proved/fdset.h",
+        "fdset_fd_index",
+        "accept the bit one past nfds (polls an fd the caller did not ask for)",
+        "    if (index >= (uint64_t) nfds)",
+        "    if (index > (uint64_t) nfds)",
+    ),
+    (
+        "fdset",
+        "src/proved/fdset.h",
+        "fdset_fd_index",
+        "drop the nfds bound (every bit of the last word is honored)",
+        "    if (index >= (uint64_t) nfds)\n        return 0;\n\n",
+        "",
+    ),
+    # ---- verify-timespec ---------------------------------------------------
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_to_ns_sat",
+        "drop the tv_sec ceiling (the product overflows int64_t)",
+        "    if (sec > TIMESPEC_SEC_MAX)\n        return INT64_MAX;\n",
+        "",
+    ),
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_to_ns_sat",
+        "drop the headroom check on the addition (a huge tv_nsec overflows)",
+        "    if (nsec > INT64_MAX - whole)\n        return INT64_MAX;\n",
+        "",
+    ),
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_to_ns_sat",
+        "accept the tv_sec one past the ceiling (off-by-one saturation)",
+        "    if (sec > TIMESPEC_SEC_MAX)",
+        "    if (sec > TIMESPEC_SEC_MAX + 1)",
+    ),
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_to_poll_ms",
+        "truncate the sub-millisecond remainder (a short wait becomes a spin)",
+        "    if (ns % TIMESPEC_NSEC_PER_MSEC != 0)\n        ms++;\n",
+        "",
+    ),
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_to_poll_ms",
+        "drop the int clamp (the ms value wraps negative, poll waits forever)",
+        "    if (ms > INT32_MAX)\n        return INT32_MAX;\n",
+        "",
+    ),
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_valid",
+        "accept a tv_nsec of exactly one second (off-by-one on the range)",
+        "    return sec >= 0 && nsec >= 0 && nsec < TIMESPEC_NSEC_PER_SEC;",
+        "    return sec >= 0 && nsec >= 0 && nsec <= TIMESPEC_NSEC_PER_SEC;",
+    ),
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_to_ns_sat",
+        "return 0 rather than saturating when tv_nsec overflows the sum",
+        "    if (nsec > INT64_MAX - whole)\n        return INT64_MAX;",
+        "    if (nsec > INT64_MAX - whole)\n        return 0;",
+    ),
+    (
+        "timespec",
+        "src/proved/timespec.h",
+        "timespec_to_poll_ms",
+        "halve the timeout (poll returns before the caller asked)",
+        "    int64_t ms = ns / TIMESPEC_NSEC_PER_MSEC;",
+        "    int64_t ms = ns / (2 * TIMESPEC_NSEC_PER_MSEC);",
+    ),
+    # ---- verify-slice ------------------------------------------------------
+    (
+        "slice",
+        "src/proved/slice.h",
+        "slice_clamp",
+        "drop the end-of-buffer guard (the remaining count underflows)",
+        "    if (offset >= src_len) {\n        *n = 0;\n        return 0;\n    }\n\n",
+        "",
+    ),
+    (
+        "slice",
+        "src/proved/slice.h",
+        "slice_clamp",
+        "serve the byte at the end offset (reads one past the buffer)",
+        "    if (offset >= src_len) {",
+        "    if (offset > src_len) {",
+    ),
+    (
+        "slice",
+        "src/proved/slice.h",
+        "slice_clamp",
+        "return the requested count unclamped (copy runs past the end)",
+        "    *n = count < avail ? count : avail;",
+        "    *n = count;",
+    ),
 ]
 
 
@@ -440,10 +864,11 @@ def analysis_mk():
 # against whatever proof sources the same PR happens to touch, which is
 # nothing when the PR only edits CI. --target already narrows a full-set
 # fallback to one shard's own mutations (see the --changed-since block
-# below), so this costs each of the nine shards its own subset, not all 40
+# below), so this costs each shard its own subset rather than all of them
 # apiece.
 HARNESS_FILES = {
     "scripts/check-mutants.py",
+    "scripts/analysis-mk.py",
     "scripts/check-wp-result.py",
     "scripts/check-acsl-coverage.py",
     "scripts/check-char-signedness.py",
@@ -537,12 +962,21 @@ def target_inputs(cc):
 
 def target_sources():
     """VERIFY_<T>_SRC for every target, as {target: path}."""
-    return {
-        m.group(1).lower(): m.group(2)
-        for m in re.finditer(
-            r"^VERIFY_([A-Z]+)_SRC\s*:=\s*(\S+)", analysis_mk(), re.MULTILINE
-        )
-    }
+    return analysis_mk_table.target_sources()
+
+
+def target_mutable_files():
+    """Files a target's mutation may edit, as {target: {paths}}.
+
+    Only VERIFY_<T>_SRC, and that restriction is structural rather than
+    cautious: run_mutation copies one file and points the prover at the copy,
+    so a mutation to any other file leaves the proof reading the original
+    through -Isrc and produces a verdict about unmutated code. src/utils.h is
+    the case that comes up, since hex_nibble lives there and both verify-elf
+    and verify-rsp prove it; covering it by mutation would need a runner that
+    stages a whole tree.
+    """
+    return {target: {src} for target, src in target_sources().items()}
 
 
 def proved_functions():
@@ -551,7 +985,7 @@ def proved_functions():
     shared = re.search(r"^VERIFY_UTILS_FCTS\s*:=\s*(.*)$", text, re.MULTILINE)
     utils = shared.group(1) if shared else ""
     out = {}
-    for m in re.finditer(r"^VERIFY_([A-Z]+)_FCTS\s*:=\s*(.*)$", text, re.MULTILINE):
+    for m in re.finditer(r"^VERIFY_([A-Z0-9_]+)_FCTS\s*:=\s*(.*)$", text, re.MULTILINE):
         name = m.group(1).lower()
         if name == "utils":
             continue
@@ -756,11 +1190,12 @@ def main():
     # instead silently analyzes the wrong file: the run still produces a
     # verdict, and the verdict means nothing.
     sources = target_sources()
+    mutable = target_mutable_files()
     misdirected = {
         f"verify-{target}: mutates {src}, but VERIFY_{target.upper()}_SRC is "
         f"{sources.get(target, '<unknown>')}"
         for target, src, *_rest in selected
-        if sources.get(target) != src
+        if src not in mutable.get(target, set())
     }
     if misdirected:
         print(
@@ -802,6 +1237,34 @@ def main():
         results = list(
             pool.map(run_mutation, [i for i, _m in selected_pairs], selected)
         )
+
+    # INFRA means the run produced no verdict, and by far its most common cause
+    # is prover starvation: several Frama-C processes, each with its own
+    # alt-ergo and z3, oversubscribe the machine and enough goals hit
+    # FRAMAC_TIMEOUT that the target exits without naming a reason. That is
+    # indistinguishable here from a genuinely broken mutation, and re-running
+    # the same mutation alone has resolved every occurrence seen so far.
+    #
+    # So re-run them once with the pool drained, one at a time. A load artifact
+    # turns into the verdict it should have had; a real failure stays INFRA and
+    # is reported. The retry is announced either way, because a gate that
+    # quietly re-rolls a failure until it passes is worse than one that flakes.
+    retried = [i for i, (status, _d) in enumerate(results) if status == "INFRA"]
+    if retried:
+        print(
+            f"  {len(retried)} mutation(s) returned no verdict; re-running "
+            "them serially before scoring"
+        )
+        for i in retried:
+            idx = selected_pairs[i][0]
+            before = results[i]
+            results[i] = run_mutation(idx, selected[i])
+            target, _src, function = selected[i][:3]
+            if results[i][0] != before[0]:
+                print(
+                    f"    verify-{target}:{function}: {before[0]} under load, "
+                    f"{results[i][0]} alone"
+                )
 
     failures = []
     for mutation, (status, detail) in zip(selected, results):

@@ -59,6 +59,8 @@
 #include "string-builder.h"
 #include "utils.h"
 
+#include "proved/slice.h"
+
 #include "debug/log.h"
 #include "runtime/procemu.h"
 #include "runtime/procemu-internal.h"
@@ -379,21 +381,20 @@ static int proc_oom_copy_slice(char *dst,
                                size_t count,
                                int64_t offset,
                                const char *src,
-                               size_t src_len,
+                               uint64_t src_len,
                                ssize_t *read_out)
 {
     if (offset < 0) {
         errno = EINVAL;
         return -1;
     }
-    if ((uint64_t) offset >= src_len) {
+    uint64_t n;
+    if (!slice_clamp(src_len, (uint64_t) offset, count, &n)) {
         *read_out = 0;
         return 1;
     }
 
-    size_t avail = src_len - (size_t) offset;
-    size_t n = count < avail ? count : avail;
-    memcpy(dst, src + offset, n);
+    memcpy(dst, src + offset, (size_t) n);
     *read_out = (ssize_t) n;
     return 1;
 }
@@ -3486,21 +3487,17 @@ int proc_intercept_readv(int guest_fd,
         errno = EIO;
         return -1;
     }
-    size_t src_len = (size_t) len;
-    if ((uint64_t) offset >= src_len) {
-        *read_out = 0;
-        return 1;
-    }
+    uint64_t src_len = (uint64_t) len;
 
-    size_t src_off = (size_t) offset;
+    uint64_t src_off = (uint64_t) offset;
     ssize_t total = 0;
-    for (int i = 0; i < iovcnt && src_off < src_len; i++) {
-        size_t n = iov[i].iov_len;
-        if (n > src_len - src_off)
-            n = src_len - src_off;
+    for (int i = 0; i < iovcnt; i++) {
+        uint64_t n;
+        if (!slice_clamp(src_len, src_off, iov[i].iov_len, &n))
+            break;
         if (n == 0)
             continue;
-        memcpy(iov[i].iov_base, text + src_off, n);
+        memcpy(iov[i].iov_base, text + src_off, (size_t) n);
         src_off += n;
         total += (ssize_t) n;
     }

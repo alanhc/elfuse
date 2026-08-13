@@ -5,3 +5,4 @@ lib/modules/
 *.o
 *.bin
 __pycache__
+.frama-c/

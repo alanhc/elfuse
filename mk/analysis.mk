@@ -1,10 +1,8 @@
 # Static analysis and formatting
 
-.PHONY: lint analyze check-format indent verify verify-elf verify-rsp \
-        verify-gva verify-cmsg verify-fuse verify-stack verify-sockaddr \
-        verify-netlink verify-sigframe \
+.PHONY: lint analyze check-format indent verify \
         check-contracts verify-mutants check-char-signedness \
-        infer-uninit
+        print-verify-targets infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -19,8 +17,21 @@ SHELL_SCRIPTS := $(shell git ls-files --cached --others --exclude-standard \
 PYTHON_FORMAT_FILES := $(shell git ls-files --cached --others \
                                --exclude-standard -- '*.py')
 
+# Missing-tool diagnostics, in the shape the verify-* targets already use:
+# name the tool, name the install, fail on purpose. Without this a developer
+# running lint/analyze/infer-uninit gets "make: clang-tidy: No such file or
+# directory / Error 1", which reads like a broken Makefile rather than a
+# missing dependency, on three of the eleven CI jobs.
+define require-tool
+	@command -v $(1) >/dev/null 2>&1 || { \
+		printf "  $(RED)%s not found$(RESET) (%s)\n" "$(1)" "$(2)"; \
+		exit 1; \
+	}
+endef
+
 ## Run clang-tidy on all source files
 lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
+	$(call require-tool,$(CLANG_TIDY),brew install llvm -- or set CLANG_TIDY=)
 	@echo "  TIDY    src/"
 	$(Q)$(CLANG_TIDY) $(SRCS) -- $(CFLAGS) -Isrc -I$(BUILD_DIR)
 
@@ -38,7 +49,7 @@ lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 # they pass a malloc'd ph_buf plus distinct stack locals, but a future
 # elf_segment_extent(..., &x, &x) would invalidate the proof with no diagnostic.
 #
-# That caveat is general, and it bites hardest for gva-math.h: guest.c cannot be
+# That caveat is general, and it bites hardest for proved/gva.h: guest.c cannot be
 # given to Frama-C at all, so nothing here checks that its call sites honor the
 # nine "requires" clauses there. check-acsl-coverage.py closes the other
 # direction (a contract assumed because its function was left out of -wp-fct);
@@ -48,7 +59,7 @@ lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
 # with -DELFUSE_CONTRACT_ASSERT so the five expressible clauses are checked on
 # every call the suite makes. The four pointer clauses (\valid x3, \separated)
 # have no C expression and stay review-only. The checks call the *_args_ok
-# predicates in gva-math.h, whose <==> contracts are proved here, so a check
+# predicates in proved/gva.h, whose <==> contracts are proved here, so a check
 # that drifted weaker than the clause it mirrors fails verify-gva.
 #
 # Install: opam install frama-c, then why3 config detect (without the latter WP
@@ -124,13 +135,22 @@ VERIFY_ELF_SCAN  := src/core/elf.c src/core/elf.h src/utils.h
 VERIFY_ELF_CLAIM := for ANY byte sequence an untrusted ELF can supply
 VERIFY_ELF_UNPROVED := the pread/malloc I/O around them stays test-covered
 
-VERIFY_GVA_SRC   := src/core/gva-math.h
+# Proved with the call-site checks compiled IN. Without this the prover never
+# sees the GVA_CONTRACT_ASSERT calls, and a check wired to the wrong predicate
+# or handed permuted arguments would show up only as a spurious runtime abort
+# under check-contracts. With it, WP must discharge each assert from the very
+# requires clause it mirrors, so the wiring is machine-checked too.
+#
+# The only target that needs a preprocessor define, which is why the rule
+# template below emits CPP_DEFS for every target and empty for the rest.
+VERIFY_GVA_CPP_DEFS := -DELFUSE_CONTRACT_ASSERT
+VERIFY_GVA_SRC   := src/proved/gva.h
 VERIFY_GVA_FCTS  := gva_pt_table_offset gva_leaf_target gva_chunk_clamp \
                     gva_span_ok gva_leaf_target_args_ok \
                     gva_chunk_clamp_args_ok
-VERIFY_GVA_MIN_GOALS ?= 66
+VERIFY_GVA_MIN_GOALS ?= 69
 VERIFY_GVA_MODEL := typed
-VERIFY_GVA_SCAN  := src/core/gva-math.h
+VERIFY_GVA_SCAN  := src/proved/gva.h
 VERIFY_GVA_CLAIM := for ANY guest address, length, and page-table content
 VERIFY_GVA_UNPROVED := the walk and copy loops around them stay test-covered
 
@@ -151,55 +171,111 @@ VERIFY_RSP_SCAN  := src/debug/gdbstub-rsp.c src/utils.h
 VERIFY_RSP_CLAIM := for ANY packet bytes a GDB remote can send
 VERIFY_RSP_UNPROVED := the socket I/O and framing loop stay test-covered
 
-VERIFY_CMSG_SRC  := src/syscall/cmsg-math.h
+VERIFY_CMSG_SRC  := src/proved/cmsg.h
 VERIFY_CMSG_FCTS := cmsg_entry_bounds
-VERIFY_CMSG_MIN_GOALS ?= 17
+VERIFY_CMSG_MIN_GOALS ?= 19
 VERIFY_CMSG_MODEL := typed
-VERIFY_CMSG_SCAN := src/syscall/cmsg-math.h
+VERIFY_CMSG_SCAN := src/proved/cmsg.h
 VERIFY_CMSG_CLAIM := for ANY control-message bytes a guest can supply
 VERIFY_CMSG_UNPROVED := the walk loop and the host cmsg build stay test-covered
 
-VERIFY_FUSE_SRC  := src/syscall/fuse-math.h
+VERIFY_FUSE_SRC  := src/proved/fuse.h
 VERIFY_FUSE_FCTS := fuse_frame_count_ok fuse_reply_extent \
                     fuse_clamp_negotiated_write
-VERIFY_FUSE_MIN_GOALS ?= 27
+VERIFY_FUSE_MIN_GOALS ?= 28
 VERIFY_FUSE_MODEL := typed
-VERIFY_FUSE_SCAN := src/syscall/fuse-math.h
+VERIFY_FUSE_SCAN := src/proved/fuse.h
 VERIFY_FUSE_CLAIM := for ANY reply frame a guest FUSE daemon can write
 VERIFY_FUSE_UNPROVED := the per-opcode payload extents stay test-covered
 
-VERIFY_STACK_SRC  := src/core/stack-math.h
+VERIFY_STACK_SRC  := src/proved/stack.h
 VERIFY_STACK_FCTS := stack_take stack_align_down stack_pushed_words \
                     stack_final_sp
 VERIFY_STACK_MIN_GOALS ?= 36
 VERIFY_STACK_MODEL := typed
-VERIFY_STACK_SCAN := src/core/stack-math.h
+VERIFY_STACK_SCAN := src/proved/stack.h
 VERIFY_STACK_CLAIM := for ANY argv, envp, and auxv set a guest can present
 VERIFY_STACK_UNPROVED := the string writes and push loop stay test-covered
 
-VERIFY_SOCKADDR_SRC  := src/syscall/sockaddr-math.h
+VERIFY_SOCKADDR_SRC  := src/proved/sockaddr.h
 VERIFY_SOCKADDR_FCTS := sockaddr_len_ok sockaddr_payload_len
 VERIFY_SOCKADDR_MIN_GOALS ?= 11
 VERIFY_SOCKADDR_MODEL := typed
-VERIFY_SOCKADDR_SCAN := src/syscall/sockaddr-math.h
+VERIFY_SOCKADDR_SCAN := src/proved/sockaddr.h
 VERIFY_SOCKADDR_CLAIM := for ANY address length a guest or host can present
 VERIFY_SOCKADDR_UNPROVED := the family translation and memcpy stay test-covered
 
-VERIFY_NETLINK_SRC  := src/syscall/netlink-math.h
+VERIFY_NETLINK_SRC  := src/proved/netlink.h
 VERIFY_NETLINK_FCTS := netlink_align_up netlink_rta_bounds netlink_msg_span
 VERIFY_NETLINK_MIN_GOALS ?= 44
 VERIFY_NETLINK_MODEL := typed
-VERIFY_NETLINK_SCAN := src/syscall/netlink-math.h
+VERIFY_NETLINK_SCAN := src/proved/netlink.h
 VERIFY_NETLINK_CLAIM := for ANY netlink message bytes a guest can send
 VERIFY_NETLINK_UNPROVED := the walk loops and attribute copies stay test-covered
 
-VERIFY_SIGFRAME_SRC  := src/syscall/sigframe-math.h
+VERIFY_SIGFRAME_SRC  := src/proved/sigframe.h
 VERIFY_SIGFRAME_FCTS := sigframe_base
 VERIFY_SIGFRAME_MIN_GOALS ?= 15
 VERIFY_SIGFRAME_MODEL := typed
-VERIFY_SIGFRAME_SCAN := src/syscall/sigframe-math.h
+VERIFY_SIGFRAME_SCAN := src/proved/sigframe.h
 VERIFY_SIGFRAME_CLAIM := for ANY interrupted stack pointer and frame size
 VERIFY_SIGFRAME_UNPROVED := the frame field layout is not covered at all yet
+
+VERIFY_DIRENT_SRC  := src/proved/dirent.h
+VERIFY_DIRENT_FCTS := dirent_reclen dirent_record_bounds
+VERIFY_DIRENT_MIN_GOALS ?= 30
+VERIFY_DIRENT_MODEL := typed
+VERIFY_DIRENT_SCAN := src/proved/dirent.h
+VERIFY_DIRENT_CLAIM := for ANY name length a host or FUSE directory can present
+VERIFY_DIRENT_UNPROVED := the readdir walk and the name translation stay test-covered
+
+VERIFY_IOV_SRC  := src/proved/iov.h
+VERIFY_IOV_FCTS := iov_count_ok iov_total_add
+VERIFY_IOV_MIN_GOALS ?= 17
+VERIFY_IOV_MODEL := typed
+VERIFY_IOV_SCAN := src/proved/iov.h
+VERIFY_IOV_CLAIM := for ANY iovec array a guest can write
+VERIFY_IOV_UNPROVED := the per-entry guest_ptr bounds stay test-covered
+
+VERIFY_FDSET_SRC  := src/proved/fdset.h
+VERIFY_FDSET_FCTS := fdset_words fdset_fd_index fdset_slot
+VERIFY_FDSET_MIN_GOALS ?= 43
+VERIFY_FDSET_MODEL := typed
+VERIFY_FDSET_SCAN := src/proved/fdset.h
+VERIFY_FDSET_CLAIM := for ANY nfds, fd_set bit, or fd-table slot index
+VERIFY_FDSET_UNPROVED := the poll translation and the result writeback stay test-covered
+
+VERIFY_TIMESPEC_SRC  := src/proved/timespec.h
+VERIFY_TIMESPEC_FCTS := timespec_valid timespec_to_ns_sat timespec_to_poll_ms
+VERIFY_TIMESPEC_MIN_GOALS ?= 35
+VERIFY_TIMESPEC_MODEL := typed
+VERIFY_TIMESPEC_SCAN := src/proved/timespec.h
+VERIFY_TIMESPEC_CLAIM := for ANY timespec a guest can write
+VERIFY_TIMESPEC_UNPROVED := the deadline bookkeeping around them stays test-covered
+
+VERIFY_SLICE_SRC  := src/proved/slice.h
+VERIFY_SLICE_FCTS := slice_clamp
+VERIFY_SLICE_MIN_GOALS ?= 17
+VERIFY_SLICE_MODEL := typed
+VERIFY_SLICE_SCAN := src/proved/slice.h
+VERIFY_SLICE_CLAIM := for ANY offset and count a guest can pass to a synthesized read
+VERIFY_SLICE_UNPROVED := the buffer synthesis itself stays test-covered
+
+VERIFY_ALIGN_SRC  := src/proved/align.h
+VERIFY_ALIGN_FCTS := align_up_ok window_fits
+VERIFY_ALIGN_MIN_GOALS ?= 24
+VERIFY_ALIGN_MODEL := typed
+VERIFY_ALIGN_SCAN := src/proved/align.h
+VERIFY_ALIGN_CLAIM := for ANY address, alignment, and search window
+VERIFY_ALIGN_UNPROVED := the region-array walk around them stays test-covered
+
+VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
+VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop
+VERIFY_PATHDEPTH_MIN_GOALS ?= 24
+VERIFY_PATHDEPTH_MODEL := typed
+VERIFY_PATHDEPTH_SCAN := src/proved/pathdepth.h
+VERIFY_PATHDEPTH_CLAIM := for ANY component depth a guest path can reach
+VERIFY_PATHDEPTH_UNPROVED := the component scan and the mark writes stay test-covered
 
 # -wp-fct wants one comma-separated argument; the lists stay space-separated so
 # the recipe can iterate them for the banner.
@@ -213,119 +289,47 @@ commafy = $(subst $(verify_space),$(verify_comma),$(strip $(1)))
 # assignments here, and the target name to the shared rule; the recipe itself is
 # written once.
 
-## Prove the ELF parser cannot be driven out of bounds by a crafted binary
-verify-elf: NAME := elf
-verify-elf: TARGET := elf
-verify-elf: SRC := $(VERIFY_ELF_SRC)
-verify-elf: FCTS := $(VERIFY_ELF_FCTS)
-verify-elf: FCT_ARG := $(call commafy,$(VERIFY_ELF_FCTS))
-verify-elf: MIN_GOALS := $(VERIFY_ELF_MIN_GOALS)
-verify-elf: MODEL := $(VERIFY_ELF_MODEL)
-verify-elf: SCAN := $(VERIFY_ELF_SCAN)
-verify-elf: CLAIM := $(VERIFY_ELF_CLAIM)
-verify-elf: UNPROVED := $(VERIFY_ELF_UNPROVED)
+# GNU make has no lowercase function, and the variable names are upper while
+# the target names are lower. One $(subst) chain per letter actually used by a
+# target name is enough and stays readable; a new target using a letter not
+# listed here shows up immediately as a literal upper-case character in the
+# rule name rather than silently misbehaving.
+lc = $(subst A,a,$(subst B,b,$(subst C,c,$(subst D,d,$(subst E,e,$(subst F,f,$(subst G,g,$(subst H,h,$(subst I,i,$(subst K,k,$(subst L,l,$(subst M,m,$(subst N,n,$(subst O,o,$(subst P,p,$(subst Q,q,$(subst R,r,$(subst S,s,$(subst T,t,$(subst U,u,$(subst V,v,$(subst X,x,$(1)))))))))))))))))))))))
 
-## Prove guest address translation cannot compute an out-of-bounds window
-# Prove with the call-site checks compiled IN. Without this the prover never
-# sees the GVA_CONTRACT_ASSERT calls, and a check wired to the wrong predicate
-# or handed permuted arguments would show up only as a spurious runtime abort
-# under check-contracts. With it, WP must discharge each assert from the very
-# requires clause it mirrors, so the wiring is machine-checked too.
-verify-gva: CPP_DEFS := -DELFUSE_CONTRACT_ASSERT
-verify-gva: NAME := gva
-verify-gva: TARGET := gva
-verify-gva: SRC := $(VERIFY_GVA_SRC)
-verify-gva: FCTS := $(VERIFY_GVA_FCTS)
-verify-gva: FCT_ARG := $(call commafy,$(VERIFY_GVA_FCTS))
-verify-gva: MIN_GOALS := $(VERIFY_GVA_MIN_GOALS)
-verify-gva: MODEL := $(VERIFY_GVA_MODEL)
-verify-gva: SCAN := $(VERIFY_GVA_SCAN)
-verify-gva: CLAIM := $(VERIFY_GVA_CLAIM)
-verify-gva: UNPROVED := $(VERIFY_GVA_UNPROVED)
+# The proof targets, derived rather than listed. Make knows every variable it
+# has read, so the set of VERIFY_<T>_SRC assignments above IS the target list;
+# writing it out again is how the four copies of it (this file twice, the CI
+# matrix, and src/proved/) drifted apart in the first place.
+VERIFY_TARGETS := $(sort $(patsubst VERIFY_%_SRC,%,$(filter VERIFY_%_SRC,$(.VARIABLES))))
+VERIFY_TARGET_NAMES := $(call lc,$(VERIFY_TARGETS))
+VERIFY_RULES := $(addprefix verify-,$(VERIFY_TARGET_NAMES))
 
-## Prove the GDB RSP parser cannot be driven out of bounds by a remote
-verify-rsp: NAME := rsp
-verify-rsp: TARGET := rsp
-verify-rsp: SRC := $(VERIFY_RSP_SRC)
-verify-rsp: FCTS := $(VERIFY_RSP_FCTS)
-verify-rsp: FCT_ARG := $(call commafy,$(VERIFY_RSP_FCTS))
-verify-rsp: MIN_GOALS := $(VERIFY_RSP_MIN_GOALS)
-verify-rsp: MODEL := $(VERIFY_RSP_MODEL)
-verify-rsp: SCAN := $(VERIFY_RSP_SCAN)
-verify-rsp: CLAIM := $(VERIFY_RSP_CLAIM)
-verify-rsp: UNPROVED := $(VERIFY_RSP_UNPROVED)
+# Declared here, not in the .PHONY at the top of the file: VERIFY_RULES does
+# not exist yet at that point and would expand to nothing.
+.PHONY: $(VERIFY_RULES)
 
-## Prove the control-message walk cannot be driven out of the control buffer
-verify-cmsg: NAME := cmsg
-verify-cmsg: TARGET := cmsg
-verify-cmsg: SRC := $(VERIFY_CMSG_SRC)
-verify-cmsg: FCTS := $(VERIFY_CMSG_FCTS)
-verify-cmsg: FCT_ARG := $(call commafy,$(VERIFY_CMSG_FCTS))
-verify-cmsg: MIN_GOALS := $(VERIFY_CMSG_MIN_GOALS)
-verify-cmsg: MODEL := $(VERIFY_CMSG_MODEL)
-verify-cmsg: SCAN := $(VERIFY_CMSG_SCAN)
-verify-cmsg: CLAIM := $(VERIFY_CMSG_CLAIM)
-verify-cmsg: UNPROVED := $(VERIFY_CMSG_UNPROVED)
+## Print the proof target names, one per line (CI reads this to build its matrix)
+print-verify-targets:
+	@printf '%s\n' $(VERIFY_TARGET_NAMES)
 
-## Prove a hostile FUSE daemon cannot drive a reply past its own frame
-verify-fuse: NAME := fuse
-verify-fuse: TARGET := fuse
-verify-fuse: SRC := $(VERIFY_FUSE_SRC)
-verify-fuse: FCTS := $(VERIFY_FUSE_FCTS)
-verify-fuse: FCT_ARG := $(call commafy,$(VERIFY_FUSE_FCTS))
-verify-fuse: MIN_GOALS := $(VERIFY_FUSE_MIN_GOALS)
-verify-fuse: MODEL := $(VERIFY_FUSE_MODEL)
-verify-fuse: SCAN := $(VERIFY_FUSE_SCAN)
-verify-fuse: CLAIM := $(VERIFY_FUSE_CLAIM)
-verify-fuse: UNPROVED := $(VERIFY_FUSE_UNPROVED)
+# One rule template, instantiated per target. The target-specific variables
+# below are exactly what the shared recipe consumes; NAME and TARGET differ only
+# because a mutation run overrides NAME to keep concurrent logs apart.
+define verify-target-vars
+verify-$(call lc,$(1)): NAME := $(call lc,$(1))
+verify-$(call lc,$(1)): TARGET := $(call lc,$(1))
+verify-$(call lc,$(1)): SRC := $$(VERIFY_$(1)_SRC)
+verify-$(call lc,$(1)): FCTS := $$(VERIFY_$(1)_FCTS)
+verify-$(call lc,$(1)): FCT_ARG := $$(call commafy,$$(VERIFY_$(1)_FCTS))
+verify-$(call lc,$(1)): MIN_GOALS := $$(VERIFY_$(1)_MIN_GOALS)
+verify-$(call lc,$(1)): MODEL := $$(VERIFY_$(1)_MODEL)
+verify-$(call lc,$(1)): SCAN := $$(VERIFY_$(1)_SCAN)
+verify-$(call lc,$(1)): CLAIM := $$(VERIFY_$(1)_CLAIM)
+verify-$(call lc,$(1)): UNPROVED := $$(VERIFY_$(1)_UNPROVED)
+verify-$(call lc,$(1)): CPP_DEFS := $$(VERIFY_$(1)_CPP_DEFS)
+endef
 
-## Prove the initial stack stays in its region and lands SP aligned on argc
-verify-stack: NAME := stack
-verify-stack: TARGET := stack
-verify-stack: SRC := $(VERIFY_STACK_SRC)
-verify-stack: FCTS := $(VERIFY_STACK_FCTS)
-verify-stack: FCT_ARG := $(call commafy,$(VERIFY_STACK_FCTS))
-verify-stack: MIN_GOALS := $(VERIFY_STACK_MIN_GOALS)
-verify-stack: MODEL := $(VERIFY_STACK_MODEL)
-verify-stack: SCAN := $(VERIFY_STACK_SCAN)
-verify-stack: CLAIM := $(VERIFY_STACK_CLAIM)
-verify-stack: UNPROVED := $(VERIFY_STACK_UNPROVED)
-
-## Prove sockaddr reshaping cannot overrun either representation
-verify-sockaddr: NAME := sockaddr
-verify-sockaddr: TARGET := sockaddr
-verify-sockaddr: SRC := $(VERIFY_SOCKADDR_SRC)
-verify-sockaddr: FCTS := $(VERIFY_SOCKADDR_FCTS)
-verify-sockaddr: FCT_ARG := $(call commafy,$(VERIFY_SOCKADDR_FCTS))
-verify-sockaddr: MIN_GOALS := $(VERIFY_SOCKADDR_MIN_GOALS)
-verify-sockaddr: MODEL := $(VERIFY_SOCKADDR_MODEL)
-verify-sockaddr: SCAN := $(VERIFY_SOCKADDR_SCAN)
-verify-sockaddr: CLAIM := $(VERIFY_SOCKADDR_CLAIM)
-verify-sockaddr: UNPROVED := $(VERIFY_SOCKADDR_UNPROVED)
-
-## Prove the netlink TLV walks stay in the message and terminate
-verify-netlink: NAME := netlink
-verify-netlink: TARGET := netlink
-verify-netlink: SRC := $(VERIFY_NETLINK_SRC)
-verify-netlink: FCTS := $(VERIFY_NETLINK_FCTS)
-verify-netlink: FCT_ARG := $(call commafy,$(VERIFY_NETLINK_FCTS))
-verify-netlink: MIN_GOALS := $(VERIFY_NETLINK_MIN_GOALS)
-verify-netlink: MODEL := $(VERIFY_NETLINK_MODEL)
-verify-netlink: SCAN := $(VERIFY_NETLINK_SCAN)
-verify-netlink: CLAIM := $(VERIFY_NETLINK_CLAIM)
-verify-netlink: UNPROVED := $(VERIFY_NETLINK_UNPROVED)
-
-## Prove the signal frame lands aligned and below the interrupted stack pointer
-verify-sigframe: NAME := sigframe
-verify-sigframe: TARGET := sigframe
-verify-sigframe: SRC := $(VERIFY_SIGFRAME_SRC)
-verify-sigframe: FCTS := $(VERIFY_SIGFRAME_FCTS)
-verify-sigframe: FCT_ARG := $(call commafy,$(VERIFY_SIGFRAME_FCTS))
-verify-sigframe: MIN_GOALS := $(VERIFY_SIGFRAME_MIN_GOALS)
-verify-sigframe: MODEL := $(VERIFY_SIGFRAME_MODEL)
-verify-sigframe: SCAN := $(VERIFY_SIGFRAME_SCAN)
-verify-sigframe: CLAIM := $(VERIFY_SIGFRAME_CLAIM)
-verify-sigframe: UNPROVED := $(VERIFY_SIGFRAME_UNPROVED)
+$(foreach t,$(VERIFY_TARGETS),$(eval $(call verify-target-vars,$(t))))
 
 # NAME and TARGET look redundant and are not. NAME picks the log path and is
 # overridden per mutation run so concurrent runs do not share a file; TARGET is
@@ -340,8 +344,7 @@ verify-sigframe: UNPROVED := $(VERIFY_SIGFRAME_UNPROVED)
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-verify-elf verify-rsp verify-gva verify-cmsg verify-fuse verify-stack \
-    verify-sockaddr verify-netlink verify-sigframe: | $(BUILD_DIR)
+$(VERIFY_RULES): | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -410,10 +413,9 @@ check-char-signedness:
 	$(Q)python3 scripts/check-char-signedness.py --cc '$(CC)'
 
 ## Run every Frama-C proof
-verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse verify-stack \
-        verify-sockaddr verify-netlink verify-sigframe
+verify: $(VERIFY_RULES)
 
-## Rebuild with the gva-math.h precondition checks live, then run the suite
+## Rebuild with the proved/gva.h precondition checks live, then run the suite
 #
 # Separate from "make check" rather than folded into it: gva_leaf_target and
 # gva_chunk_clamp sit on the guest_read / guest_write hot path, and the tree has
@@ -425,15 +427,13 @@ verify: verify-elf verify-gva verify-rsp verify-cmsg verify-fuse verify-stack \
 # checks on its hot path. A separate tree also means no -B is needed, since it
 # starts empty.
 check-contracts:
-	@echo "  CONTRACT gva-math.h call-site preconditions (5 of 9 clauses)"
+	@echo "  CONTRACT proved/gva.h call-site preconditions (5 of 9 clauses)"
 	$(Q)$(MAKE) BUILD_DIR=$(BUILD_DIR)/contracts \
 	    EXTRA_CFLAGS="-DELFUSE_CONTRACT_ASSERT $(EXTRA_CFLAGS)" check
 
 ## Re-run Infer with the uninitialized-value checker that .inferconfig disables
 infer-uninit: | $(BUILD_DIR)
-	@command -v $(INFER) >/dev/null 2>&1 || { \
-		printf "  $(RED)infer not found$(RESET) (set INFER=)\n"; exit 1; \
-	}
+	$(call require-tool,$(INFER),brew install infer -- or set INFER=)
 	@echo "  INFER   uninitialized-value checker (disabled in .inferconfig)"
 	@echo "          A count of 0 means the suppression is no longer needed and"
 	@echo "          .inferconfig should be deleted. Anything else is the known"
@@ -459,6 +459,7 @@ infer-uninit: | $(BUILD_DIR)
 
 ## Run clang static analyzer (scan-build)
 analyze:
+	$(call require-tool,scan-build,brew install llvm)
 	@echo "  SCAN    elfuse"
 	$(Q)scan-build --use-cc=$(CC) $(MAKE) -B elfuse
 

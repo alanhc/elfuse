@@ -80,7 +80,7 @@ static inline int sigframe_base(uint64_t sp,
     /* Align down, written as subtract-the-remainder rather than "& ~15": the
      * compiler emits the same instruction, and the prover reasons about the
      * arithmetic form without first establishing that the mask is one less than
-     * a power of two. Same reason src/core/gva-math.h uses "% granule".
+     * a power of two. Same reason src/proved/gva.h uses "% granule".
      */
     uint64_t candidate = sp - frame_bytes;
     candidate -= candidate % SIGFRAME_ALIGN;

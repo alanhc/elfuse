@@ -24,7 +24,8 @@
 
 #include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
-#include "syscall/fuse-math.h"
+#include "proved/dirent.h"
+#include "proved/fuse.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
@@ -174,8 +175,8 @@ typedef struct {
     uint16_t padding;
 } fuse_in_header_t;
 
-/* fuse_out_header_t lives in syscall/fuse-math.h, next to the frame arithmetic
- * proved against it.
+/* fuse_out_header_t lives in proved/fuse.h, next to the frame arithmetic proved
+ * against it.
  */
 
 typedef struct {
@@ -219,7 +220,7 @@ typedef struct {
 #define FUSE_NODE_REF_HASH_TOMBSTONE (-2)
 #define FUSE_FAKE_DEV 0xF00D
 
-/* FUSE_FRAME_CAP and FUSE_MAX_NEGOTIATED_WRITE live in syscall/fuse-math.h. */
+/* FUSE_FRAME_CAP and FUSE_MAX_NEGOTIATED_WRITE live in proved/fuse.h. */
 
 typedef struct fuse_request {
     bool used;
@@ -2330,7 +2331,7 @@ int64_t fuse_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
          * overflow the fixed entry[] buffer below or exceed the remaining frame
          * body.
          */
-        if (fde->namelen > 255) {
+        if (fde->namelen > DIRENT64_NAME_MAX) {
             free(tmp);
             fuse_file_release(&snap);
             return dst ? (int64_t) dst : -LINUX_EIO;
@@ -2341,16 +2342,16 @@ int64_t fuse_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         if (src + freclen > (size_t) raw)
             break;
 
-        size_t lreclen = (19 + fde->namelen + 1 + 7) & ~7ULL;
-
-        /* d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + name(<=255) + NUL(1)
-         * + padding(<=7) <= 280. Defense in depth against an arithmetic error
-         * -- never trust the daemon's record length.
+        /* dirent_record_bounds proves the record fits both this buffer and the
+         * guest's remaining count, so the two hand-written checks that used to
+         * stand here (lreclen > sizeof(entry), dst + lreclen > count) are now
+         * postconditions. dst <= count holds by induction: it starts at 0 and
+         * only advances by a length the same call proved fits count - dst.
          */
-        uint8_t entry[280];
-        if (lreclen > sizeof(entry))
-            break;
-        if (dst + lreclen > count)
+        uint8_t entry[DIRENT64_MAX_RECLEN];
+        uint64_t lreclen, pad_start;
+        if (!dirent_record_bounds(fde->namelen, dst, count, &lreclen,
+                                  &pad_start))
             break;
 
         struct {
@@ -2365,11 +2366,10 @@ int64_t fuse_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
             .d_type = (uint8_t) fde->type,
         };
         memcpy(entry, &lde, sizeof(lde));
-        memcpy(entry + 19, fde->name, fde->namelen);
-        entry[19 + fde->namelen] = '\0';
-        if (19 + fde->namelen + 1 < lreclen)
-            memset(entry + 19 + fde->namelen + 1, 0,
-                   lreclen - (19 + fde->namelen + 1));
+        memcpy(entry + DIRENT64_HDR_BYTES, fde->name, fde->namelen);
+        entry[DIRENT64_HDR_BYTES + fde->namelen] = '\0';
+        if (pad_start < lreclen)
+            memset(entry + pad_start, 0, lreclen - pad_start);
         if (guest_write(g, buf_gva + dst, entry, lreclen) < 0) {
             free(tmp);
             fuse_file_release(&snap);
@@ -2510,7 +2510,7 @@ int64_t fuse_dev_write(guest_t *g,
     fuse_out_header_t hdr;
     memcpy(&hdr, buf, sizeof(hdr));
 
-    /* Proved in src/syscall/fuse-math.h: on success the payload at buf +
+    /* Proved in src/proved/fuse.h: on success the payload at buf +
      * FUSE_OUT_HDR_BYTES for reply_len bytes lies inside the count bytes read
      * above.
      */
