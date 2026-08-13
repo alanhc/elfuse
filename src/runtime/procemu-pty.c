@@ -71,9 +71,9 @@
  * the path mapping past close, the subsequent /dev/pts/N open in the child
  * loses its translation and fails with ENOENT even though the parent still
  * holds the master and the macOS slave node is openable. Those stale entries
- * keep the received slave fd until the first translated open attempt, then
- * expire before the minor can be reused for an unrelated host tty. Ordinary
- * local master closes clear the mapping immediately.
+ * keep the received slave fd, which pins the macOS tty so the mapping cannot
+ * come to name an unrelated minor, and give it up once a translated open has
+ * failed. Ordinary local master closes clear the mapping immediately.
  */
 #define PTY_KEEPALIVE_MAX 256
 
@@ -365,9 +365,127 @@ static int pty_keepalive_find_master_locked(int master_host_fd)
     return -1;
 }
 
+/* Whether row i describes pty minor pts. A fully cleared row keeps neither a
+ * path nor a minor, so the path test is what stops it matching minor 0.
+ */
+static bool pty_row_is_pts_locked(int i, uint32_t pts)
+{
+    return pty_keepalive_table[i].linux_pts_num == pts &&
+           pty_keepalive_table[i].slave_path[0] != '\0';
+}
+
+/* The one row that carries a pty's slave accounting: whichever row already
+ * holds a count, else the first row for that minor. Aliased masters (dup,
+ * SCM_RIGHTS adopt, fork restore) each get a row of their own, but the slaves
+ * belong to the pty rather than to any one master fd, so every counting path
+ * has to agree on a single home.
+ *
+ * except_slot excludes a row from the answer, which the master-close path needs
+ * to find an heir for a row that still holds the count it is giving up.
+ */
+static int pty_account_row_locked(uint32_t pts, int except_slot)
+{
+    int seen = -1, first = -1;
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (i == except_slot || !pty_row_is_pts_locked(i, pts))
+            continue;
+        if (pty_keepalive_table[i].guest_slave_count > 0)
+            return i;
+
+        /* Below a live count, a row that has seen a slave outranks one that
+         * never did. Without that, an alias registered at a lower index takes
+         * the home from a row whose count has fallen to zero, and the
+         * no-segment hangup test reads guest_slave_seen off the wrong row and
+         * never reports the hangup.
+         */
+        if (seen < 0 && pty_keepalive_table[i].guest_slave_seen)
+            seen = i;
+        if (first < 0)
+            first = i;
+    }
+    return seen >= 0 ? seen : first;
+}
+
+/* Record on the pty's shared segment that it has had a slave, through whichever
+ * row still maps it. Every row for a minor attaches the same segment by
+ * slave_path, so the heir taking over the accounting need not be the row that
+ * holds the mapping, and pty_slot_hung_up_locked reads the segment rather than
+ * any one row's copy.
+ */
+static void pty_shared_mark_seen_locked(uint32_t pts)
+{
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_row_is_pts_locked(i, pts) && pty_keepalive_table[i].shared) {
+            atomic_store(&pty_keepalive_table[i].shared->seen, 1);
+            return;
+        }
+    }
+}
+
+/* Defined below, next to the one-shot open it serves. */
+static int pty_keepalive_retire_stale_locked(int slot);
+
 static int pty_keepalive_clear_slot_locked(int slot)
 {
     int slave = pty_keepalive_table[slot].slave_host_fd;
+
+    /* Slaves the guest still holds outlive this master. Hand the accounting to
+     * another row for the same pty when one exists; otherwise keep this row as
+     * the pty's master-less home. Returning the count to the segment here would
+     * report a hangup with those slaves open.
+     */
+    if (pty_keepalive_table[slot].guest_slave_count > 0) {
+        int heir = pty_account_row_locked(
+            pty_keepalive_table[slot].linux_pts_num, slot);
+
+        /* An heir that maps no segment cannot take over a count that was
+         * contributed to one: its releases would not reach the segment the
+         * other processes read.
+         */
+        if (heir >= 0 && pty_keepalive_table[slot].shared &&
+            !pty_keepalive_table[heir].shared)
+            heir = -1;
+
+        if (heir < 0) {
+            /* Nobody to take it, so this row stays as the pty's master-less
+             * home until its last slave closes.
+             */
+            pty_keepalive_table[slot].master_host_fd = PTY_KEEPALIVE_FREE;
+            return pty_keepalive_retire_stale_locked(slot);
+        }
+
+        /* A count that was never in a segment becomes one that is, so the
+         * segment has to learn about it here. Otherwise each of those slaves
+         * decrements on close a total it was never added to, and the count goes
+         * negative under the other processes reading it.
+         */
+        if (!pty_keepalive_table[slot].shared &&
+            pty_keepalive_table[heir].shared) {
+            atomic_fetch_add(&pty_keepalive_table[heir].shared->slave_count,
+                             pty_keepalive_table[slot].guest_slave_count);
+        }
+        pty_shared_mark_seen_locked(pty_keepalive_table[slot].linux_pts_num);
+
+        pty_keepalive_table[heir].guest_slave_count +=
+            pty_keepalive_table[slot].guest_slave_count;
+        pty_keepalive_table[heir].guest_slave_seen = true;
+        pty_keepalive_table[slot].guest_slave_count = 0;
+    } else if (pty_keepalive_table[slot].guest_slave_seen) {
+        /* No count left, but the fact that this pty ever had a slave is what
+         * the no-segment hangup test reads. Hand it on so an alias does not
+         * answer "never had one" for a pty that has already hung up.
+         */
+        int heir = pty_account_row_locked(
+            pty_keepalive_table[slot].linux_pts_num, slot);
+        if (heir >= 0)
+            pty_keepalive_table[heir].guest_slave_seen = true;
+
+        /* Not conditional on the heir mapping the segment: the row that does
+         * may be a third alias, and the hangup test reads the segment rather
+         * than any row's local copy.
+         */
+        pty_shared_mark_seen_locked(pty_keepalive_table[slot].linux_pts_num);
+    }
     pty_shared_detach(pty_keepalive_table[slot].shared,
                       pty_keepalive_table[slot].slave_path,
                       pty_keepalive_table[slot].guest_slave_count);
@@ -497,18 +615,28 @@ static int pty_keepalive_register_locked(int master_host_fd,
             return PTY_REG_FULL;
     }
 
-    /* Reusing a stale-path slot inherits its mapping; hand it back before the
+    /* Reusing a row for a different pty hands its mapping back before the
      * fields below are overwritten, or the reference and any slaves it still
      * counted would be stranded in the segment.
+     *
+     * A row being reused for the minor it already describes keeps that pty's
+     * accounting: the slaves counted on it are still open. A freshly allocated
+     * host pty is the exception -- the minor only comes back once every fd on
+     * it is gone, so a leftover count there is dead state.
      */
-    pty_shared_detach(pty_keepalive_table[slot].shared,
-                      pty_keepalive_table[slot].slave_path,
-                      pty_keepalive_table[slot].guest_slave_count);
-    pty_keepalive_table[slot].shared = NULL;
+    bool same_pty = !fresh_segment &&
+                    pty_keepalive_table[slot].slave_path[0] != '\0' &&
+                    pty_keepalive_table[slot].linux_pts_num == linux_pts_num;
+    if (!same_pty) {
+        pty_shared_detach(pty_keepalive_table[slot].shared,
+                          pty_keepalive_table[slot].slave_path,
+                          pty_keepalive_table[slot].guest_slave_count);
+        pty_keepalive_table[slot].shared = NULL;
+        pty_keepalive_table[slot].guest_slave_count = 0;
+        pty_keepalive_table[slot].guest_slave_seen = false;
+    }
 
     pty_keepalive_table[slot].master_host_fd = master_host_fd;
-    pty_keepalive_table[slot].guest_slave_count = 0;
-    pty_keepalive_table[slot].guest_slave_seen = false;
     if (pty_keepalive_table[slot].slave_host_fd >= 0 &&
         pty_keepalive_table[slot].slave_host_fd != slave_host_fd)
         close(pty_keepalive_table[slot].slave_host_fd);
@@ -528,17 +656,21 @@ static int pty_keepalive_register_locked(int master_host_fd,
      * would split the aliases onto separate counters, so slaves opened through
      * one would be invisible to the other and the hangup would be lost.
      */
-    pty_keepalive_table[slot].shared =
-        pty_shared_attach(pty_keepalive_table[slot].slave_path, fresh_segment);
+    if (!pty_keepalive_table[slot].shared)
+        pty_keepalive_table[slot].shared = pty_shared_attach(
+            pty_keepalive_table[slot].slave_path, fresh_segment);
     return PTY_REG_INSERTED;
 }
 
 /* Lock-acquiring convenience wrapper used by the open-time and fork-restore
  * paths where atomicity with fd_table is not required.
  *
- * Returns 0 on success (including PTY_REG_EXISTS, in which case the caller
- * should close its own redundant slave_host_fd), -1 with errno set on
- * table-full (ENOSPC).
+ * Returns the PTY_REG_* status. It used to report through errno instead, which
+ * the insert path could not do honestly: pty_shared_attach reaches an existing
+ * segment by letting an O_EXCL create fail with EEXIST and reopening, and
+ * nothing after that clears errno. A successful insert during fork restore
+ * therefore returned with errno still EEXIST, and the caller read that as "a
+ * duplicate, drop the slave" and closed an fd the table had already recorded.
  */
 static int pty_keepalive_register(int master_host_fd,
                                   int slave_host_fd,
@@ -552,13 +684,7 @@ static int pty_keepalive_register(int master_host_fd,
         master_host_fd, slave_host_fd, linux_pts_num, slave_path,
         stale_open_once, fresh_segment, NULL);
     pthread_mutex_unlock(&pty_keepalive_lock);
-    if (rc == PTY_REG_FULL) {
-        errno = ENOSPC;
-        return -1;
-    }
-    if (rc == PTY_REG_EXISTS)
-        errno = EEXIST;
-    return 0;
+    return rc;
 }
 
 uint32_t proc_pty_master_pts_num(int master_host_fd)
@@ -771,43 +897,40 @@ static void pty_guest_slave_table_init_once(void)
     done = true;
 }
 
-/* Retire a recorded slave fd and credit its master. Caller holds the lock. */
-static void pty_guest_slave_release_locked(int slave_host_fd)
+/* Retire a recorded slave fd and credit its master. Caller holds the lock.
+ * Returns any retained keepalive slave fd the caller must close.
+ */
+static int pty_guest_slave_release_locked(int slave_host_fd)
 {
     for (int i = 0; i < PTY_GUEST_SLAVE_MAX; i++) {
         if (pty_guest_slave_table[i].slave_host_fd != slave_host_fd)
             continue;
         uint32_t pts_num = pty_guest_slave_table[i].linux_pts_num;
         pty_guest_slave_table[i].slave_host_fd = PTY_KEEPALIVE_FREE;
-        for (int k = 0; k < PTY_KEEPALIVE_MAX; k++) {
-            /* A slot whose master already closed still owns this slave's
-             * accounting: the guest can drop the master and keep the slave as
-             * its stdio, and that slave has to be able to give its count back.
-             * Matching on the retained pts number covers both states; a fully
-             * cleared slot has neither a path nor a mapping and cannot match.
+        int k = pty_account_row_locked(pts_num, -1);
+        if (k >= 0 && pty_keepalive_table[k].guest_slave_count > 0) {
+            pty_keepalive_table[k].guest_slave_count--;
+            pty_diag(
+                "pty: -slave pts=%u hostfd=%d local=%d shared=%d", pts_num,
+                slave_host_fd, pty_keepalive_table[k].guest_slave_count,
+                pty_keepalive_table[k].shared
+                    ? atomic_load(&pty_keepalive_table[k].shared->slave_count) -
+                          1
+                    : -1);
+            if (pty_keepalive_table[k].shared)
+                atomic_fetch_sub(&pty_keepalive_table[k].shared->slave_count,
+                                 1);
+
+            /* A master-less home with nothing left to account for can go now
+             * rather than at process teardown.
              */
-            if (pty_keepalive_table[k].slave_path[0] == '\0')
-                continue;
-            if (pty_keepalive_table[k].linux_pts_num != pts_num)
-                continue;
-            if (pty_keepalive_table[k].guest_slave_count > 0) {
-                pty_keepalive_table[k].guest_slave_count--;
-                pty_diag(
-                    "pty: -slave pts=%u hostfd=%d local=%d shared=%d", pts_num,
-                    slave_host_fd, pty_keepalive_table[k].guest_slave_count,
-                    pty_keepalive_table[k].shared
-                        ? atomic_load(
-                              &pty_keepalive_table[k].shared->slave_count) -
-                              1
-                        : -1);
-                if (pty_keepalive_table[k].shared)
-                    atomic_fetch_sub(
-                        &pty_keepalive_table[k].shared->slave_count, 1);
-            }
-            break;
+            if (pty_keepalive_table[k].guest_slave_count == 0 &&
+                pty_keepalive_table[k].master_host_fd == PTY_KEEPALIVE_FREE)
+                return pty_keepalive_clear_slot_locked(k);
         }
         break;
     }
+    return -1;
 }
 
 /* Put a slave fd on this process's books and credit its master. Caller holds
@@ -828,19 +951,16 @@ static void pty_guest_slave_record_locked(int slave_host_fd,
             continue;
         pty_guest_slave_table[i].slave_host_fd = slave_host_fd;
         pty_guest_slave_table[i].linux_pts_num = linux_pts_num;
-        for (int k = 0; k < PTY_KEEPALIVE_MAX; k++) {
-            /* Match the rule the release path uses: a slot whose master has
-             * already closed still owns this pty's accounting. A fork-restored
-             * child routinely drops its copy of the master and only then opens
-             * /dev/pts/N, and requiring a live master here left that slave
-             * credited to nobody -- so the parent, still holding the master,
-             * never learned the shell had one. A fully cleared slot keeps
-             * neither a path nor a mapping and cannot match.
-             */
-            if (pty_keepalive_table[k].slave_path[0] == '\0')
-                continue;
-            if (pty_keepalive_table[k].linux_pts_num != linux_pts_num)
-                continue;
+
+        /* The accounting home, not merely the first row for this pty. A slot
+         * whose master has already closed still owns the count: a fork-restored
+         * child routinely drops its copy of the master and only then opens
+         * /dev/pts/N, and requiring a live master here left that slave credited
+         * to nobody, so the parent still holding the master never learned the
+         * shell had one.
+         */
+        int k = pty_account_row_locked(linux_pts_num, -1);
+        if (k >= 0) {
             pty_keepalive_table[k].guest_slave_count++;
             pty_keepalive_table[k].guest_slave_seen = true;
             pty_diag(
@@ -858,7 +978,6 @@ static void pty_guest_slave_record_locked(int slave_host_fd,
                         &pty_keepalive_table[k].shared->slave_count, 1);
                 atomic_store(&pty_keepalive_table[k].shared->seen, 1);
             }
-            break;
         }
         break;
     }
@@ -878,9 +997,11 @@ static void pty_note_guest_slave(int slave_host_fd,
      * the host fd without passing through the close hooks; retiring the stale
      * slot on reuse keeps that from inflating an unrelated pty's count.
      */
-    pty_guest_slave_release_locked(slave_host_fd);
+    int slave = pty_guest_slave_release_locked(slave_host_fd);
     pty_guest_slave_record_locked(slave_host_fd, linux_pts_num, bump_shared);
     pthread_mutex_unlock(&pty_keepalive_lock);
+    if (slave >= 0)
+        close(slave);
 }
 
 void proc_pty_note_guest_slave(int slave_host_fd, uint32_t linux_pts_num)
@@ -910,16 +1031,15 @@ void proc_pty_fork_parent_note_inherited(void)
         if (pty_guest_slave_table[i].slave_host_fd == PTY_KEEPALIVE_FREE)
             continue;
         uint32_t pts_num = pty_guest_slave_table[i].linux_pts_num;
-        for (int k = 0; k < PTY_KEEPALIVE_MAX; k++) {
-            if (pty_keepalive_table[k].master_host_fd == PTY_KEEPALIVE_FREE)
-                continue;
-            if (pty_keepalive_table[k].linux_pts_num != pts_num)
-                continue;
-            if (pty_keepalive_table[k].shared)
-                atomic_fetch_add(&pty_keepalive_table[k].shared->slave_count,
-                                 1);
-            break;
-        }
+
+        /* The accounting home, not the first row with a live master. Picking
+         * differently here would credit the child's inherited slave to one row
+         * while pty_guest_slave_release_locked takes it back off another, and
+         * the two rows need not share a segment.
+         */
+        int k = pty_account_row_locked(pts_num, -1);
+        if (k >= 0 && pty_keepalive_table[k].shared)
+            atomic_fetch_add(&pty_keepalive_table[k].shared->slave_count, 1);
     }
     pthread_mutex_unlock(&pty_keepalive_lock);
 }
@@ -947,8 +1067,10 @@ void proc_pty_dup_guest_slave_locked(int src_slave_host_fd,
      * original left the count at zero with three references still open -- the
      * master then reported a hangup with the shell still running.
      */
-    pty_guest_slave_release_locked(dst_slave_host_fd);
+    int slave = pty_guest_slave_release_locked(dst_slave_host_fd);
     pty_guest_slave_record_locked(dst_slave_host_fd, pts_num, true);
+    if (slave >= 0)
+        close(slave);
 }
 
 void proc_pty_release_process_slaves(void)
@@ -1066,8 +1188,16 @@ void proc_pty_slave_fd_closed(int host_fd)
         return;
     pty_keepalive_lock_acquire();
     pty_guest_slave_table_init_once();
-    pty_guest_slave_release_locked(host_fd);
+    int slave = pty_guest_slave_release_locked(host_fd);
     pthread_mutex_unlock(&pty_keepalive_lock);
+    if (slave >= 0)
+        close(slave);
+}
+
+void proc_pty_forget_host_fd(int host_fd)
+{
+    proc_pty_close_keepalive(host_fd);
+    proc_pty_slave_fd_closed(host_fd);
 }
 
 /* Whether this slot's pty has no guest slave left. Reads the shared segment
@@ -1079,12 +1209,21 @@ static bool pty_slot_hung_up_locked(int slot)
 {
     pty_shared_t *sh = pty_keepalive_table[slot].shared;
     bool hung_up;
-    if (sh)
+    if (sh) {
         hung_up =
             atomic_load(&sh->seen) != 0 && atomic_load(&sh->slave_count) <= 0;
-    else
-        hung_up = pty_keepalive_table[slot].guest_slave_seen &&
-                  pty_keepalive_table[slot].guest_slave_count == 0;
+    } else {
+        /* No segment, so the counters are this process's own -- and they live
+         * on the pty's accounting home, which for an aliased master is not this
+         * row. Reading them here is what the shared case gets for free.
+         */
+        int home =
+            pty_account_row_locked(pty_keepalive_table[slot].linux_pts_num, -1);
+        if (home < 0)
+            home = slot;
+        hung_up = pty_keepalive_table[home].guest_slave_seen &&
+                  pty_keepalive_table[home].guest_slave_count == 0;
+    }
 
     /* Only on the way to reporting one: the negative answer is the steady state
      * and every poll would log it. This subsystem spans processes, so without a
@@ -1171,10 +1310,14 @@ int pty_open_slave(uint32_t linux_pts_num, int linux_flags)
         return -1;
     }
 
-    /* Stale fork-child entries are one-shot. The retained slave fd pins the
-     * macOS tty while we translate the close-before-open sequence, preventing
-     * the cached path from resolving to a reused unrelated minor. Regardless of
-     * open success, consume the stale mapping before returning.
+    /* The retained slave fd pins the macOS tty while this translates the
+     * close-before-open sequence, so the cached path cannot resolve to a reused
+     * unrelated minor. The mapping is consumed only when the open failed:
+     * keeping it while the pin is still doing its job is what lets the child
+     * open its slave more than once, and stat it, and see it in /dev/pts.
+     * Retiring on success made the entry one-shot, so a second open, a stat of
+     * the child's own pts path, or a readdir after the first open answered
+     * ENOENT while the child still held a live slave on that pty.
      */
     size_t len = strlen(pty_keepalive_table[stale_hit].slave_path);
     if (len >= sizeof(host_path)) {
@@ -1188,7 +1331,7 @@ int pty_open_slave(uint32_t linux_pts_num, int linux_flags)
     memcpy(host_path, pty_keepalive_table[stale_hit].slave_path, len + 1);
     fd = open(host_path, oflags);
     int saved = errno;
-    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+    for (int i = 0; fd < 0 && i < PTY_KEEPALIVE_MAX; i++) {
         if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE)
             continue;
         if (!pty_keepalive_table[i].stale_open_once)
@@ -1222,9 +1365,9 @@ int pty_open_pts_dir(int linux_flags)
 
     pty_keepalive_lock_acquire();
 
-    /* Enumerate live masters and fork-child one-shot stale entries. The stale
-     * entries retain a slave fd until the first open attempt consumes them, so
-     * they cannot name a reused unrelated tty while they appear in readdir.
+    /* Enumerate live masters and fork-child stale entries. A stale entry holds
+     * its slave fd for as long as it is listed here, so it cannot name a reused
+     * unrelated tty while it appears in readdir.
      */
     for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
         if (pty_keepalive_table[i].slave_path[0] == '\0')
@@ -1234,9 +1377,9 @@ int pty_open_pts_dir(int linux_flags)
              pty_keepalive_table[i].slave_host_fd < 0))
             continue;
 
-        /* The recycle/reuse-by-pts_num invariant in
-         * pty_keepalive_register_locked keeps at most one entry per minor, so
-         * no de-duplication pass is needed here.
+        /* Aliased masters give one minor several rows, so the same number can
+         * come up more than once. A duplicate only re-creates the placeholder
+         * file it already made, which readdir reports once either way.
          */
         pts_nums[pts_count++] = pty_keepalive_table[i].linux_pts_num;
     }
@@ -1324,14 +1467,14 @@ void proc_pty_close_keepalive(int master_host_fd)
     int slot = pty_keepalive_find_master_locked(master_host_fd);
     if (slot >= 0) {
         if (pty_keepalive_table[slot].stale_open_once) {
-            /* Fork-restored child entry: retain the slave fd and path for one
-             * /dev/pts/N open after close(master). pty_open_slave consumes and
-             * closes it on the first translated open attempt. Only the master
-             * goes away here. Any slave fd this process still holds stays open
-             * and keeps counting: closing the master does not close the slaves,
-             * and a terminal's child routinely drops its copy of the master
-             * while holding the slave as its stdio. Retiring the count here
-             * would report a hangup with the shell still running. The slaves
+            /* Fork-restored child entry: retain the slave fd and path so
+             * /dev/pts/N stays openable after close(master). pty_open_slave
+             * gives them up only once an open has failed. Only the master goes
+             * away here. Any slave fd this process still holds stays open and
+             * keeps counting: closing the master does not close the slaves, and
+             * a terminal's child routinely drops its copy of the master while
+             * holding the slave as its stdio. Retiring the count here would
+             * report a hangup with the shell still running. The slaves
              * decrement themselves as they close.
              */
             pty_keepalive_table[slot].master_host_fd = PTY_KEEPALIVE_FREE;
@@ -1432,15 +1575,15 @@ void proc_pty_restore_keepalive(int master_host_fd,
     /* Trust the parent's linux_pts_num verbatim instead of re-parsing
      * slave_path. The wire-format string is bounded to PTY_SLAVE_PATH_MAX - 1
      * bytes; if a future macOS canonical form ever exceeded that, the parent
-     * would have truncated and reparsing here would yield the wrong number. On
-     * EEXIST the child's fd_table-restore path replayed master_host_fd over a
-     * prior recv-keepalive entry; drop the redundant slave so it does not leak.
+     * would have truncated and reparsing here would yield the wrong number.
+     *
+     * Anything but PTY_REG_INSERTED means the child's fd_table-restore path
+     * replayed master_host_fd over a prior recv-keepalive entry, so the slave
+     * handed in here is redundant; drop it rather than leak it.
      */
-    errno = 0;
-    if (pty_keepalive_register_recycled(master_host_fd, slave_host_fd,
-                                        linux_pts_num, slave_path, true,
-                                        /*fresh_segment=*/false) < 0 ||
-        errno == EEXIST)
+    if (pty_keepalive_register_recycled(
+            master_host_fd, slave_host_fd, linux_pts_num, slave_path, true,
+            /*fresh_segment=*/false) != PTY_REG_INSERTED)
         goto drop;
     return;
 
@@ -1494,14 +1637,14 @@ int pty_open_master(int linux_flags)
         close_keep_errno(master);
         return -1;
     }
-    errno = 0;
 
     /* The host just allocated this pty, so nothing live can be using a segment
      * under its name; any leftover is state a process died holding.
      */
-    if (pty_keepalive_register_recycled(master, slave, linux_pts_num,
-                                        slave_path, false,
-                                        /*fresh_segment=*/true) < 0) {
+    int reg = pty_keepalive_register_recycled(master, slave, linux_pts_num,
+                                              slave_path, false,
+                                              /*fresh_segment=*/true);
+    if (reg == PTY_REG_FULL) {
         close(slave);
         close(master);
         errno = EMFILE;
@@ -1513,7 +1656,7 @@ int pty_open_master(int linux_flags)
      * run proc_pty_close_keepalive). Drop the redundant slave so it does not
      * leak.
      */
-    if (errno == EEXIST)
+    if (reg == PTY_REG_EXISTS)
         close(slave);
     return master;
 }

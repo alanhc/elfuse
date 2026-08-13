@@ -866,8 +866,13 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
     if (proc_acquire_cwd_view(&view) < 0)
         return 0;
 
+    /* /dev/pts joins /proc here: both are served from host directories whose
+     * contents are not what the guest names, so a relative path measured
+     * against one has to be rebuilt as a guest path and re-offered to the
+     * intercepts. The component walk below is base-agnostic.
+     */
     int rc = 0;
-    if (!strncmp(view.path, "/proc", 5)) {
+    if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8)) {
         size_t marks[PROC_PATH_COMPONENTS_MAX];
         size_t depth;
         if (proc_seed_absolute_path(view.path, out, outsz, marks,

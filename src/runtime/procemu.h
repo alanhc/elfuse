@@ -122,6 +122,16 @@ void proc_pty_note_guest_slave(int slave_host_fd, uint32_t linux_pts_num);
  */
 void proc_pty_slave_fd_closed(int host_fd);
 
+/* Drop a host fd from both pty side tables, master and slave.
+ *
+ * A host fd that goes away without becoming a guest fd has to leave both, and
+ * which of the two it is registered in is not known at the call site. Calling
+ * only one is silent: a leaked keepalive slave, or a phantom slave count that
+ * suppresses the master's hangup for good. Every path that closes a host fd
+ * outside fd_cleanup_entry wants this rather than either half.
+ */
+void proc_pty_forget_host_fd(int host_fd);
+
 /* Count the pty slave fds a forked child inherited from its parent.
  *
  * The host-fd-to-pty mapping is per-process and does not cross the fork, so
