@@ -74,8 +74,14 @@ check accept "--user UINT32_MAX" '' --user 4294967295
 # lands in /var/folders, outside is_sysroot_backed_temp_path()'s /tmp prefix,
 # so proc_resolve_sysroot_path's host fallback is reachable here.
 scratch=$(mktemp -d)
+# create_private_dir() rejects a group or other bit on the /dev/shm backing
+# root, and that failure surfaces as a resolve error, not the refusal the last
+# check measures. The leaf itself never has to exist: path_translate_at() sets
+# is_dev_shm from the guest prefix alone.
+shm_root="/tmp/elfuse-shm-$(id -u)"
 trap 'rm -rf "$scratch"' EXIT
-mkdir -p "$scratch/sysroot/inroot" "$scratch/hostonly"
+mkdir -p "$scratch/sysroot/inroot" "$scratch/hostonly" "$shm_root"
+chmod 700 "$shm_root"
 
 check reject "--workdir absent in the sysroot, present on the host" \
     "does not resolve inside the sysroot" \
@@ -87,6 +93,10 @@ check accept "--workdir present in the sysroot" '' \
 # Pins elfuse_launch's "--sysroot /" carve-out: a bare separator must not
 # reject every workdir under it.
 check accept "--workdir under a root sysroot" '' --sysroot / --workdir /var/tmp
+
+# Refusal rationale in elfuse_launch; see dev_shm_resolve_path().
+check reject "--workdir under /dev/shm" "not supported" \
+    --workdir /dev/shm/launch-flags-wd
 
 report_summary
 # shellcheck disable=SC2154  # fail is incremented in tests/lib/report.sh
