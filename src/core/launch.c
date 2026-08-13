@@ -29,8 +29,8 @@
 #include "runtime/futex.h"   /* futex_interrupt_request */
 #include "runtime/procemu.h" /* proc_pty_release_process_slaves */
 #include "runtime/thread.h"
-#include "syscall/poll.h" /* wakeup_pipe_signal */
 #include "syscall/proc.h"
+#include "syscall/wakeup-pipe.h"
 
 #include "debug/gdbstub.h"
 #include "debug/log.h"

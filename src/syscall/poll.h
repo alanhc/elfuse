@@ -61,13 +61,3 @@ int epoll_dup_fd(int src_fd,
                  int fixed_guest_fd,
                  bool fixed_slot,
                  int linux_flags);
-
-/* Global wakeup pipe for interrupting blocking poll/select/epoll. When
- * exit_group, futex_interrupt, or a guest signal is requested, write to
- * wakeup_pipe_wr to unblock any thread stuck in a host-side poll/select/kevent
- * with infinite timeout.
- */
-void wakeup_pipe_init(void);
-void wakeup_pipe_signal(void);
-int wakeup_pipe_read_fd(void);
-void wakeup_pipe_drain(void);

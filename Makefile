@@ -50,6 +50,7 @@ SRCS := \
     syscall/fs-xattr.c \
     syscall/io.c \
     syscall/poll.c \
+    syscall/wakeup-pipe.c \
     syscall/fd.c \
     syscall/asyncio.c \
     syscall/inotify.c \
@@ -217,6 +218,14 @@ $(BUILD_DIR)/probe-volume-naming: $(BUILD_DIR)/probe-volume-naming.o \
 # the test links exactly the code under test and nothing else.
 $(BUILD_DIR)/test-casefold-host: $(BUILD_DIR)/test-casefold-host.o \
 		$(BUILD_DIR)/syscall/casefold.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the wakeup pipe concurrency host test (native macOS binary)
+# wakeup-pipe.o is a leaf translation unit, so the test links the code under
+# test and nothing else.
+$(BUILD_DIR)/test-wakeup-pipe-host: $(BUILD_DIR)/test-wakeup-pipe-host.o \
+		$(BUILD_DIR)/syscall/wakeup-pipe.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

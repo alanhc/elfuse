@@ -33,53 +33,7 @@
 #include "syscall/proc.h" /* proc_exit_group_requested */
 #include "syscall/signal.h"
 #include "syscall/time.h" /* linux_timespec_valid */
-
-/* Global wakeup pipe: write end signals exit_group/futex_interrupt/guest
- * signals to threads blocked in host poll/select/kevent. The read end is added
- * to every blocking wait with infinite timeout.
- */
-static int wakeup_pipe_rd = -1, wakeup_pipe_wr = -1;
-
-void wakeup_pipe_init(void)
-{
-    /* Idempotent: syscall_init is reached twice on some paths (bootstrap and
-     * the fork-child's fork_ipc_recv_fd_table), and re-running the pipe(2) here
-     * would overwrite the fds and leak the first pair.
-     */
-    if (wakeup_pipe_rd >= 0)
-        return;
-
-    int pipefd[2];
-    if (pipe(pipefd) == 0) {
-        fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
-        fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
-        wakeup_pipe_rd = pipefd[0];
-        wakeup_pipe_wr = pipefd[1];
-    }
-}
-
-void wakeup_pipe_signal(void)
-{
-    if (wakeup_pipe_wr >= 0) {
-        uint8_t byte = 1;
-        write(wakeup_pipe_wr, &byte, 1);
-    }
-}
-
-int wakeup_pipe_read_fd(void)
-{
-    return wakeup_pipe_rd;
-}
-
-void wakeup_pipe_drain(void)
-{
-    if (wakeup_pipe_rd < 0)
-        return;
-
-    uint8_t drain;
-    while (read(wakeup_pipe_rd, &drain, 1) > 0)
-        ;
-}
+#include "syscall/wakeup-pipe.h"
 
 /* polling/select. */
 
@@ -220,8 +174,9 @@ int64_t sys_ppoll(guest_t *g,
      * they're not in hv_vcpu_run().
      */
     bool added_wakeup = false;
-    if (timeout_ms < 0 && wakeup_pipe_rd >= 0 && nfds < 256) {
-        host_fds[nfds].fd = wakeup_pipe_rd;
+    int wake_fd = wakeup_pipe_read_fd();
+    if (timeout_ms < 0 && wake_fd >= 0 && nfds < 256) {
+        host_fds[nfds].fd = wake_fd;
         host_fds[nfds].events = POLLIN;
         host_fds[nfds].revents = 0;
         added_wakeup = true;
@@ -515,11 +470,15 @@ int64_t sys_pselect6(guest_t *g,
      * requests can interrupt.
      */
     bool added_wakeup = false;
-    if (!has_timeout && wakeup_pipe_rd >= 0) {
-        if (RANGE_CHECK(wakeup_pipe_rd, 0, FD_SETSIZE)) {
-            FD_SET(wakeup_pipe_rd, &read_set);
-            if (wakeup_pipe_rd > max_host_fd)
-                max_host_fd = wakeup_pipe_rd;
+    /* One read of the pipe fd for the whole call: the FD_SET here and the
+     * FD_ISSET/FD_CLR after the wait must name the same descriptor.
+     */
+    int wake_fd = wakeup_pipe_read_fd();
+    if (!has_timeout && wake_fd >= 0) {
+        if (RANGE_CHECK(wake_fd, 0, FD_SETSIZE)) {
+            FD_SET(wake_fd, &read_set);
+            if (wake_fd > max_host_fd)
+                max_host_fd = wake_fd;
         }
         added_wakeup = true;
         read_setp = &read_set;
@@ -548,7 +507,7 @@ int64_t sys_pselect6(guest_t *g,
             break;
         }
     }
-    if (added_wakeup && !RANGE_CHECK(wakeup_pipe_rd, 0, FD_SETSIZE))
+    if (added_wakeup && !RANGE_CHECK(wake_fd, 0, FD_SETSIZE))
         use_poll_fallback = true;
 
     int ret;
@@ -587,7 +546,7 @@ pselect_retry:
                 poll_fds[i].revents = 0;
             }
             if (added_wakeup) {
-                poll_fds[req_count].fd = wakeup_pipe_rd;
+                poll_fds[req_count].fd = wake_fd;
                 poll_fds[req_count].events = POLLIN;
                 poll_fds[req_count].revents = 0;
             }
@@ -629,12 +588,11 @@ pselect_retry:
      */
     bool wakeup_fired =
         added_wakeup &&
-        (use_poll_fallback ? poll_wakeup_fired
-                           : FD_ISSET(wakeup_pipe_rd, &read_set));
+        (use_poll_fallback ? poll_wakeup_fired : FD_ISSET(wake_fd, &read_set));
     if (wakeup_fired) {
         wakeup_pipe_drain();
         if (!use_poll_fallback)
-            FD_CLR(wakeup_pipe_rd, &read_set);
+            FD_CLR(wake_fd, &read_set);
         if (ret > 0)
             ret--;
         if (ret == 0 && !has_timeout)

@@ -36,11 +36,11 @@
 
 #include "syscall/linux-wire.h"
 #include "syscall/fd.h"   /* signalfd_notify */
-#include "syscall/poll.h" /* wakeup_pipe_signal */
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
 #include "syscall/sigframe-math.h"
 #include "syscall/signal.h"
 #include "syscall/time.h" /* linux_timespec_valid, linux_timespec_to_ns_sat */
+#include "syscall/wakeup-pipe.h"
 
 /* sigaltstack rejects a stack below LINUX_MINSIGSTKSZ, and that is the only
  * thing keeping a frame from being placed below the altstack base: the
