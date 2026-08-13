@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * elfuse_launch is the single entry point for "run a guest binary in a
- * fresh HVF VM until it exits". main() is its only in-tree caller; keeping
- * bring-up behind one struct is what lets another front end (the planned
- * OCI run helper) reuse this path instead of growing a second bring-up.
+ * fresh HVF VM until it exits". main() is its only caller; keeping bring-up
+ * behind one struct is what lets a front end select the guest identity and
+ * cwd through the CLI instead of growing a second bring-up.
  *
  * The function owns the guest_t, the vCPU, the GDB stub, the run loop, the
  * diagnostic dumps, and guest teardown; it does NOT own the elf_path /
@@ -33,9 +33,9 @@ typedef struct {
 
     /* elf_path is a FUSE-materialized temp to unlink once
      * guest_bootstrap_prepare has loaded it (kept for Rosetta guests, which
-     * reopen the path). The caller owns the unlink on any pre-prepare
-     * failure; elfuse_launch owns it from the prepare call onward,
-     * including a prepare that fails.
+     * reopen the path). Ownership of the unlink transfers to elfuse_launch
+     * at the call: every failure path inside it, refusals before the
+     * prepare call included, unlinks a temp elf_path.
      */
     bool elf_host_temp;
 
@@ -51,6 +51,18 @@ typedef struct {
      */
     int guest_argc;
     const char **guest_argv;
+
+    /* When true, uid/gid are staged before bring-up so the auxv AT_UID/AT_GID
+     * snapshot and getuid()/getgid() agree. When false the guest runs under
+     * GUEST_UID/GUEST_GID (0 under fakeroot), never the host identity.
+     */
+    bool has_creds;
+    uint32_t uid, gid;
+
+    /* Guest-absolute initial working directory, resolved under sysroot.
+     * NULL inherits the host cwd.
+     */
+    const char *cwd_guest;
 
     /* GDB Remote Serial Protocol port (0 disables the stub) and whether
      * to halt before the first guest instruction.
