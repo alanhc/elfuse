@@ -1069,13 +1069,16 @@ int64_t sys_recvmmsg(guest_t *g,
                 return -LINUX_EINVAL;
             }
 
-            /* Same conversion as ppoll, pselect6 and epoll_pwait2. Truncating
-             * turned a sub-millisecond timeout into poll(0) and an immediate
-             * EAGAIN, and the old tv_sec ceiling turned a large finite timeout
-             * into an infinite wait. The EINVAL half is the guard above.
+            /* Same conversion as ppoll and pselect6. Truncating turned a
+             * sub-millisecond timeout into poll(0) and an immediate EAGAIN.
+             *
+             * Deliberately the finite conversion, unlike epoll_pwait2: the
+             * wait below is one poll with nothing to re-arm it, so a -1 here
+             * would block forever with no way back out, on a call the guest
+             * asked to bound. timespec_to_poll_ms saturates instead, which is
+             * still far past any real timeout but is reached.
              */
-            int timeout_ms =
-                syscall_timeout_ms_or_forever(ts.tv_sec, ts.tv_nsec);
+            int timeout_ms = timespec_to_poll_ms(ts.tv_sec, ts.tv_nsec);
             struct pollfd pfd = {.fd = host_ref.fd, .events = POLLIN};
             int pr = poll(&pfd, 1, timeout_ms);
             host_fd_ref_close(&host_ref);

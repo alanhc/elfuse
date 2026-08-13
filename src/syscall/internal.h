@@ -467,12 +467,8 @@ static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
     return 0;
 }
 
-/* A guest timeout above this many seconds means "wait indefinitely", and the
- * wait paths spell indefinite as timeout_ms = -1. The comparison is strict, so
- * this exact value is still converted; the cutoff carries no meaning of its own
- * beyond being far past any real timeout, and one second either side of it is
- * equally unreachable. Both callers spelled it strictly before this helper
- * existed, and moving the boundary would change what they return.
+/* A guest timeout at or above this many seconds means "wait indefinitely", and
+ * the wait path spells indefinite as timeout_ms = -1.
  *
  * That -1 is load-bearing, not a rounding convenience. sys_epoll_pwait reads
  * timeout_ms < 0 as has_timeout = false, which selects the 200 ms re-arm loop
@@ -489,12 +485,16 @@ static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
 
 /* Guest timespec to a poll(2)/kevent millisecond timeout, mapping an
  * effectively-infinite request onto the -1 that selects the interruptible path.
- * Two callers need exactly this (epoll_pwait2 and recvmmsg); ppoll and pselect6
- * do not, because neither ever spelled a timespec as indefinite.
+ *
+ * epoll_pwait2 is the only caller, and the mapping is only safe there. ppoll
+ * and pselect6 never spelled a timespec as indefinite, and recvmmsg waits in a
+ * single poll with nothing to re-arm it, so -1 would strand it rather than
+ * making it interruptible. A caller without a re-arm loop wants the saturating
+ * conversion instead.
  */
 static inline int syscall_timeout_ms_or_forever(int64_t sec, int64_t nsec)
 {
-    if (sec > SYSCALL_TIMEOUT_FOREVER_SEC)
+    if (sec >= SYSCALL_TIMEOUT_FOREVER_SEC)
         return -1;
     return timespec_to_poll_ms(sec, nsec);
 }
