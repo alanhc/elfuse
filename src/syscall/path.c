@@ -23,6 +23,7 @@
 #include "syscall/fuse.h"
 #include "proved/pathdepth.h"
 
+#include "syscall/internal.h" /* fd_to_host_dup */
 #include "syscall/path.h"
 #include "syscall/proc.h"
 
@@ -200,6 +201,146 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
                                                    char *host_out,
                                                    size_t host_outsz);
 
+int path_parse_proc_name(const char *name)
+{
+    if (!name || !*name)
+        return -1;
+    /* Linux rejects a leading zero on any name longer than one character, so
+     * "0" names descriptor 0 but "00" and "03" name nothing.
+     */
+    if (name[0] == '0' && name[1] != '\0')
+        return -1;
+
+    long n = 0;
+    for (const char *p = name; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return -1;
+        n = n * 10 + (*p - '0');
+        if (n > INT_MAX)
+            return -1;
+    }
+    return (int) n;
+}
+
+/* Parse an absolute fd magic link to the guest descriptor it names. This
+ * accepts
+ * "/proc/self/fd/<n>", the equivalent spelling with this process's own pid, and
+ * the /dev aliases Linux exposes as symlinks to procfs.
+ *
+ * Linux makes that a magic symlink, so a path-based syscall against it acts on
+ * the file the descriptor holds. It is the standard way to reach a file through
+ * an fd when no f*() variant applies -- systemd's fchmod_opath() chmods
+ * /proc/self/fd/<n> precisely because fchmod() rejects O_PATH descriptors, and
+ * reads ENOENT there as "this fd is not valid" (reporting EBADF) rather than as
+ * a missing file.
+ *
+ * Returns the guest descriptor, or -1 when the path is not that shape.
+ */
+static int parse_fd_magiclink(const char *path)
+{
+    const char *rest = NULL;
+
+    if (strncmp(path, "/proc/", 6) == 0) {
+        rest = path + 6;
+        if (!strncmp(rest, "self/", 5)) {
+            rest += 5;
+        } else {
+            /* The pid component gets the same strict rules as the fd leaf:
+             * Linux resolves /proc/<pid> through name_to_int as well, so
+             * "/proc/+1234/fd/3" names nothing there even when 1234 is this
+             * process. A component too long for the buffer is not a pid either.
+             */
+            const char *slash = strchr(rest, '/');
+            if (!slash)
+                return -1;
+            char pid_name[16];
+            if (path_component_copy(pid_name, sizeof(pid_name), rest,
+                                    (size_t) (slash - rest)) < 0)
+                return -1;
+            if (path_parse_proc_name(pid_name) != (int) proc_get_pid())
+                return -1;
+            rest = slash + 1;
+        }
+
+        if (strncmp(rest, "fd/", 3) != 0)
+            return -1;
+        rest += 3;
+    } else if (strncmp(path, "/dev/fd/", 8) == 0) {
+        rest = path + 8;
+    } else if (!strcmp(path, "/dev/stdin")) {
+        rest = "0";
+    } else if (!strcmp(path, "/dev/stdout")) {
+        rest = "1";
+    } else if (!strcmp(path, "/dev/stderr")) {
+        rest = "2";
+    } else {
+        return -1;
+    }
+
+    /* Only a bare descriptor number names the file itself. Anything trailing
+     * ("/proc/self/fd/3/x" or "/dev/fd/3/x") walks through it, which the host
+     * path cannot express here, and a leaf Linux would not accept as a procfs
+     * fd name is not this shape at all.
+     */
+    return path_parse_proc_name(rest);
+}
+
+int path_fd_magiclink_dup(const char *path)
+{
+    int fd = parse_fd_magiclink(path);
+    if (fd < 0)
+        return -1;
+
+    /* Only descriptors whose host fd is the object itself. A FUSE or synthetic
+     * fd is served by an emulation layer rather than by the host file behind
+     * it, so an f*() call would act on the wrong thing; those keep the path
+     * form and the intercepts that go with it.
+     */
+    fd_entry_t snap;
+    if (!fd_snapshot(fd, &snap))
+        return -1;
+    if (snap.type != FD_REGULAR && snap.type != FD_DIR &&
+        snap.type != FD_PATH && snap.type != FD_STDIO)
+        return -1;
+
+    /* dup under fd_lock: a sibling vCPU closing this slot would otherwise
+     * leave the number free for the next open to claim.
+     */
+    return fd_to_host_dup(fd);
+}
+
+/* Resolve an absolute fd magic link to the host path its descriptor is open on.
+ *
+ * Returns 1 and fills out on success, 0 when the path is not that shape or the
+ * descriptor has no host path (a pipe, socket, or anonymous fd, where F_GETPATH
+ * fails and the caller's own /proc intercepts remain the right answer).
+ *
+ * Callers that can act on a descriptor should prefer path_fd_magiclink_dup():
+ * a pathname taken here and used later is a TOCTOU, since a rename or an
+ * unlink-and-recreate in between leaves it naming a different inode, where
+ * Linux resolves the link inside the syscall and cannot be redirected.
+ */
+static int resolve_fd_magiclink_host_path(const char *path,
+                                          char *out,
+                                          size_t outsz)
+{
+    int host_fd = path_fd_magiclink_dup(path);
+    if (host_fd < 0)
+        return 0;
+
+    char resolved[MAXPATHLEN];
+    int rc = fcntl(host_fd, F_GETPATH, resolved);
+    close(host_fd);
+    if (rc < 0)
+        return 0;
+
+    size_t len = strlen(resolved);
+    if (len >= outsz)
+        return 0;
+    memcpy(out, resolved, len + 1);
+    return 1;
+}
+
 int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,
@@ -262,6 +403,39 @@ int path_translate_at(guest_fd_t dirfd,
             return -1;
         tx->host_path = tx->host_buf;
         tx->is_dev_shm = true;
+        return 0;
+    }
+
+    /* Only host_path moves; guest_path and intercept_path keep the /proc
+     * spelling. open, stat and readlink never reach host_path for these paths:
+     * proc_intercept_open dups the descriptor, proc_intercept_stat fstats it,
+     * and proc_intercept_readlink reports its path, and none of the three fall
+     * through to the host on a fd magic link that names an open slot (a
+     * closed one fails as EBADF rather than falling through). What this changes
+     * is every other follow-style operation -- chmod, chown, utimensat,
+     * truncate, access -- which now acts on the file the descriptor holds, the
+     * way Linux does when it resolves the magic link.
+     *
+     * Returning before sysroot resolution is not a containment claim about the
+     * path: F_GETPATH reports where the descriptor's file actually lives, which
+     * is regularly outside the sysroot -- an emulated character device, a
+     * /dev/shm backing file, inherited stdio. Re-resolving one of those as a
+     * guest path would be wrong, since it is already a host path. Nothing is
+     * widened by it either: the guest holds the descriptor, so this reaches
+     * only what it could already reach through it.
+     *
+     * Follow-style only. Linux resolves the link for an operation that follows
+     * the final component and acts on the link itself otherwise, so a no-follow
+     * or create-style caller -- unlinkat, renameat, chmod with
+     * AT_SYMLINK_NOFOLLOW -- must not be handed the descriptor's file, or
+     * unlinkat("/proc/self/fd/<n>") would delete it instead of failing on the
+     * /proc entry.
+     */
+    if (tx->guest_path[0] == '/' &&
+        !(flags & (PATH_TR_NOFOLLOW | PATH_TR_CREATE)) &&
+        resolve_fd_magiclink_host_path(tx->guest_path, tx->host_buf,
+                                       sizeof(tx->host_buf))) {
+        tx->host_path = tx->host_buf;
         return 0;
     }
 

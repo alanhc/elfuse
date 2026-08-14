@@ -2734,6 +2734,19 @@ int64_t sys_fchmodat(guest_t *g,
         return 0;
     }
 
+    /* An fd magic link names the descriptor's file, and Linux resolves it
+     * inside the syscall. Act on the descriptor so nothing can redirect the
+     * chmod between resolution and use; see path_fd_magiclink_dup().
+     */
+    if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW)) {
+        int magic_fd = path_fd_magiclink_dup(path);
+        if (magic_fd >= 0) {
+            int mrc = fchmod(magic_fd, mode);
+            close_keep_errno(magic_fd);
+            return mrc < 0 ? linux_errno() : 0;
+        }
+    }
+
     path_translation_t tx;
     if (path_translate_at(dirfd, path,
                           path_tr_nofollow(flags & LINUX_AT_SYMLINK_NOFOLLOW),
@@ -2898,6 +2911,24 @@ int64_t sys_fchownat(guest_t *g,
         return out;
     }
 
+    /* Same reasoning as the fd magic link branch in sys_fchmodat: act on the
+     * descriptor, not on a pathname resolved from it a moment earlier.
+     */
+    if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW)) {
+        int magic_fd = path_fd_magiclink_dup(path);
+        if (magic_fd >= 0) {
+            int host_rc = fchown(magic_fd, owner, group);
+            int saved_errno = errno;
+            struct stat host_st;
+            const struct stat *st_ptr =
+                fstat(magic_fd, &host_st) == 0 ? &host_st : NULL;
+            errno = saved_errno;
+            int64_t out = chown_result(host_rc, st_ptr, owner, group);
+            close_keep_errno(magic_fd);
+            return out;
+        }
+    }
+
     path_translation_t tx;
     if (path_translate_at(dirfd, path,
                           path_tr_nofollow(flags & LINUX_AT_SYMLINK_NOFOLLOW),
@@ -3039,6 +3070,19 @@ int64_t sys_utimensat(guest_t *g,
         if (rc < 0) {
             host_fd_ref_close(&dir_ref);
             return rc;
+        }
+
+        /* Same reasoning as the fd magic link branch in sys_fchmodat: act on
+         * the descriptor, not on a pathname resolved from it a moment earlier.
+         */
+        if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW)) {
+            int magic_fd = path_fd_magiclink_dup(path);
+            if (magic_fd >= 0) {
+                int mrc = futimens(magic_fd, times_gva ? ts : NULL);
+                close_keep_errno(magic_fd);
+                host_fd_ref_close(&dir_ref);
+                return mrc < 0 ? linux_errno() : 0;
+            }
         }
         rc = reject_unsupported_fuse_path_op(&tx);
         if (rc != INT64_MIN) {

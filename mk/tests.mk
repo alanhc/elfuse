@@ -25,7 +25,8 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-config \
         test-mremap-tail-emfile \
         test-proctitle-host test-proctitle-low-stack \
-        test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
+        test-sysroot-procfs-exec test-sysroot-fd-magiclink \
+        test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-sysroot-inotify-names test-sysroot-exec-names \
@@ -212,6 +213,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage test-config \
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
 	$(call run-lane,test-busybox,busybox applet validation)
 	$(call run-lane,test-sysroot-procfs-exec,sysroot procfs exec validation)
+	$(call run-lane,test-sysroot-fd-magiclink,fd magic link resolution)
 	$(call run-lane,test-getdents64-overlong,getdents64 overlong-UTF-8 dirent skip)
 	$(call run-lane,test-sysroot-host-fallback,sysroot host-fallback validation)
 	$(call run-lane,test-sysroot-tmp-remove,sysroot /tmp remove/rename consistency)
@@ -1009,6 +1011,15 @@ test-sysroot-procfs-exec: $(ELFUSE_BIN) $(BUILD_DIR)/test-procfs-exec
 	mkdir -p "$$tmpdir/bin"; \
 	cp $(BUILD_DIR)/test-procfs-exec "$$tmpdir/bin/test-procfs-exec"; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" "$$tmpdir/bin/test-procfs-exec"
+
+## Magic link (/proc/self/fd/<n>, /dev/fd/<n>) resolution. Runs in a throwaway
+## sysroot so the fixtures it creates at the guest root land in the tmpdir.
+test-sysroot-fd-magiclink: $(ELFUSE_BIN) $(BUILD_DIR)/test-fd-magiclink
+	@tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$tmpdir/bin"; \
+	cp $(BUILD_DIR)/test-fd-magiclink "$$tmpdir/bin/test-fd-magiclink"; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" "$$tmpdir/bin/test-fd-magiclink"
 
 test-timeout-disable: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@$(ELFUSE_BIN) --timeout 0 $(TEST_DIR)/test-hello > /dev/null
