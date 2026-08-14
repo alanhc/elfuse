@@ -19,13 +19,18 @@ What is checked, per file:
 
   1. Frontmatter: name matches the directory, description is non-empty.
   2. Backticked path-like tokens resolve: exactly one file in the tree ends
-     with the path as written. Two files ending that way is a failure too,
-     because the reference is ambiguous and wants a longer path.
+     with the path as written, or the path resolves beside the skill itself,
+     which is how references/*.md pointers are written. Two files ending that
+     way is a failure too, because the reference is ambiguous and wants a
+     longer path. A path inside a fenced block is checked the same way; it
+     carries no backticks, so it needs a directory component to be recognized.
   3. "make <target>" names a target the makefiles define, including the
      verify-<name> targets that mk/analysis.mk instantiates from a template.
   4. A quoted section name attached to the word "section" exists as a heading
      in the docs file nearest it.
-  5. A cross-reference to a sibling skill names a skill that exists.
+  5. A cross-reference to a sibling skill names a skill that exists. Only
+     prose counts: an inline span holding a directory component is a path, so
+     cmd/elfuse-container is not read as a missing skill.
 
 Only typeset references are checked: a path in backticks, a make command in
 backticks or in a fenced block. A file named in running prose, or in the
@@ -52,11 +57,11 @@ Usage:
     check-skill-refs.py [file ...]
     check-skill-refs.py --self-test
 
-Every file under .claude/skills/ is checked. Any extra file named on the
-command line is checked the same way, which is how a local routing document
-that points at the skills gets covered without this script having to know it
-exists. --self-test asserts this script still rejects each class of stale
-reference; see self_test() for why that is not optional.
+Every SKILL.md and every references/*.md under .claude/skills/ is checked,
+and so is any extra file named on the command line, which is how a local
+routing document that points at the skills gets covered without this script
+having to know it exists. --self-test asserts this script still rejects each
+class of stale reference; see self_test() for why that is not optional.
 """
 
 import functools
@@ -100,9 +105,29 @@ PATH_RE = re.compile(
 # inline, or a command line inside a fenced block. Plain prose says things like
 # "no make target may reference it", and treating that as a target name is how
 # a checker earns the reputation that gets it disabled.
+#
+# Both fenced patterns tolerate leading whitespace: a fence inside a numbered
+# step is indented to the step's content column, which is most of the fences
+# here, and a column-0 anchor skipped those blocks whole. The width is
+# unbounded rather than markdown's top-level three, since a fence one list
+# deeper is indented further still.
 MAKE_RE = re.compile(r"`make ([a-z][a-z0-9-]*)")
-MAKE_FENCED_RE = re.compile(r"^make ([a-z][a-z0-9-]*)", re.M)
-FENCE_RE = re.compile(r"^```.*?^```", re.M | re.S)
+MAKE_FENCED_RE = re.compile(r"^[ \t]*make ([a-z][a-z0-9-]*)", re.M)
+FENCE_RE = re.compile(r"^[ \t]*```.*?^[ \t]*```", re.M | re.S)
+
+# A path inside a fenced block carries no backticks, so PATH_RE cannot see it.
+# Requiring a directory component keeps this off ordinary words: build/elfuse and
+# ./binary have no extension and are not references to a file this tree owns.
+FENCED_PATH_RE = re.compile(
+    r"(?<![\w./-])((?:[A-Za-z0-9_.+-]+/)+[A-Za-z0-9_.+-]+\.(?:"
+    + "|".join(PATH_EXTS)
+    + r"))\b"
+)
+
+# An inline span holding a directory component is a path, not a skill name, so
+# the cross-reference pass must not read cmd/elfuse-container as a skill that
+# went missing. A bare `elfuse-guest-abi` span stays visible to it.
+INLINE_PATH_RE = re.compile(r"`[^`]*/[^`]*`")
 
 DOCPATH_RE = re.compile(r"docs/[a-z0-9-]+\.md")
 QUOTED_RE = re.compile(r'"([^"]+)"')
@@ -270,8 +295,26 @@ def check_frontmatter(path, raw):
     return messages
 
 
-def check_paths(text, paths):
-    """Every backticked path names exactly one file in the tree."""
+def local_bases(path):
+    """Directories a skill's own pointers are written relative to.
+
+    A skill cites its own reference files as references/x.md from SKILL.md and
+    from a sibling under references/, so both the file's directory and the
+    skill root have to be tried. The skills directory is third, which is what
+    lets one skill cite another's file as elfuse-verify/SKILL.md.
+    """
+    parent = path.parent
+    root = parent.parent if parent.name == "references" else parent
+    return [parent, root, SKILL_DIR]
+
+
+def check_paths(text, raw, paths, bases):
+    """Every typeset path names exactly one file in the tree.
+
+    @bases are the directories a skill's own pointers resolve against, which is
+    how references/*.md is written. .claude stays pruned from the tree walk, so
+    no unrelated file can satisfy one of those by accident.
+    """
     messages = []
     for token in sorted(set(SHORTHAND_RE.findall(text))):
         names = token.split("/")
@@ -279,8 +322,17 @@ def check_paths(text, paths):
         spelled = " and ".join(f"`{stem}.{ext}`" for ext in [names[0][-1]] + names[1:])
         messages.append(f"writes {token}, which nothing resolves; write {spelled}")
 
-    for token in sorted(set(PATH_RE.findall(text))):
-        if unverifiable(token) or (ROOT / token).exists():
+    tokens = set(PATH_RE.findall(text))
+    for block in FENCE_RE.findall(raw):
+        tokens.update(FENCED_PATH_RE.findall(block))
+
+    # is_file() rather than exists() throughout: resolve() matches against
+    # tree_paths(), which is files only, so a directory that happens to be
+    # named like a reference would otherwise satisfy one here and nowhere else.
+    for token in sorted(tokens):
+        if unverifiable(token) or (ROOT / token).is_file():
+            continue
+        if any((b / token).is_file() for b in bases):
             continue
         # A reference has to identify one file. Accepting "something in the
         # tree ends this way" would pass a deleted src/a/foo.c because an
@@ -346,7 +398,7 @@ def check_sections(text):
 def check_skill_refs(text, skills):
     """Every sibling skill named in prose exists as a skill directory."""
     messages = []
-    for ref in sorted(set(SKILLREF_RE.findall(text))):
+    for ref in sorted(set(SKILLREF_RE.findall(INLINE_PATH_RE.sub(" ", text)))):
         if ref in LANES or ref in skills:
             continue
         messages.append(f"refers to skill {ref}, which does not exist")
@@ -374,7 +426,7 @@ def check_file(path, paths, targets, skills, errors):
 
     messages = (
         check_frontmatter(path, raw)
-        + check_paths(text, paths)
+        + check_paths(text, raw, paths, local_bases(path))
         + check_targets(text, raw, targets)
         + check_sections(text)
         + check_skill_refs(text, skills)
@@ -412,7 +464,48 @@ SELF_TEST_CASES = [
         "Helpers in `fd.c/h` classify it.",
         "write `fd.c` and `fd.h`",
     ),
+    (
+        "sibling reference file that is missing",
+        "Load `references/gone.md` at step 3.",
+        "does not exist",
+    ),
+    ("path in a fenced block", "```sh\npython3 scripts/nope.py\n```", "does not exist"),
+    (
+        "path in a fenced block inside a numbered step",
+        "1. Run it:\n\n   ```sh\n   python3 scripts/nope.py\n   ```",
+        "does not exist",
+    ),
+    (
+        "make target in a fenced block inside a numbered step",
+        "1. Run it:\n\n   ```sh\n   make check-fmt\n   ```",
+        "check-fmt",
+    ),
+    (
+        "sibling reference that resolves to a directory",
+        "Load `references/dirlike.md` at step 3.",
+        "does not exist",
+    ),
     ("valid repo path", "See `src/core/guest.c`.", None),
+    (
+        "sibling reference file beside the skill",
+        "Load `references/fixture.md` at step 3.",
+        None,
+    ),
+    (
+        "valid path in a fenced block",
+        "```sh\npython3 scripts/check-mutants.py\n```",
+        None,
+    ),
+    (
+        "valid path in a fenced block inside a numbered step",
+        "1. Run it:\n\n   ```sh\n   python3 scripts/check-mutants.py\n   ```",
+        None,
+    ),
+    (
+        "repo path that looks like a skill name",
+        "The Go `cmd/elfuse-container` CLI.",
+        None,
+    ),
     ("valid include-style path", "Include it as `core/guest.h`.", None),
     ("valid system header", "Frama-C cannot model `sys/mount.h`.", None),
     ("valid line-wrapped target", "Run `make\ncheck-format` first.", None),
@@ -454,7 +547,11 @@ def self_test():
 
     with tempfile.TemporaryDirectory() as tmp:
         skill_dir = pathlib.Path(tmp) / "elfuse-syscall"
-        skill_dir.mkdir()
+        (skill_dir / "references").mkdir(parents=True)
+        (skill_dir / "references" / "fixture.md").write_text("fixture\n")
+        # A directory named like a reference: the case that separates
+        # is_file() from exists() in check_paths().
+        (skill_dir / "references" / "dirlike.md").mkdir()
         fixture = skill_dir / "SKILL.md"
 
         for label, body, expect in SELF_TEST_CASES:
@@ -467,6 +564,15 @@ def self_test():
             elif expect is not None and expect not in found:
                 failures.append(f"{label}: expected {expect!r}, got: {found or 'none'}")
 
+        # A reference file cites its siblings the way SKILL.md does, from one
+        # directory deeper, so it needs a fixture that actually sits there.
+        sibling = skill_dir / "references" / "sibling.md"
+        sibling.write_text("See `references/fixture.md`.\n")
+        errors = []
+        check_file(sibling, paths, targets, skills, errors)
+        if errors:
+            failures.append(f"reference sibling: expected no error, got: {errors}")
+
         # Frontmatter drift needs its own directory: the name is checked
         # against the directory the file sits in.
         other = pathlib.Path(tmp) / "elfuse-other"
@@ -478,7 +584,7 @@ def self_test():
         if not any("frontmatter name" in e for e in errors):
             failures.append("frontmatter drift: expected a name mismatch, got none")
 
-    total = len(SELF_TEST_CASES) + 1
+    total = len(SELF_TEST_CASES) + 2
     if failures:
         print(
             f"  {len(failures)} of {total} self-test case(s) failed:", file=sys.stderr
@@ -500,7 +606,9 @@ def main():
     skills, files = set(), []
     if SKILL_DIR.is_dir():
         skills = {d.name for d in SKILL_DIR.iterdir() if (d / "SKILL.md").is_file()}
-        files = sorted(SKILL_DIR.glob("*/SKILL.md"))
+        files = sorted(SKILL_DIR.glob("*/SKILL.md")) + sorted(
+            SKILL_DIR.glob("*/references/*.md")
+        )
 
     # A routing file that points at the skills gets checked the same way, but
     # only when its owner names it. Whether one exists, and what it is called,
