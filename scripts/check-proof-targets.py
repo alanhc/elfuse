@@ -97,16 +97,17 @@ def workflow_matrix_is_derived():
     """Whether the verify-mutants matrix is built from mk/verify.mk.
 
     It used to be a hand-kept copy of the target list and this function
-    compared the two. The copy is gone: a proof-targets job runs
-    "make print-verify-targets" and the matrix is fromJson of its output, so
-    the matrix cannot drift from what make generates. What is worth checking
+    compared the two. The copy is gone: a proof-targets job emits the list
+    (from "make print-verify-targets", or from proof-scope.py narrowed to what
+    a pull request's diff can reach) and the matrix is fromJson of its output,
+    so the matrix cannot drift from what make generates. What is worth checking
     now is that nobody has quietly gone back to a literal list, which would
     restore the drift this script exists to prevent.
 
     That leaves one gap this cannot see, which make_target_names covers: the
     matrix faithfully reproduces a target list that silently dropped a block.
     """
-    expected = "${{ fromJson(needs.proof-targets.outputs.targets) }}"
+    expected = "${{ fromJson(needs.proof-targets.outputs.mutants) }}"
     text = (ROOT / ".github" / "workflows" / "verify.yml").read_text()
     # [^\n]* rather than .*, because re.S would run the capture to the end of
     # the file and accept a literal list here on the strength of an unrelated
@@ -134,8 +135,87 @@ def workflow_matrix_is_derived():
     return True
 
 
+def verdict_covers_every_prover_job():
+    """Whether the historic check name still covers every job that proves.
+
+    "Frama-C WP proofs (make verify)" aggregated a matrix whose legs ran the
+    proofs AND their mutations, so a branch rule requiring it enforced both.
+    Splitting those halves into separate jobs already moved that name once,
+    and a reviewer had to notice; the next split should not need one. Every
+    macOS job in the workflow does prover work, so each must be reachable from
+    that job's needs, or the name goes green without it.
+    """
+    # Regex rather than a YAML parser, matching what this file already does
+    # above and keeping the lint job free of a PyYAML dependency it does not
+    # otherwise need. The shapes read here are the ones this workflow uses:
+    # a two-space job key, and needs as either a scalar or a flow list.
+    #
+    # Split the "jobs:" section rather than the whole file, and accept any
+    # leading identifier character rather than a lower-case letter. A key class
+    # of [a-z] silently drops a job named "Verify-extra" or "_probe" from BOTH
+    # sides of the comparison below, so a macOS job the check name does not
+    # reach reads as no job at all -- the exact miss this function exists to
+    # make loud. Splitting the whole file also read the sub-keys of "on:",
+    # "concurrency:" and "permissions:" as jobs.
+    text = (ROOT / ".github" / "workflows" / "verify.yml").read_text()
+    section = re.split(r"^jobs:[ \t]*$", text, maxsplit=1, flags=re.M)
+    if len(section) != 2:
+        print(
+            "  no top-level 'jobs:' key in .github/workflows/verify.yml",
+            file=sys.stderr,
+        )
+        return False
+    blocks = re.split(r"^  (?=[A-Za-z_])", section[1], flags=re.M)[1:]
+    jobs = {}
+    for block in blocks:
+        job = block.split(":", 1)[0]
+        needs = re.search(r"^    needs:\s*(.+)$", block, re.M)
+        jobs[job] = {
+            "name": (re.search(r"^    name:\s*(.+)$", block, re.M) or [None, ""])[1],
+            "runs-on": (re.search(r"^    runs-on:\s*(.+)$", block, re.M) or [None, ""])[
+                1
+            ],
+            "needs": re.findall(r"[A-Za-z][\w-]*", needs.group(1)) if needs else [],
+        }
+    verdict = [j for j, v in jobs.items() if v["name"].endswith("(make verify)")]
+    if len(verdict) != 1:
+        print(
+            "  expected exactly one job named '... (make verify)' in "
+            f".github/workflows/verify.yml, found {verdict}",
+            file=sys.stderr,
+        )
+        return False
+
+    seen, stack = set(), list(jobs[verdict[0]]["needs"])
+    while stack:
+        job = stack.pop()
+        if job in seen or job not in jobs:
+            continue
+        seen.add(job)
+        stack.extend(jobs[job]["needs"])
+    # Substring, case-folded, rather than a prefix on "macos". The hosted
+    # runner is "macos-15", but the self-hosted one build.yml already uses is
+    # the flow list "[self-hosted, macOS, arm64]", which a prefix test reads as
+    # a non-macOS job and stops enforcing on the day this workflow moves there.
+    # Over-matching only demands one more "needs" edge; under-matching drops a
+    # prover job out from under the required check with nothing said.
+    prover_jobs = {j for j, v in jobs.items() if "macos" in v["runs-on"].lower()}
+    missing = sorted(prover_jobs - seen)
+    if missing:
+        print(
+            f"  {missing} run on macOS but the '{jobs[verdict[0]]['name']}' check "
+            "does not reach them through needs, so requiring that check would "
+            "not enforce them",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def main():
     mk = verify_mk.targets()
+    if not verdict_covers_every_prover_job():
+        return 1
     if not workflow_matrix_is_derived():
         return 2
 

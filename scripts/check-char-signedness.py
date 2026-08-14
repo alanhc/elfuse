@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Detect plain-char use in proved code with the compiler, not a regex.
 
-Frama-C 31 has no aarch64 machdep, so every target is proved under gcc_x86_64.
-That model matches arm64 macOS on pointer width, byte order and alignment, but
-not on one property: it makes plain char SIGNED where arm64 makes it unsigned
-(see the table in mk/verify.mk). The risk only exists where proved code reads
-a plain char, so knowing exactly which sources do that is the thing worth
-automating.
+Every target is proved under one data model, gcc_x86_64 (see mk/verify.mk).
+That model matches arm64 macOS on pointer width, byte order, alignment and
+plain-char signedness, all four checked with the compilers involved rather than
+assumed (see the table in mk/verify.mk). Plain char is signed on Apple's arm64
+target, which compiles every proved source, and unsigned on aarch64-linux,
+which compiles the guest tests. A proved function that reads a plain char
+without an explicit cast would therefore mean something different in guest-side
+code, so knowing exactly which sources do that is the thing worth automating.
 
 check-acsl-coverage.py answers it with a regex, which cannot see a plain char
 reached through a typedef or produced by a macro. This asks the compiler
@@ -71,12 +73,11 @@ def proof_sources():
     if m:
         utils = m.group(1)
 
-    srcs = {
-        m.group(1).lower(): m.group(2).strip()
-        for m in re.finditer(
-            r"^VERIFY_([A-Z0-9_]+)_SRC\s*:=\s*(\S+)", text, re.MULTILINE
-        )
-    }
+    # Through the shared reader, not a fourth regex over the same lines. Its
+    # own \S+ kept the first word of a VERIFY_<T>_SRC that named two sources,
+    # which is the truncation target_sources() now refuses outright; this was
+    # the one consumer still doing it quietly.
+    srcs = verify_mk.target_sources()
     out = {}
     for m in re.finditer(r"^VERIFY_([A-Z0-9_]+)_FCTS\s*:=\s*(.*)$", text, re.MULTILINE):
         target = m.group(1).lower()
@@ -262,8 +263,8 @@ def main():
     if char_failures:
         print(
             "\n  proved code depends on plain-char signedness.\n"
-            "  gcc_x86_64 makes plain char signed where arm64 macOS makes it\n"
-            "  unsigned, so the proof would not describe the real target. Read\n"
+            "  That would make the proved function depend on which compiler\n"
+            "  built it, so the proof would not cover every real target. Read\n"
             "  the char through an explicit (unsigned char) or (uint8_t) cast.",
             file=sys.stderr,
         )

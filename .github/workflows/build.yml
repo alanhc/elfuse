@@ -9,20 +9,56 @@
 # Apple Silicon runners; the hosted job stops at build.
 name: Build
 
+# paths-ignore skips the run only when EVERY changed file matches, so the list
+# below is what cannot reach a build or a test: prose, editor and agent
+# configuration, the Frama-C stubs (reached only through mk/verify.mk, never
+# through -Isrc), and the other workflows. Everything else, src/ and tests/ and
+# mk/ and scripts/ and this file included, still runs the full job. Adding a
+# path here says "no build or test input can depend on this"; anything new is
+# unlisted and therefore builds, which is the safe direction. .gitignore is NOT
+# listed for that reason: checkout's git clean -ffdx wipes exactly what it
+# names, which is why the fixture-restore step further down exists at all.
+#
+# On pull_request only. Actions does not expand YAML anchors, so a filter on
+# push too would be a second copy with nothing keeping the two in step, and a
+# drift between them means a branch and its own merge commit run different
+# checks. The cost of dropping it is one build on a doc-only merge to main.
+# verify.yml keeps its push filter instead, and the asymmetry is the price:
+# the same doc-only merge would start seventeen macOS proof legs there.
+#
+# The failure directions differ from the proof scoping in proof-scope.py, which
+# is why that one needs a self-test and this one does not: a stale entry here
+# (path renamed) matches nothing and the workflow runs MORE, while a stale
+# entry in HARNESS_FILES widens nothing and the proofs run LESS.
+#
+# One condition on all of that: main carries no branch protection and no
+# ruleset today, so a run that never starts blocks nothing. A path filter skips
+# the whole run rather than reporting a skipped job, and a REQUIRED check that
+# never reports stays pending forever. Whoever makes these checks required has
+# to move the filtering into the jobs (a cheap classifier job plus "if:" on the
+# expensive ones) at the same time.
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
   pull_request:
     branches: [main]
     paths-ignore:
       - '**.md'
       - 'docs/**'
       - 'LICENSE'
+      - '.agents/**'
+      - '.claude/**'
+      - '.editorconfig'
+      - '.clang-format'
+      - 'frama-c-stubs/**'
+      - '.github/workflows/lint.yml'
+      - '.github/workflows/static-analysis.yml'
+      - '.github/workflows/verify.yml'
   workflow_dispatch:
+  # A merge queue runs the merged result, not the PR, and merge_group carries
+  # no path filter and no pull_request payload: every check runs in full there.
+  # Without this trigger a queue would merge with nothing having run at all.
+  merge_group:
 
 # Cancel in-progress runs for the same PR; keep main runs going.
 concurrency:
@@ -96,7 +132,8 @@ jobs:
     if: >
       github.repository == 'sysprog21/elfuse' &&
       (github.event_name == 'push' || github.event_name == 'pull_request' ||
-      github.event_name == 'workflow_dispatch')
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'merge_group')
     runs-on: [self-hosted, macOS, arm64]
     # Sanitizer builds run several times slower than the release build, so the
     # job budget and the per-test TEST_TIMEOUT are set per leg. Without

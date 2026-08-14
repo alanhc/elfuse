@@ -1,12 +1,15 @@
 # Frama-C WP proofs of the attacker-facing arithmetic.
 #
-#   proof-targets : the proof target list, read out of mk/verify.mk
-#   verify-mutants: per target, the Frama-C WP proof AND the mutations that
-#                   show it bites; one runner per target, sharded from
-#                   mk/verify.mk's VERIFY_<T>_SRC list
-#   verify        : aggregate check name over that matrix, kept because branch
-#                   protection requires it by name
-#   verify-mutants-gate: the same aggregate under the mutation-gate name
+#   proof-targets : the target list, read out of mk/verify.mk and, on a pull
+#                   request, narrowed twice: once for what the diff can prove
+#                   differently, once for what it can mutate differently
+#   verify-proofs : proves whatever the matrix below will not, which is
+#                   usually nothing, since a mutation leg proves its own target
+#                   first as its control
+#   verify-mutants: the targets whose mutation verdict the diff can move,
+#                   packed into a few runners, expensive and usually empty
+#   verify        : both verdicts under the check name that predates the split,
+#                   which covered both halves and still does
 name: Proofs
 
 on:
@@ -23,6 +26,11 @@ on:
       - 'docs/**'
       - 'LICENSE'
   workflow_dispatch:
+  # A merge queue runs the merged result, not the PR, and merge_group carries
+  # no path filter and no pull_request payload: the proof-targets job below
+  # sees an empty base and proves everything. Without this trigger a queue
+  # would merge with nothing having run at all.
+  merge_group:
 
 # Cancel in-progress runs for the same PR; keep main runs going.
 concurrency:
@@ -32,19 +40,41 @@ concurrency:
 permissions:
   contents: read
 
+# Reaches -wp-timeout in mk/verify.mk, and both macOS jobs must inherit the
+# same value: the mutation runs prove an unmutated control through the very
+# recipe the proving job runs, and check-mutants.py's docstring explains how a
+# shorter budget silently converts a MISS into a "caught". One block, so the
+# two cannot drift. The floor is check_baseline, which proves that control
+# first, so a value too tight to prove real code fails loudly instead.
+env:
+  FRAMAC_TIMEOUT: 45
+
 jobs:
   # The proof target list has ONE home, mk/verify.mk's VERIFY_<T>_SRC
   # assignments. This job reads it there and the matrix below is built from the
   # result, so adding a proof target is a one-file edit and a target can no
   # longer exist locally while silently having no CI leg.
   #
+  # On a pull request it then drops the targets the branch cannot have affected,
+  # so the matrix below is proportional to the diff instead of spinning up a
+  # macOS runner per proof to re-establish a verdict the base already has. The
+  # scope comes from the compiler's own include closure per proved source, and
+  # every "cannot tell" answer inside proof-scope.py widens back to the full
+  # set, which is the safe direction for an optimization. A push to main always
+  # runs everything, so the guarantee on the branch a PR merges into is never
+  # the narrowed one.
+  #
   # Runs on Linux with no toolchain: "make print-verify-targets" only reads the
-  # makefile, so this costs seconds and gates nothing.
+  # makefile and the closure scan is cc -MM, so this costs seconds and gates
+  # nothing.
   proof-targets:
     name: Enumerate proof targets
     runs-on: ubuntu-latest
     outputs:
-      targets: ${{ steps.list.outputs.targets }}
+      rules: ${{ steps.list.outputs.rules }}
+      empty: ${{ steps.list.outputs.empty }}
+      mutants: ${{ steps.list.outputs.mutants }}
+      mutants_empty: ${{ steps.list.outputs.mutants_empty }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -53,14 +83,96 @@ jobs:
         id: list
         run: |
           set -euo pipefail
-          targets=$(make print-verify-targets)
-          test -n "$targets"
-          json=$(printf '%s\n' "$targets" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "targets=$json" >> "$GITHUB_OUTPUT"
-          echo "proof targets: $json"
+          # Two questions, not one. Proving asks what the diff can reach;
+          # mutating asks the narrower "can this diff change whether a target
+          # rejects a broken source", which the files that only schedule the
+          # run cannot. See MUTATION_HARNESS_FILES in proof-scope.py.
+          #
+          # The checkout is shallow, so the base commit has to be fetched
+          # before it can be diffed against. A fetch that does not work falls
+          # through to the full list, same as a push. A merge_group event has
+          # no pull_request payload, so base is empty there and the queue
+          # proves and mutates everything.
+          #
+          # No --cc: the include scan only walks #include lines, which every C
+          # preprocessor agrees on.
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -n "$base" ] && git fetch --no-tags --depth=1 origin "$base"; then
+            # No fallback around these two: proof-scope.py answers every
+            # expected failure with the full set itself, so a non-zero exit
+            # here is the tool being broken, which should be loud.
+            targets=$(python3 scripts/proof-scope.py \
+                --print-targets-changed-since "$base")
+            mutants=$(python3 scripts/proof-scope.py \
+                --print-targets-changed-since "$base" --mutation)
+          else
+            # make owns the full list. proof-scope.py derives its own by regex
+            # over the same file and check-proof-targets.py gates the two for
+            # equality in lint.yml, but where no narrowing happens there is no
+            # reason to ask anything but make.
+            targets=$(make print-verify-targets)
+            test -n "$targets"
+            mutants=$targets
+          fi
+          # The proving job takes what the mutation matrix will NOT cover.
+          # check-mutants.py proves an unmutated control through the very same
+          # "make verify-<t>" rule before it mutates anything, so a target in
+          # both scopes would otherwise be proved twice, once in a job of its
+          # own and once inside its leg. Over the last 400 commits the proof
+          # scope was never wider than the mutation scope, so this is usually
+          # empty and the macOS job does not start at all.
+          extra=$(comm -23 <(printf '%s\n' "$targets" | sort -u) \
+                           <(printf '%s\n' "$mutants" | sort -u))
+          # rules is already prefixed, so the prove job needs no shell of its
+          # own; mutants is JSON because it is a matrix. The guard matters:
+          # printf runs its format once even with no arguments, so an empty
+          # list would yield a lone "verify-" and send make at a rule that does
+          # not exist.
+          rules=""
+          if [ -n "$extra" ]; then
+            # Word splitting is the point of the unquoted expansion.
+            # shellcheck disable=SC2086
+            rules=$(printf 'verify-%s ' $extra)
+          fi
+          # Packed into at most five groups rather than one leg per target:
+          # each leg spends about 90 seconds on Homebrew and the opam switch
+          # before it proves anything, and GitHub bills wall time rounded up to
+          # the minute. Measured on a full-scope run, 17 legs cost 85
+          # macOS-minutes where 5 buckets cost 61.
+          #
+          # Five because that is about what runs concurrently on macOS anyway,
+          # so the whole matrix fits one wave and the wall clock improves as
+          # well. check-mutants.py owns the packing because it owns the
+          # mutation counts it packs by.
+          # shellcheck disable=SC2086
+          buckets=$(python3 scripts/check-mutants.py --pack 5 $mutants)
+          json=$(printf '%s\n' "$buckets" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          # An explicit boolean for the matrix, so neither consumer has to know
+          # that jq -c spells an empty list "[]", and neither fails open if that
+          # encoding changes.
+          mutants_empty=$([ "$json" = '[]' ] && echo true || echo false)
+          {
+            echo "rules=$rules"
+            echo "empty=$([ -z "$rules" ] && echo true || echo false)"
+            echo "mutants=$json"
+            echo "mutants_empty=$mutants_empty"
+          } >> "$GITHUB_OUTPUT"
+          echo "proof targets: ${targets//$'\n'/ }"
+          echo "proved by a job of their own: ${rules:-<none, the matrix covers them>}"
+          echo "mutation targets: ${mutants//$'\n'/ }"
+          echo "packed into: $json (empty: $mutants_empty)"
 
-  # Frama-C WP proofs of the attacker-facing arithmetic, plus the mutation gate
-  # that shows those proofs bite. One runner per proof target.
+  # Frama-C WP proofs for the targets the mutation matrix will not cover.
+  #
+  # One job, not one per target: proving all 17 costs 6.5 macOS-minutes
+  # measured across a real run, while the setup each leg pays before it
+  # (Homebrew, then restoring a ~1 GB opam switch) is 82 seconds apiece.
+  #
+  # It exists for the case where a diff can change which targets get proved
+  # without changing any mutation verdict, since then nothing else proves them.
+  # In every other shape the matrix below proves each of its targets already,
+  # through the unmutated control check-mutants.py runs first, and this job
+  # skips rather than repeat that work in a runner of its own.
   #
   # GATING, unlike tidy-macos and scan-macos: the inputs these proofs cover come
   # from untrusted binaries and from the guest itself, so an unproved
@@ -68,187 +180,156 @@ jobs:
   # job the proofs are only enforced when a human runs them, and they rot the
   # first time someone edits elf.c or gdbstub-rsp.c.
   #
-  # Proves one target and shows its mutations are rejected, one runner per
-  # target. Both halves live here because they are the same work: check-mutants
-  # runs "make verify-<target>" on an UNMUTATED copy as its control, so a
-  # separate serial verify job proved every target and then every shard
-  # proved its own target over again.
-  #
-  # Sharding is what makes the mutation half affordable at all: a caught
-  # mutation grinds against every unprovable goal until FRAMAC_TIMEOUT, so the
-  # whole set on one runner is minutes where a single proof is seconds. Running
-  # the proof first inside the shard keeps the fast failure the old "needs:
-  # verify" edge gave, now per target rather than across all of them, and
-  # without a barrier that made every shard wait for the slowest proof.
-  #
-  # The matrix comes from the proof-targets job above, which reads
-  # mk/verify.mk, so this list cannot drift from the targets that exist.
-  verify-mutants:
-    name: Proof and mutations (${{ matrix.target }})
+  # A new check name, deliberately. The historic one covered proofs AND
+  # mutations, because the matrix legs it aggregated ran both, so hanging it on
+  # a proof-only job would quietly stop enforcing half of what anyone requiring
+  # it expected. The combined verdict keeps that name; see the last job here.
+  verify-proofs:
+    name: Frama-C WP proofs
     needs: proof-targets
+    # Nothing to prove, so do not boot a macOS runner for it.
+    if: ${{ needs.proof-targets.outputs.empty != 'true' }}
     runs-on: macos-15
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        target: ${{ fromJson(needs.proof-targets.outputs.targets) }}
-    env:
-      HOMEBREW_NO_INSTALL_CLEANUP: 1
-      HOMEBREW_NO_AUTO_UPDATE: 1
-      BREW_PKGS: opam gmp pkg-config graphviz llvm@17 zlib
-      OPAMCONFIRMLEVEL: unsafe-yes
-      # Reaches -wp-timeout in mk/verify.mk and is the biggest term in this
-      # job's runtime: both steps below use it, and a caught mutation leaves
-      # a goal open that costs both provers the full value. The floor is
-      # check_baseline in check-mutants.py, which proves an UNMUTATED copy
-      # through this same path first, so a value too tight to prove real
-      # code fails loudly instead of scoring mutations as caught. "make
-      # verify" discharges 803 obligations across 17 targets in 23s
-      # locally, the slowest target in 19s.
-      FRAMAC_TIMEOUT: 45
-      FRAMAC_VERSION: "31.0"
-      ALT_ERGO_VERSION: 2.6.3
-      Z3_VERSION: 4.16.0
-      OPAMROOT: ${{ github.workspace }}/.opam
-      OPAM_SWITCH: frama-c-elfuse
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Cache Homebrew downloads
-        uses: actions/cache@v6
-        with:
-          path: ~/Library/Caches/Homebrew/downloads
-          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
+      - name: Set up Frama-C
+        id: framac
+        uses: ./.github/actions/framac
 
-      - name: Install Homebrew packages
-        # shellcheck disable=SC2086 -- BREW_PKGS is a space-separated list.
+      - name: Prove the selected targets
+        # Named targets rather than "make verify", which would prove all 17
+        # whatever the scope said. The -j has to be passed here: mk/verify.mk
+        # adds one only inside the aggregate "verify" rule, so a list of
+        # verify-<t> targets would otherwise run one prover at a time.
         run: |
           set -euo pipefail
-          brew install --quiet $BREW_PKGS
-
-      # Every leg shares one key, so a warm cache costs one restore per leg.
-      # Nothing primes it any more: the job that used to build the switch first
-      # is gone, and proof-targets runs on Linux, so on a miss all legs build
-      # Frama-C and the provers from source at once. That is the whole cost of
-      # bumping any of the three pinned versions below, and the first run after
-      # such a bump is the one at risk of the 60-minute timeout. A prime job
-      # would trade that for a barrier in front of every run; the versions move
-      # rarely enough that the miss is the cheaper side.
-      - name: Cache opam switch
-        id: opam-cache
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.OPAMROOT }}
-          key: opam-${{ runner.os }}-${{ runner.arch }}-frama-c${{ env.FRAMAC_VERSION }}-ae${{ env.ALT_ERGO_VERSION }}-z3${{ env.Z3_VERSION }}
-
-      - name: Install Frama-C, Alt-Ergo, Z3
-        if: steps.opam-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          opam init -y --bare --disable-sandboxing
-          opam switch create "$OPAM_SWITCH" 4.14.1
-          eval "$(opam env --switch="$OPAM_SWITCH")"
-          opam install -y \
-            frama-c.$FRAMAC_VERSION \
-            alt-ergo.$ALT_ERGO_VERSION \
-            z3.$Z3_VERSION
-
-      - name: Prove the target (make verify-<target>)
-        # First, so a broken proof fails this shard in seconds instead of after
-        # its mutation set. check-mutants would catch it too, through
-        # check_baseline, but only after paying for the setup a second time and
-        # with a message about infrastructure rather than about the proof.
-        run: |
-          set -euo pipefail
-          eval "$(opam env --switch="$OPAM_SWITCH")"
-          why3 config detect
-          frama-c -version
-          make verify-${{ matrix.target }}
-
-      - name: Prove the gate bites (make verify-mutants)
-        # why3 config detect is cheap and idempotent; the proof step above
-        # already ran it on this runner.
-        #
-        # MUTANT_JOBS is set explicitly for the same reason as before
-        # sharding: this runner has few enough cores that the script's
-        # one-per-core default lands near serial.
-        run: |
-          set -euo pipefail
-          eval "$(opam env --switch="$OPAM_SWITCH")"
-          why3 config detect
-          # On a pull request, re-verify only the targets whose source the
-          # branch actually touches; a target it does not touch has the verdict
-          # the base already established. A push to the base runs the full set,
-          # so the guarantee is never weaker than the branch it merges into.
-          # The checkout is shallow, so the base commit has to be fetched
-          # before it can be diffed against. If that does not work the script
-          # says so and runs the full set, which is the safe direction for an
-          # optimization.
-          base="${{ github.event.pull_request.base.sha }}"
-          if [ -n "$base" ] && git fetch --no-tags --depth=1 origin "$base"; then
-            make verify-mutants MUTANT_JOBS=4 MUTANT_TARGET=${{ matrix.target }} MUTANT_SINCE="$base"
-          else
-            make verify-mutants MUTANT_JOBS=4 MUTANT_TARGET=${{ matrix.target }}
-          fi
+          eval "$(opam env --switch="${{ steps.framac.outputs.switch }}")"
+          # -j4 for the same reason MUTANT_JOBS is 4 in the next job: the
+          # hosted runner has few cores and each target is a frama-c process
+          # holding its own goals in memory.
+          rules='${{ needs.proof-targets.outputs.rules }}'
+          # The job's "if" already covers this, so reaching it means the two
+          # outputs disagreed. Worth a line because the silent version is bad:
+          # "make -j4" with no goal falls through to .DEFAULT_GOAL, prints the
+          # help text, exits 0, and the check goes green having proved nothing.
+          test -n "$rules" || {
+            echo "::error::no rules to prove, but the job was not skipped"
+            exit 1
+          }
+          # Word splitting is the point: rules is a space-separated list of
+          # make goals, produced by the job above from mk/verify.mk and never
+          # from anything a pull request writes.
+          # shellcheck disable=SC2086
+          make -j4 $rules
 
       - name: Upload prover log
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: verify-logs-${{ matrix.target }}
+          name: verify-logs
+          path: build/verify-*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  # The mutation gate, sharded because it is the expensive half: a caught
+  # mutation grinds against every unprovable goal until FRAMAC_TIMEOUT, so the
+  # whole set on one runner is 51 macOS-minutes where the proofs are 6.5.
+  #
+  # Its matrix is a different question from the proofs above. A branch that
+  # edits the scheduling machinery has to re-prove everything, since which
+  # targets run is exactly what it changed, but it cannot change whether a
+  # target rejects a broken source, so nothing here needs to re-run. See
+  # MUTATION_HARNESS_FILES in proof-scope.py for what separates the two.
+  #
+  # check-mutants proves an UNMUTATED copy first as its control, so a leg that
+  # runs at all also re-establishes the proof for its own target; the job above
+  # is not a prerequisite and deliberately not a "needs" edge, so the two halves
+  # run in parallel.
+  verify-mutants:
+    name: Mutations (${{ matrix.target }})
+    needs: proof-targets
+    # Skipped through the condition rather than through matrix expansion:
+    # what Actions does with a zero-entry matrix vector is observed behavior
+    # rather than documented syntax, and the verdict job depends on the answer.
+    if: ${{ needs.proof-targets.outputs.mutants_empty != 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.proof-targets.outputs.mutants) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Frama-C
+        id: framac
+        uses: ./.github/actions/framac
+
+      - name: Prove the gate bites (make verify-mutants)
+        # One target at a time within the bucket, so a failure names the target
+        # rather than the group. MUTANT_JOBS is set explicitly because this
+        # runner has few enough cores that the script's one-per-core default
+        # lands near serial.
+        run: |
+          set -euo pipefail
+          eval "$(opam env --switch="${{ steps.framac.outputs.switch }}")"
+          for target in ${{ matrix.target }}; do
+            echo "::group::$target"
+            make verify-mutants MUTANT_JOBS=4 MUTANT_TARGET="$target"
+            echo "::endgroup::"
+          done
+
+      - name: Upload prover log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-logs-${{ matrix.target }}
           path: |
             build/verify-*.log
             build/verify-mutants/*.log
           if-no-files-found: warn
           retention-days: 7
 
-  # The proving moved into the matrix above, but this check name predates that
-  # and branch protection requires it by name, so it stays as an aggregate over
-  # the same matrix. The "(make verify)" suffix is kept for that continuity
-  # alone: this job runs no proofs itself, and renaming it would silently
-  # unrequire the check until someone updated the branch rule to match.
+  # One job owning the whole verdict, under the check name that predates this
+  # split. It meant "proofs and mutations both passed" when it aggregated a
+  # matrix whose legs ran both halves, and it means that still. Two aggregate
+  # jobs were one too many: a second requirable name that nothing requires,
+  # with the skip rules split across two scripts that had to agree.
+  #
+  # Each half's empty-scope case is a pass, and only for the exact reason its
+  # own job was skipped. proof-targets failing instead leaves both outputs
+  # empty rather than "true", which neither test accepts.
+  #
+  # if: always() is what makes this run when a leg fails; without it the job
+  # would be skipped, and a skipped check does not block a merge. !cancelled()
+  # would skip it on a cancelled run, which always() reports instead.
+  #
+  # check-proof-targets.py asserts that every macOS job in this file is in this
+  # job's needs, so the next split cannot quietly leave one out from under the
+  # name.
   verify:
     name: Frama-C WP proofs (make verify)
-    needs: verify-mutants
-    # always(), matching verify-mutants-gate below and for the reason stated
-    # there: a required check that is SKIPPED does not block a merge, and
-    # !cancelled() skips this job whenever the run is cancelled. always() makes
-    # it run and report the matrix verdict in that case too.
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Report the matrix result
-        run: |
-          set -euo pipefail
-          result='${{ needs.verify-mutants.result }}'
-          if [ "$result" != "success" ]; then
-            echo "proof matrix did not succeed: $result" >&2
-            exit 1
-          fi
-          echo "every proof target discharged"
-
-  # One stable check name covering the whole mutation matrix, so branch
-  # protection has something to require. The matrix leg names carry the target
-  # in them ("Mutation gate (fuse)"), which means every added proof target
-  # would otherwise need its own branch-protection entry, and a target added
-  # without that entry would be unenforced from the day it landed.
-  #
-  # needs.<matrix job>.result is the aggregate over all legs, so this passes
-  # only when every one of them did. if: always() is what makes it run at all
-  # when a leg fails; without it this job would be skipped, and a skipped
-  # required check does not block a merge. A skipped matrix (verify failed
-  # upstream) reports "skipped" here too, which the equality test rejects.
-  verify-mutants-gate:
-    name: Mutation gate
-    needs: verify-mutants
+    needs: [proof-targets, verify-proofs, verify-mutants]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require every matrix leg to have passed
+      - name: Require both halves to have passed
         run: |
           set -euo pipefail
-          result='${{ needs.verify-mutants.result }}'
-          echo "mutation matrix: $result"
-          [ "$result" = success ] || exit 1
+          proofs='${{ needs.verify-proofs.result }}'
+          mutations='${{ needs.verify-mutants.result }}'
+          no_proofs='${{ needs.proof-targets.outputs.empty }}'
+          no_mutants='${{ needs.proof-targets.outputs.mutants_empty }}'
+          echo "proofs: $proofs (empty scope: ${no_proofs:-<unknown>})"
+          echo "mutations: $mutations (empty scope: ${no_mutants:-<unknown>})"
+          ok() {
+            [ "$1" = success ] || { [ "$1" = skipped ] && [ "$2" = true ]; }
+          }
+          ok "$proofs" "$no_proofs" || exit 1
+          ok "$mutations" "$no_mutants" || exit 1
+          echo "both halves accounted for"

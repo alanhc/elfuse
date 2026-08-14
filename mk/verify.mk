@@ -38,24 +38,35 @@
 # proved "for x86_64" and no x86_64 code is involved; the flag only tells the
 # prover how wide a size_t is.
 #
-# Frama-C 31 ships avr_16, avr_8, gcc_x86_16, gcc_x86_32, gcc_x86_64,
-# msvc_x86_64, ppc_32, x86_16, x86_32, x86_64 -- no aarch64 entry at all. Of
-# those, gcc_x86_64 is the only one that matches arm64 macOS on the properties
-# these proofs rest on:
+# gcc_x86_64 matches arm64 macOS, the platform this host code is compiled for,
+# on every property these proofs rest on:
 #
 #   property               arm64 macOS   gcc_x86_64   used by the proof?
 #   pointer / long / size_t  64-bit        64-bit       yes
 #   byte order               little        little       yes
 #   uint64_t alignment       8             8            yes
-#   plain char signedness    unsigned      signed       see below
+#   plain char signedness    signed        signed       see below
 #
-# Plain-char signedness is the one mismatch, and the RSP proof DOES cover
-# functions taking plain char: gdb_hex_pair, gdb_hex_decode, gdb_parse_hex and
-# rsp_checksum. What keeps the result signedness-independent is not their
-# parameter types but that every use of a char value goes through an explicit
-# (unsigned char) or (uint8_t) cast before it is compared or accumulated. That
-# is the invariant to preserve: no proved function may read a plain char
-# without such a cast.
+# The signedness row is the one worth checking rather than recalling, because
+# the two arm64 targets in this tree disagree: plain char is SIGNED on Apple's
+# arm64, which compiles every proved source, and UNSIGNED on aarch64-linux,
+# which the cross toolchain compiles the guest tests with. Both answers come
+# from asking those compilers.
+#
+# Frama-C 33 ships a macos_arm machdep, which sounds like the honest name for
+# what is being assumed here, and it is not usable: it is not GCC-based, and
+# -include gcc-atomics.h pulls in Frama-C's own __fc_gcc_builtins.h, which
+# refuses __int128 outside a GCC-based machdep. Measured, not assumed: every
+# target aborts at parse time with "use a GCC-based machdep to enable it".
+# Revisit if the atomics stub ever stops being needed.
+#
+# The RSP proof DOES cover functions taking plain char: gdb_hex_pair,
+# gdb_hex_decode, gdb_parse_hex and rsp_checksum. What keeps their results
+# signedness-independent is not their parameter types but that every use of a
+# char value goes through an explicit (unsigned char) or (uint8_t) cast before
+# it is compared or accumulated. That is the invariant to preserve, and it is
+# what makes the data model's answer to this question stop mattering: no proved
+# function may read a plain char without such a cast.
 #
 # check-acsl-coverage.py enforces the part a regex can, and its
 # CHAR_PARAM_ALLOWLIST carries the rest of the reasoning: a proved function
@@ -389,8 +400,8 @@ $(VERIFY_RULES): check-stub-constants | $(BUILD_DIR)
 	@echo "                 these compute no out-of-bounds access and no overflow"
 	@for f in $(FCTS); do echo "                 - $$f"; done
 	@echo "          memory model: $(MODEL);  data model: $(FRAMAC_DATA_MODEL)"
-	@echo "          (data model is type widths only; Frama-C 31"
-	@echo "           has no aarch64 machdep, so this is the LP64 stand-in)"
+	@echo "          (data model is type widths only, and matches arm64"
+	@echo "           macOS on width, order, alignment and char signedness)"
 	@$(FRAMAC) -machdep $(FRAMAC_DATA_MODEL) \
 	    -cpp-extra-args="$(FRAMAC_CPP_ARGS)" \
 	    $(SRC) -wp -wp-rte -wp-model $(MODEL) \
@@ -411,8 +422,12 @@ $(VERIFY_RULES): check-stub-constants | $(BUILD_DIR)
 # MUTANT_JOBS overrides the script's one-per-core default, which a CI runner
 # with few cores would otherwise resolve to near-serial.
 # MUTANT_SINCE restricts the run to targets whose source differs from that ref,
-# which keeps a per-PR run proportional to the diff. Leave it empty to run the
-# whole set, which is what the base branch needs to do.
+# for a local run that only wants what a branch touched. Leave it empty to run
+# the whole set, which is what the base branch needs to do. This asks
+# scripts/proof-scope.py the same question CI's mutation matrix asks, so a
+# local run reproduces that scope; CI does not pass MUTANT_SINCE, since a leg
+# that exists at all has a target the diff reaches and applying the scoping a
+# second time inside the leg selects everything.
 # MUTANT_TARGET restricts the run to one proof target, letting CI shard the
 # full set across parallel jobs instead of one job working through all of it.
 # Leave it empty to run every target in one process, which is what a local
@@ -432,13 +447,13 @@ verify-mutants:
 # Every verify-* target already runs this for itself, so "make verify" gets it
 # without listing it; this entry point is for checking the whole set at once.
 #
-# The data-model note above says gcc_x86_64 differs from arm64 macOS on plain
-# char signedness, and that the proofs stay sound because no proved function
-# reads a plain char without an explicit cast. check-acsl-coverage.py checks
-# that with a regex, which cannot see a char behind a typedef or a macro. This
-# asks the compiler instead, per proved function and at -O0: identical code
-# under -fsigned-char and -funsigned-char means that function behaves the same
-# either way, which is the invariant rather than a proxy for it.
+# The data-model note above says the tree's real arm64 compilers disagree on
+# plain-char signedness, and the proofs stay portable because no proved
+# function reads a plain char without an explicit cast. check-acsl-coverage.py
+# checks that with a regex, which cannot see a char behind a typedef or a macro.
+# This asks the compiler instead, per proved function and at -O0: identical
+# code under -fsigned-char and -funsigned-char means that function behaves the
+# same either way, which is the invariant rather than a proxy for it.
 check-char-signedness:
 	@echo "  CHARSIGN proof sources under both char signedness settings"
 	$(Q)python3 scripts/check-char-signedness.py --cc '$(CC)'

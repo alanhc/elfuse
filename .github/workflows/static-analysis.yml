@@ -5,20 +5,40 @@
 #   infer-macos   : Facebook Infer capture + analyze over the full build
 name: Static analysis
 
+# All three jobs analyze "make elfuse" and nothing else, so tests/ joins the
+# prose and configuration below: a change there cannot alter a single
+# translation unit any of them sees. paths-ignore skips the run only when EVERY
+# changed file matches, and anything not listed still runs the full set, which
+# is the safe direction for a path that turns out to matter after all.
+#
+# On pull_request only, and the same conditions build.yml states at length: one
+# list per file so nothing can drift, and a path filter skips the whole run, so
+# a REQUIRED check that never reports would stay pending. main has no branch
+# protection today; making these required means moving the filter into the
+# jobs.
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
   pull_request:
     branches: [main]
     paths-ignore:
       - '**.md'
       - 'docs/**'
       - 'LICENSE'
+      - 'tests/**'
+      - '.agents/**'
+      - '.claude/**'
+      - '.editorconfig'
+      - '.clang-format'
+      - 'frama-c-stubs/**'
+      - '.github/workflows/build.yml'
+      - '.github/workflows/lint.yml'
+      - '.github/workflows/verify.yml'
   workflow_dispatch:
+  # A merge queue runs the merged result, not the PR, and merge_group carries
+  # no path filter and no pull_request payload: every check runs in full there.
+  # Without this trigger a queue would merge with nothing having run at all.
+  merge_group:
 
 # Cancel in-progress runs for the same PR; keep main runs going.
 concurrency:
