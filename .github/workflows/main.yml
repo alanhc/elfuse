@@ -88,11 +88,7 @@ jobs:
             $LINT_PKGS
 
       - name: Trailing newline
-        # always(), matching verify-mutants-gate below and for the reason stated
-    # there: a required check that is SKIPPED does not block a merge, and
-    # !cancelled() skips this job whenever the run is cancelled. always() makes
-    # it run and report the matrix verdict in that case too.
-    if: always()
+        if: ${{ !cancelled() }}
         run: .ci/check-newline.sh
 
       - name: clang-format
@@ -328,8 +324,14 @@ jobs:
           set -euo pipefail
           brew install --quiet $BREW_PKGS
 
-      # Same cache key as the verify job's opam switch, so this restores the
-      # switch that job already built instead of rebuilding it nine times.
+      # Every leg shares one key, so a warm cache costs one restore per leg.
+      # Nothing primes it any more: the job that used to build the switch first
+      # is gone, and proof-targets runs on Linux, so on a miss all legs build
+      # Frama-C and the provers from source at once. That is the whole cost of
+      # bumping any of the three pinned versions below, and the first run after
+      # such a bump is the one at risk of the 60-minute timeout. A prime job
+      # would trade that for a barrier in front of every run; the versions move
+      # rarely enough that the miss is the cheaper side.
       - name: Cache opam switch
         id: opam-cache
         uses: actions/cache@v6
@@ -406,7 +408,11 @@ jobs:
   verify:
     name: Frama-C WP proofs (make verify)
     needs: verify-mutants
-    if: ${{ !cancelled() }}
+    # always(), matching verify-mutants-gate below and for the reason stated
+    # there: a required check that is SKIPPED does not block a merge, and
+    # !cancelled() skips this job whenever the run is cancelled. always() makes
+    # it run and report the matrix verdict in that case too.
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Report the matrix result
