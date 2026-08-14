@@ -36,8 +36,8 @@ void proc_scratch_remove_one(const char *dir);
 /* Provided by procemu-pty.c, used by procemu.c.
  *
  * The proc_pty_* entry points are in runtime/procemu.h because callers outside
- * procemu use them too. These four are internal to the interceptor: they were
- * static before the split and stay unexported beyond this pair of files.
+ * procemu use them too. The five below are internal to the interceptor: they
+ * were static before the split and stay unexported beyond this pair of files.
  */
 
 /* Parse the N out of "/dev/pts/N". False when the path is not a slave. */
