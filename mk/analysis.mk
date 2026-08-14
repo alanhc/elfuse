@@ -245,12 +245,13 @@ VERIFY_SOCKADDR_CLAIM := for ANY address length a guest or host can present
 VERIFY_SOCKADDR_UNPROVED := the family translation and memcpy stay test-covered
 
 VERIFY_NETLINK_SRC  := src/proved/netlink.h
-VERIFY_NETLINK_FCTS := netlink_align_up netlink_rta_bounds netlink_msg_span
-VERIFY_NETLINK_MIN_GOALS ?= 44
+VERIFY_NETLINK_FCTS := netlink_align_up netlink_rta_bounds netlink_msg_span \
+                       netlink_attr_extent
+VERIFY_NETLINK_MIN_GOALS ?= 65
 VERIFY_NETLINK_MODEL := typed
 VERIFY_NETLINK_SCAN := src/proved/netlink.h
 VERIFY_NETLINK_CLAIM := for ANY netlink message bytes a guest can send
-VERIFY_NETLINK_UNPROVED := the walk loops and attribute copies stay test-covered
+VERIFY_NETLINK_UNPROVED := the attribute copies stay test-covered
 
 VERIFY_SIGFRAME_SRC  := src/proved/sigframe.h
 VERIFY_SIGFRAME_FCTS := sigframe_base

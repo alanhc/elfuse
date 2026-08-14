@@ -183,17 +183,20 @@ static size_t nl_put_attr(uint8_t *buf,
                           const void *data,
                           uint16_t datalen)
 {
-    uint16_t total = (uint16_t) (RTA_HDRLEN + datalen);
-    uint16_t aligned = (uint16_t) netlink_align_up(total);
-    if (aligned > max)
+    /* Proved in src/proved/netlink.h: on success total is RTA_HDRLEN + datalen
+     * and fits the 16-bit wire field, and aligned is at most max. The cast to
+     * rta_len is therefore lossless and both writes below land inside max.
+     */
+    uint64_t total, aligned;
+    if (!netlink_attr_extent(datalen, max, &total, &aligned))
         return 0;
-    rtattr_t rta = {.rta_len = total, .rta_type = type};
+    rtattr_t rta = {.rta_len = (uint16_t) total, .rta_type = type};
     memcpy(buf, &rta, sizeof(rta));
     memcpy(buf + RTA_HDRLEN, data, datalen);
     /* Zero padding */
     if (aligned > total)
-        memset(buf + total, 0, aligned - total);
-    return aligned;
+        memset(buf + total, 0, (size_t) (aligned - total));
+    return (size_t) aligned;
 }
 
 /* Build RTM_GETLINK response from host getifaddrs(). A non-empty name_filter or

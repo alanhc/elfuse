@@ -155,3 +155,59 @@ static inline int netlink_msg_span(uint64_t nlmsg_len, uint64_t *span)
     *span = netlink_align_up(nlmsg_len);
     return 1;
 }
+
+/* Ceiling on one attribute's length field, which is 16 bits on the wire. */
+#define NETLINK_ATTR_LEN_MAX 0xFFFFULL
+
+/* Header-plus-payload extent for one outgoing rtattr, or 0 when the payload
+ * does not fit the wire length field or the remaining buffer.
+ *
+ * nl_put_attr computed this as "(uint16_t) (RTA_HDRLEN + datalen)" and checked
+ * only the ALIGNED result against the space left. For datalen >= 65532 the cast
+ * wraps: the total comes back as 3 or less, the aligned value as 4, the space
+ * check passes, and the payload memcpy then writes up to 65535 bytes into a
+ * buffer with 4 bytes free. Its five call sites all pass 4, 16, or an interface
+ * name from getifaddrs, so nothing reaches it -- unreachable by caller
+ * provenance, which is the same argument netlink_msg_span above was written to
+ * stop relying on.
+ *
+ * Both halves of the guard carry weight. Without the wire-field half the total
+ * wraps as before; without the space half the write runs past the buffer. The
+ * result is uint64_t, so the caller's remaining cast to uint16_t is lossless
+ * exactly when this returned non-zero, which is what the total ceiling states.
+ */
+/*@
+  requires \valid(total);
+  requires \valid(aligned);
+  requires \separated(total, aligned);
+  assigns *total, *aligned;
+  ensures \result == 0 || \result == 1;
+  ensures \result != 0 <==>
+            (datalen <= NETLINK_ATTR_LEN_MAX - RTA_HDRLEN &&
+             (RTA_HDRLEN + datalen + (NETLINK_ALIGNTO - 1))
+                 - (RTA_HDRLEN + datalen + (NETLINK_ALIGNTO - 1))
+                     % NETLINK_ALIGNTO <= max);
+  ensures \result != 0 ==> *total == RTA_HDRLEN + datalen;
+  ensures \result != 0 ==> *aligned >= *total;
+  ensures \result != 0 ==> *aligned < *total + NETLINK_ALIGNTO;
+  ensures \result != 0 ==> *aligned % NETLINK_ALIGNTO == 0;
+  ensures \result == 0 ==> *total == \old(*total);
+  ensures \result == 0 ==> *aligned == \old(*aligned);
+ */
+static inline int netlink_attr_extent(uint64_t datalen,
+                                      uint64_t max,
+                                      uint64_t *total,
+                                      uint64_t *aligned)
+{
+    if (datalen > NETLINK_ATTR_LEN_MAX - RTA_HDRLEN)
+        return 0;
+
+    uint64_t t = RTA_HDRLEN + datalen;
+    uint64_t a = netlink_align_up(t);
+    if (a > max)
+        return 0;
+
+    *total = t;
+    *aligned = a;
+    return 1;
+}

@@ -410,6 +410,22 @@ MUTATIONS = [
         "    uint64_t padded = len + (NETLINK_ALIGNTO - 1);",
         "    uint64_t padded = len;",
     ),
+    (
+        "netlink",
+        "src/proved/netlink.h",
+        "netlink_attr_extent",
+        "drop the wire-field ceiling (the caller's cast to rta_len truncates)",
+        "    if (datalen > NETLINK_ATTR_LEN_MAX - RTA_HDRLEN)\n        return 0;\n\n",
+        "",
+    ),
+    (
+        "netlink",
+        "src/proved/netlink.h",
+        "netlink_attr_extent",
+        "drop the remaining-space guard (the payload runs past the buffer)",
+        "    if (a > max)\n        return 0;\n\n",
+        "",
+    ),
     # ---- verify-sigframe ---------------------------------------------------
     (
         "sigframe",
