@@ -253,6 +253,30 @@ VERIFY_NETLINK_SCAN := src/proved/netlink.h
 VERIFY_NETLINK_CLAIM := for ANY netlink message bytes a guest can send
 VERIFY_NETLINK_UNPROVED := the attribute copies stay test-covered
 
+# The two walk loops in netlink.c itself, which verify-netlink above could only
+# describe as "test-covered". This is the first target whose source is a .c file
+# that needed the Hypervisor stub and -D_Atomic= to parse at all; see
+# FRAMAC_CPP_ARGS. The proved helpers are re-proved here rather than assumed,
+# for the same reason VERIFY_UTILS_FCTS exists.
+VERIFY_NETLINKWALK_SRC  := src/syscall/netlink.c
+VERIFY_NETLINKWALK_FCTS := nl_parse_link_filter nl_complete_span nl_put_attr \
+                           netlink_align_up netlink_rta_bounds \
+                           netlink_msg_span netlink_attr_extent
+VERIFY_NETLINKWALK_MIN_GOALS ?= 190
+
+# Bytes, and neither of the two models already in this file. Both walks memcpy a
+# wire header out of a uint8_t buffer at an offset the message itself chose, so
+# typed leaves every memcpy validity and separation goal open (58 of 74), and
+# caveat cannot size the byte array at all ("Undefined array-size"). Typed+cast
+# gets 73 of 74. Bytes models memory as bytes, which is what the code does, and
+# closes all of them.
+VERIFY_NETLINKWALK_MODEL := Bytes
+VERIFY_NETLINKWALK_SCAN := src/syscall/netlink.c src/proved/netlink.h
+VERIFY_NETLINKWALK_CLAIM := for ANY rtattr chain a guest can write and ANY \
+reply buffer state
+VERIFY_NETLINKWALK_UNPROVED := the reply builders, the socket I/O, and whether \
+their callers honor these preconditions stay test-covered
+
 VERIFY_SIGFRAME_SRC  := src/proved/sigframe.h
 VERIFY_SIGFRAME_FCTS := sigframe_base
 VERIFY_SIGFRAME_MIN_GOALS ?= 15
@@ -334,7 +358,7 @@ commafy = $(subst $(verify_space),$(verify_comma),$(strip $(1)))
 # target name is enough and stays readable; a new target using a letter not
 # listed here shows up immediately as a literal upper-case character in the
 # rule name rather than silently misbehaving.
-lc = $(subst A,a,$(subst B,b,$(subst C,c,$(subst D,d,$(subst E,e,$(subst F,f,$(subst G,g,$(subst H,h,$(subst I,i,$(subst K,k,$(subst L,l,$(subst M,m,$(subst N,n,$(subst O,o,$(subst P,p,$(subst Q,q,$(subst R,r,$(subst S,s,$(subst T,t,$(subst U,u,$(subst V,v,$(subst X,x,$(1)))))))))))))))))))))))
+lc = $(subst A,a,$(subst B,b,$(subst C,c,$(subst D,d,$(subst E,e,$(subst F,f,$(subst G,g,$(subst H,h,$(subst I,i,$(subst K,k,$(subst L,l,$(subst M,m,$(subst N,n,$(subst O,o,$(subst P,p,$(subst Q,q,$(subst R,r,$(subst S,s,$(subst T,t,$(subst U,u,$(subst V,v,$(subst W,w,$(subst X,x,$(1))))))))))))))))))))))))
 
 # The proof targets, derived rather than listed. Make knows every variable it
 # has read, so the set of VERIFY_<T>_SRC assignments above IS the target list;

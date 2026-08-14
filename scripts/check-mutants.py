@@ -426,6 +426,31 @@ MUTATIONS = [
         "    if (a > max)\n        return 0;\n\n",
         "",
     ),
+    # ---- verify-netlinkwalk ------------------------------------------------
+    (
+        "netlinkwalk",
+        "src/syscall/netlink.c",
+        "nl_parse_link_filter",
+        "leave no room for the terminator (name_out[name_cap] is written)",
+        "            for (; i < dlen && i + 1 < name_cap && req[off + RTA_HDRLEN + i];",
+        "            for (; i < dlen && i < name_cap && req[off + RTA_HDRLEN + i];",
+    ),
+    (
+        "netlinkwalk",
+        "src/syscall/netlink.c",
+        "nl_complete_span",
+        "drop the fits-the-copy guard (the span reported exceeds to_copy)",
+        "        if (msg_bytes > to_copy)\n            break;\n",
+        "",
+    ),
+    (
+        "netlinkwalk",
+        "src/syscall/netlink.c",
+        "nl_put_attr",
+        "pad one byte past the aligned extent (writes past max)",
+        "        memset(buf + total, 0, (size_t) (aligned - total));",
+        "        memset(buf + total, 0, (size_t) (aligned - total) + 1);",
+    ),
     # ---- verify-sigframe ---------------------------------------------------
     (
         "sigframe",

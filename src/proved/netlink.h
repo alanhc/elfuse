@@ -10,10 +10,12 @@
  * reply span walk reads elfuse's own synthesized buffer, and is here for the
  * termination argument rather than for bounds; see below.
  *
- * Split out of netlink.c because that file cannot be given to Frama-C: it
- * includes the macOS network headers, which the analyzer's libc does not model.
- * This header needs nothing but stdint.h, so make verify-netlink proves it
- * directly.
+ * Split out of netlink.c when that file could not be given to Frama-C at all.
+ * It can now, under make verify-netlinkwalk, which proves the two walk loops
+ * that call into here; this header stays separate because it needs nothing but
+ * stdint.h and so proves in a second, while netlink.c drags in the whole
+ * syscall layer. The two targets overlap on purpose: verify-netlinkwalk
+ * re-proves these functions rather than assuming them.
  */
 
 #pragma once

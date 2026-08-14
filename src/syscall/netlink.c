@@ -176,7 +176,21 @@ static void netlink_clear_readable(netlink_state_t *ns)
     }
 }
 
-/* Append a netlink attribute to the buffer. Returns bytes written. */
+/* Append a netlink attribute to the buffer.
+ *
+ * Returns bytes written. The payload precondition is memcpy's own predicate
+ * from Frama-C's string.h, not a hand-written \valid_read. datalen may be 0,
+ * and an empty \valid_read range says nothing at all about the pointer, while
+ * memcpy still demands \object_pointer on it. Restating the predicate is what
+ * keeps the two in step.
+ */
+/*@
+  requires \valid(buf + (0 .. max - 1));
+  requires valid_read_or_empty(data, datalen);
+  requires \separated(buf + (0 .. max - 1), (char *) data + (0 .. datalen - 1));
+  assigns buf[0 .. max - 1];
+  ensures \result <= max;
+ */
 static size_t nl_put_attr(uint8_t *buf,
                           size_t max,
                           uint16_t type,
@@ -486,6 +500,17 @@ int64_t netlink_bind(int guest_fd,
 /* Extract the LinkByName/LinkByIndex filter (ifi_index plus an optional
  * IFLA_IFNAME) from a RTM_GETLINK request. Empty name / zero index = no filter.
  */
+/*@
+  requires \valid_read(req + (0 .. reqlen - 1));
+  requires \valid(name_out + (0 .. name_cap - 1));
+  requires \valid(index_out);
+  requires name_cap > 0;
+  requires reqlen <= NETLINK_LEN_MAX;
+  requires \separated(name_out + (0 .. name_cap - 1),
+                      req + (0 .. reqlen - 1),
+                      index_out);
+  assigns name_out[0 .. name_cap - 1], *index_out;
+ */
 static void nl_parse_link_filter(const uint8_t *req,
                                  size_t reqlen,
                                  char *name_out,
@@ -508,6 +533,16 @@ static void nl_parse_link_filter(const uint8_t *req,
     size_t total = (nlmsg_len < reqlen) ? nlmsg_len : reqlen;
 
     size_t off = NLMSG_HDRLEN + netlink_align_up(sizeof(ifinfomsg_t));
+
+    /* The invariant bounds off itself, not just off relative to total.
+     * Without it the C loop test "off + RTA_HDRLEN <= total" is not known to be
+     * free of unsigned wrap, and every goal under the loop inherits that doubt.
+     */
+    /*@
+      loop invariant off <= reqlen + NETLINK_ALIGNTO;
+      loop assigns off, name_out[0 .. name_cap - 1];
+      loop variant total - off;
+     */
     while (off + RTA_HDRLEN <= total) {
         rtattr_t rta;
         memcpy(&rta, req + off, sizeof(rta));
@@ -522,6 +557,11 @@ static void nl_parse_link_filter(const uint8_t *req,
         if (rta.rta_type == IFLA_IFNAME) {
             size_t dlen = (size_t) data_len;
             size_t i = 0;
+            /*@
+              loop invariant i < name_cap;
+              loop assigns i, name_out[0 .. name_cap - 1];
+              loop variant dlen - i;
+             */
             for (; i < dlen && i + 1 < name_cap && req[off + RTA_HDRLEN + i];
                  i++)
                 name_out[i] = (char) req[off + RTA_HDRLEN + i];
@@ -723,9 +763,23 @@ static int64_t nl_wait_readable_locked(netlink_state_t *ns,
  * starts at ns->buf_pos and fits within to_copy. Falls back to to_copy when not
  * even one whole message fits (MSG_TRUNC semantics). Called with nl_lock held.
  */
+/*@
+  requires \valid_read(ns);
+  requires ns->buf_pos <= ns->buf_len;
+  requires ns->buf_len <= NETLINK_BUF_SIZE;
+  requires to_copy <= ns->buf_len - ns->buf_pos;
+  assigns \nothing;
+  ensures \result <= to_copy;
+ */
 static size_t nl_complete_span(const netlink_state_t *ns, size_t to_copy)
 {
     size_t msg_end = 0, pos = ns->buf_pos;
+    /*@
+      loop invariant ns->buf_pos <= pos <= ns->buf_len;
+      loop invariant msg_end <= to_copy;
+      loop assigns pos, msg_end;
+      loop variant ns->buf_len - pos;
+     */
     while (pos < ns->buf_len && (pos - ns->buf_pos + NLMSG_HDRLEN) <= to_copy) {
         /* memcpy rather than a cast: pos is not guaranteed to sit on a message
          * boundary (see the header), so ns->buf + pos need not be suitably

@@ -115,14 +115,20 @@ def contracted_definitions(text):
 # This regex is the cheap half and it names the offending function, which is
 # what makes a failure actionable. It cannot see a char reached through a
 # typedef or a macro; check-char-signedness.py settles that half with the
-# compiler, which resolves both, and "make verify" runs it. The four below
-# predate the invariant and satisfy it by casting at every use, so they are
-# listed and hand-audited rather than rewritten.
+# compiler, which resolves both, and "make verify" runs it. The five below
+# satisfy the invariant and are listed and hand-audited rather than rewritten.
+#
+# The four RSP ones predate the invariant and cast at every read.
+# nl_parse_link_filter is a different shape: its char * is an output buffer it
+# only ever writes, and the byte it writes comes from a uint8_t source through
+# an explicit (char) cast. It reads no plain char at all, so there is nothing
+# for the signedness to change.
 CHAR_PARAM_ALLOWLIST = {
     "gdb_hex_pair",
     "gdb_hex_decode",
     "gdb_parse_hex",
     "rsp_checksum",
+    "nl_parse_link_filter",
 }
 
 # A char parameter, with its signedness qualifier if it has one. Matching the
