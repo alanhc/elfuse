@@ -95,7 +95,8 @@ jobs:
     needs: build-macos
     if: >
       github.repository == 'sysprog21/elfuse' &&
-      (github.event_name == 'push' || github.event_name == 'pull_request')
+      (github.event_name == 'push' || github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, macOS, arm64]
     # Sanitizer builds run several times slower than the release build, so the
     # job budget and the per-test TEST_TIMEOUT are set per leg. Without
