@@ -88,7 +88,11 @@ jobs:
             $LINT_PKGS
 
       - name: Trailing newline
-        if: ${{ !cancelled() }}
+        # always(), matching verify-mutants-gate below and for the reason stated
+    # there: a required check that is SKIPPED does not block a merge, and
+    # !cancelled() skips this job whenever the run is cancelled. always() makes
+    # it run and report the matrix verdict in that case too.
+    if: always()
         run: .ci/check-newline.sh
 
       - name: clang-format
