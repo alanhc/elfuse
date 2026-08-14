@@ -2,7 +2,7 @@
 
 .PHONY: lint analyze check-format indent verify \
         check-contracts verify-mutants check-char-signedness \
-        print-verify-targets infer-uninit
+        check-stub-constants print-verify-targets infer-uninit
 
 CLANG_TIDY ?= clang-tidy
 INFER ?= infer
@@ -383,7 +383,7 @@ $(foreach t,$(VERIFY_TARGETS),$(eval $(call verify-target-vars,$(t))))
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-$(VERIFY_RULES): | $(BUILD_DIR)
+$(VERIFY_RULES): check-stub-constants | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -472,6 +472,15 @@ VERIFY_JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || ech
 # for the filter below to find. Apple's /usr/bin/make is 3.81 and records
 # nothing for -j1, so there it reads as a plain invocation and parallelizes;
 # VERIFY_JOBS=1 asks for serial in a way both understand.
+## Assert every frama-c-stubs constant matches the macOS SDK
+#
+# The stub headers claim to carry Darwin's real values, and the analyzer never
+# links, so a wrong one cannot fail a build: it silently changes what the proofs
+# reason about. ETOOMANYREFS was written as 62, which is Darwin's ELOOP and
+# another arm of the same linux_errno() switch, and only a review caught it.
+check-stub-constants:
+	$(Q)python3 scripts/check-stub-constants.py
+
 verify:
 	+@$(MAKE) --no-print-directory \
 	    $(if $(filter -j%,$(MAKEFLAGS)),,-j$(VERIFY_JOBS)) $(VERIFY_RULES)
