@@ -217,8 +217,8 @@ static void mark_overlay_metadata_range(guest_t *g,
 
 /* Mark every region overlapping [start, end) as backed by a fd that lost write
  * access, so sys_mprotect rejects a later PROT_WRITE upgrade. mremap can split
- * an inherited VMA at the fork boundary, so callers must not require one
- * exact region match here.
+ * an inherited VMA at the fork boundary, so callers must not require one exact
+ * region match here.
  */
 static void mark_region_backing_ro(guest_t *g, uint64_t start, uint64_t end)
 {
@@ -288,9 +288,9 @@ static int64_t finish_mremap(mremap_source_t *source, int64_t result)
 /* Resolve a logical mremap source. Fork-aware growth intentionally leaves an
  * inherited prefix and a child-private tail as separate records; those two
  * records are still one VMA for mremap purposes. The stable vma_id proves that
- * provenance even after another fork changes inherited_at_fork on both
- * records. Reject any boundary with a different lineage so unrelated adjacent
- * mappings cannot be copied as one source.
+ * provenance even after another fork changes inherited_at_fork on both records.
+ * Reject any boundary with a different lineage so unrelated adjacent mappings
+ * cannot be copied as one source.
  */
 static int find_mremap_source(const guest_t *g,
                               uint64_t start,
@@ -883,7 +883,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
      * page-rounds length, but addr is guest-supplied and a huge length against
      * a high VA can still overflow. Also reject the case where addr + length is
      * too close to UINT64_MAX for ALIGN_UP to round up the 2 MiB boundary
-     * without wrapping to 0 (which would make va_end smaller than va_start and
+     * without wrapping to 0 (which would make va_limit smaller than va_base and
      * underflow backing_span).
      */
     if (length == 0 || addr > UINT64_MAX - length)
@@ -952,14 +952,14 @@ static int64_t sys_mmap_high_va(guest_t *g,
         replacing_existing = true;
     }
 
-    uint64_t va_start = ALIGN_DOWN(addr, BLOCK_2MIB);
-    uint64_t va_end = ALIGN_UP(addr + length, BLOCK_2MIB);
-    uint64_t backing_span = va_end - va_start;
+    uint64_t va_base = ALIGN_DOWN(addr, BLOCK_2MIB);
+    uint64_t va_limit = ALIGN_UP(addr + length, BLOCK_2MIB);
+    uint64_t backing_span = va_limit - va_base;
     uint64_t backing_gpa_start = 0;
     uint64_t backing_limit = 0;
 
     if (replacing_existing) {
-        backing_gpa_start = replaced_gpa_base - (addr - va_start);
+        backing_gpa_start = replaced_gpa_base - (addr - va_base);
     } else {
         backing_gpa_start =
             ALIGN_UP((g->mmap_end > g->mmap_next) ? g->mmap_end : g->mmap_next,
@@ -1025,7 +1025,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
         (prot == LINUX_PROT_NONE) ? MEM_PERM_RW : prot_to_perms(prot);
 
     if (replacing_existing) {
-        map_host = host_ptr_for_gpa(g, backing_gpa_start + (addr - va_start));
+        map_host = host_ptr_for_gpa(g, backing_gpa_start + (addr - va_base));
         if (!map_host)
             goto fail;
         goto populate_existing;
@@ -1036,10 +1036,10 @@ static int64_t sys_mmap_high_va(guest_t *g,
      * zero descriptors after invalidation and harmless until reused by a later
      * mmap.
      */
-    va_installed_end = va_start;
+    va_installed_end = va_base;
 
-    for (uint64_t va = va_start; va < va_end; va += BLOCK_2MIB) {
-        uint64_t gpa = backing_gpa_start + (va - va_start);
+    for (uint64_t va = va_base; va < va_limit; va += BLOCK_2MIB) {
+        uint64_t gpa = backing_gpa_start + (va - va_base);
 
         void *host = host_ptr_for_gpa(g, gpa);
         if (!host)
@@ -1083,7 +1083,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
         }
     }
 
-    map_host = host_ptr_for_gpa(g, backing_gpa_start + (addr - va_start));
+    map_host = host_ptr_for_gpa(g, backing_gpa_start + (addr - va_base));
     if (!map_host)
         goto fail;
 
@@ -1159,7 +1159,7 @@ populate_existing:
         if (guest_invalidate_ptes(g, addr, addr + length) < 0)
             goto fail;
     } else {
-        uint64_t gpa_for_addr = backing_gpa_start + (addr - va_start);
+        uint64_t gpa_for_addr = backing_gpa_start + (addr - va_base);
         replaced_ptes_modified = replacing_existing;
         if (guest_install_va_pages(g, addr, length, gpa_for_addr,
                                    prot_to_perms(prot)) < 0)
@@ -1174,7 +1174,7 @@ populate_existing:
             g->mmap_end = backing_gpa_end;
     }
 
-    uint64_t gpa_base = backing_gpa_start + (addr - va_start);
+    uint64_t gpa_base = backing_gpa_start + (addr - va_base);
     if (!region_has_capacity_after_removes(
             g,
             replacing_existing ? &(remove_range_t) {addr, addr + length} : NULL,
@@ -1250,7 +1250,7 @@ fail:
                 (unsigned long long) (inflight_fresh_block_va + BLOCK_2MIB));
         }
     }
-    if (va_installed_end > va_start) {
+    if (va_installed_end > va_base) {
         if (guest_invalidate_ptes(g, addr, addr + length) < 0) {
             log_error(
                 "sys_mmap_high_va: rollback invalidate failed for "
@@ -1263,6 +1263,7 @@ fail:
         close(track_backing_fd);
     if (replaced_remove_fd >= 0)
         close(replaced_remove_fd);
+
     /* Restore region/PTE snapshots when this call mutated regions[] or the page
      * tables; otherwise just drop the snapshot allocation. Whichever path runs,
      * the common cleanup below frees snapshots and fds and resumes siblings, so
@@ -1631,7 +1632,8 @@ static int capture_region_snapshots(guest_t *g,
 {
     /* Split and snapshot as one metadata transaction. A failed boundary split,
      * descriptor dup, or snapshot-capacity check must leave regions[] and its
-     * owned fds exactly as they were on entry. */
+     * owned fds exactly as they were on entry.
+     */
     region_array_txn_t txn;
     int txn_err = begin_region_array_txn(g, &txn);
     if (txn_err < 0)
@@ -1697,7 +1699,8 @@ static int capture_region_snapshots(guest_t *g,
 /* MREMAP_FIXED may remove a destination fragment that used to share the same
  * tracker backing fd as a source fragment. Rebind file-backed source segments
  * to the owned source snapshots before destination removal, so later overlay
- * restore and pread-based copies cannot observe a closed borrowed fd. */
+ * restore and pread-based copies cannot observe a closed borrowed fd.
+ */
 static int rebind_mremap_source_backings(mremap_source_t *source,
                                          const region_snapshot_t *snaps,
                                          int n)
@@ -2285,7 +2288,7 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
     uint64_t host_start = ALIGN_DOWN(start, hps);
     uint64_t host_end = ALIGN_UP(end, hps);
 
-    /* Boundary splits are only needed to isolate live host overlays.  A plain
+    /* Boundary splits are only needed to isolate live host overlays. A plain
      * guest range removal must not consume a region-table slot just to prove
      * that there is no overlay to tear down; when the table is full that would
      * turn an operation that only reduces mappings into a spurious ENOMEM.
@@ -2453,11 +2456,11 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
      * see no heap region.
      */
     if (new_off < old_brk) {
-        /* Trim every semantic heap segment covered by the released suffix.
-         * In a fork child this may shorten or remove the private tail while
-         * leaving the inherited prefix intact. Keeping the tracker end equal
-         * to brk_current prevents a later regrowth from overlapping stale
-         * tail metadata.
+        /* Trim every semantic heap segment covered by the released suffix. In a
+         * fork child this may shorten or remove the private tail while leaving
+         * the inherited prefix intact. Keeping the tracker end equal to
+         * brk_current prevents a later regrowth from overlapping stale tail
+         * metadata.
          */
         guest_region_remove_reserved(g, new_off, old_brk, shrink_remove_fd);
     } else if (new_off > g->brk_base) {
@@ -2470,8 +2473,8 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
                 if (new_off > old_heap_end && heap->inherited_at_fork) {
                     /* Keep the fork-snapshot portion separate from pages
                      * materialized by post-fork brk growth. On later growths,
-                     * extend the existing child-private tail rather than
-                     * adding an overlapping range from the old boundary.
+                     * extend the existing child-private tail rather than adding
+                     * an overlapping range from the old boundary.
                      */
                     guest_region_t *right =
                         i + 1 < g->nregions ? &g->regions[i + 1] : NULL;
@@ -2488,11 +2491,11 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
                                    LINUX_PROT_READ | LINUX_PROT_WRITE,
                                    LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0,
                                    "[heap]", -1, false, heap->vma_id) < 0) {
-                        /* Widening the inherited prefix would either overlap
-                         * an incompatible child-private tail or mislabel new
-                         * pages as inherited. Keep the original boundary; brk
-                         * memory already grew successfully, so only the
-                         * semantic tracker becomes stale.
+                        /* Widening the inherited prefix would either overlap an
+                         * incompatible child-private tail or mislabel new pages
+                         * as inherited. Keep the original boundary; brk memory
+                         * already grew successfully, so only the semantic
+                         * tracker becomes stale.
                          */
                         g->regions_tracker_stale = true;
                     }
@@ -3394,9 +3397,9 @@ int64_t sys_mremap(guest_t *g,
     if (guest_range_hits_infra(g, old_off, old_off + old_size))
         return -LINUX_EINVAL;
 
-    /* Verify the whole source range is covered by one logical VMA. A
-     * fork-aware growth can split that VMA at the inherited/private boundary,
-     * but no unrelated adjacent mapping may be included.
+    /* Verify the whole source range is covered by one logical VMA. A fork-aware
+     * growth can split that VMA at the inherited/private boundary, but no
+     * unrelated adjacent mapping may be included.
      */
     mremap_source_t source;
     bool collect_source_segments =
@@ -3429,6 +3432,7 @@ int64_t sys_mremap(guest_t *g,
         if (guest_region_remove_prepare(g, tail_off, tail_end,
                                         &tail_remove_fd) < 0)
             return finish_mremap(&source, -LINUX_ENOMEM);
+
         /* Restore slab backing under any tail overlay before zeroing so the
          * memset does not write zeros into a file.
          */
@@ -3438,6 +3442,7 @@ int64_t sys_mremap(guest_t *g,
                 close(tail_remove_fd);
             return finish_mremap(&source, cleanup_err);
         }
+
         /* Zero the trimmed region on its real backing (high-VA tails live at
          * gpa_base, not host_base + tail_off).
          */
@@ -3546,9 +3551,10 @@ int64_t sys_mremap(guest_t *g,
         }
 
         /* Keep both boundary captures in one transaction. The per-capture
-         * helper rolls back its own edits, while this outer guard also undoes
-         * a successful source capture if destination capture or the preflight
-         * shared-file flush fails afterward. */
+         * helper rolls back its own edits, while this outer guard also undoes a
+         * successful source capture if destination capture or the preflight
+         * shared-file flush fails afterward.
+         */
         region_array_txn_t capture_txn;
         int capture_txn_err = begin_region_array_txn(g, &capture_txn);
         if (capture_txn_err < 0) {
@@ -4069,8 +4075,8 @@ int64_t sys_mremap(guest_t *g,
         }
 
         /* Copy each source segment according to its own backing state, then
-         * zero the extension. The new range is a fresh gap and receives no
-         * live overlay.
+         * zero the extension. The new range is a fresh gap and receives no live
+         * overlay.
          */
         if (prot == LINUX_PROT_NONE) {
             memset((uint8_t *) g->host_base + new_off, 0, new_size);
@@ -4342,9 +4348,9 @@ static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
     if (guest_range_hits_infra(g, unmap_off, end))
         return -LINUX_EINVAL;
 
-    /* An interior removal from a file-backed region needs a second owned fd
-     * for the surviving right half. Reserve it before changing overlays,
-     * page tables, or host memory so descriptor exhaustion is failure-atomic.
+    /* An interior removal from a file-backed region needs a second owned fd for
+     * the surviving right half. Reserve it before changing overlays, page
+     * tables, or host memory so descriptor exhaustion is failure-atomic.
      */
     int remove_fd = -1;
     if (guest_region_remove_prepare(g, unmap_off, end, &remove_fd) < 0)
