@@ -656,9 +656,29 @@ static int pty_keepalive_register_locked(int master_host_fd,
      * would split the aliases onto separate counters, so slaves opened through
      * one would be invisible to the other and the hangup would be lost.
      */
-    if (!pty_keepalive_table[slot].shared)
+    if (!pty_keepalive_table[slot].shared) {
         pty_keepalive_table[slot].shared = pty_shared_attach(
             pty_keepalive_table[slot].slave_path, fresh_segment);
+
+        /* A count kept across the reuse above was accumulated while this row
+         * had no segment, so the segment it has just joined knows nothing about
+         * it. Without this, each of those slaves decrements on close a total it
+         * was never added to, the shared count goes negative, and
+         * pty_slot_hung_up_locked reports a hangup with the slaves still open.
+         * Same compensation pty_keepalive_clear_slot_locked makes when it hands
+         * a segment-less count to an heir that maps one.
+         *
+         * Only reachable through the same_pty path: every other route zeroed
+         * the count just above, and a fresh_segment registration is by
+         * definition not one of them.
+         */
+        if (pty_keepalive_table[slot].shared &&
+            pty_keepalive_table[slot].guest_slave_count > 0) {
+            atomic_fetch_add(&pty_keepalive_table[slot].shared->slave_count,
+                             pty_keepalive_table[slot].guest_slave_count);
+            atomic_store(&pty_keepalive_table[slot].shared->seen, 1);
+        }
+    }
     return PTY_REG_INSERTED;
 }
 
