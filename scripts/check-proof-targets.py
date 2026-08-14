@@ -4,7 +4,7 @@
 Three places name the same set of proved sources, and nothing but this script
 keeps them in agreement:
 
-  1. mk/analysis.mk's VERIFY_<T>_SRC entries -- the targets themselves.
+  1. mk/verify.mk's VERIFY_<T>_SRC entries -- the targets themselves.
   2. .github/workflows/main.yml's verify-mutants matrix -- the CI sharding.
   3. src/proved/ -- the directory the proved headers live in.
 
@@ -19,7 +19,7 @@ target, and its matrix is fromJson of "make print-verify-targets" rather than
 a list of its own. What is checked here is that it stays that way, and that
 the list make generates is the whole list: a VERIFY_<T>_SRC block written
 below the line that snapshots them is invisible to make and to CI while
-still reading as a target in this file.
+still reading as a target in that file.
 
 Usage:
     check-proof-targets.py
@@ -36,17 +36,17 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # scripts/ filenames are kebab-case per CLAUDE.md, which no plain "import"
 # statement can name, so the shared reader is loaded by path. The alternative
 # was an underscore in the filename, which the tree does not use anywhere.
-def _load_analysis_mk():
+def _load_verify_mk():
     import importlib.util
 
-    path = pathlib.Path(__file__).resolve().parent / "analysis-mk.py"
-    spec = importlib.util.spec_from_file_location("analysis_mk", path)
+    path = pathlib.Path(__file__).resolve().parent / "verify-mk.py"
+    spec = importlib.util.spec_from_file_location("verify_mk", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-analysis_mk = _load_analysis_mk()
+verify_mk = _load_verify_mk()
 
 
 PROVED_DIR = ROOT / "src" / "proved"
@@ -71,7 +71,7 @@ def make_target_names():
     """The target names make actually generates rules for.
 
     Deliberately asks make rather than reading the file, because the two can
-    disagree. mk/analysis.mk derives its list with
+    disagree. mk/verify.mk derives its list with
     "VERIFY_TARGETS := $(filter VERIFY_%_SRC,$(.VARIABLES))", and := is
     immediate: .VARIABLES holds only what make has read so far, so a
     VERIFY_<T>_SRC block written below that line is invisible to it. The block
@@ -94,7 +94,7 @@ def make_target_names():
 
 
 def workflow_matrix_is_derived():
-    """Whether the verify-mutants matrix is built from mk/analysis.mk.
+    """Whether the verify-mutants matrix is built from mk/verify.mk.
 
     It used to be a hand-kept copy of the target list and this function
     compared the two. The copy is gone: a proof-targets job runs
@@ -126,7 +126,7 @@ def workflow_matrix_is_derived():
             "  verify-mutants' matrix.target is not derived: "
             f"{shape}\n"
             f"  It should be exactly {expected} so the target list has one "
-            "home in mk/analysis.mk. Another job's output would be derived "
+            "home in mk/verify.mk. Another job's output would be derived "
             "too, but from something this script does not read.",
             file=sys.stderr,
         )
@@ -135,7 +135,7 @@ def workflow_matrix_is_derived():
 
 
 def main():
-    mk = analysis_mk.targets()
+    mk = verify_mk.targets()
     if not workflow_matrix_is_derived():
         return 2
 
@@ -146,10 +146,10 @@ def main():
     dropped = {t.lower() for t in mk} - generated
     if dropped:
         print(
-            "  VERIFY_<T>_SRC block(s) in mk/analysis.mk that make generates "
-            "no rule for. Nothing fails today: the proof simply never runs, "
-            "here or in CI. Move the block above the 'VERIFY_TARGETS :=' "
-            "line, which snapshots the target list at the point it appears:",
+            "  VERIFY_<T>_SRC block(s) that make generates no rule for. "
+            "Nothing fails today: the proof simply never runs, here or in "
+            "CI. Move the block above the 'VERIFY_TARGETS :=' line, which "
+            "snapshots the target list at the point it appears:",
             file=sys.stderr,
         )
         for t in sorted(dropped):
@@ -161,12 +161,12 @@ def main():
     # exists but is untracked, and breaks every fresh clone and CI checkout.
     missing_files = {
         src
-        for src in analysis_mk.sources()
+        for src in verify_mk.sources()
         if src.startswith("src/proved/") and not (ROOT / src).exists()
     }
     if missing_files:
         print(
-            "  VERIFY_<T>_SRC entries in mk/analysis.mk naming a file that "
+            "  VERIFY_<T>_SRC entries in mk/verify.mk naming a file that "
             "does not exist. The build and the proofs reference it, so a "
             "fresh clone fails even though this tree works:",
             file=sys.stderr,
@@ -177,7 +177,7 @@ def main():
 
     untracked = {
         src
-        for src in analysis_mk.sources()
+        for src in verify_mk.sources()
         if src.startswith("src/proved/") and src not in tracked_sources()
     }
     if untracked:
@@ -191,12 +191,12 @@ def main():
             print(f"    {src}", file=sys.stderr)
         return 1
 
-    unproved = proved_dir_sources() - analysis_mk.sources()
+    unproved = proved_dir_sources() - verify_mk.sources()
     if unproved:
         print(
             "  file(s) under src/proved/ that no verify-<name> target "
             "proves. The directory name says otherwise, so either add a "
-            "VERIFY_<T>_SRC block in mk/analysis.mk or move the file out:",
+            "VERIFY_<T>_SRC block in mk/verify.mk or move the file out:",
             file=sys.stderr,
         )
         for f in sorted(unproved):
@@ -204,7 +204,7 @@ def main():
         return 1
 
     print(
-        f"  {len(mk)} proof target(s) in mk/analysis.mk, all with a proved "
+        f"  {len(mk)} proof target(s) in mk/verify.mk, all with a proved "
         f"source; the CI matrix is derived from that list, and all "
         f"{len(proved_dir_sources())} file(s) under src/proved/ are proved "
         "by one"

@@ -6,7 +6,7 @@
 #   tidy-macos    : clang-tidy via `make lint`
 #   verify-mutants: per target, the Frama-C WP proof AND the mutations that
 #                   show it bites; one runner per target, sharded from
-#                   mk/analysis.mk's VERIFY_<T>_SRC list
+#                   mk/verify.mk's VERIFY_<T>_SRC list
 #   verify        : aggregate check name over that matrix, kept because branch
 #                   protection requires it by name
 #   verify-mutants-gate: the same aggregate under the mutation-gate name
@@ -119,7 +119,7 @@ jobs:
         run: python3 scripts/gen-syscall-dispatch.py --output "$RUNNER_TEMP/dispatch.h"
 
       - name: Proof target consistency
-        # Three lists name the same proved sources: mk/analysis.mk's targets,
+        # Three lists name the same proved sources: mk/verify.mk's targets,
         # the verify-mutants matrix below, and src/proved/. A target in one
         # but not another either drops that target's mutation coverage from CI
         # with no error, or leaves an unproved header sitting in a directory
@@ -224,7 +224,7 @@ jobs:
       - name: clang-tidy (make lint)
         run: make lint
 
-  # The proof target list has ONE home, mk/analysis.mk's VERIFY_<T>_SRC
+  # The proof target list has ONE home, mk/verify.mk's VERIFY_<T>_SRC
   # assignments. This job reads it there and the matrix below is built from the
   # result, so adding a proof target is a one-file edit and a target can no
   # longer exist locally while silently having no CI leg.
@@ -240,7 +240,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Read the targets from mk/analysis.mk
+      - name: Read the targets from mk/verify.mk
         id: list
         run: |
           set -euo pipefail
@@ -273,7 +273,7 @@ jobs:
   # without a barrier that made every shard wait for the slowest proof.
   #
   # The matrix comes from the proof-targets job above, which reads
-  # mk/analysis.mk, so this list cannot drift from the targets that exist.
+  # mk/verify.mk, so this list cannot drift from the targets that exist.
   verify-mutants:
     name: Proof and mutations (${{ matrix.target }})
     needs: proof-targets

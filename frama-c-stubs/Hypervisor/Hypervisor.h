@@ -14,9 +14,9 @@
  * Deliberately outside src/. A compile resolves headers through -Isrc, so a
  * stub living there would sit on the real build's include path and could shadow
  * the SDK header the binary must link against. Up here nothing but
- * FRAMAC_STUB_DIR in mk/analysis.mk can reach it.
+ * FRAMAC_STUB_DIR in mk/verify.mk can reach it.
  *
- * This is reached only through mk/analysis.mk, never by a compile. Nothing
+ * This is reached only through mk/verify.mk, never by a compile. Nothing
  * proved reads any constant defined here, so the values matter only in that
  * they must not collide: HV_REG_X0 + n is how src/hvutil.h names a register,
  * which needs the X registers consecutive and in order, and the rest are

@@ -22,7 +22,7 @@
  * function-like macro over its prototype fails the preprocessor outright.
  *
  * Modeled as the single-threaded reads and writes they reduce to, which is the
- * same trade -D_Atomic= already makes in mk/analysis.mk and carries the same
+ * same trade -D_Atomic= already makes in mk/verify.mk and carries the same
  * limit: sound for the per-function runtime-error and bounds obligations these
  * targets discharge, NOT sound for any analysis of concurrent behaviour. The
  * memory order argument is evaluated and discarded, so a call that computes it

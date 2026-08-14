@@ -4,7 +4,7 @@
 Frama-C 31 has no aarch64 machdep, so every target is proved under gcc_x86_64.
 That model matches arm64 macOS on pointer width, byte order and alignment, but
 not on one property: it makes plain char SIGNED where arm64 makes it unsigned
-(see the table in mk/analysis.mk). The risk only exists where proved code reads
+(see the table in mk/verify.mk). The risk only exists where proved code reads
 a plain char, so knowing exactly which sources do that is the thing worth
 automating.
 
@@ -47,14 +47,25 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
-def analysis_mk():
-    """mk/analysis.mk with line continuations joined."""
-    return re.sub(r"\\\n", " ", (ROOT / "mk" / "analysis.mk").read_text())
+# scripts/ filenames are kebab-case per CLAUDE.md, which no plain "import"
+# statement can name, so the shared reader is loaded by path. The alternative
+# was an underscore in the filename, which the tree does not use anywhere.
+def _load_verify_mk():
+    import importlib.util
+
+    path = pathlib.Path(__file__).resolve().parent / "verify-mk.py"
+    spec = importlib.util.spec_from_file_location("verify_mk", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+verify_mk = _load_verify_mk()
 
 
 def proof_sources():
     """{target: (source path, [proved function names])}."""
-    text = analysis_mk()
+    text = verify_mk.joined_text()
     utils = ""
     m = re.search(r"^VERIFY_UTILS_FCTS\s*:=\s*(.*)$", text, re.MULTILINE)
     if m:
@@ -213,7 +224,7 @@ def main():
             return 2
         targets = {args.target: targets[args.target]}
     if not targets:
-        print("no proof targets found in mk/analysis.mk", file=sys.stderr)
+        print("no proof targets found in mk/verify.mk", file=sys.stderr)
         return 2
 
     # Two distinct failure classes, reported with two distinct headers. An

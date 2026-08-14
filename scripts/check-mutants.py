@@ -66,17 +66,17 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # scripts/ filenames are kebab-case per CLAUDE.md, which no plain "import"
 # statement can name, so the shared reader is loaded by path. The alternative
 # was an underscore in the filename, which the tree does not use anywhere.
-def _load_analysis_mk():
+def _load_verify_mk():
     import importlib.util
 
-    path = pathlib.Path(__file__).resolve().parent / "analysis-mk.py"
-    spec = importlib.util.spec_from_file_location("analysis_mk", path)
+    path = pathlib.Path(__file__).resolve().parent / "verify-mk.py"
+    spec = importlib.util.spec_from_file_location("verify_mk", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-analysis_mk_table = _load_analysis_mk()
+verify_mk = _load_verify_mk()
 BUILD = ROOT / "build" / "mutants"
 # The recipe writes $(BUILD_DIR)/verify-$(NAME).log, and NAME is overridden per
 # run to keep concurrent mutations off a shared log. That path must exist first:
@@ -883,18 +883,13 @@ MUTATIONS = [
 ]
 
 
-def analysis_mk():
-    """mk/analysis.mk with make line continuations joined."""
-    return re.sub(r"\\\n", " ", (ROOT / "mk" / "analysis.mk").read_text())
-
-
 # Changing any of these can change a verdict for every target, so a run that
 # sees one move must not skip anything. mk/toolchain.mk sets CC, which
 # check-char-signedness.py compiles with, and the top-level Makefile is what
-# pulls in both it and mk/analysis.mk to build the "make verify-<target>" a
-# mutation is judged by; the individual VERIFY_*_SRC/_SCAN/
-# _FCTS lines in mk/analysis.mk are covered separately by target_inputs()
-# below, but everything else in that file (the shared recipe, MIN_GOALS,
+# pulls in both it and the mk/ files below to build the "make verify-<target>"
+# a mutation is judged by; the individual VERIFY_*_SRC/_SCAN/
+# _FCTS lines in mk/verify.mk are covered separately by target_inputs()
+# below, but the rest of that file (the shared recipe, MIN_GOALS,
 # FRAMAC_TIMEOUT) is not, so the whole file still belongs here.
 #
 # .github/workflows/main.yml belongs here for the same reason even though it
@@ -909,11 +904,11 @@ def analysis_mk():
 # apiece.
 HARNESS_FILES = {
     "scripts/check-mutants.py",
-    "scripts/analysis-mk.py",
+    "scripts/verify-mk.py",
     "scripts/check-wp-result.py",
     "scripts/check-acsl-coverage.py",
     "scripts/check-char-signedness.py",
-    "mk/analysis.mk",
+    "mk/verify.mk",
     "mk/toolchain.mk",
     "Makefile",
     ".github/workflows/main.yml",
@@ -1003,7 +998,7 @@ def target_inputs(cc):
 
 def target_sources():
     """VERIFY_<T>_SRC for every target, as {target: path}."""
-    return analysis_mk_table.target_sources()
+    return verify_mk.target_sources()
 
 
 def target_mutable_files():
@@ -1022,7 +1017,7 @@ def target_mutable_files():
 
 def proved_functions():
     """Every function named in a VERIFY_*_FCTS list, as {target: [names]}."""
-    text = analysis_mk()
+    text = verify_mk.joined_text()
     shared = re.search(r"^VERIFY_UTILS_FCTS\s*:=\s*(.*)$", text, re.MULTILINE)
     utils = shared.group(1) if shared else ""
     out = {}

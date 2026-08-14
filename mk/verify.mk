@@ -1,40 +1,7 @@
-# Static analysis and formatting
+# Frama-C WP proofs
 
-.PHONY: lint analyze check-format indent verify \
-        check-contracts verify-mutants check-char-signedness \
-        check-stub-constants print-verify-targets infer-uninit
-
-CLANG_TIDY ?= clang-tidy
-INFER ?= infer
-
-# Tracked source-like files only. Avoid editor/agent worktrees and other
-# untracked mirrors under dot-directories.
-C_FORMAT_FILES := $(shell git ls-files --cached --others --exclude-standard \
-                           -- 'src/**/*.[ch]' 'src/*.[ch]' \
-                           'tests/*.c' 'tests/*.h' \
-                           'frama-c-stubs/**/*.h' 'frama-c-stubs/*.h')
-SHELL_SCRIPTS := $(shell git ls-files --cached --others --exclude-standard \
-                         -- '*.sh')
-PYTHON_FORMAT_FILES := $(shell git ls-files --cached --others \
-                               --exclude-standard -- '*.py')
-
-# Missing-tool diagnostics, in the shape the verify-* targets already use:
-# name the tool, name the install, fail on purpose. Without this a developer
-# running lint/analyze/infer-uninit gets "make: clang-tidy: No such file or
-# directory / Error 1", which reads like a broken Makefile rather than a
-# missing dependency, on three of the eleven CI jobs.
-define require-tool
-	@command -v $(1) >/dev/null 2>&1 || { \
-		printf "  $(RED)%s not found$(RESET) (%s)\n" "$(1)" "$(2)"; \
-		exit 1; \
-	}
-endef
-
-## Run clang-tidy on all source files
-lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
-	$(call require-tool,$(CLANG_TIDY),brew install llvm -- or set CLANG_TIDY=)
-	@echo "  TIDY    src/"
-	$(Q)$(CLANG_TIDY) $(SRCS) -- $(CFLAGS) -Isrc -I$(BUILD_DIR)
+.PHONY: verify check-contracts verify-mutants check-char-signedness \
+        check-stub-constants print-verify-targets
 
 # Frama-C proof of the ELF parsing core. ELF headers come from untrusted
 # binaries, so every offset and extent computed from them is discharged as a
@@ -525,71 +492,3 @@ check-contracts:
 	@echo "  CONTRACT proved/gva.h call-site preconditions (5 of 9 clauses)"
 	$(Q)$(MAKE) BUILD_DIR=$(BUILD_DIR)/contracts \
 	    EXTRA_CFLAGS="-DELFUSE_CONTRACT_ASSERT $(EXTRA_CFLAGS)" check
-
-## Re-run Infer with the uninitialized-value checker that .inferconfig disables
-infer-uninit: | $(BUILD_DIR)
-	$(call require-tool,$(INFER),brew install infer -- or set INFER=)
-	@echo "  INFER   uninitialized-value checker (disabled in .inferconfig)"
-	@echo "          A count of 0 means the suppression is no longer needed and"
-	@echo "          .inferconfig should be deleted. Anything else is the known"
-	@echo "          false-positive class: Pulse cannot prove guest_copy's"
-	@echo "          chunked loop fills its destination."
-	@status=0; \
-	$(INFER) run --keep-going --enable-issue-type PULSE_UNINITIALIZED_VALUE \
-	    --results-dir $(BUILD_DIR)/infer-uninit \
-	    -- $(MAKE) -B elfuse > $(BUILD_DIR)/infer-uninit.log 2>&1 || status=$$?; \
-	if [ "$$status" -ne 0 ] && [ "$$status" -ne 2 ]; then \
-		printf "  $(RED)FAILED$(RESET)   infer exited %s; this is an analysis\n" "$$status"; \
-		printf "           failure, not an audit result. See $(BUILD_DIR)/infer-uninit.log\n"; \
-		exit 1; \
-	fi; \
-	if [ ! -s $(BUILD_DIR)/infer-uninit/report.json ]; then \
-		printf "  $(RED)FAILED$(RESET)   infer produced no report\n"; exit 1; \
-	fi; \
-	python3 -c "import json,sys; \
-	    d=json.load(open('$(BUILD_DIR)/infer-uninit/report.json')); \
-	    u=[x for x in d if x['bug_type']=='PULSE_UNINITIALIZED_VALUE']; \
-	    print('  %d PULSE_UNINITIALIZED_VALUE finding(s) across %d file(s)' \
-	          % (len(u), len({x['file'] for x in u})))"
-
-## Run clang static analyzer (scan-build)
-analyze:
-	$(call require-tool,scan-build,brew install llvm)
-	@echo "  SCAN    elfuse"
-	$(Q)scan-build --use-cc=$(CC) $(MAKE) -B elfuse
-
-## Check formatting: C (clang-format --dry-run) + shell (shellcheck)
-check-format: check-syscall-dispatch
-	@echo "  FMT     src/ tests/ (check)"
-	$(Q)$(CLANG_FORMAT) --dry-run --Werror $(C_FORMAT_FILES)
-	@echo "  MATRIX  skip lists"
-	$(Q)bash .ci/check-matrix-lists.sh
-	@printf "  SHCHK   %d scripts\n" $(words $(SHELL_SCRIPTS))
-	@fail=0; \
-	for f in $(SHELL_SCRIPTS); do \
-		if shellcheck --severity=warning "$$f" 2>&1; then \
-			printf "  $(GREEN)OK$(RESET) %s\n" "$$f"; \
-		else \
-			printf "  $(RED)FAIL$(RESET) %s\n" "$$f"; \
-			fail=$$((fail + 1)); \
-		fi; \
-	done; \
-	if [ "$$fail" -eq 0 ]; then \
-		printf "$(GREEN)All %d scripts pass$(RESET)\n" $(words $(SHELL_SCRIPTS)); \
-	else \
-		printf "$(RED)%d script(s) have warnings$(RESET)\n" "$$fail"; \
-		exit 1; \
-	fi
-
-## Indent all C, shell, and Python files in-place
-indent: gen-syscall-dispatch
-	@echo "  FMT     src/ tests/"
-	$(Q)$(CLANG_FORMAT) -i $(C_FORMAT_FILES)
-	@if command -v shfmt >/dev/null 2>&1; then \
-		printf "  SHFMT   %d scripts\n" $(words $(SHELL_SCRIPTS)); \
-		shfmt -w -ln=bash -i 4 -ci -bn -fn -sr $(SHELL_SCRIPTS); \
-	fi
-	@if command -v black >/dev/null 2>&1 && [ -n "$(PYTHON_FORMAT_FILES)" ]; then \
-		printf "  BLACK   %d files\n" $(words $(PYTHON_FORMAT_FILES)); \
-		black --quiet $(PYTHON_FORMAT_FILES); \
-	fi
