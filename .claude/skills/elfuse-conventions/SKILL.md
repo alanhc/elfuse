@@ -18,15 +18,13 @@ reads as authoritative.
 
 ## Working docs
 
-The repo root carries per-developer working docs that are deliberately
-untracked: `CLAUDE.md`, `spec.md`, and a few others alongside them. Never
-`git add`, commit, stage, gitignore, or delete any of them. They stay
-untracked but visible in `git status`. This applies to `CLAUDE.md` itself.
-
-`spec.md` holds the full coding conventions and wins where it and this file
-disagree, but it does not survive a fresh clone. That is why the load-bearing
-subset is duplicated below rather than referenced: on a clean checkout, `docs/`
-and these skills are all a contributor gets.
+A contributor may keep untracked working docs at the repo root or under
+`.claude/`; which ones exist differs per clone. Never `git add`, commit,
+stage, gitignore, or delete another person's: untracked but visible in
+`git status` is deliberate. None of them survive a fresh clone, so nothing
+here defers to one; the load-bearing conventions are written out below,
+because on a clean checkout `docs/` and these skills are all a contributor
+gets.
 
 ## Style
 
@@ -159,9 +157,10 @@ All source under `src/`, artifacts under `build/`. The build passes `-Isrc`,
 so headers are included as `core/guest.h`, `syscall/internal.h`,
 `proved/gva.h`.
 
-Reports and analyses go in `claudedocs/` (ignored via `.git/info/exclude`,
-which is local to the clone, so never `git add` it), tests in `tests/`,
-scripts in `scripts/`.
+Tests in `tests/`, scripts in `scripts/`. Reports and analyses stay out of
+the tree: keep them in a scratch directory or in a repo-root directory the
+clone excludes through `.git/info/exclude`, never through `.gitignore`, which
+would push one person's habit onto everybody.
 
 Build and toolchain requirements are in `docs/testing.md`, section "Build
 Requirements". They belong to a machine, not to this convention set.
