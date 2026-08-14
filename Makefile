@@ -445,5 +445,7 @@ $(BUILD_DIR)/test-mremap-tail-emfile: tests/test-mremap-tail-emfile.c | $(BUILD_
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $<
 
 include mk/tests.mk
-include mk/analysis.mk
+include mk/lint.mk
+include mk/verify.mk
+include mk/format.mk
 include mk/help.mk

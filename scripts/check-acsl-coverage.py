@@ -108,7 +108,7 @@ def contracted_definitions(text):
 
 # The gcc_x86_64 data model is a sound stand-in for arm64 macOS on every
 # property these proofs use EXCEPT plain-char signedness (see the table in
-# mk/analysis.mk). What keeps the results signedness-independent is that no
+# mk/verify.mk). What keeps the results signedness-independent is that no
 # proved function reads a plain char without an explicit (unsigned char) or
 # (uint8_t) cast first.
 #
