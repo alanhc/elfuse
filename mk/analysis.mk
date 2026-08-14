@@ -11,7 +11,8 @@ INFER ?= infer
 # untracked mirrors under dot-directories.
 C_FORMAT_FILES := $(shell git ls-files --cached --others --exclude-standard \
                            -- 'src/**/*.[ch]' 'src/*.[ch]' \
-                           'tests/*.c' 'tests/*.h')
+                           'tests/*.c' 'tests/*.h' \
+                           'frama-c-stubs/**/*.h' 'frama-c-stubs/*.h')
 SHELL_SCRIPTS := $(shell git ls-files --cached --others --exclude-standard \
                          -- '*.sh')
 PYTHON_FORMAT_FILES := $(shell git ls-files --cached --others \
@@ -113,8 +114,37 @@ FRAMAC_PROVERS ?= alt-ergo,z3
 # Per-target preprocessor defines, empty for every target that does not set one.
 CPP_DEFS :=
 
+# Two additions, both of which decide whether a .c file can be proved at all.
+#
+# frama-c-stubs supplies Hypervisor/Hypervisor.h. Frama-C has no Apple SDK, so
+# every source reaching src/core/guest.h or src/runtime/thread.h aborted on the
+# missing header before parsing began. See the stub for what it declares.
+#
+# -include gcc-atomics.h covers everything the analyzer needs and a compiler
+# provides for free. It supplies the type-generic __atomic_*_n builtins, which
+# Frama-C's libc does not model at all; without them those calls are implicit
+# declarations whose argument types are inferred per translation unit, which
+# parses one file at a time and then refuses the moment two files disagree on a
+# width. It also pulls in __fc_gcc_builtins.h for the builtins Frama-C does
+# model, and stdatomic.h for the _Atomic qualifier its front end cannot parse --
+# that header is where Frama-C states "_Atomic is currently ignored", so the
+# concession is the analyzer's own rather than one invented here. The tree
+# includes stdatomic.h nowhere, so it has to arrive ahead of the source.
+#
+# Ignoring _Atomic is sound for exactly the reasoning these targets do, which is
+# per-function runtime-error and bounds obligations under WP, one thread at a
+# time. It would NOT be sound for a concurrency analysis. No target here is one.
+# See the stub for the same limit on the atomic builtins.
+#
+# Together these took the parsing set from 2 sources to 15 of the tree's 55.
+# The other 40 stop on macOS headers Frama-C's libc does not model (sys/mount.h,
+# sys/event.h, sys/sysctl.h, sys/xattr.h, sys/attr.h, sys/spawn.h), which is a
+# real modeling gap rather than a missing declaration.
+FRAMAC_STUB_DIR := frama-c-stubs
+
 FRAMAC_CPP_ARGS = -nostdinc \
-    -isystem $$($(FRAMAC) -print-share-path)/libc -Isrc -I$(BUILD_DIR) \
+    -isystem $$($(FRAMAC) -print-share-path)/libc \
+    -I$(FRAMAC_STUB_DIR) -include gcc-atomics.h -include macos-libc.h -Isrc -I$(BUILD_DIR) \
     $(CPP_DEFS)
 
 # One proof per attacker-facing parser. Each is declared by a single
