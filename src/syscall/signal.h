@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include <stddef.h>
+
 #include <Hypervisor/Hypervisor.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -100,6 +102,7 @@ typedef enum {
 /* Linux siginfo_t (aarch64, 128 bytes). */
 typedef struct {
     int32_t si_signo, si_errno, si_code, _pad0;
+
     /* Common Linux siginfo fields on aarch64. The union payload starts at
      * offset 16; queued RT signals carry sigval at offset 24.
      */
@@ -162,6 +165,39 @@ typedef struct {
     linux_ucontext_t uc;
 } linux_rt_sigframe_t;
 
+/* Field offsets against arch/arm64 Linux, which is what makes rt_sigreturn
+ * work: musl and glibc both return through __restore_rt, which reads this frame
+ * back at these exact offsets. A silent drift here restores garbage into the
+ * guest's registers, and no test would name the struct that caused it.
+ *
+ * The values are derived, not observed. sigcontext is fault_address at 0,
+ * regs[31] at 8 through 256, sp 256, pc 264, pstate 272; __reserved carries
+ * __attribute__((aligned(16))), so it starts at 288 rather than 280. ucontext
+ * is uc_flags 0, uc_link 8, uc_stack 16 (stack_t is 24 bytes), uc_sigmask 40,
+ * then 120 bytes of __unused reaching 168, and uc_mcontext is 16-byte aligned
+ * so it starts at 176. rt_sigframe puts uc after a 128-byte siginfo.
+ *
+ * sigframe.h proves where the frame lands; this pins what is inside it, which
+ * is the half that proof deliberately does not reach.
+ */
+_Static_assert(sizeof(linux_siginfo_t) == 128, "siginfo_t is 128 bytes");
+_Static_assert(sizeof(linux_stack_t) == 24, "stack_t is 24 bytes");
+_Static_assert(offsetof(linux_sigcontext_t, regs) == 8, "sigcontext.regs");
+_Static_assert(offsetof(linux_sigcontext_t, sp) == 256, "sigcontext.sp");
+_Static_assert(offsetof(linux_sigcontext_t, pc) == 264, "sigcontext.pc");
+_Static_assert(offsetof(linux_sigcontext_t, pstate) == 272,
+               "sigcontext.pstate");
+_Static_assert(offsetof(linux_sigcontext_t, __reserved) == 288,
+               "sigcontext.__reserved is 16-byte aligned, so 288 not 280");
+_Static_assert(offsetof(linux_ucontext_t, uc_link) == 8, "ucontext.uc_link");
+_Static_assert(offsetof(linux_ucontext_t, uc_stack) == 16, "ucontext.uc_stack");
+_Static_assert(offsetof(linux_ucontext_t, uc_sigmask) == 40,
+               "ucontext.uc_sigmask");
+_Static_assert(offsetof(linux_ucontext_t, uc_mcontext) == 176,
+               "ucontext.uc_mcontext is 16-byte aligned, so 176 not 168");
+_Static_assert(offsetof(linux_rt_sigframe_t, uc) == 128,
+               "rt_sigframe.uc follows a 128-byte siginfo");
+
 /* RT signal queue. Maximum queued instances per RT signal. POSIX says at least
  * _POSIX_SIGQUEUE_MAX (32); Linux defaults to ~1024 per user.
  */
@@ -191,6 +227,7 @@ typedef struct {
      */
     bool std_info_valid[LINUX_SIGRTMIN - 1];
     signal_rt_info_t std_info[LINUX_SIGRTMIN - 1];
+
     /* RT signal queue: count of pending instances per signal. Standard signals
      * (1-31) use the pending bitmask plus std_info[]. RT signals (32-64) are
      * queued: each instance is tracked separately.
@@ -315,9 +352,11 @@ void signal_set_shim_globals_guest(guest_t *g);
  */
 int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code);
 
-/* Return and clear the Linux wait-format status recorded when the current
- * vCPU thread terminated because of a signal. Returns zero after a normal
- * syscall exit or when no fatal signal was delivered.
+/* Return and clear the Linux wait-format status recorded when the current vCPU
+ * thread terminated because of a signal.
+ *
+ * Returns zero after a normal syscall exit or when no fatal signal was
+ * delivered.
  */
 int signal_take_termination_wait_status(void);
 
@@ -368,13 +407,13 @@ int64_t signal_rt_sigsuspend(guest_t *g,
 /* Handle rt_sigpending (SYS 136). */
 int64_t signal_rt_sigpending(guest_t *g, uint64_t set_gva, uint64_t sigsetsize);
 
-/* Handle rt_sigtimedwait (SYS 137).
- * Synchronously consume a pending signal whose number is in *set*.
- * info_gva (may be 0): if non-zero, populate the guest siginfo_t there.
- * timeout_gva (may be 0): if zero, block indefinitely; otherwise block for
- * at most the specified duration.  Returns the signal number on success,
- * -EAGAIN if the timeout expired with no matching signal, or -EINTR if an
- * unrelated signal arrived while waiting.
+/* Handle rt_sigtimedwait (SYS 137). Synchronously consume a pending signal
+ * whose number is in *set*. info_gva (may be 0): if non-zero, populate the
+ * guest siginfo_t there. timeout_gva (may be 0): if zero, block indefinitely;
+ * otherwise block for at most the specified duration.
+ *
+ * Returns the signal number on success, -EAGAIN if the timeout expired with no
+ * matching signal, or -EINTR if an unrelated signal arrived while waiting.
  */
 int64_t signal_rt_sigtimedwait(guest_t *g,
                                uint64_t set_gva,

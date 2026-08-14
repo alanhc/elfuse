@@ -92,6 +92,12 @@
  * and the walker indexes all 512 of them, so the whole table must fit, not
  * merely its first byte. "*off < guest_size" would be satisfied by off ==
  * guest_size - 8, which puts l1[511] past the end of the slab.
+ *
+ * The reject path leaves off alone, stated as a postcondition because
+ * "assigns" permits writing it: without that clause a conforming
+ * implementation could scribble on it before returning 0, and a caller reading
+ * it on the failure path would be relying on the body rather than the
+ * contract.
  */
 #define GVA_PT_TABLE_BYTES 4096ULL
 
@@ -105,6 +111,7 @@
             ((desc & GVA_PT_ADDR_MASK) >= base &&
              (desc & GVA_PT_ADDR_MASK) - base + GVA_PT_TABLE_BYTES
                <= guest_size);
+  ensures \result == 0 ==> *off == \old(*off);
  */
 static inline int gva_pt_table_offset(uint64_t desc,
                                       uint64_t base,
@@ -162,6 +169,8 @@ static inline int gva_leaf_target_args_ok(uint64_t granule, uint64_t ipa)
   ensures \result != 0 ==> 1 <= *chunk <= granule;
   ensures \result != 0 ==> *chunk == granule - gva % granule;
   ensures \result != 0 ==> *gpa == ipa - base + gva % granule;
+  ensures \result == 0 ==> *gpa == \old(*gpa);
+  ensures \result == 0 ==> *chunk == \old(*chunk);
  */
 static inline int gva_leaf_target(uint64_t ipa,
                                   uint64_t base,

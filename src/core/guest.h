@@ -935,8 +935,8 @@ int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa);
  */
 int guest_install_kbuf_user_alias(guest_t *g);
 
-/* Install L2 block descriptors mapping [va_start, va_end) to [gpa_start,
- * gpa_start + (va_end-va_start)) under TTBR0. Both addresses and the size must
+/* Install L2 block descriptors mapping [va_base, va_limit) to [gpa_start,
+ * gpa_start + (va_limit-va_base)) under TTBR0. Both addresses and the size must
  * be 2 MiB-aligned. Walks the existing TTBR0 tree at g->ttbr0 and allocates
  * L1/L2 tables from the PT pool as needed.
  *
@@ -956,8 +956,8 @@ int guest_install_kbuf_user_alias(guest_t *g);
  * Locking: callers MUST hold mmap_lock.
  */
 int guest_map_va_range(guest_t *g,
-                       uint64_t va_start,
-                       uint64_t va_end,
+                       uint64_t va_base,
+                       uint64_t va_limit,
                        uint64_t gpa_start,
                        int perms);
 
@@ -1216,7 +1216,8 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
 
 /* Re-seed the logical-VMA allocator from a restored region snapshot. Fork IPC
  * restores regions by value, so next_vma_id must be advanced past every
- * serialized lineage before child-private mappings are added. */
+ * serialized lineage before child-private mappings are added.
+ */
 void guest_reseed_next_vma_id(guest_t *g);
 
 /* Add a preannounced region that appears in /proc/self/maps only. These entries
@@ -1237,8 +1238,8 @@ int guest_preannounce(guest_t *g,
                       uint64_t offset,
                       const char *name);
 
-/* Reserve any backing fd needed by an interior split in [start, end).
- * The reservation must be consumed by guest_region_remove_reserved().
+/* Reserve any backing fd needed by an interior split in [start, end). The
+ * reservation must be consumed by guest_region_remove_reserved().
  * Returns 0 on success, -1 when the backing fd cannot be duplicated.
  */
 int guest_region_remove_prepare(guest_t *g,

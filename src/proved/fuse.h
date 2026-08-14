@@ -77,6 +77,11 @@ static inline int fuse_frame_count_ok(uint64_t count)
  * FUSE_OUT_HDR_BYTES out of a buffer holding exactly count bytes. Dropping
  * either half of the guard breaks it, the lower half by underflowing the
  * subtraction and the upper half by reading past the frame.
+ *
+ * The reject path leaves the output alone, stated as a postcondition because
+ * "assigns" permits writing them: without it a conforming implementation could
+ * scribble on it before returning 0, and a caller reading it on the failure
+ * path would be relying on the body rather than the contract.
  */
 /*@
   requires FUSE_OUT_HDR_BYTES <= count <= FUSE_FRAME_CAP;
@@ -87,6 +92,7 @@ static inline int fuse_frame_count_ok(uint64_t count)
   ensures \result != 0 ==> *reply_len == hdr_len - FUSE_OUT_HDR_BYTES;
   ensures \result != 0 ==> FUSE_OUT_HDR_BYTES + *reply_len <= count;
   ensures \result != 0 ==> *reply_len <= FUSE_FRAME_CAP - FUSE_OUT_HDR_BYTES;
+  ensures \result == 0 ==> *reply_len == \old(*reply_len);
  */
 static inline int fuse_reply_extent(uint64_t count,
                                     uint64_t hdr_len,

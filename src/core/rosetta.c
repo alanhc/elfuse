@@ -217,12 +217,12 @@ int rosetta_prepare(guest_t *g,
      * resolve through a single Stage-2 region.
      */
     uint64_t va_base = ALIGN_2MIB_DOWN(ri->load_min);
-    uint64_t va_end = ALIGN_2MIB_UP(ri->load_max);
-    if (va_end <= va_base) {
+    uint64_t va_limit = ALIGN_2MIB_UP(ri->load_max);
+    if (va_limit <= va_base) {
         log_error("rosetta: empty load range");
         return -1;
     }
-    uint64_t size = va_end - va_base;
+    uint64_t size = va_limit - va_base;
 
     /* Pick a primary-buffer placement below the full high-IPA infra reserve, 2
      * MiB aligned. guest_init() has already reserved [interp_base -
@@ -734,6 +734,7 @@ static ssize_t rosettad_recv_fd(int sock, void *buf, size_t buflen, int *out_fd)
     if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
         cmsg->cmsg_type == SCM_RIGHTS && cmsg->cmsg_len >= CMSG_LEN(0)) {
         size_t payload = cmsg->cmsg_len - CMSG_LEN(0);
+
         /* Cap by the fds that actually fit after the header so a corrupt
          * cmsg_len cannot drive the memcpy source past the end of cmsg_buf.
          */
@@ -1141,6 +1142,7 @@ int rosettad_start_handler(int handler_fd, int client_fd)
 {
     if (handler_fd < 0 || client_fd < 0)
         return -1;
+
     /* Only one bridge per process is supported. Claim the slot via a single
      * atomic compare-exchange so two threads cannot both observe -1 and then
      * race to install their own client fd; the loser sees the winner's fd

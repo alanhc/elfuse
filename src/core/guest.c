@@ -40,7 +40,7 @@
 #include <unistd.h>
 
 #include "core/guest.h"
-#include "core/gva-math.h"
+#include "proved/gva.h"
 #include "core/startup-trace.h"
 #include "debug/log.h"
 #include "utils.h"
@@ -1119,18 +1119,18 @@ int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa)
 static uint64_t make_block_desc(uint64_t gpa, int perms);
 
 int guest_map_va_range(guest_t *g,
-                       uint64_t va_start,
-                       uint64_t va_end,
+                       uint64_t va_base,
+                       uint64_t va_limit,
                        uint64_t gpa_start,
                        int perms)
 {
-    if (!g || va_end <= va_start)
+    if (!g || va_limit <= va_base)
         return -1;
-    if ((va_start | va_end | gpa_start) & (BLOCK_2MIB - 1)) {
+    if ((va_base | va_limit | gpa_start) & (BLOCK_2MIB - 1)) {
         log_error(
             "guest_map_va_range: arguments not 2 MiB aligned "
             "(va=[0x%llx,0x%llx) gpa=0x%llx)",
-            (unsigned long long) va_start, (unsigned long long) va_end,
+            (unsigned long long) va_base, (unsigned long long) va_limit,
             (unsigned long long) gpa_start);
         return -1;
     }
@@ -1147,7 +1147,7 @@ int guest_map_va_range(guest_t *g,
     bool bcast = tlbi_request_is_broadcast();
     if (perms & MEM_PERM_X)
         tlbi_request_mark_icache();
-    for (uint64_t va = va_start; va < va_end;
+    for (uint64_t va = va_base; va < va_limit;
          va += BLOCK_2MIB, cur_gpa += BLOCK_2MIB) {
         unsigned l0_idx = (unsigned) (va / (512ULL * BLOCK_1GIB));
         if (l0_idx >= 512) {
@@ -1894,12 +1894,12 @@ int guest_get_used_regions(const guest_t *g,
  * Check whether two adjacent regions have merge-compatible layouts. An actual
  * merge additionally requires a shared vma_id; a new same-generation mapping
  * may adopt its compatible neighbor's ID below. Regions must be contiguous in
- * address space, have identical protection/flags/name, and have contiguous
- * file offsets (so the merged region still represents valid mapping). For
- * anonymous regions the offset is meaningless (always 0, but may become
- * non-zero after split/trim), so the contiguity check is skipped. Without this,
- * adjacent anonymous mmaps (common in megablock-style allocators) each create
- * separate entries that exhaust the region table.
+ * address space, have identical protection/flags/name, and have contiguous file
+ * offsets (so the merged region still represents valid mapping). For anonymous
+ * regions the offset is meaningless (always 0, but may become non-zero after
+ * split/trim), so the contiguity check is skipped. Without this, adjacent
+ * anonymous mmaps (common in megablock-style allocators) each create separate
+ * entries that exhaust the region table.
  */
 static bool regions_mergeable_layout(const guest_region_t *a,
                                      const guest_region_t *b)
@@ -2245,8 +2245,9 @@ int guest_region_remove_prepare(guest_t *g,
         if (r->start >= end)
             break;
         if (r->start < start && r->end > end) {
-            /* A full table follows the existing stale-tracker fallback and
-             * does not publish a right-hand record, so no fd is required. */
+            /* A full table follows the existing stale-tracker fallback and does
+             * not publish a right-hand record, so no fd is required.
+             */
             if (g->nregions >= GUEST_MAX_REGIONS || r->backing_fd < 0)
                 return 0;
             *reserved_backing_fd = dup(r->backing_fd);

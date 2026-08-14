@@ -47,8 +47,8 @@
 
 #include "test-harness.h"
 
-/* Linux spells the ordinary-data packet type this way; the
- * value is 0 and matches macOS.
+/* Linux spells the ordinary-data packet type this way; the value is 0 and
+ * matches macOS.
  */
 #ifndef TIOCPKT_DATA
 #define TIOCPKT_DATA 0
@@ -382,6 +382,7 @@ int main(void)
             int child_ok = (n == 1) && (status == 'Y') && WIFEXITED(wstatus) &&
                            WEXITSTATUS(wstatus) == 0;
             EXPECT_TRUE(child_ok, "child TIOCSWINSZ on master failed");
+
             /* Parent should still see the child's update because the slave
              * keepalive in the parent is still alive.
              */
@@ -436,9 +437,18 @@ int main(void)
         } else {
             char spawn_pts[32];
             snprintf(spawn_pts, sizeof(spawn_pts), "/dev/pts/%u", spawn_ptyno);
-            int spawn_pipe[2];
-            if (pipe(spawn_pipe) != 0) {
+            int spawn_pipe[2] = {-1, -1};
+            int stale_pipe[2] = {-1, -1};
+            if (pipe(spawn_pipe) != 0 || pipe(stale_pipe) != 0) {
                 FAIL("pipe for spawn scenario");
+                if (spawn_pipe[0] >= 0)
+                    close(spawn_pipe[0]);
+                if (spawn_pipe[1] >= 0)
+                    close(spawn_pipe[1]);
+                if (stale_pipe[0] >= 0)
+                    close(stale_pipe[0]);
+                if (stale_pipe[1] >= 0)
+                    close(stale_pipe[1]);
                 close(spawn_master);
             } else {
                 pid_t spawn_pid = fork();
@@ -446,12 +456,15 @@ int main(void)
                     FAIL("fork for spawn scenario");
                     close(spawn_pipe[0]);
                     close(spawn_pipe[1]);
+                    close(stale_pipe[0]);
+                    close(stale_pipe[1]);
                     close(spawn_master);
                 } else if (spawn_pid == 0) {
                     /* Child: foot's slave_exec sequence -- close the master,
                      * then open(pts_name) for the controlling terminal.
                      */
                     close(spawn_pipe[0]);
+                    close(stale_pipe[1]);
                     if (setsid() < 0)
                         _exit(11);
                     close(spawn_master);
@@ -462,18 +475,23 @@ int main(void)
                         (void) !write(slave_fd, "ok\n", 3);
                         close(slave_fd);
                     }
+                    char go;
+                    if (read(stale_pipe[0], &go, 1) == 1) {
+                        int stale_fd = open(spawn_pts, O_RDWR);
+                        char stale_status = (stale_fd >= 0) ? 'Y' : 'N';
+                        (void) !write(spawn_pipe[1], &stale_status, 1);
+                        if (stale_fd >= 0)
+                            close(stale_fd);
+                    }
+                    close(stale_pipe[0]);
                     close(spawn_pipe[1]);
                     _exit(slave_fd >= 0 ? 0 : 12);
                 } else {
                     close(spawn_pipe[1]);
+                    close(stale_pipe[0]);
                     char status = '?';
                     ssize_t n = read(spawn_pipe[0], &status, 1);
-                    close(spawn_pipe[0]);
-                    int wstatus = 0;
-                    waitpid(spawn_pid, &wstatus, 0);
-                    int spawn_ok = (n == 1) && (status == 'Y') &&
-                                   WIFEXITED(wstatus) &&
-                                   WEXITSTATUS(wstatus) == 0;
+                    int spawn_ok = (n == 1) && (status == 'Y');
                     EXPECT_TRUE(spawn_ok,
                                 "child open(/dev/pts/N) after close(master)");
                     if (spawn_ok) {
@@ -487,20 +505,18 @@ int main(void)
                         }
                     }
                     close(spawn_master);
+                    (void) !write(stale_pipe[1], "x", 1);
+                    close(stale_pipe[1]);
 
                     TEST("stale /dev/pts/N expires after master teardown");
-                    int stale_fd = open(spawn_pts, O_RDWR);
-                    /* Both ENOENT (devfs node gone) and ENXIO (devfs node
-                     * lingers but the pty pair has been torn down) are valid
-                     * macOS responses depending on kernel version. The
-                     * invariant the test guards is "the stale cached path does
-                     * not silently hand back an unrelated tty"; any open
-                     * failure satisfies that.
-                     */
-                    int stale_ok =
-                        stale_fd < 0 && (errno == ENOENT || errno == ENXIO);
-                    if (stale_fd >= 0)
-                        close(stale_fd);
+                    char stale_status = '?';
+                    ssize_t stale_n = read(spawn_pipe[0], &stale_status, 1);
+                    close(spawn_pipe[0]);
+                    int wstatus = 0;
+                    waitpid(spawn_pid, &wstatus, 0);
+                    int stale_ok = stale_n == 1 && stale_status == 'N' &&
+                                   WIFEXITED(wstatus) &&
+                                   WEXITSTATUS(wstatus) == 0;
                     EXPECT_TRUE(stale_ok, "stale /dev/pts/N stayed openable");
                 }
             }
@@ -591,6 +607,7 @@ int main(void)
                         char recv_pts_path[32];
                         snprintf(recv_pts_path, sizeof(recv_pts_path),
                                  "/dev/pts/%u", recv_ptyno);
+
                         /* TIOCPKT has to work on a master the receiver never
                          * opened itself, the shape libvte sees when a terminal
                          * is handed a pty from elsewhere.
@@ -654,11 +671,11 @@ int main(void)
                     TEST("packet-mode read carries a status byte");
                     FAIL("open slave");
                 } else {
-                    /* Raw mode so the slave does not echo the payload back
-                     * at the master and confuse the packet stream. A failure
-                     * here is a setup failure rather than a verdict on packet
-                     * mode, so it gets its own message below: reporting it as
-                     * a bad read would blame the feature under test.
+                    /* Raw mode so the slave does not echo the payload back at
+                     * the master and confuse the packet stream. A failure here
+                     * is a setup failure rather than a verdict on packet mode,
+                     * so it gets its own message below: reporting it as a bad
+                     * read would blame the feature under test.
                      */
                     struct termios tio;
                     bool raw_ok = tcgetattr(pkt_slave, &tio) == 0;
@@ -765,8 +782,8 @@ int main(void)
                 FAIL("open slave");
             } else {
                 /* Queued output must survive: Linux hands over what the slave
-                 * wrote before reporting the hangup, so a shell's parting
-                 * words are not swallowed.
+                 * wrote before reporting the hangup, so a shell's parting words
+                 * are not swallowed.
                  */
                 static const char bye[] = "bye";
                 ssize_t put = write(hup_slave, bye, sizeof(bye) - 1);
@@ -844,10 +861,10 @@ int main(void)
                 EXPECT_TRUE(er > 0 && ev.data.u64 == 0x5eed,
                             "hangup event lost its user data");
 
-                /* An already-pending hangup must not be held until the
-                 * caller's deadline: the host never makes the fd ready, so a
-                 * finite wait that only checks after kevent returns would
-                 * block for the full timeout before reporting.
+                /* An already-pending hangup must not be held until the caller's
+                 * deadline: the host never makes the fd ready, so a finite wait
+                 * that only checks after kevent returns would block for the
+                 * full timeout before reporting.
                  */
                 struct timespec t0, t1;
                 clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1076,10 +1093,10 @@ int main(void)
 
     /* What a terminal actually does to hand a shell its tty: dup2 the slave
      * onto stdin/stdout/stderr, then close the original fd. Only the open() was
-     * ever counted, so those three live references were invisible and the
-     * close of the original drove the count to zero -- the master reported a
-     * hangup with the shell still running. Every other case here opens a slave
-     * and keeps that same fd, which is why none of them caught it.
+     * ever counted, so those three live references were invisible and the close
+     * of the original drove the count to zero -- the master reported a hangup
+     * with the shell still running. Every other case here opens a slave and
+     * keeps that same fd, which is why none of them caught it.
      */
     {
         int dp_master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
@@ -1171,6 +1188,196 @@ int main(void)
             }
             close(rv_master);
         }
+    }
+
+    /* Slave accounting belongs to the pty, not to whichever master fd happens
+     * to hold it. Aliased masters each get their own keepalive row, so closing
+     * one used to hand the whole slave count back and report a hangup with the
+     * slave still open.
+     */
+    {
+        int am = open("/dev/ptmx", O_RDWR | O_NONBLOCK | O_NOCTTY);
+        unsigned int an = 0;
+        int aunlock = 0;
+        if (am >= 0 && ioctl(am, TIOCGPTN, &an) == 0 &&
+            ioctl(am, TIOCSPTLCK, &aunlock) == 0) {
+            char apath[64];
+            snprintf(apath, sizeof(apath), "/dev/pts/%u", an);
+            int aslave = open(apath, O_RDWR | O_NOCTTY);
+            int aalias = dup(am);
+            if (aslave >= 0 && aalias >= 0) {
+                close(am);
+
+                TEST("closing one master alias does not hang up a live slave");
+                struct pollfd apf = {.fd = aalias, .events = POLLIN};
+                poll(&apf, 1, 0);
+                EXPECT_TRUE((apf.revents & POLLHUP) == 0,
+                            "alias reported POLLHUP with the slave still open");
+
+                TEST("reading that alias gives EAGAIN, not the hangup EIO");
+                char adrain[8];
+                errno = 0;
+                ssize_t ard = read(aalias, adrain, sizeof(adrain));
+                int aerr = errno;
+                EXPECT_TRUE(ard < 0 && aerr != EIO,
+                            "alias read reported the hangup as EIO");
+
+                TEST("the hangup arrives once the slave really closes");
+                close(aslave);
+                aslave = -1;
+                struct pollfd apf2 = {.fd = aalias, .events = POLLIN};
+                poll(&apf2, 1, 500);
+                EXPECT_TRUE((apf2.revents & POLLHUP) != 0,
+                            "no POLLHUP after the last slave closed");
+                am = aalias;
+                aalias = -1;
+            }
+            if (aslave >= 0)
+                close(aslave);
+            if (aalias >= 0)
+                close(aalias);
+        }
+        if (am >= 0)
+            close(am);
+    }
+
+    /* A slave open that fails after the intercept ran must not leave the slave
+     * counted, or the master can never report its hangup again.
+     */
+    {
+        int lm = open("/dev/ptmx", O_RDWR | O_NONBLOCK | O_NOCTTY);
+        unsigned int ln = 0;
+        int lunlock = 0;
+        if (lm >= 0 && ioctl(lm, TIOCGPTN, &ln) == 0 &&
+            ioctl(lm, TIOCSPTLCK, &lunlock) == 0) {
+            char lpath[64];
+            snprintf(lpath, sizeof(lpath), "/dev/pts/%u", ln);
+            int lslave = open(lpath, O_RDWR | O_NOCTTY);
+
+            TEST("a slave open rejected by O_DIRECTORY reports ENOTDIR");
+            int lbad = open(lpath, O_RDWR | O_DIRECTORY);
+            int lbad_errno = errno;
+            EXPECT_TRUE(lbad < 0 && lbad_errno == ENOTDIR,
+                        "O_DIRECTORY on a pty slave did not report ENOTDIR");
+            if (lbad >= 0)
+                close(lbad);
+
+            TEST("the rejected open left no phantom slave behind");
+            if (lslave >= 0)
+                close(lslave);
+            struct pollfd lpf = {.fd = lm, .events = POLLIN};
+            poll(&lpf, 1, 500);
+            EXPECT_TRUE((lpf.revents & POLLHUP) != 0,
+                        "master never hung up after its only slave closed");
+        }
+        if (lm >= 0)
+            close(lm);
+    }
+
+    /* /dev/pts is served from a staging directory of placeholder files, so a
+     * relative call measured against that directory fd has to re-derive the
+     * guest path rather than reach the placeholder.
+     */
+    {
+        int dm = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        unsigned int dn = 0;
+        int dunlock = 0;
+        if (dm >= 0 && ioctl(dm, TIOCGPTN, &dn) == 0 &&
+            ioctl(dm, TIOCSPTLCK, &dunlock) == 0) {
+            int dfd = open("/dev/pts", O_RDONLY | O_DIRECTORY);
+            char dname[16];
+            snprintf(dname, sizeof(dname), "%u", dn);
+
+            TEST("fstatat through the /dev/pts fd reports a character device");
+            struct stat dst;
+            int drc = dfd >= 0 ? fstatat(dfd, dname, &dst, 0) : -1;
+            EXPECT_TRUE(drc == 0 && S_ISCHR(dst.st_mode),
+                        "relative stat saw the staging placeholder");
+
+            TEST("openat through the /dev/pts fd yields the slave itself");
+            int ds = dfd >= 0 ? openat(dfd, dname, O_RDWR | O_NOCTTY) : -1;
+            EXPECT_TRUE(ds >= 0 && isatty(ds),
+                        "relative open did not give a tty");
+            if (ds >= 0)
+                close(ds);
+
+            /* A cwd on /dev/pts has to re-derive the same way a directory fd
+             * does, or the placeholder is what a bare name reaches.
+             */
+            TEST("a relative open with /dev/pts as cwd reaches the slave");
+            char cwd_save[4096];
+            const char *saved = getcwd(cwd_save, sizeof(cwd_save));
+            if (!saved) {
+                FAIL(
+                    "getcwd failed, refusing to move the cwd without a way "
+                    "back");
+            } else if (dfd < 0 || fchdir(dfd) != 0) {
+                FAIL("fchdir onto /dev/pts failed");
+            } else {
+                int cs = open(dname, O_RDWR | O_NOCTTY);
+                EXPECT_TRUE(cs >= 0 && isatty(cs),
+                            "relative open under a /dev/pts cwd missed the "
+                            "slave");
+                if (cs >= 0)
+                    close(cs);
+
+                /* Every later test resolves relative paths, and the forked
+                 * child inherits this, so a restore that quietly failed would
+                 * run the rest of the suite somewhere else.
+                 */
+                TEST("the cwd is restored after the /dev/pts excursion");
+                EXPECT_TRUE(chdir(cwd_save) == 0,
+                            "could not return to the original cwd");
+            }
+            if (dfd >= 0)
+                close(dfd);
+        }
+        if (dm >= 0)
+            close(dm);
+    }
+
+    /* A forked child keeps its inherited /dev/pts/N mapping usable while the
+     * shared pty lives, and registering that mapping must not disturb fds the
+     * child already holds.
+     */
+    {
+        int fm = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        unsigned int fn = 0;
+        int funlock = 0;
+        if (fm >= 0 && ioctl(fm, TIOCGPTN, &fn) == 0 &&
+            ioctl(fm, TIOCSPTLCK, &funlock) == 0) {
+            char fpath[64];
+            snprintf(fpath, sizeof(fpath), "/dev/pts/%u", fn);
+            int fkeep = open(fpath, O_RDWR | O_NOCTTY);
+            fflush(stdout);
+            pid_t fpid = fork();
+            if (fpid == 0) {
+                /* An unrelated descriptor the restore path must not disturb. */
+                int victim = open("/dev/null", O_RDONLY);
+                close(fm);
+                int first = open(fpath, O_RDWR | O_NOCTTY);
+                int second = open(fpath, O_RDWR | O_NOCTTY);
+                struct stat cst;
+                int strc = stat(fpath, &cst);
+                char vb[1];
+                int vrc = victim >= 0 ? (int) read(victim, vb, 1) : -1;
+                _exit(first >= 0 && second >= 0 && strc == 0 && vrc >= 0 ? 0
+                                                                         : 1);
+            }
+            TEST("a forked child can reopen and stat its inherited slave");
+            if (fpid < 0) {
+                FAIL("fork failed");
+            } else {
+                int fst = 0;
+                waitpid(fpid, &fst, 0);
+                EXPECT_TRUE(WIFEXITED(fst) && WEXITSTATUS(fst) == 0,
+                            "child lost its slave mapping or an unrelated fd");
+            }
+            if (fkeep >= 0)
+                close(fkeep);
+        }
+        if (fm >= 0)
+            close(fm);
     }
 
     SUMMARY("test-pty");

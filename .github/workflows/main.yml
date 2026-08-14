@@ -4,11 +4,12 @@
 #   lint          : format/newline/security/cppcheck/dispatch on Linux
 #   build-macos   : compile + entitlement check on macOS Apple Silicon
 #   tidy-macos    : clang-tidy via `make lint`
-#   verify        : Frama-C WP proofs of the attacker-facing arithmetic via
-#                   `make verify`; gating, not advisory
-#   verify-mutants: shows each proof rejects a known-broken source, one job
-#                   per proof target so the 40-mutation set runs as nine
-#                   parallel shards instead of one long serial job
+#   verify-mutants: per target, the Frama-C WP proof AND the mutations that
+#                   show it bites; one runner per target, sharded from
+#                   mk/analysis.mk's VERIFY_<T>_SRC list
+#   verify        : aggregate check name over that matrix, kept because branch
+#                   protection requires it by name
+#   verify-mutants-gate: the same aggregate under the mutation-gate name
 #   scan-macos    : LLVM scan-build via `make analyze`
 #   infer-macos   : Facebook Infer capture + analyze over the full build
 #   runtime-macos : HVF runtime tests on self-hosted Apple Silicon,
@@ -117,14 +118,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/gen-syscall-dispatch.py --output "$RUNNER_TEMP/dispatch.h"
 
-      - name: Mutation matrix consistency
-        # verify-mutants (the Frama-C job below) hand-lists the same proof
-        # targets mk/analysis.mk defines, sharded one job per target. A
-        # target present in one but not the other silently drops that
-        # target's mutation coverage from CI with no error, so catch the
-        # drift here instead.
+      - name: Proof target consistency
+        # Three lists name the same proved sources: mk/analysis.mk's targets,
+        # the verify-mutants matrix below, and src/proved/. A target in one
+        # but not another either drops that target's mutation coverage from CI
+        # with no error, or leaves an unproved header sitting in a directory
+        # whose name claims it is proved.
         if: ${{ !cancelled() }}
-        run: python3 scripts/check-mutant-matrix-sync.py
+        run: python3 scripts/check-proof-targets.py
 
   # Build verification on macOS Apple Silicon (no HVF runtime tests).
   # Hosted runners don't expose Hypervisor.framework, so this job stops at
@@ -223,137 +224,65 @@ jobs:
       - name: clang-tidy (make lint)
         run: make lint
 
-  # Frama-C WP proofs of the attacker-facing arithmetic via `make verify`.
+  # The proof target list has ONE home, mk/analysis.mk's VERIFY_<T>_SRC
+  # assignments. This job reads it there and the matrix below is built from the
+  # result, so adding a proof target is a one-file edit and a target can no
+  # longer exist locally while silently having no CI leg.
+  #
+  # Runs on Linux with no toolchain: "make print-verify-targets" only reads the
+  # makefile, so this costs seconds and gates nothing.
+  proof-targets:
+    name: Enumerate proof targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Read the targets from mk/analysis.mk
+        id: list
+        run: |
+          set -euo pipefail
+          targets=$(make print-verify-targets)
+          test -n "$targets"
+          json=$(printf '%s\n' "$targets" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "targets=$json" >> "$GITHUB_OUTPUT"
+          echo "proof targets: $json"
+
+  # Frama-C WP proofs of the attacker-facing arithmetic, plus the mutation gate
+  # that shows those proofs bite. One runner per proof target.
   #
   # GATING, unlike tidy-macos and scan-macos: the inputs these proofs cover come
   # from untrusted binaries and from the guest itself, so an unproved
   # obligation fails the job instead of being logged for review. Without this
   # job the proofs are only enforced when a human runs them, and they rot the
   # first time someone edits elf.c or gdbstub-rsp.c.
-  verify:
-    name: Frama-C WP proofs (make verify)
-    runs-on: macos-15
-    timeout-minutes: 60
-    env:
-      HOMEBREW_NO_INSTALL_CLEANUP: 1
-      HOMEBREW_NO_AUTO_UPDATE: 1
-      # graphviz/llvm/zlib are frama-c's system dependencies; conf-graphviz
-      # fails without dot(1). The exact Python formula opam wants moves between
-      # releases, so it is not listed here: OPAMCONFIRMLEVEL below lets opam
-      # install whatever depexts it still needs rather than having this list
-      # guess. Guessing python@3.11 when opam wanted python@3.9 is what made the
-      # previous attempt abort.
-      BREW_PKGS: opam gmp pkg-config graphviz llvm@17 zlib
-      # Without this, opam's "some required external dependencies are missing"
-      # prompt has no TTY to answer it, silently takes option 4 (abort), and the
-      # step exits 10.
-      OPAMCONFIRMLEVEL: unsafe-yes
-      # The gate fails on any single [Timeout], and a shared runner is slower
-      # than a dev machine (the three proofs take 3-9s each locally). The job
-      # already has a 60-minute budget, so headroom here costs nothing and
-      # removes a flake class that would read as a proof regression.
-      FRAMAC_TIMEOUT: 120
-      # Pinned so the gating proofs run against a known toolchain. The opam
-      # cache key below is built from these three, so bumping a version here is
-      # all that is needed to install afresh rather than reuse a stale switch.
-      FRAMAC_VERSION: "31.0"
-      ALT_ERGO_VERSION: 2.6.3
-      Z3_VERSION: 4.16.0
-      OPAMROOT: ${{ github.workspace }}/.opam
-      OPAM_SWITCH: frama-c-elfuse
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Cache Homebrew downloads
-        uses: actions/cache@v6
-        with:
-          path: ~/Library/Caches/Homebrew/downloads
-          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ env.BREW_PKGS }}
-
-      - name: Install Homebrew packages
-        # shellcheck disable=SC2086 -- BREW_PKGS is a space-separated list.
-        run: |
-          set -euo pipefail
-          brew install --quiet $BREW_PKGS
-
-      # Building Frama-C and the provers from source takes tens of minutes, so
-      # the whole opam root is cached. Bump the key suffix to force a rebuild.
-      - name: Cache opam switch
-        id: opam-cache
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.OPAMROOT }}
-          # Keyed on the pinned versions, so changing any of them installs
-          # afresh instead of silently reusing a stale toolchain.
-          key: opam-${{ runner.os }}-${{ runner.arch }}-frama-c${{ env.FRAMAC_VERSION }}-ae${{ env.ALT_ERGO_VERSION }}-z3${{ env.Z3_VERSION }}
-
-      - name: Install Frama-C, Alt-Ergo, Z3
-        if: steps.opam-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          opam init -y --bare --disable-sandboxing
-          opam switch create "$OPAM_SWITCH" 4.14.1
-          eval "$(opam env --switch="$OPAM_SWITCH")"
-          # No --assume-depexts: the system packages are installed above, and
-          # asserting they exist when they do not is what made conf-graphviz
-          # fail with "dot: command not found".
-          opam install -y \
-            frama-c.$FRAMAC_VERSION \
-            alt-ergo.$ALT_ERGO_VERSION \
-            z3.$Z3_VERSION
-
-      - name: Prove the parsers and translation (make verify)
-        # why3 config detect runs here rather than in the install step: it
-        # writes ~/.why3.conf, which lives outside OPAMROOT and so is absent on
-        # a cache hit. Skipping it makes WP abort with "Prover not found in
-        # why3.conf" instead of reporting unproved obligations, which the gate
-        # would then report as "Frama-C emitted no result".
-        run: |
-          set -euo pipefail
-          eval "$(opam env --switch="$OPAM_SWITCH")"
-          why3 config detect
-          frama-c -version
-          make verify
-
-      - name: Upload prover log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: verify-logs
-          path: build/verify-*.log
-          if-no-files-found: warn
-
-  # Shows each Frama-C proof target rejects a known-broken source. Split from
-  # the "verify" job (needs: verify, so a broken proof fails fast without
-  # spending nine runners on mutating it) and sharded one job per proof
-  # target: a caught mutation grinds against every unprovable goal until
-  # FRAMAC_TIMEOUT, so the 40-mutation set run as one job is minutes where
-  # "make verify" is seconds. Sharding trades that for nine runners in
-  # parallel, each bounded by its own target's mutation count instead of the
-  # whole set's.
   #
-  # The matrix list is VERIFY_<T>_SRC's targets from mk/analysis.mk, hand-kept
-  # in step: a target missing here silently drops its mutation coverage from
-  # CI with no error, so add new proof targets to both places.
+  # Proves one target and shows its mutations are rejected, one runner per
+  # target. Both halves live here because they are the same work: check-mutants
+  # runs "make verify-<target>" on an UNMUTATED copy as its control, so a
+  # separate serial verify job proved all sixteen targets and then every shard
+  # proved its own target over again.
+  #
+  # Sharding is what makes the mutation half affordable at all: a caught
+  # mutation grinds against every unprovable goal until FRAMAC_TIMEOUT, so the
+  # whole set on one runner is minutes where a single proof is seconds. Running
+  # the proof first inside the shard keeps the fast failure the old "needs:
+  # verify" edge gave, now per target rather than across all of them, and
+  # without a barrier that made every shard wait for the slowest proof.
+  #
+  # The matrix comes from the proof-targets job above, which reads
+  # mk/analysis.mk, so this list cannot drift from the targets that exist.
   verify-mutants:
-    name: Mutation gate (${{ matrix.target }})
-    needs: verify
+    name: Proof and mutations (${{ matrix.target }})
+    needs: proof-targets
     runs-on: macos-15
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - cmsg
-          - elf
-          - fuse
-          - gva
-          - netlink
-          - rsp
-          - sigframe
-          - sockaddr
-          - stack
+        target: ${{ fromJson(needs.proof-targets.outputs.targets) }}
     env:
       HOMEBREW_NO_INSTALL_CLEANUP: 1
       HOMEBREW_NO_AUTO_UPDATE: 1
@@ -395,8 +324,14 @@ jobs:
           set -euo pipefail
           brew install --quiet $BREW_PKGS
 
-      # Same cache key as the verify job's opam switch, so this restores the
-      # switch that job already built instead of rebuilding it nine times.
+      # Every leg shares one key, so a warm cache costs one restore per leg.
+      # Nothing primes it any more: the job that used to build the switch first
+      # is gone, and proof-targets runs on Linux, so on a miss all legs build
+      # Frama-C and the provers from source at once. That is the whole cost of
+      # bumping any of the three pinned versions below, and the first run after
+      # such a bump is the one at risk of the 60-minute timeout. A prime job
+      # would trade that for a barrier in front of every run; the versions move
+      # rarely enough that the miss is the cheaper side.
       - name: Cache opam switch
         id: opam-cache
         uses: actions/cache@v6
@@ -416,10 +351,21 @@ jobs:
             alt-ergo.$ALT_ERGO_VERSION \
             z3.$Z3_VERSION
 
+      - name: Prove the target (make verify-<target>)
+        # First, so a broken proof fails this shard in seconds instead of after
+        # its mutation set. check-mutants would catch it too, through
+        # check_baseline, but only after paying for the setup a second time and
+        # with a message about infrastructure rather than about the proof.
+        run: |
+          set -euo pipefail
+          eval "$(opam env --switch="$OPAM_SWITCH")"
+          why3 config detect
+          frama-c -version
+          make verify-${{ matrix.target }}
+
       - name: Prove the gate bites (make verify-mutants)
-        # why3 config detect is required here too: it writes ~/.why3.conf,
-        # which lives outside OPAMROOT and so is absent on a cache hit even
-        # though the verify job already ran this once on its own runner.
+        # why3 config detect is cheap and idempotent; the proof step above
+        # already ran it on this runner.
         #
         # MUTANT_JOBS is set explicitly for the same reason as before
         # sharding: this runner has few enough cores that the script's
@@ -447,10 +393,37 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: verify-mutants-logs-${{ matrix.target }}
-          path: build/verify-mutants/*.log
+          name: verify-logs-${{ matrix.target }}
+          path: |
+            build/verify-*.log
+            build/verify-mutants/*.log
           if-no-files-found: warn
           retention-days: 7
+
+  # The proving moved into the matrix above, but this check name predates that
+  # and branch protection requires it by name, so it stays as an aggregate over
+  # the same matrix. The "(make verify)" suffix is kept for that continuity
+  # alone: this job runs no proofs itself, and renaming it would silently
+  # unrequire the check until someone updated the branch rule to match.
+  verify:
+    name: Frama-C WP proofs (make verify)
+    needs: verify-mutants
+    # always(), matching verify-mutants-gate below and for the reason stated
+    # there: a required check that is SKIPPED does not block a merge, and
+    # !cancelled() skips this job whenever the run is cancelled. always() makes
+    # it run and report the matrix verdict in that case too.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the matrix result
+        run: |
+          set -euo pipefail
+          result='${{ needs.verify-mutants.result }}'
+          if [ "$result" != "success" ]; then
+            echo "proof matrix did not succeed: $result" >&2
+            exit 1
+          fi
+          echo "every proof target discharged"
 
   # One stable check name covering the whole mutation matrix, so branch
   # protection has something to require. The matrix leg names carry the target

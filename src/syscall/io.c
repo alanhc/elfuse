@@ -30,6 +30,8 @@
 
 #include "utils.h"
 
+#include "proved/slice.h"
+
 #include "core/rosetta.h"
 #include "core/shim-globals.h"
 #include "hvutil.h"
@@ -310,11 +312,10 @@ static int64_t urandom_fill_iov(int guest_fd,
     if (err < 0)
         return err;
 
-    size_t total = 0;
+    uint64_t total = 0;
     for (int i = 0; i < iovcnt; i++) {
-        if (iov[i].iov_len > (size_t) SSIZE_MAX - total)
+        if (!iov_total_add(total, iov[i].iov_len, &total))
             return -LINUX_EINVAL;
-        total += iov[i].iov_len;
     }
     if (total == 0)
         return 0;
@@ -349,18 +350,17 @@ static int64_t urandom_fill_iov(int guest_fd,
 
 static int64_t validate_iov_total(guest_t *g, uint64_t iov_gva, int iovcnt)
 {
-    if (iovcnt <= 0 || iovcnt > SYSCALL_IOV_MAX)
+    if (!iov_count_ok(iovcnt))
         return -LINUX_EINVAL;
 
-    size_t total = 0;
+    uint64_t total = 0;
     for (int i = 0; i < iovcnt; i++) {
         linux_iovec_t giov;
         if (guest_read_small(g, iov_gva + (uint64_t) i * sizeof(giov), &giov,
                              sizeof(giov)) < 0)
             return -LINUX_EFAULT;
-        if (giov.iov_len > (uint64_t) SSIZE_MAX - total)
+        if (!iov_total_add(total, giov.iov_len, &total))
             return -LINUX_EINVAL;
-        total += (size_t) giov.iov_len;
     }
     return 0;
 }
@@ -847,10 +847,10 @@ static int64_t host_fd_ref_open_checked(int guest_fd,
 
 /* True when a read on this pty master must fail with EIO.
  *
- * Linux fails every read variant once the master has hung up, not just
- * read(2). Only after the queue drains: a shell that printed on its way out
- * leaves that output behind, and Linux hands it over before reporting the
- * hangup, so deciding on the hangup first would swallow it.
+ * Linux fails every read variant once the master has hung up, not just read(2).
+ * Only after the queue drains: a shell that printed on its way out leaves that
+ * output behind, and Linux hands it over before reporting the hangup, so
+ * deciding on the hangup first would swallow it.
  *
  * Without this the host read simply blocks -- elfuse's keepalive slave keeps
  * the pty alive from its point of view -- so a terminal that drains its master
@@ -947,15 +947,27 @@ static int64_t proc_try_writev_intercept(int fd,
                                          int64_t offset,
                                          int use_pwrite)
 {
-    size_t total = 0;
+    uint64_t total = 0;
     char stack_buf[256];
     char *buf = stack_buf;
     char *heap = NULL;
     ssize_t written = 0;
     int handled;
 
-    for (int i = 0; i < iovcnt; i++)
-        total += iov[i].iov_len;
+    /* The sum feeds malloc() and then a memcpy loop that writes exactly that
+     * many bytes, so a wrapped total here is a short allocation followed by a
+     * long copy. host_iov_prepare clamps every entry to the guest mapping it
+     * points into, which made the wrap unreachable by provenance rather than by
+     * construction; iov_total_add makes it unreachable by construction.
+     */
+    for (int i = 0; i < iovcnt; i++) {
+        /* INT64_MIN is this helper's "not handled", and that is the right
+         * answer: the fd may well not be a /proc node, so the size verdict
+         * belongs to the real writev below, not to the interceptor.
+         */
+        if (!iov_total_add(total, iov[i].iov_len, &total))
+            return INT64_MIN;
+    }
     if (total > sizeof(stack_buf)) {
         heap = malloc(total);
         if (!heap)
@@ -1298,7 +1310,7 @@ int64_t host_iov_prepare(guest_t *g,
     buf->iov = buf->stack;
     buf->heap = NULL;
 
-    if (iovcnt <= 0 || iovcnt > SYSCALL_IOV_MAX)
+    if (!iov_count_ok(iovcnt))
         return -LINUX_EINVAL;
 
     if (iovcnt > SYSCALL_IOV_STACK_MAX) {
@@ -1825,12 +1837,10 @@ static int64_t process_vm_import_iov(guest_t *g,
 
     uint64_t total = 0;
     for (uint64_t i = 0; i < iovcnt; i++) {
-        if (iov[i].iov_len > (uint64_t) SSIZE_MAX ||
-            total > (uint64_t) SSIZE_MAX - iov[i].iov_len) {
+        if (!iov_total_add(total, iov[i].iov_len, &total)) {
             free(iov);
             return -LINUX_EINVAL;
         }
-        total += iov[i].iov_len;
     }
 
     *iov_out = iov;
@@ -2363,6 +2373,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
+
         /* Resolve the Linux pts number before opening, the same way TIOCGPTN
          * does: the slave handed out here counts toward the master's hangup
          * accounting, and that table is keyed by pts number. Pass the guest fd
@@ -2499,13 +2510,17 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
             host_fd_ref_close(&host_ref);
             return linux_errno();
         }
-        if (offset >= st.st_size) {
+
+        /* Zero only through the current EOF, so KEEP_SIZE stays guest-visible.
+         * st_size is signed and offset is already proved non-negative above.
+         */
+        uint64_t window;
+        if (!slice_clamp((uint64_t) st.st_size, (uint64_t) offset,
+                         (uint64_t) len, &window)) {
             host_fd_ref_close(&host_ref);
             return 0;
         }
-        int64_t remaining = st.st_size - offset;
-        if (remaining > len)
-            remaining = len;
+        int64_t remaining = (int64_t) window;
 
         static const char zeros[4096];
         off_t cur = (off_t) offset;

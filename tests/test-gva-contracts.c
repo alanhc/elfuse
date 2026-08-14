@@ -1,5 +1,5 @@
 /*
- * gva-math.h call-site precondition checks
+ * proved/gva.h call-site precondition checks
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -24,7 +24,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "core/gva-math.h"
+#include "proved/gva.h"
 
 #ifdef ELFUSE_CONTRACT_ASSERT
 

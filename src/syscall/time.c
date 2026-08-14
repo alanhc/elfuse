@@ -19,6 +19,9 @@
 
 #include "core/vdso.h"
 #include "runtime/thread.h" /* current_thread, guest_tid */
+
+#include "proved/timespec.h"
+
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h" /* proc_exit_group_requested, proc_get_pid */
@@ -61,25 +64,17 @@ _Static_assert(sizeof(struct timespec) == sizeof(linux_timespec_t),
 _Static_assert(sizeof(struct timeval) == sizeof(linux_timeval_t),
                "host and guest timeval must match on LP64");
 
+_Static_assert(NSEC_PER_SEC == TIMESPEC_NSEC_PER_SEC,
+               "the proved conversions must use this tree's nanosecond scale");
+
 bool linux_timespec_valid(const linux_timespec_t *ts)
 {
-    if (ts->tv_sec < 0)
-        return false;
-    return ts->tv_nsec >= 0 && ts->tv_nsec < NSEC_PER_SEC;
+    return timespec_valid(ts->tv_sec, ts->tv_nsec) != 0;
 }
 
 int64_t linux_timespec_to_ns_sat(const linux_timespec_t *ts)
 {
-    if (ts->tv_sec < 0)
-        return 0;
-
-    const int64_t max_sec = INT64_MAX / NSEC_PER_SEC;
-    const int64_t max_nsec = INT64_MAX % NSEC_PER_SEC;
-    if (ts->tv_sec > max_sec ||
-        (ts->tv_sec == max_sec && ts->tv_nsec > max_nsec))
-        return INT64_MAX;
-
-    return ts->tv_sec * NSEC_PER_SEC + ts->tv_nsec;
+    return timespec_to_ns_sat(ts->tv_sec, ts->tv_nsec);
 }
 
 static int64_t host_timespec_to_ns_sat(const struct timespec *ts)

@@ -19,7 +19,8 @@
 
 #include "utils.h"
 
-#include "syscall/cmsg-math.h"
+#include "proved/cmsg.h"
+#include "proved/timespec.h"
 #include "syscall/internal.h"
 #include "syscall/io.h"
 #include "syscall/net.h"
@@ -307,9 +308,9 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
             memcpy(&lcmsg_level, linux_ctrl + lpos + 8, 4);
             memcpy(&lcmsg_type, linux_ctrl + lpos + 12, 4);
 
-            /* Proved in src/syscall/cmsg-math.h: on success the ldata_len
-             * payload bytes at lpos + CMSG_LINUX_HDR_BYTES lie inside
-             * linux_ctrl, and next_lpos is strictly past lpos.
+            /* Proved in src/proved/cmsg.h: on success the ldata_len payload
+             * bytes at lpos + CMSG_LINUX_HDR_BYTES lie inside linux_ctrl, and
+             * next_lpos is strictly past lpos.
              */
             uint64_t ldata_len, next_lpos;
             if (!cmsg_entry_bounds(lpos, lctl_len, lcmsg_len, &ldata_len,
@@ -1067,11 +1068,17 @@ int64_t sys_recvmmsg(guest_t *g,
                 host_fd_ref_close(&host_ref);
                 return -LINUX_EINVAL;
             }
-            int timeout_ms;
-            if (ts.tv_sec > 2000000)
-                timeout_ms = -1;
-            else
-                timeout_ms = (int) (ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+
+            /* Same conversion as ppoll and pselect6. Truncating turned a
+             * sub-millisecond timeout into poll(0) and an immediate EAGAIN.
+             *
+             * Deliberately the finite conversion, unlike epoll_pwait2: the
+             * wait below is one poll with nothing to re-arm it, so a -1 here
+             * would block forever with no way back out, on a call the guest
+             * asked to bound. timespec_to_poll_ms saturates instead, which is
+             * still far past any real timeout but is reached.
+             */
+            int timeout_ms = timespec_to_poll_ms(ts.tv_sec, ts.tv_nsec);
             struct pollfd pfd = {.fd = host_ref.fd, .events = POLLIN};
             int pr = poll(&pfd, 1, timeout_ms);
             host_fd_ref_close(&host_ref);

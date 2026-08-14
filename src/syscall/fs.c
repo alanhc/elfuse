@@ -24,6 +24,17 @@
 #include "debug/log.h"
 #include "utils.h"
 
+#include "proved/dirent.h"
+
+/* dirent_record_bounds' precondition is name_len <= DIRENT64_NAME_MAX, and the
+ * translation buffer below is sized from the host's NAME_MAX. proved/dirent.h
+ * deliberately does not take that constant from limits.h, since the 255 it
+ * states is the guest's limit; this ties the two so a host with a larger
+ * NAME_MAX cannot slip a filename past the proof and overrun entry_buf.
+ */
+_Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
+               "the dirent name bound must match the proved one");
+
 #include "core/shim-globals.h" /* shim_globals_mark_urandom_fd */
 
 #include "runtime/procemu.h"
@@ -175,6 +186,21 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
 
     if (!strcmp(path, "/dev/ptmx")) {
         str_copy_trunc(out, path, out_size);
+        return true;
+    }
+
+    /* /dev/pts is served from a host staging directory holding one empty
+     * placeholder file per live slave, which is what makes getdents64 list the
+     * right names. The placeholders are names and nothing else: opening one
+     * yields a 0444 regular file rather than a tty, and the openat/fstatat
+     * intercepts key on an absolute path, so a descriptor opened on the
+     * directory used to reach them directly. Stamping the guest spelling lets
+     * resolve_proc_dirfd_path rebuild /dev/pts/N for a relative call measured
+     * against this descriptor, which puts it back through the intercept that
+     * opens the real slave and accounts for it.
+     */
+    if (!strcmp(path, "/dev/pts") || !strcmp(path, "/dev/pts/")) {
+        str_copy_trunc(out, "/dev/pts", out_size);
         return true;
     }
 
@@ -546,7 +572,7 @@ int64_t sys_openat_path(guest_t *g,
                  * leaks because nothing else has the master in fd_table.
                  * proc_pty_close_keepalive is a no-op for other paths.
                  */
-                proc_pty_close_keepalive(intercepted);
+                proc_pty_forget_host_fd(intercepted);
                 close_keep_errno(intercepted);
                 return linux_errno();
             }
@@ -556,7 +582,7 @@ int64_t sys_openat_path(guest_t *g,
                 intercepted, type, linux_flags, min_guest_fd,
                 fd_cleanup_for_type(type), tx.intercept_path);
             if (guest_fd < 0) {
-                proc_pty_close_keepalive(intercepted);
+                proc_pty_forget_host_fd(intercepted);
                 close_keep_errno(intercepted);
                 return linux_errno();
             }
@@ -752,19 +778,11 @@ int64_t sys_close(int fd)
     int host_fd = -1;
     if (fd_close_regular_relaxed(fd, &host_fd)) {
         /* The fast path bypasses fd_cleanup_entry, so any side tables keyed by
-         * host_fd that the slow path drops must be drained here too.
-         * proc_pty_close_keepalive is a cheap no-op for non-pty fds and
-         * prevents the keepalive slave from leaking past a /dev/ptmx close when
-         * no per-type cleanup is registered.
+         * host_fd that the slow path drops must be drained here too. A no-op
+         * for anything that is not a pty, and a pty slave is an ordinary
+         * FD_REGULAR slot, so every guest close of one lands here.
          */
-        proc_pty_close_keepalive(host_fd);
-
-        /* A pty slave is an ordinary FD_REGULAR slot, so every guest close of
-         * one lands here rather than in fd_cleanup_entry. Without this the
-         * per-master slave count never falls back to zero and the master never
-         * reports its hangup.
-         */
-        proc_pty_slave_fd_closed(host_fd);
+        proc_pty_forget_host_fd(host_fd);
         chown_overlay_clear_closed_unlinked_fd(host_fd);
         if (close(host_fd) < 0)
             return linux_errno();
@@ -965,6 +983,7 @@ static int duplicate_guest_fd(int src_fd,
      * race and leak the slave fd. No-op when the source has no keepalive.
      */
     proc_pty_dup_keepalive_locked(src_snap.host_fd, new_host_fd);
+
     /* Same reasoning for the slave side: the alias is a live reference to the
      * pty and must be on the books before the guest fd is published, or the
      * source's close will retire the only counted reference.
@@ -990,8 +1009,7 @@ static int duplicate_guest_fd(int src_fd,
          * is about to be closed on the books, and the master would never see
          * its last slave go.
          */
-        proc_pty_close_keepalive(new_host_fd);
-        proc_pty_slave_fd_closed(new_host_fd);
+        proc_pty_forget_host_fd(new_host_fd);
         close_keep_errno(new_host_fd);
         return -1;
     }
@@ -1628,12 +1646,17 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     size_t guest_pos = 0;
     struct dirent *de;
 
-    /* Temp buffer for dirent serialization. Max dirent64 is 280 bytes (19-byte
-     * header + NAME_MAX=255 + null + padding to 8). Using a stack buffer avoids
-     * guest_ptr boundary issues: guest_write() handles 2MiB block crossings
-     * that raw memcpy into guest_ptr() cannot.
+    /* Temp buffer for dirent serialization. dirent_record_bounds proves every
+     * record it accepts fits DIRENT64_MAX_RECLEN, so nothing below re-checks
+     * the extent. Using a stack buffer avoids guest_ptr boundary issues:
+     * guest_write() handles 2MiB block crossings that raw memcpy into
+     * guest_ptr() cannot.
+     *
+     * guest_pos <= count holds on every iteration, which is what lets the call
+     * below meet its precondition: it starts at 0 and only advances by a reclen
+     * the same call proved fits in count - guest_pos.
      */
-    uint8_t entry_buf[280];
+    uint8_t entry_buf[DIRENT64_MAX_RECLEN];
 
     /* One answer per call, not per entry: which side of the sysroot boundary
      * the stream reads from is a property of the directory.
@@ -1682,11 +1705,14 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
             goto out;
         }
 
-        size_t name_len = strlen(guest_name);
-        /* Linux dirent64: 19-byte header + name + null, padded to 8 */
-        size_t reclen = (19 + name_len + 1 + 7) & ~7ULL;
+        /* path_translate_dirent_name wrote into a NAME_MAX + 1 buffer, so the
+         * length is within dirent_record_bounds' precondition.
+         */
+        uint64_t name_len = strlen(guest_name);
+        uint64_t reclen, pad_start;
 
-        if (guest_pos + reclen > count) {
+        if (!dirent_record_bounds(name_len, guest_pos, count, &reclen,
+                                  &pad_start)) {
             /* Entry does not fit; rewind so next call gets it */
             seekdir(dir, saved_pos);
             break;
@@ -1702,8 +1728,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
          * guest_write() which handles 2MiB block boundary crossings.
          */
         memcpy(entry_buf, &lde, sizeof(lde));
-        memcpy(entry_buf + 19, guest_name, name_len + 1);
-        size_t pad_start = 19 + name_len + 1;
+        memcpy(entry_buf + DIRENT64_HDR_BYTES, guest_name, name_len + 1);
         if (pad_start < reclen)
             memset(entry_buf + pad_start, 0, reclen - pad_start);
 
@@ -1814,6 +1839,15 @@ int64_t sys_fchdir(int fd)
     char proc_virt[64];
     const char *proc_virtual = proc_virtual_dir_path(
         fd_table[fd].proc_path, proc_virt, sizeof(proc_virt));
+
+    /* /dev/pts is not a /proc path, so proc_virtual_dir_path does not name it,
+     * but it is virtual for the same reason: the host directory behind it holds
+     * placeholder files, not the slaves. Publishing the guest spelling is what
+     * lets a relative open resolved against this cwd re-derive /dev/pts/N and
+     * reach the intercept, exactly as a directory fd does.
+     */
+    if (!proc_virtual && !strcmp(fd_table[fd].proc_path, "/dev/pts"))
+        proc_virtual = "/dev/pts";
     if (fchdir(host_ref.fd) < 0) {
         host_fd_ref_close(&host_ref);
         return linux_errno();

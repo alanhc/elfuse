@@ -78,7 +78,7 @@ static inline int stack_take(uint64_t *ptr, uint64_t floor, uint64_t bytes)
  * Written as subtract-the-remainder rather than "& ~15": the compiler emits the
  * same instruction, and the prover reasons about the arithmetic form without
  * first establishing that the mask is one less than a power of two. Same reason
- * src/core/gva-math.h uses "% granule".
+ * src/proved/gva.h uses "% granule".
  */
 /*@
   assigns \nothing;

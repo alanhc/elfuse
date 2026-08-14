@@ -207,7 +207,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage test-config \
 	$(call run-lane,test-sysroot-path-matrix,addressing modes agree across the path matrix)
 	$(call run-lane,test-usage-synopsis,usage synopsis renderings)
 	$(call run-lane,test-shebang-host,shebang parser unit test)
-	$(call run-lane,test-gva-contracts,gva-math.h call-site contract checks)
+	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
 	$(call run-lane,test-busybox,busybox applet validation)
@@ -1479,6 +1479,6 @@ probe-volume-naming: $(BUILD_DIR)/probe-volume-naming
 test-shebang-host: $(BUILD_DIR)/test-shebang-host
 	$(BUILD_DIR)/test-shebang-host
 
-## Run the gva-math.h call-site precondition checks (skips without the flag)
+## Run the proved/gva.h call-site precondition checks (skips without the flag)
 test-gva-contracts: $(BUILD_DIR)/test-gva-contracts
 	$(BUILD_DIR)/test-gva-contracts

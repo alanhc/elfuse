@@ -21,6 +21,8 @@
 #include "syscall/linux-wire.h"
 #include "syscall/casefold-walk.h"
 #include "syscall/fuse.h"
+#include "proved/pathdepth.h"
+
 #include "syscall/path.h"
 #include "syscall/proc.h"
 
@@ -500,8 +502,9 @@ static size_t path_lexical_depth(const char *path)
         if (path_component_is_dot(comp, len))
             continue;
         if (path_component_is_dotdot(comp, len)) {
-            if (depth > 0)
-                depth--;
+            uint64_t popped;
+            if (path_depth_pop(depth, &popped))
+                depth = popped;
             continue;
         }
         depth++;
@@ -677,9 +680,10 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
             continue;
         if (clamp) {
             if (path_component_is_dotdot(comp, len)) {
-                if (depth == 0)
+                uint64_t popped;
+                if (!path_depth_pop(depth, &popped))
                     continue; /* '..' at the guest root names the root */
-                depth--;
+                depth = popped;
             } else {
                 depth++;
             }
@@ -751,7 +755,6 @@ static int proc_push_component(char *out,
         marks[*depth] = cur;
         memcpy(out + cur, comp, len);
         out[cur + len] = '\0';
-        (*depth)++;
         return 0;
     }
 
@@ -762,7 +765,6 @@ static int proc_push_component(char *out,
     out[write_pos] = '/';
     memcpy(out + write_pos + 1, comp, len);
     out[write_pos + 1 + len] = '\0';
-    (*depth)++;
     return 0;
 }
 
@@ -790,19 +792,28 @@ static int proc_apply_components(const char *path,
             continue;
         }
         if (len == 2 && seg[0] == '.' && seg[1] == '.') {
-            if (*depth > 0) {
-                *depth -= 1;
+            uint64_t popped;
+            if (path_depth_pop(*depth, &popped)) {
+                *depth = popped;
                 out[marks[*depth]] = '\0';
             }
             seg = end;
             continue;
         }
-        if (*depth >= marks_cap) {
+
+        /* The bound and the advance are one step: path_depth_push refuses at
+         * capacity, so the marks[] write inside proc_push_component is in range
+         * by postcondition rather than by a check the caller repeats. The depth
+         * advances only after the write succeeds, as before.
+         */
+        uint64_t pushed;
+        if (!path_depth_push(*depth, marks_cap, &pushed)) {
             errno = ENAMETOOLONG;
             return -1;
         }
         if (proc_push_component(out, outsz, marks, depth, seg, len) < 0)
             return -1;
+        *depth = pushed;
         seg = end;
     }
     return 0;
@@ -855,8 +866,13 @@ static int resolve_proc_cwd_path(const char *path, char *out, size_t outsz)
     if (proc_acquire_cwd_view(&view) < 0)
         return 0;
 
+    /* /dev/pts joins /proc here: both are served from host directories whose
+     * contents are not what the guest names, so a relative path measured
+     * against one has to be rebuilt as a guest path and re-offered to the
+     * intercepts. The component walk below is base-agnostic.
+     */
     int rc = 0;
-    if (!strncmp(view.path, "/proc", 5)) {
+    if (!strncmp(view.path, "/proc", 5) || !strncmp(view.path, "/dev/pts", 8)) {
         size_t marks[PROC_PATH_COMPONENTS_MAX];
         size_t depth;
         if (proc_seed_absolute_path(view.path, out, outsz, marks,

@@ -111,6 +111,84 @@ int main(void)
             FAIL("pselect failed");
     }
 
+    /* A sub-millisecond ppoll timeout must actually wait. Converting it to
+     * poll(2) milliseconds by truncation yields poll(0), which returns
+     * immediately, so a guest polling with a 500 us timeout spins at full CPU
+     * instead of sleeping. Linux rounds the remainder up.
+     */
+    TEST("ppoll waits out a sub-millisecond timeout");
+    {
+        struct pollfd pfd = {.fd = -1, .events = POLLIN, .revents = 0};
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 500000}; /* 500 us */
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int ret = ppoll(&pfd, 1, &ts, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        int64_t elapsed_ns =
+            (t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+        if (ret != 0)
+            FAIL("ppoll did not time out");
+        else if (elapsed_ns < 200000)
+            FAIL("ppoll returned before its sub-millisecond timeout");
+        else
+            PASS();
+    }
+
+    /* Bits above nfds in the last fd_set word must be ignored. Linux bounds its
+     * per-word scan by nfds (fs/select.c); a walk that iterates whole words
+     * instead polls an fd the caller never asked about, and fails with EBADF
+     * when that fd is not open. nfds is deliberately not a multiple of 64 so
+     * the last word is partial.
+     */
+    TEST("pselect ignores fd_set bits above nfds");
+    {
+        int fds[2];
+        if (pipe(fds) < 0) {
+            FAIL("pipe failed");
+        } else {
+            int closed = dup(fds[0]);
+            if (closed < 0) {
+                FAIL("dup failed");
+            } else if (closed >= FD_SETSIZE) {
+                FAIL("dup returned an fd outside the fd_set");
+            } else {
+                /* nfds is the fd itself, so the set bit sits at index nfds: the
+                 * first bit the kernel must ignore, and always inside the last
+                 * word the walk reads. Deriving nfds from the fd instead
+                 * (clamped to some constant) lets the bit land in a word
+                 * pselect never reads at all, and the test then passes for a
+                 * reason unrelated to what it guards.
+                 *
+                 * A multiple of 64 is the one value that does not work: the
+                 * word holding bit nfds is then past the end of the read, so
+                 * step to the next fd, which cannot also be a multiple of 64.
+                 */
+                if (closed % 64 == 0) {
+                    int next = dup(fds[0]);
+                    if (next >= 0) {
+                        close(closed);
+                        closed = next;
+                    }
+                }
+                int nfds = closed;
+                close(closed);
+                fd_set rd;
+                FD_ZERO(&rd);
+                FD_SET(closed, &rd);
+                struct timespec ts = {.tv_sec = 0, .tv_nsec = 0};
+                int ret = pselect(nfds, &rd, NULL, NULL, &ts, NULL);
+                if (closed % 64 == 0)
+                    FAIL("could not place the bit inside the last word");
+                else if (ret == 0)
+                    PASS();
+                else
+                    FAIL("pselect honored a bit above nfds");
+            }
+            close(fds[0]);
+            close(fds[1]);
+        }
+    }
+
     /* Test kill(getpid(), 0): process existence check */
     TEST("kill(getpid, 0)");
     {
@@ -225,6 +303,7 @@ int main(void)
                     int saved = errno;
                     pthread_join(sender, NULL);
                     errno = saved;
+
                     /* The handler running is the hard requirement (got_usr1);
                      * that alone proves the signal reached a thread blocked in
                      * a host read(). The read outcome is accepted either way:
@@ -282,6 +361,7 @@ int main(void)
                     int saved = errno;
                     pthread_join(sender, NULL);
                     errno = saved;
+
                     /* got_usr1 is the hard requirement: it proves the signal
                      * reached a thread blocked in a host recv(). The recv
                      * outcome is accepted either way (restarted read returns

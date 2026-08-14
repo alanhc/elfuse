@@ -1049,9 +1049,9 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
     if (entry && entry->host_waitable) {
         /* proc_process_exit() publishes the status and raises SIGCHLD while the
          * host process is still tearing down, so wait4 reports "running" for a
-         * moment after the guest was told the child is gone, a skew Linux
-         * never has. Copy the status across so a WNOHANG poll from the handler
-         * cannot miss it; proc_deferred_reap_poll() does the host reap later so
+         * moment after the guest was told the child is gone, a skew Linux never
+         * has. Copy the status across so a WNOHANG poll from the handler cannot
+         * miss it; proc_deferred_reap_poll() does the host reap later so
          * nothing blocks here.
          */
         if (source->exited && !entry->exited) {
@@ -3134,6 +3134,433 @@ static const hv_sys_reg_t hvc4_sysregs[] = {
     HV_SYS_REG_TTBR1_EL1, /* 8 */
 };
 
+/* HVC #7: MRS trap emulation. Guest EL0 code read a system register; extract
+ * the encoding from ESR_EL1's ISS field, read it via HVF, and leave the value
+ * in X0 for the shim to store into the saved register frame.
+ *
+ * Lifted out of vcpu_run_loop_with_hooks, which every syscall passes through
+ * and which had grown past a thousand lines. This case cannot end the loop and
+ * reads no loop state beyond the vCPU handle and the two logging arguments, so
+ * it moves whole.
+ */
+static void vcpu_handle_mrs_trap(hv_vcpu_t vcpu,
+                                 bool verbose,
+                                 const char *prefix)
+{
+    uint64_t esr;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+    uint32_t iss = (uint32_t) (esr & 0x1FFFFFF);
+
+    /* ISS encoding for EC=0x18 (MSR/MRS trap):
+     *   [21:20] = Op0    [19:17] = Op2
+     *   [16:14] = Op1    [13:10] = CRn
+     *   [9:5]   = Rt     [4:1]   = CRm
+     *   [0]     = Direction (1=MRS read)
+     */
+    uint32_t op0 = (iss >> 20) & 0x3, op2 = (iss >> 17) & 0x7;
+    uint32_t op1 = (iss >> 14) & 0x7, crn = (iss >> 10) & 0xF;
+    uint32_t crm = (iss >> 1) & 0xF;
+
+    /* Construct HVF system register ID:
+     *   (Op0<<14) | (Op1<<11) | (CRn<<7) | (CRm<<3) | Op2
+     */
+    hv_sys_reg_t reg = (hv_sys_reg_t) ((op0 << 14) | (op1 << 11) | (crn << 7) |
+                                       (crm << 3) | op2);
+
+    uint64_t value = 0;
+
+    /* ID register emulation: return VZ-sanitized values matching a real VZ
+     * (Lima) VM BEFORE trying HVF. HVF's hv_vcpu_get_sys_reg succeeds for ID
+     * registers but returns raw hardware values, which include features the
+     * hypervisor does not actually virtualize.
+     *
+     * Values captured from a Lima VZ VM on Apple Silicon via inline MRS from
+     * EL0 (kernel trap-and-emulate). These are checked first, before the HVF
+     * call.
+     */
+    bool have_vz_override = false;
+
+    /* ID_AA64MMFR0_EL1 (3,0,0,7,0) */
+    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 7 && op2 == 0) {
+        value = 0x00000111ff000000ULL;
+        have_vz_override = true;
+    }
+
+    /* ID_AA64MMFR1_EL1 (3,0,0,7,1): VZ returns 0. Raw hardware (e.g.,
+     * 0x11212000) exposes HPDS, PAN, LO, XNX etc. that VZ does not virtualize.
+     */
+    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 7 && op2 == 1) {
+        value = 0x0000000000000000ULL;
+        have_vz_override = true;
+    }
+    /* ID_AA64MMFR2_EL1 (3,0,0,7,2): VZ returns 0. */
+    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 7 && op2 == 2) {
+        value = 0x0000000000000000ULL;
+        have_vz_override = true;
+    }
+    /* ID_AA64ISAR0_EL1 (3,0,0,6,0) */
+    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 6 && op2 == 0) {
+        value = 0x0021100110212120ULL;
+        have_vz_override = true;
+    }
+    /* ID_AA64ISAR1_EL1 (3,0,0,6,1) */
+    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 6 && op2 == 1) {
+        value = 0x0000101110211402ULL;
+        have_vz_override = true;
+    }
+    /* ID_AA64PFR0_EL1 (3,0,0,4,0) */
+    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 4 && op2 == 0) {
+        value = 0x0001000000110011ULL;
+        have_vz_override = true;
+    }
+    /* ID_AA64PFR1_EL1 (3,0,0,4,1): VZ returns 0. */
+    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 4 && op2 == 1) {
+        value = 0x0000000000000000ULL;
+        have_vz_override = true;
+    }
+
+    if (have_vz_override) {
+        if (verbose)
+            log_debug(
+                "%s: MRS trap: Op0=%u Op1=%u "
+                "CRn=%u CRm=%u Op2=%u -> 0x%llx (VZ)",
+                prefix, op0, op1, crn, crm, op2, (unsigned long long) value);
+    }
+
+    hv_return_t ret =
+        have_vz_override ? HV_SUCCESS : hv_vcpu_get_sys_reg(vcpu, reg, &value);
+    if (ret != HV_SUCCESS) {
+        /* HVF does not expose this register. Provide a host-side fallback for
+         * known registers.
+         */
+        bool have_fallback = false;
+
+        /* CNTFRQ_EL0 (3,3,14,0,0): counter frequency. Read directly from host
+         * hardware (Apple Silicon uses 24MHz).
+         */
+        if (op0 == 3 && op1 == 3 && crn == 14 && crm == 0 && op2 == 0) {
+            __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(value));
+            have_fallback = true;
+        }
+
+        /* Non-ID register fallbacks for registers that HVF does not expose. ID
+         * registers are handled above (VZ overrides).
+         */
+
+        if (verbose) {
+            if (have_fallback) {
+                log_debug(
+                    "%s: MRS trap: "
+                    "Op0=%u Op1=%u CRn=%u CRm=%u "
+                    "Op2=%u -> 0x%llx (host)",
+                    prefix, op0, op1, crn, crm, op2,
+                    (unsigned long long) value);
+            } else {
+                log_debug(
+                    "%s: MRS trap: unknown reg "
+                    "Op0=%u Op1=%u CRn=%u CRm=%u "
+                    "Op2=%u (hv_reg=0x%x) -> 0",
+                    prefix, op0, op1, crn, crm, op2, (unsigned) reg);
+            }
+        }
+    } else if (verbose) {
+        log_debug(
+            "%s: MRS trap: Op0=%u Op1=%u "
+            "CRn=%u CRm=%u Op2=%u -> 0x%llx",
+            prefix, op0, op1, crn, crm, op2, (unsigned long long) value);
+    }
+
+    hv_vcpu_set_reg(vcpu, HV_REG_X0, value);
+}
+
+/* HVC #12: system instruction trap. The guest executed a cache maintenance
+ * instruction HVF traps; log it and step past. Lifted out of
+ * vcpu_run_loop_with_hooks with the other self-contained cases: it reads no
+ * loop state and cannot end the loop.
+ */
+static void vcpu_handle_sysinstr_trap(hv_vcpu_t vcpu,
+                                      bool verbose,
+                                      const char *prefix)
+{
+    /* HVC #12: System instruction trap (EC=0x18 Direction=0). The shim forwards
+     * trapped cache maintenance instructions (DC CVAU, IC IVAU, etc.) here for
+     * logging/counting. It also passes the original Rt value in X0 so host-side
+     * emulation can handle MSR writes such as TPIDR_EL0. The shim has already
+     * advanced PC and will restore X0 from its saved frame before returning to
+     * EL0.
+     */
+    atomic_fetch_add(&sysreg_write_count, 1);
+    uint64_t rt_value = 0;
+    hv_vcpu_get_reg(vcpu, HV_REG_X0, &rt_value);
+    uint64_t esr;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+    uint32_t iss = (uint32_t) (esr & 0x1FFFFFF);
+
+    /* Decode ISS for system instruction:
+     *   Op0[21:20] Op2[19:17] Op1[16:14]
+     *   CRn[13:10] Rt[9:5] CRm[4:1] Dir[0]
+     */
+    uint32_t op0 = (iss >> 20) & 0x3, op2 = (iss >> 17) & 0x7;
+    uint32_t op1 = (iss >> 14) & 0x7, crn = (iss >> 10) & 0xF;
+    uint32_t crm = (iss >> 1) & 0xF, rt = (iss >> 5) & 0x1F;
+
+    /* TPIDR_EL0 (S3_3_C13_C0_2): userspace TLS base. Static glibc writes this
+     * during early startup. HVF traps the MSR, so Linux-compatible execution
+     * requires reflecting the write into the virtual sysreg.
+     */
+    if (op0 == 3 && op1 == 3 && crn == 13 && crm == 0 && op2 == 2) {
+        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, rt_value));
+    }
+    if (verbose) {
+        /* DC CVAU: Op0=1,Op1=3,CRn=7,CRm=11,Op2=1 IC IVAU:
+         * Op0=1,Op1=3,CRn=7,CRm=5,Op2=1
+         */
+        const char *name = "unknown";
+        if (op0 == 1 && op1 == 3 && crn == 7 && crm == 11 && op2 == 1)
+            name = "DC CVAU";
+        else if (op0 == 1 && op1 == 3 && crn == 7 && crm == 5 && op2 == 1)
+            name = "IC IVAU";
+        else if (op0 == 1 && op1 == 3 && crn == 7 && crm == 10 && op2 == 1)
+            name = "DC CVAC";
+        else if (op0 == 1 && op1 == 3 && crn == 7 && crm == 14 && op2 == 1)
+            name = "DC CIVAC";
+        else if (op0 == 3 && op1 == 3 && crn == 13 && crm == 0 && op2 == 2)
+            name = "MSR TPIDR_EL0";
+        log_debug(
+            "%s: sysreg trap #%llu: %s "
+            "(Op0=%u Op1=%u CRn=%u CRm=%u Op2=%u "
+            "Rt=X%u val=0x%llx)",
+            prefix, (unsigned long long) atomic_load(&sysreg_write_count), name,
+            op0, op1, crn, crm, op2, rt, (unsigned long long) rt_value);
+    }
+}
+
+/* HVC #9: W^X toggle. HVF enforces W^X on stage-2, so a guest page that must
+ * become executable is flipped RW -> RX here (and back on the first write).
+ * Returns false when the fault cannot be served and the vCPU must stop.
+ */
+static bool vcpu_handle_wx_toggle(guest_t *g,
+                                  hv_vcpu_t vcpu,
+                                  bool verbose,
+                                  const char *prefix,
+                                  int *exit_code)
+{
+    /* HVC #9: W^X page permission toggle for JIT.
+     *
+     * Apple HVF enforces W^X: pages cannot be both writable and executable
+     * simultaneously. JIT code needs to be written (RW), then executed (RX).
+     * The shim detects permission faults (EC=0x20 instruction abort, EC=0x24
+     * data abort) and forwards the faulting address here.
+     *
+     * Toggling at 2MiB granularity causes thrashing when the JIT writes new
+     * code and executes existing code within the same 2MiB block. Instead, the
+     * code splits the 2MiB block into 4KiB L3 pages and toggle only the
+     * faulting 4KiB page. This allows different pages within a 2MiB block to
+     * have independent RW/RX permissions simultaneously.
+     *
+     * x0 = FAR_EL1 (faulting virtual address) x1 = type: 0 = exec fault -> flip
+     * to RX
+     *            1 = write fault -> flip to RW
+     */
+    uint64_t far, type;
+    hv_vcpu_get_reg(vcpu, HV_REG_X0, &far);
+    hv_vcpu_get_reg(vcpu, HV_REG_X1, &type);
+
+    uint64_t page_start = far & ~(4096ULL - 1);
+    uint64_t page_end = page_start + 4096;
+    int new_perms = (type == 0) ? MEM_PERM_RX : MEM_PERM_RW;
+
+    /* Hold mmap_lock for page table modifications AND region lookups to prevent
+     * races with concurrent mmap/mprotect/munmap from other vCPU threads.
+     */
+    pthread_mutex_lock(&mmap_lock);
+
+    /* Check if this is a genuine permission violation (not a W^X toggle). If
+     * the guest region lacks the required permission, deliver SIGSEGV instead
+     * of toggling. This handles mprotect(PROT_READ), SHM_RDONLY, PROT_NONE, and
+     * non-exec pages.
+     */
+    {
+        uint64_t off = far - g->ipa_base;
+        const guest_region_t *reg = guest_region_find(g, off);
+        int required = (type == 1) ? LINUX_PROT_WRITE : LINUX_PROT_EXEC;
+        if (reg && !(reg->prot & required)) {
+            pthread_mutex_unlock(&mmap_lock);
+            uint64_t esr;
+            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+            signal_set_fault_info(LINUX_SEGV_ACCERR, far, esr);
+            int sig_ret =
+                signal_deliver_fault(vcpu, g, LINUX_SIGSEGV, exit_code);
+            if (sig_ret < 0)
+                return false;
+            /* Fault delivered; the loop keeps running. */
+            return true;
+        }
+    }
+
+    /* Count W^X toggles for JIT debugging */
+    if (type == 0)
+        atomic_fetch_add(&wxcount_to_rx, 1);
+    else
+        atomic_fetch_add(&wxcount_to_rw, 1);
+
+    if (verbose)
+        log_debug("%s: W^X toggle at 0x%llx -> %s (page 0x%llx)", prefix,
+                  (unsigned long long) far, (type == 0) ? "RX" : "RW",
+                  (unsigned long long) page_start);
+    uint64_t block_start = far & ~(BLOCK_2MIB - 1);
+    int sr = guest_split_block(g, block_start);
+    int ur = guest_update_perms(g, page_start, page_end, new_perms);
+    pthread_mutex_unlock(&mmap_lock);
+    if (verbose && (sr < 0 || ur < 0))
+        log_warn(
+            "%s: W^X toggle FAILED "
+            "(split=%d update=%d) far=0x%llx",
+            prefix, sr, ur, (unsigned long long) far);
+
+    /* TLB flush is done by the shim (tlbi_restore_eret) for the single faulting
+     * page. Clear this thread's pending request so the next syscall epilogue
+     * does not re-flush the W^X page. cpu_tlbi_req is per-vCPU, so this only
+     * touches our own slot -- concurrent vCPUs are unaffected.
+     *
+     * The HVC #9 shim now consumes X8 as a post-HVC marker: 0 means W^X
+     * succeeded and the shim should run the TLBI retry epilogue; 2 means
+     * signal_deliver_fault installed a handler frame and the shim must drop its
+     * saved frame. Clear X8 here so a guest's pre-fault X8 value cannot be
+     * misread as the frame-drop marker after a normal toggle.
+     */
+    tlbi_request_clear();
+    hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
+    return true;
+}
+
+/* HVC #10: BRK from EL0. A guest breakpoint becomes a ptrace-stop when the
+ * thread is traced, and SIGTRAP otherwise.
+ *
+ * Returns false when the vCPU must stop.
+ */
+static bool vcpu_handle_brk(guest_t *g,
+                            hv_vcpu_t vcpu,
+                            bool verbose,
+                            const char *prefix,
+                            int *exit_code)
+{
+    /* HVC #10: BRK from EL0 -> deliver SIGTRAP or ptrace-stop.
+     *
+     * If the thread is ptraced, the BRK enters a ptrace-stop (the tracer
+     * reads/writes registers then CONT's). Otherwise the run loop queues
+     * SIGTRAP and delivers it via the signal frame mechanism.
+     *
+     * The shim has already restored all GPRs to their EL0 values, so
+     * signal_deliver / ptrace_stop read correct state.
+     *
+     * The Linux kernel sets si_code=TRAP_BRKPT, si_addr=BRK_PC, and
+     * fault_address=BRK_PC for BRK-triggered SIGTRAP.
+     */
+    uint64_t brk_pc;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &brk_pc);
+
+    if (verbose) {
+        log_debug("%s: BRK at 0x%llx -> %s", prefix,
+                  (unsigned long long) brk_pc,
+                  current_thread->ptraced ? "ptrace-stop" : "SIGTRAP");
+    }
+
+    if (current_thread->ptraced) {
+        /* Ptrace-stop: suspend vCPU, notify tracer. thread_ptrace_stop blocks
+         * until tracer CONT's.
+         */
+        int cont_sig = thread_ptrace_stop(current_thread, 5);
+        if (cont_sig > 0) {
+            signal_queue(cont_sig);
+            int sr = signal_deliver(vcpu, g, exit_code);
+            if (sr < 0)
+                return false;
+        }
+    } else {
+        /* Non-ptraced: deliver SIGTRAP via signal frame. Read ESR_EL1 to
+         * include in sigcontext.
+         */
+        uint64_t brk_esr;
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &brk_esr);
+        signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc, brk_esr);
+        if (verbose) {
+            uint64_t thread_blocked =
+                current_thread ? current_thread->blocked : 0xDEAD;
+            log_debug(
+                "%s: BRK: thread_blocked=0x%llx "
+                "pending=0x%llx",
+                prefix, (unsigned long long) thread_blocked,
+                (unsigned long long) signal_get_state()->shared.pending);
+        }
+        int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGTRAP, exit_code);
+        if (verbose)
+            log_debug("%s: signal_deliver returned %d", prefix, sig_ret);
+        if (sig_ret < 0) {
+            /* SIG_DFL for SIGTRAP: terminate */
+            return false;
+        }
+    }
+    return true;
+}
+
+/* HVC #2: bad exception from the shim's vector table. Dumps the guest state and
+ * stops the vCPU. Its inner continue binds to the register-dump for loop, not
+ * the enclosing run loop, so this lifts like cases 9 and 10.
+ */
+static bool vcpu_handle_bad_exception(guest_t *g,
+                                      hv_vcpu_t vcpu,
+                                      const char *prefix,
+                                      int *exit_code)
+{
+    /* HVC #2: Bad exception in guest. Shim clobbers X0-X3,X5 with exception
+     * info. X4,X6-X30 and SP_EL0 still hold faulting values.
+     */
+    uint64_t x0, x1, x2, x3, x5;
+    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
+    hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
+    hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
+    hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
+    hv_vcpu_get_reg(vcpu, HV_REG_X5, &x5);
+    log_error(
+        "%s: guest exception vec=0x%03llx "
+        "ESR=0x%llx FAR=0x%llx ELR=0x%llx SPSR=0x%llx",
+        prefix, (unsigned long long) x5, (unsigned long long) x0,
+        (unsigned long long) x1, (unsigned long long) x2,
+        (unsigned long long) x3);
+
+    /* Dump preserved registers for debugging */
+    uint64_t sp_el0;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp_el0);
+    log_error("%s:   SP_EL0=0x%llx", prefix, (unsigned long long) sp_el0);
+    for (int ri = 4; ri <= 30; ri++) {
+        /* Skip X5 (clobbered by shim for vec offset) */
+        if (ri == 5)
+            continue;
+        uint64_t rv;
+        hv_vcpu_get_reg(vcpu, (hv_reg_t) (HV_REG_X0 + ri), &rv);
+        log_error("%s:   X%-2d=0x%016llx", prefix, ri, (unsigned long long) rv);
+    }
+
+    /* Check if FAR looks like a tagged pointer */
+    uint64_t far = x1;
+    uint16_t top16 = (uint16_t) (far >> 48);
+    if (top16 != 0x0000 && top16 != 0xFFFF) {
+        log_error("%s:   FAR tag=0x%04x, extracted addr=0x%llx", prefix, top16,
+                  (unsigned long long) (far & 0x0000FFFFFFFFFFFFULL));
+    }
+
+    {
+        char detail[128];
+        snprintf(detail, sizeof(detail), "vec=0x%03llx ESR=0x%llx FAR=0x%llx",
+                 (unsigned long long) x5, (unsigned long long) x0,
+                 (unsigned long long) x1);
+        crash_report(vcpu, g, CRASH_BAD_EXCEPTION, detail);
+    }
+    *exit_code = 128;
+    return false;
+}
+
 /* Unified vCPU execution loop for both main and worker threads.
  *
  * When timeout_sec > 0 (main thread): uses alarm() for per-iteration safety
@@ -3368,322 +3795,19 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                 }
 
                 case 7: {
-                    /* HVC #7: MRS trap emulation. Guest EL0 code read a system
-                     * register. Extract the register encoding from ESR_EL1's
-                     * ISS field and read it via HVF.
-                     *
-                     * Return value in X0 for the shim to store into the saved
-                     * register frame.
-                     */
-                    uint64_t esr;
-                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
-                    uint32_t iss = (uint32_t) (esr & 0x1FFFFFF);
-
-                    /* ISS encoding for EC=0x18 (MSR/MRS trap):
-                     *   [21:20] = Op0    [19:17] = Op2
-                     *   [16:14] = Op1    [13:10] = CRn
-                     *   [9:5]   = Rt     [4:1]   = CRm
-                     *   [0]     = Direction (1=MRS read)
-                     */
-                    uint32_t op0 = (iss >> 20) & 0x3, op2 = (iss >> 17) & 0x7;
-                    uint32_t op1 = (iss >> 14) & 0x7, crn = (iss >> 10) & 0xF;
-                    uint32_t crm = (iss >> 1) & 0xF;
-
-                    /* Construct HVF system register ID:
-                     *   (Op0<<14) | (Op1<<11) | (CRn<<7) | (CRm<<3) | Op2
-                     */
-                    hv_sys_reg_t reg =
-                        (hv_sys_reg_t) ((op0 << 14) | (op1 << 11) | (crn << 7) |
-                                        (crm << 3) | op2);
-
-                    uint64_t value = 0;
-
-                    /* ID register emulation: return VZ-sanitized values
-                     * matching a real VZ (Lima) VM BEFORE trying HVF. HVF's
-                     * hv_vcpu_get_sys_reg succeeds for ID registers but returns
-                     * raw hardware values, which include features the
-                     * hypervisor does not actually virtualize.
-                     *
-                     * Values captured from a Lima VZ VM on Apple Silicon via
-                     * inline MRS from EL0 (kernel trap-and-emulate). These are
-                     * checked first, before the HVF call.
-                     */
-                    bool have_vz_override = false;
-
-                    /* ID_AA64MMFR0_EL1 (3,0,0,7,0) */
-                    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 7 &&
-                        op2 == 0) {
-                        value = 0x00000111ff000000ULL;
-                        have_vz_override = true;
-                    }
-
-                    /* ID_AA64MMFR1_EL1 (3,0,0,7,1): VZ returns 0. Raw hardware
-                     * (e.g., 0x11212000) exposes HPDS, PAN, LO, XNX etc. that
-                     * VZ does not virtualize.
-                     */
-                    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 7 &&
-                        op2 == 1) {
-                        value = 0x0000000000000000ULL;
-                        have_vz_override = true;
-                    }
-                    /* ID_AA64MMFR2_EL1 (3,0,0,7,2): VZ returns 0. */
-                    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 7 &&
-                        op2 == 2) {
-                        value = 0x0000000000000000ULL;
-                        have_vz_override = true;
-                    }
-                    /* ID_AA64ISAR0_EL1 (3,0,0,6,0) */
-                    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 6 &&
-                        op2 == 0) {
-                        value = 0x0021100110212120ULL;
-                        have_vz_override = true;
-                    }
-                    /* ID_AA64ISAR1_EL1 (3,0,0,6,1) */
-                    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 6 &&
-                        op2 == 1) {
-                        value = 0x0000101110211402ULL;
-                        have_vz_override = true;
-                    }
-                    /* ID_AA64PFR0_EL1 (3,0,0,4,0) */
-                    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 4 &&
-                        op2 == 0) {
-                        value = 0x0001000000110011ULL;
-                        have_vz_override = true;
-                    }
-                    /* ID_AA64PFR1_EL1 (3,0,0,4,1): VZ returns 0. */
-                    if (op0 == 3 && op1 == 0 && crn == 0 && crm == 4 &&
-                        op2 == 1) {
-                        value = 0x0000000000000000ULL;
-                        have_vz_override = true;
-                    }
-
-                    if (have_vz_override) {
-                        if (verbose)
-                            log_debug(
-                                "%s: MRS trap: Op0=%u Op1=%u "
-                                "CRn=%u CRm=%u Op2=%u -> 0x%llx (VZ)",
-                                prefix, op0, op1, crn, crm, op2,
-                                (unsigned long long) value);
-                    }
-
-                    hv_return_t ret = have_vz_override ? HV_SUCCESS
-                                                       : hv_vcpu_get_sys_reg(
-                                                             vcpu, reg, &value);
-                    if (ret != HV_SUCCESS) {
-                        /* HVF does not expose this register. Provide a
-                         * host-side fallback for known registers.
-                         */
-                        bool have_fallback = false;
-
-                        /* CNTFRQ_EL0 (3,3,14,0,0): counter frequency. Read
-                         * directly from host hardware (Apple Silicon uses
-                         * 24MHz).
-                         */
-                        if (op0 == 3 && op1 == 3 && crn == 14 && crm == 0 &&
-                            op2 == 0) {
-                            __asm__ volatile("mrs %0, cntfrq_el0"
-                                             : "=r"(value));
-                            have_fallback = true;
-                        }
-
-                        /* Non-ID register fallbacks for registers that HVF does
-                         * not expose. ID registers are handled above (VZ
-                         * overrides).
-                         */
-
-                        if (verbose) {
-                            if (have_fallback) {
-                                log_debug(
-                                    "%s: MRS trap: "
-                                    "Op0=%u Op1=%u CRn=%u CRm=%u "
-                                    "Op2=%u -> 0x%llx (host)",
-                                    prefix, op0, op1, crn, crm, op2,
-                                    (unsigned long long) value);
-                            } else {
-                                log_debug(
-                                    "%s: MRS trap: unknown reg "
-                                    "Op0=%u Op1=%u CRn=%u CRm=%u "
-                                    "Op2=%u (hv_reg=0x%x) -> 0",
-                                    prefix, op0, op1, crn, crm, op2,
-                                    (unsigned) reg);
-                            }
-                        }
-                    } else if (verbose) {
-                        log_debug(
-                            "%s: MRS trap: Op0=%u Op1=%u "
-                            "CRn=%u CRm=%u Op2=%u -> 0x%llx",
-                            prefix, op0, op1, crn, crm, op2,
-                            (unsigned long long) value);
-                    }
-
-                    hv_vcpu_set_reg(vcpu, HV_REG_X0, value);
+                    vcpu_handle_mrs_trap(vcpu, verbose, prefix);
                     break;
                 }
 
                 case 9: {
-                    /* HVC #9: W^X page permission toggle for JIT.
-                     *
-                     * Apple HVF enforces W^X: pages cannot be both writable and
-                     * executable simultaneously. JIT code needs to be written
-                     * (RW), then executed (RX). The shim detects permission
-                     * faults (EC=0x20 instruction abort, EC=0x24 data abort)
-                     * and forwards the faulting address here.
-                     *
-                     * Toggling at 2MiB granularity causes thrashing when the
-                     * JIT writes new code and executes existing code within the
-                     * same 2MiB block. Instead, the code splits the 2MiB block
-                     * into 4KiB L3 pages and toggle only the faulting 4KiB
-                     * page. This allows different pages within a 2MiB block to
-                     * have independent RW/RX permissions simultaneously.
-                     *
-                     * x0 = FAR_EL1 (faulting virtual address) x1 = type: 0 =
-                     * exec fault -> flip to RX
-                     *            1 = write fault -> flip to RW
-                     */
-                    uint64_t far, type;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &far);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &type);
-
-                    uint64_t page_start = far & ~(4096ULL - 1);
-                    uint64_t page_end = page_start + 4096;
-                    int new_perms = (type == 0) ? MEM_PERM_RX : MEM_PERM_RW;
-
-                    /* Hold mmap_lock for page table modifications AND region
-                     * lookups to prevent races with concurrent
-                     * mmap/mprotect/munmap from other vCPU threads.
-                     */
-                    pthread_mutex_lock(&mmap_lock);
-
-                    /* Check if this is a genuine permission violation (not a
-                     * W^X toggle). If the guest region lacks the required
-                     * permission, deliver SIGSEGV instead of toggling. This
-                     * handles mprotect(PROT_READ), SHM_RDONLY, PROT_NONE, and
-                     * non-exec pages.
-                     */
-                    {
-                        uint64_t off = far - g->ipa_base;
-                        const guest_region_t *reg = guest_region_find(g, off);
-                        int required =
-                            (type == 1) ? LINUX_PROT_WRITE : LINUX_PROT_EXEC;
-                        if (reg && !(reg->prot & required)) {
-                            pthread_mutex_unlock(&mmap_lock);
-                            uint64_t esr;
-                            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
-                            signal_set_fault_info(LINUX_SEGV_ACCERR, far, esr);
-                            int sig_ret = signal_deliver_fault(
-                                vcpu, g, LINUX_SIGSEGV, &exit_code);
-                            if (sig_ret < 0)
-                                running = false;
-                            break;
-                        }
-                    }
-
-                    /* Count W^X toggles for JIT debugging */
-                    if (type == 0)
-                        atomic_fetch_add(&wxcount_to_rx, 1);
-                    else
-                        atomic_fetch_add(&wxcount_to_rw, 1);
-
-                    if (verbose)
-                        log_debug(
-                            "%s: W^X toggle at 0x%llx -> %s (page 0x%llx)",
-                            prefix, (unsigned long long) far,
-                            (type == 0) ? "RX" : "RW",
-                            (unsigned long long) page_start);
-                    uint64_t block_start = far & ~(BLOCK_2MIB - 1);
-                    int sr = guest_split_block(g, block_start);
-                    int ur =
-                        guest_update_perms(g, page_start, page_end, new_perms);
-                    pthread_mutex_unlock(&mmap_lock);
-                    if (verbose && (sr < 0 || ur < 0))
-                        log_warn(
-                            "%s: W^X toggle FAILED "
-                            "(split=%d update=%d) far=0x%llx",
-                            prefix, sr, ur, (unsigned long long) far);
-
-                    /* TLB flush is done by the shim (tlbi_restore_eret) for the
-                     * single faulting page. Clear this thread's pending request
-                     * so the next syscall epilogue does not re-flush the W^X
-                     * page. cpu_tlbi_req is per-vCPU, so this only touches our
-                     * own slot -- concurrent vCPUs are unaffected.
-                     *
-                     * The HVC #9 shim now consumes X8 as a post-HVC marker: 0
-                     * means W^X succeeded and the shim should run the TLBI
-                     * retry epilogue; 2 means signal_deliver_fault installed a
-                     * handler frame and the shim must drop its saved frame.
-                     * Clear X8 here so a guest's pre-fault X8 value cannot be
-                     * misread as the frame-drop marker after a normal toggle.
-                     */
-                    tlbi_request_clear();
-                    hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
+                    running = vcpu_handle_wx_toggle(g, vcpu, verbose, prefix,
+                                                    &exit_code);
                     break;
                 }
 
                 case 10: {
-                    /* HVC #10: BRK from EL0 -> deliver SIGTRAP or ptrace-stop.
-                     *
-                     * If the thread is ptraced, the BRK enters a ptrace-stop
-                     * (the tracer reads/writes registers then CONT's).
-                     * Otherwise the run loop queues SIGTRAP and delivers it via
-                     * the signal frame mechanism.
-                     *
-                     * The shim has already restored all GPRs to their EL0
-                     * values, so signal_deliver / ptrace_stop read correct
-                     * state.
-                     *
-                     * The Linux kernel sets si_code=TRAP_BRKPT, si_addr=BRK_PC,
-                     * and fault_address=BRK_PC for BRK-triggered SIGTRAP.
-                     */
-                    uint64_t brk_pc;
-                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &brk_pc);
-
-                    if (verbose) {
-                        log_debug("%s: BRK at 0x%llx -> %s", prefix,
-                                  (unsigned long long) brk_pc,
-                                  current_thread->ptraced ? "ptrace-stop"
-                                                          : "SIGTRAP");
-                    }
-
-                    if (current_thread->ptraced) {
-                        /* Ptrace-stop: suspend vCPU, notify tracer.
-                         * thread_ptrace_stop blocks until tracer CONT's.
-                         */
-                        int cont_sig = thread_ptrace_stop(current_thread, 5);
-                        if (cont_sig > 0) {
-                            signal_queue(cont_sig);
-                            int sr = signal_deliver(vcpu, g, &exit_code);
-                            if (sr < 0)
-                                running = false;
-                        }
-                    } else {
-                        /* Non-ptraced: deliver SIGTRAP via signal frame. Read
-                         * ESR_EL1 to include in sigcontext.
-                         */
-                        uint64_t brk_esr;
-                        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &brk_esr);
-                        signal_set_fault_info(LINUX_TRAP_BRKPT, brk_pc,
-                                              brk_esr);
-                        if (verbose) {
-                            uint64_t thread_blocked =
-                                current_thread ? current_thread->blocked
-                                               : 0xDEAD;
-                            log_debug(
-                                "%s: BRK: thread_blocked=0x%llx "
-                                "pending=0x%llx",
-                                prefix, (unsigned long long) thread_blocked,
-                                (unsigned long long) signal_get_state()
-                                    ->shared.pending);
-                        }
-                        int sig_ret = signal_deliver_fault(
-                            vcpu, g, LINUX_SIGTRAP, &exit_code);
-                        if (verbose)
-                            log_debug("%s: signal_deliver returned %d", prefix,
-                                      sig_ret);
-                        if (sig_ret < 0) {
-                            /* SIG_DFL for SIGTRAP: terminate */
-                            running = false;
-                        }
-                    }
+                    running =
+                        vcpu_handle_brk(g, vcpu, verbose, prefix, &exit_code);
                     break;
                 }
 
@@ -3936,126 +4060,13 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                 }
 
                 case 12: {
-                    /* HVC #12: System instruction trap (EC=0x18 Direction=0).
-                     * The shim forwards trapped cache maintenance instructions
-                     * (DC CVAU, IC IVAU, etc.) here for logging/counting. It
-                     * also passes the original Rt value in X0 so host-side
-                     * emulation can handle MSR writes such as TPIDR_EL0. The
-                     * shim has already advanced PC and will restore X0 from its
-                     * saved frame before returning to EL0.
-                     */
-                    atomic_fetch_add(&sysreg_write_count, 1);
-                    uint64_t rt_value = 0;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &rt_value);
-                    uint64_t esr;
-                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
-                    uint32_t iss = (uint32_t) (esr & 0x1FFFFFF);
-
-                    /* Decode ISS for system instruction:
-                     *   Op0[21:20] Op2[19:17] Op1[16:14]
-                     *   CRn[13:10] Rt[9:5] CRm[4:1] Dir[0]
-                     */
-                    uint32_t op0 = (iss >> 20) & 0x3, op2 = (iss >> 17) & 0x7;
-                    uint32_t op1 = (iss >> 14) & 0x7, crn = (iss >> 10) & 0xF;
-                    uint32_t crm = (iss >> 1) & 0xF, rt = (iss >> 5) & 0x1F;
-
-                    /* TPIDR_EL0 (S3_3_C13_C0_2): userspace TLS base. Static
-                     * glibc writes this during early startup. HVF traps the
-                     * MSR, so Linux-compatible execution requires reflecting
-                     * the write into the virtual sysreg.
-                     */
-                    if (op0 == 3 && op1 == 3 && crn == 13 && crm == 0 &&
-                        op2 == 2) {
-                        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0,
-                                                     rt_value));
-                    }
-                    if (verbose) {
-                        /* DC CVAU: Op0=1,Op1=3,CRn=7,CRm=11,Op2=1 IC IVAU:
-                         * Op0=1,Op1=3,CRn=7,CRm=5,Op2=1
-                         */
-                        const char *name = "unknown";
-                        if (op0 == 1 && op1 == 3 && crn == 7 && crm == 11 &&
-                            op2 == 1)
-                            name = "DC CVAU";
-                        else if (op0 == 1 && op1 == 3 && crn == 7 && crm == 5 &&
-                                 op2 == 1)
-                            name = "IC IVAU";
-                        else if (op0 == 1 && op1 == 3 && crn == 7 &&
-                                 crm == 10 && op2 == 1)
-                            name = "DC CVAC";
-                        else if (op0 == 1 && op1 == 3 && crn == 7 &&
-                                 crm == 14 && op2 == 1)
-                            name = "DC CIVAC";
-                        else if (op0 == 3 && op1 == 3 && crn == 13 &&
-                                 crm == 0 && op2 == 2)
-                            name = "MSR TPIDR_EL0";
-                        log_debug(
-                            "%s: sysreg trap #%llu: %s "
-                            "(Op0=%u Op1=%u CRn=%u CRm=%u Op2=%u "
-                            "Rt=X%u val=0x%llx)",
-                            prefix,
-                            (unsigned long long) atomic_load(
-                                &sysreg_write_count),
-                            name, op0, op1, crn, crm, op2, rt,
-                            (unsigned long long) rt_value);
-                    }
+                    vcpu_handle_sysinstr_trap(vcpu, verbose, prefix);
                     break;
                 }
 
                 case 2: {
-                    /* HVC #2: Bad exception in guest. Shim clobbers X0-X3,X5
-                     * with exception info. X4,X6-X30 and SP_EL0 still hold
-                     * faulting values.
-                     */
-                    uint64_t x0, x1, x2, x3, x5;
-                    hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X1, &x1);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X2, &x2);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X3, &x3);
-                    hv_vcpu_get_reg(vcpu, HV_REG_X5, &x5);
-                    log_error(
-                        "%s: guest exception vec=0x%03llx "
-                        "ESR=0x%llx FAR=0x%llx ELR=0x%llx SPSR=0x%llx",
-                        prefix, (unsigned long long) x5,
-                        (unsigned long long) x0, (unsigned long long) x1,
-                        (unsigned long long) x2, (unsigned long long) x3);
-
-                    /* Dump preserved registers for debugging */
-                    uint64_t sp_el0;
-                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp_el0);
-                    log_error("%s:   SP_EL0=0x%llx", prefix,
-                              (unsigned long long) sp_el0);
-                    for (int ri = 4; ri <= 30; ri++) {
-                        /* Skip X5 (clobbered by shim for vec offset) */
-                        if (ri == 5)
-                            continue;
-                        uint64_t rv;
-                        hv_vcpu_get_reg(vcpu, (hv_reg_t) (HV_REG_X0 + ri), &rv);
-                        log_error("%s:   X%-2d=0x%016llx", prefix, ri,
-                                  (unsigned long long) rv);
-                    }
-
-                    /* Check if FAR looks like a tagged pointer */
-                    uint64_t far = x1;
-                    uint16_t top16 = (uint16_t) (far >> 48);
-                    if (top16 != 0x0000 && top16 != 0xFFFF) {
-                        log_error(
-                            "%s:   FAR tag=0x%04x, extracted addr=0x%llx",
-                            prefix, top16,
-                            (unsigned long long) (far & 0x0000FFFFFFFFFFFFULL));
-                    }
-
-                    {
-                        char detail[128];
-                        snprintf(detail, sizeof(detail),
-                                 "vec=0x%03llx ESR=0x%llx FAR=0x%llx",
-                                 (unsigned long long) x5,
-                                 (unsigned long long) x0,
-                                 (unsigned long long) x1);
-                        crash_report(vcpu, g, CRASH_BAD_EXCEPTION, detail);
-                    }
-                    exit_code = 128;
-                    running = false;
+                    running =
+                        vcpu_handle_bad_exception(g, vcpu, prefix, &exit_code);
                     break;
                 }
 
