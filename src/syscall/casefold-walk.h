@@ -85,6 +85,20 @@ typedef struct {
      * rebuild the directory a relative target is measured from.
      */
     size_t link_guest_offset;
+    /* Object type the leaf's probe answered. False when the readdir fallback
+     * answered, whose listing carries no type, and for dot components, which
+     * are never probed.
+     */
+    bool leaf_type_known;
+    bool leaf_is_link;
+    /* True when every component that resolved was typed by its probe, so no
+     * symlink can hide in the resolved path; only the readdir fallback,
+     * whose listing carries no type, can pass one unseen. Dot components
+     * navigate rather than name an entry, and components below an absent one
+     * name nothing, so neither withholds a type. A FOUND path with this set
+     * cannot resolve outside the prefix it was built under.
+     */
+    bool all_types_known;
 } casefold_walk_t;
 
 /* Resolve @guest_path, interpreted relative to @base_fd, into its host spelling
@@ -113,6 +127,12 @@ typedef struct {
  *
  * @follow_final rechecks the resolved object through symlinks, so a dangling
  * link reports absent, matching what an access(2) existence probe would say.
+ *
+ * @walk may be NULL when the caller needs only the verdict and @out.
+ *
+ * @out doubles as the walk's probe scratch, so it must not overlap
+ * @guest_path or @base_host_prefix, and it holds nothing meaningful once
+ * CASEFOLD_ERROR is returned.
  */
 casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
                                        const char *base_host_prefix,

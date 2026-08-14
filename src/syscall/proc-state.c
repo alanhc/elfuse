@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -55,7 +56,16 @@ static char sysroot_path[LINUX_PATH_MAX] = {0};
  * the snprintf input buffer underneath that thread.
  */
 static pthread_mutex_t sysroot_lock = PTHREAD_MUTEX_INITIALIZER;
-static bool sysroot_casefold = false;
+/* Atomic, not guarded by sysroot_lock: published once at startup and to a
+ * forked child before any vCPU thread issues a syscall, and no other state is
+ * kept consistent with it.
+ */
+static _Atomic bool sysroot_casefold = false;
+/* True when proc_set_sysroot's realpath succeeded, so containment checks can
+ * copy sysroot_path instead of re-deriving it; false leaves them the per-call
+ * realpath. Atomic for the same reason as the fold flag above.
+ */
+static _Atomic bool sysroot_canonical = false;
 
 /* Cached current working directory for getcwd() and /proc/self/cwd. */
 static pthread_mutex_t cwd_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -74,6 +84,7 @@ void proc_state_init(void)
     auxv_len = 0;
     sysroot_path[0] = '\0';
     sysroot_casefold = false;
+    sysroot_canonical = false;
 
     pthread_mutex_lock(&cwd_lock);
     cwd_path[0] = '\0';
@@ -382,14 +393,17 @@ const void *proc_get_auxv(size_t *len_out)
 void proc_set_sysroot(const char *path)
 {
     pthread_mutex_lock(&sysroot_lock);
+    sysroot_canonical = false;
     if (path && path[0]) {
         str_copy_trunc(sysroot_path, path, sizeof(sysroot_path));
         size_t len = strlen(sysroot_path);
         while (len > 1 && sysroot_path[len - 1] == '/')
             sysroot_path[--len] = '\0';
         char resolved[LINUX_PATH_MAX];
-        if (realpath(sysroot_path, resolved))
+        if (realpath(sysroot_path, resolved)) {
             str_copy_trunc(sysroot_path, resolved, sizeof(sysroot_path));
+            sysroot_canonical = true;
+        }
     } else {
         sysroot_path[0] = '\0';
     }
@@ -427,18 +441,12 @@ bool proc_sysroot_snapshot(char *out, size_t outsz)
 
 void proc_set_sysroot_casefold(bool enabled)
 {
-    pthread_mutex_lock(&sysroot_lock);
-    sysroot_casefold = enabled;
-    pthread_mutex_unlock(&sysroot_lock);
+    atomic_store(&sysroot_casefold, enabled);
 }
 
 bool proc_sysroot_casefold_enabled(void)
 {
-    bool enabled;
-    pthread_mutex_lock(&sysroot_lock);
-    enabled = sysroot_casefold;
-    pthread_mutex_unlock(&sysroot_lock);
-    return enabled;
+    return atomic_load(&sysroot_casefold);
 }
 
 /* True when realpath(3) failed because the path stopped resolving rather than
@@ -476,7 +484,12 @@ static bool sysroot_path_is_contained(const char *resolved_path,
 {
     char real_sysroot[LINUX_PATH_MAX], real_path[LINUX_PATH_MAX];
 
-    if (!realpath(sysroot, real_sysroot))
+    /* proc_set_sysroot canonicalized @sysroot at configuration time, so
+     * re-deriving it here would realpath() a process constant per check.
+     */
+    if (sysroot_canonical)
+        str_copy_trunc(real_sysroot, sysroot, sizeof(real_sysroot));
+    else if (!realpath(sysroot, real_sysroot))
         return realpath_vanished();
 
     if (follow_final) {
@@ -682,6 +695,8 @@ static bool clamp_dotdot_at_guest_root(char *dest,
 /* Snapshot the sysroot, clamp @path, and spell the host path it names.
  * Returns 1 with @buf, @sr, and @clamped filled, 0 when sysroot resolution
  * does not apply and the caller owes its input back, or -1 with errno set.
+ * On 0 the outputs are indeterminate: a relative path opts out before the
+ * snapshot runs, so @sr is not even the empty string.
  */
 static int sysroot_seed_host_path(const char *path,
                                   char *buf,
@@ -690,7 +705,8 @@ static int sysroot_seed_host_path(const char *path,
                                   char clamped[LINUX_PATH_MAX],
                                   bool follow_final)
 {
-    if (!proc_sysroot_snapshot(sr, LINUX_PATH_MAX) || !path || path[0] != '/')
+    /* Ordered so a relative path opts out before the snapshot locks. */
+    if (!path || path[0] != '/' || !proc_sysroot_snapshot(sr, LINUX_PATH_MAX))
         return 0;
 
     char real_path[LINUX_PATH_MAX];
@@ -1048,6 +1064,7 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
     bool folded = false;
     bool followed_link = false;
     bool followed_relative_link = false;
+    bool walk_typed_all = false;
     char followed[LINUX_PATH_MAX];
     if (casefold_active()) {
         casefold_walk_t walk;
@@ -1059,6 +1076,7 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
             return NULL;
         present = verdict == CASEFOLD_FOUND;
         folded = walk.folded;
+        walk_typed_all = present && walk.all_types_known;
         /* The walk stopped at a component that is not a directory, which is
          * the answer the byte-exact branch below reads off ENOTDIR: resolution
          * fails there (path_resolution(7)) and the host fallback must not run,
@@ -1106,22 +1124,21 @@ static const char *proc_resolve_sysroot_path_flags(const char *path,
         if (!present && errno == ENOTDIR)
             return buf;
     } else {
-        int n = snprintf(buf, bufsz, "%s%s", sr, lookup);
-        if (n < 0) {
-            if (errno == 0)
-                errno = EINVAL;
-            return NULL;
-        }
-        if ((size_t) n >= bufsz) {
-            errno = ENAMETOOLONG;
-            return NULL;
-        }
+        /* @buf already holds sr + the clamped lookup, spelled by the seed. */
         present = sysroot_path_exists(buf, follow_final);
         if (!present && errno == ENOTDIR)
             return buf;
     }
 
     if (present) {
+        /* A walk that typed every component has proven containment: '..' was
+         * clamped before it ran and no unseen symlink can hide in a fully
+         * typed path, so realpath() would re-derive the same bytes. The
+         * recheck remains for a readdir-answered component and for the
+         * byte-exact arm, which runs no walk.
+         */
+        if (walk_typed_all)
+            return buf;
         if (!sysroot_path_is_contained(buf, sr, follow_final)) {
             errno = ELOOP;
             return NULL;
@@ -1282,16 +1299,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
             return NULL;
         }
     } else {
-        int n = snprintf(buf, bufsz, "%s%s", sr, lookup);
-        if (n < 0) {
-            if (errno == 0)
-                errno = EINVAL;
-            return NULL;
-        }
-        if ((size_t) n >= bufsz) {
-            errno = ENAMETOOLONG;
-            return NULL;
-        }
+        /* @buf already holds sr + the clamped lookup, spelled by the seed. */
 
         /* An all-slash guest path ("/", "///") names the root, which always
          * exists and has no parent to check; trimming it would walk strrchr
