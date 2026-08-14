@@ -60,8 +60,15 @@ Usage:
 Every SKILL.md and every references/*.md under .claude/skills/ is checked,
 and so is any extra file named on the command line, which is how a local
 routing document that points at the skills gets covered without this script
-having to know it exists. --self-test asserts this script still rejects each
-class of stale reference; see self_test() for why that is not optional.
+having to know it exists.
+
+--self-test is the script's other mode, and it reads no skill file at all.
+It writes synthetic skills whose references are known broken, runs them
+through the same check_file() the normal mode uses, and requires each one to
+be rejected. Nothing else separates "nothing is stale" from "nothing is
+checked": a pass whose pattern has stopped matching prints the same clean
+line as a tree where every reference resolves. make check-skill-refs runs
+both modes, self-test first. See self_test() for the case list.
 """
 
 import functools
@@ -532,15 +539,11 @@ FRONTMATTER = "---\nname: {name}\ndescription: fixture\n---\n\n"
 def self_test():
     """Assert this script still rejects each class of stale reference.
 
-    Every case here is a bug this script shipped with at some point. Two of
-    them are the reason it exists in this form: a reference broken across a
-    line boundary was invisible to every pass, and a section name that was a
-    prefix of a real heading passed as a match. Both were found by mutating a
-    file by hand, which is not a thing the next person will think to do.
-
-    The negative cases matter as much as the positive ones. A checker that
-    starts flagging valid prose gets switched off, and then it protects
-    nothing at all.
+    Every case is a bug this script shipped with: a reference broken across
+    a line boundary was invisible to every pass, a section name that was a
+    prefix of a real heading passed as a match. The negative cases carry the
+    same weight, since a checker that flags valid prose gets switched off and
+    then protects nothing.
     """
     paths, targets, skills = tree_paths(), make_targets(), {"elfuse-syscall"}
     failures = []

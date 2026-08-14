@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage test-gdbstub test-coreutils test-busybox \
+.PHONY: test-hello test-all check check-syscall-coverage check-skill-refs test-gdbstub test-coreutils test-busybox \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -67,6 +67,11 @@ test-mremap-tail-emfile: $(ELFUSE_BIN) $(BUILD_DIR)/test-mremap-tail-emfile
 ## Verify dispatch.tbl coverage of the kernel-supported syscall set
 check-syscall-coverage:
 	@python3 scripts/check-syscall-coverage.py
+
+## Verify every path, target, and section the skills name still resolves
+check-skill-refs:
+	@python3 scripts/check-skill-refs.py --self-test
+	@python3 scripts/check-skill-refs.py
 
 define RUN_OPTIONAL_SKIP77
 	@set -e; \
@@ -201,7 +206,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage test-config \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-skill-refs test-config \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
