@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # driver.sh - Data-driven test driver for elfuse
 #
 # Copyright 2026 elfuse contributors
@@ -15,8 +16,8 @@
 #   -l           List available tests without running them
 #   -v           Verbose: show test stdout/stderr on failure
 #   -T           TAP output format
-# If test-name arguments are given, only those tests run.
-# The test list is read from tests/manifest.txt.
+# If test-name arguments are given, only those tests run. The test list is read
+# from tests/manifest.txt.
 
 set -uo pipefail
 
@@ -28,13 +29,13 @@ SECTION=""
 LIST_ONLY=0
 VERBOSE=0
 TAP=0
-# Three values: 0 (strict, default), 1 (skip missing), auto (legacy).
-# In strict mode any missing test binary is a FAIL. The legacy "auto"
-# value flips to skip when TESTDIR is not the canonical build/ or
-# build/bin tree, which used to silently turn a partial out-of-tree
-# fixture set into a wall of green skips. Callers that genuinely want
-# permissive-skip-mode behavior should set ALLOW_MISSING_BINARIES=1
-# explicitly.
+
+# Three values: 0 (strict, default), 1 (skip missing), auto (legacy). In strict
+# mode any missing test binary is a FAIL. The legacy "auto" value flips to skip
+# when TESTDIR is not the canonical build/ or build/bin tree, which used to
+# silently turn a partial out-of-tree fixture set into a wall of green skips.
+# Callers that genuinely want permissive-skip-mode behavior should set
+# ALLOW_MISSING_BINARIES=1 explicitly.
 ALLOW_MISSING_BINARIES="${ALLOW_MISSING_BINARIES:-0}"
 
 usage()
@@ -109,9 +110,9 @@ esac
 
 # Canonicalize before the auto-policy comparison so that equivalent paths
 # (./build, symlinked build dir, trailing-slash) still resolve to the
-# default-strict branch instead of silently flipping into allow-missing
-# mode. If the dir does not exist yet, fall back to the raw string; the
-# per-test "not built" check still fires later.
+# default-strict branch instead of silently flipping into allow-missing mode. If
+# the dir does not exist yet, fall back to the raw string; the per-test "not
+# built" check still fires later.
 canonicalize()
 {
     if [ -d "$1" ]; then
@@ -205,8 +206,9 @@ if [ $# -gt 0 ]; then
         exit 1
     fi
 else
-    # -f (name) and -s (section) are independent constraints; when both are
-    # set a test must match both. Neither set selects everything.
+
+    # -f (name) and -s (section) are independent constraints; when both are set
+    # a test must match both. Neither set selects everything.
     for i in "${!test_names[@]}"; do
         if [ -n "$FILTER" ] && ! printf "%s\n" "${test_names[$i]}" | grep -Eq "$FILTER"; then
             continue
@@ -249,10 +251,11 @@ evaluate_result()
     if [ "$rc" -eq 124 ]; then
         return 1
     fi
+
     # When the manifest declares expected_rc=N, only that exact rc passes.
-    # Without this guard, a test that mistakenly exits 0 instead of its
-    # declared non-zero code (e.g. test-complex with expected_rc=42)
-    # would be reported PASS because rc=0 short-circuited the OR clause.
+    # Without this guard, a test that mistakenly exits 0 instead of its declared
+    # non-zero code (e.g. test-complex with expected_rc=42) would be reported
+    # PASS because rc=0 short-circuited the OR clause.
     if [ -n "$expected" ]; then
         if [ "$rc" -ne "$expected" ]; then
             return 1
@@ -315,10 +318,10 @@ for i in "${filtered_idx[@]}"; do
         binary="$TESTDIR_ABS/$binary"
     fi
 
-    # bash 3.2 + set -u rejects "${argv[@]}" after 'unset argv[0]' has
-    # left the array empty ("unbound variable"). The offset form
-    # "${argv[@]:1}" is well-defined to produce zero elements when the
-    # array has only one slot, so it works in every supported bash.
+    # bash 3.2 + set -u rejects "${argv[@]}" after 'unset argv[0]' has left the
+    # array empty ("unbound variable"). The offset form "${argv[@]:1}" is
+    # well-defined to produce zero elements when the array has only one slot, so
+    # it works in every supported bash.
     args=()
     for arg in "${argv[@]:1}"; do
         arg="${arg//\$TESTDIR/$TESTDIR_ABS}"
@@ -359,17 +362,17 @@ for i in "${filtered_idx[@]}"; do
     fi
 
     output=""
+
     # ${args[@]+...} guards the array expansion so a test with no extra
-    # arguments (args=()) does not trip bash 3.2's set -u rejection of
-    # an empty "${array[@]}".
-    # Host-limit annotations live in the manifest. Keep this execution path
-    # generic so adding another constrained test does not require a
-    # name-qualified branch here.
+    # arguments (args=()) does not trip bash 3.2's set -u rejection of an empty
+    # "${array[@]}". Host-limit annotations live in the manifest. Keep this
+    # execution path generic so adding another constrained test does not require
+    # a name-qualified branch here.
     if host_nofile=$(elfuse_test_host_nofile "$TEST_LIST" "$name"); then
         if [ -n "$host_nofile" ]; then
-            if output=$(ulimit -n "$host_nofile" && \
-                timeout "$TIMEOUT" "$ELFUSE" "$binary" \
-                ${args[@]+"${args[@]}"} 2>&1); then
+            if output=$(ulimit -n "$host_nofile" \
+                && timeout "$TIMEOUT" "$ELFUSE" "$binary" \
+                    ${args[@]+"${args[@]}"} 2>&1); then
                 rc=0
             else
                 rc=$?

@@ -1,0 +1,158 @@
+---
+name: elfuse-conventions
+description: elfuse conventions that are not guessable from the code - the seven-rule commit message style, ASCII-only source comments, kebab-case filenames, the type and return conventions at the ABI boundary, the untracked root working docs, and externals/ being evaluation-only. Use when drafting a commit message or PR description, adding a new file or a new type, or touching anything under externals/.
+---
+
+# elfuse conventions
+
+Almost nothing here is enforced by a gate. `clang-format` settles formatting
+and `make check-format` settles the generated files, so those are not in this
+file; what is left is the set a reviewer would otherwise have to say out loud.
+
+The one exception is these files themselves. `scripts/check-skill-refs.py`
+fails when a skill names a file, make target, docs section, or sibling skill
+that no longer exists. It checks every skill, plus any routing document you
+name on the command line. Run it after renaming or moving anything the skills
+point at, because a pointer that no longer resolves does not read as stale, it
+reads as authoritative.
+
+## Working docs
+
+The repo root carries per-developer working docs that are deliberately
+untracked: `CLAUDE.md`, `spec.md`, and a few others alongside them. Never
+`git add`, commit, stage, gitignore, or delete any of them. They stay
+untracked but visible in `git status`. This applies to `CLAUDE.md` itself.
+
+`spec.md` holds the full coding conventions and wins where it and this file
+disagree, but it does not survive a fresh clone. That is why the load-bearing
+subset is duplicated below rather than referenced: on a clean checkout, `docs/`
+and these skills are all a contributor gets.
+
+## Style
+
+Source comments and commit messages are ASCII only, no markdown syntax: no em
+dashes, no inline backticks, no non-ASCII arrows. Use `-`, `--`, or `:`
+instead of an em dash. Write code, path, and symbol references as plain text
+(EPOLL_CTL_MOD, tests/foo.c).
+
+This rule covers `src/` comments, `tests/` comments, and commit messages.
+Markdown files are exempt and use normal GitHub Markdown: the working docs,
+`AGENTS.md`, and these skill files. Do not strip backticks out of a `.md` file
+in the name of this rule.
+
+Comments and commit messages are third-person: name the subject (the caller,
+this function) or use imperative phrasing.
+
+Filenames use kebab-case, never underscore. Symbol names use snake_case.
+
+## Code
+
+The conventions below are the ones that come from this project being a Linux
+ABI reimplementation rather than an ordinary C program.
+
+Fixed-width types for anything the guest defines: guest addresses, Linux ABI
+structures, binary layouts, protocol fields, page-table entries. Host-side
+types (`size_t`, `ssize_t`, `int`, POSIX types) for host API calls, where they
+match what the host declares. The distinction is not cosmetic; it is how a
+reader tells which side of the boundary a value came from.
+
+```c
+uint64_t gva;       /* guest virtual address */
+uint64_t ipa;       /* intermediate physical address */
+size_t len;         /* host buffer length */
+int host_fd;        /* macOS file descriptor */
+```
+
+Packed Linux ABI structures are explicit and live next to the translation code
+that uses them, not in a shared header where they can drift away from the
+conversion that gives them meaning.
+
+Never pass a guest pointer to a host syscall. Copy through the guest memory
+helpers so bounds checking and fault behavior stay in one place.
+
+`bool` is for functions whose only meaningful outcome is success or failure.
+`int` is reserved for returns that carry a number: errno-style codes, counts,
+indices, or forwarding the status of an `int`-returning primitive. A helper
+that only ever returns 0 or -1 and is read with a `< 0` test should have been
+a `bool`; a helper that forwards a page-table or syscall primitive's status
+should stay `int`.
+
+New code goes in the existing domain file, not a new one. New shared
+declarations go in the domain's `internal.h` or an existing header. A new lock
+is documented in the lock-order comment before it is used from a second
+module.
+
+New C tests are `tests/test-<feature>.c` and use the shared harness macros
+rather than rolling their own reporting.
+
+## externals/
+
+Tools vendored under `externals/` (`ls externals/` for what is actually
+checked out locally) are for evaluation and discovery.
+
+`externals/` is gitignored, so anything that depends on it breaks on a fresh
+clone and cannot run in CI. That single fact settles every case: no make
+target, no script, no CI job, no documented workflow step may reference it.
+
+Run such a tool by hand from a scratch directory and leave any fixes to the
+tool inside its own checkout. Record the outcome in the root working docs,
+including when the answer was "evaluated, not integrated" - a rejected
+evaluation is worth writing down so the next person does not repeat it. If the
+output is worth keeping, land the finding in tree, not the tool.
+
+## Commit messages
+
+The house style is Chris Beams' seven rules (https://cbea.ms/git-commit/), and
+the log follows them closely enough that a deviation reads as an outsider
+patch. `git log --no-merges --format=%s` is the calibration set if you want to
+check the claim rather than take it.
+
+1. Separate subject from body with a blank line.
+2. Keep the subject within 50 characters. 72 is the hard ceiling, not the
+   target; if you are past 50, the commit usually wants splitting.
+3. Capitalize the subject.
+4. No period at the end of the subject.
+5. Imperative mood: "Fix the race", not "Fixed" or "Fixes" or "Fixing". The
+   test is that the subject completes "If applied, this commit will ___".
+6. Wrap the body at 72 columns. Do not let the editor reflow it into one line.
+7. The body explains what and why, not how. The diff already shows how.
+
+Real subjects from this tree, for calibration:
+
+```
+Stop nl_put_attr truncating its own extent
+Prove the netlink walk loops
+Count the shared pty declarations correctly
+Give a pty's slave accounting one home
+Say what the proof matrix cache actually costs
+```
+
+Note what is absent: no Conventional Commits prefix (`fix:`, `feat:`, `chore:`),
+no area tag, no ticket number in the subject. The subject is a sentence about
+behavior. A commit that removes something says what stops happening; a commit
+that adds a proof says what is now proved.
+
+The body is where the reasoning goes, and it is expected to be substantial for
+anything non-mechanical: what the old code claimed, why that was wrong, what
+breaks if you do it the obvious other way. Some commits label body paragraphs
+(`Verified:`, `Coverage:`, `Concurrency:`) when a specific claim needs to be
+findable later. Issue references go at the end as `Fixes #187`, `Closes #156`,
+or the full URL form.
+
+The ASCII and third-person rules above apply here too: no backticks around
+symbol names, no em dashes, no non-ASCII arrows.
+
+Merge commits keep git's generated subject and are exempt.
+
+## Layout
+
+All source under `src/`, artifacts under `build/`. The build passes `-Isrc`,
+so headers are included as `core/guest.h`, `syscall/internal.h`,
+`proved/gva.h`.
+
+Reports and analyses go in `claudedocs/` (ignored via `.git/info/exclude`,
+which is local to the clone, so never `git add` it), tests in `tests/`,
+scripts in `scripts/`.
+
+Build and toolchain requirements are in `docs/testing.md`, section "Build
+Requirements". They belong to a machine, not to this convention set.
