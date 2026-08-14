@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,12 +49,20 @@ int fork_ipc_read_all(int fd, void *buf, size_t len)
  */
 #define FORK_IPC_FD_CHUNK 120
 
+/* Consecutive waits that fail to place a chunk before the sender starts
+ * sleeping between attempts, and how long it then sleeps. Only reached if a
+ * platform asserts POLLOUT with less room free than one control message needs.
+ */
+#define FORK_IPC_SEND_STALL_LIMIT 8
+#define FORK_IPC_SEND_BACKOFF_US 1000
+
 int fork_ipc_send_fds(int sock, const int *fds, int count)
 {
     if (count <= 0)
         return 0;
 
     int sent = 0;
+    int stalled = 0;
     while (sent < count) {
         int chunk = count - sent;
         if (chunk > FORK_IPC_FD_CHUNK)
@@ -88,10 +97,49 @@ int fork_ipc_send_fds(int sock, const int *fds, int count)
         memcpy(CMSG_DATA(cmsg), fds + sent, (size_t) chunk * sizeof(int));
 
         ssize_t ret = sendmsg(sock, &msg, 0);
+        int send_errno = errno;
         free(cmsg_buf);
-        if (ret < 0)
+        if (ret >= 0) {
+            sent += chunk;
+            stalled = 0;
+            continue;
+        }
+        if (send_errno != EMSGSIZE) {
+            errno = send_errno;
             return -1;
-        sent += chunk;
+        }
+
+        /* EMSGSIZE here is backpressure, not an oversized message: the chunk is
+         * fixed and small, so the only way it does not fit is that the peer has
+         * not drained yet. A control message that does not fit is refused
+         * outright rather than queued, so a blocking sendmsg reports EMSGSIZE
+         * where a data-only write would block. The receiver is the freshly
+         * cloned child, draining concurrently, so waiting for writability and
+         * retrying the same chunk converges. Waiting without a deadline matches
+         * fork_ipc_write_all, which blocks on the same socket for the same
+         * peer.
+         *
+         * POLLOUT is asserted only once SO_SNDLOWAT bytes are free (2048 on
+         * macOS, against 492 for a full chunk), so poll blocks here rather than
+         * returning writable on room too small to use. That is a platform
+         * tunable, not a guarantee, so sleep once waiting stops making
+         * progress: a smaller lowat can then only slow the transfer, never spin
+         * a core.
+         */
+        struct pollfd pfd = {.fd = sock, .events = POLLOUT};
+        int pret;
+        do {
+            pret = poll(&pfd, 1, -1);
+        } while (pret < 0 && errno == EINTR);
+        if (pret < 0)
+            return -1;
+        if (!(pfd.revents & POLLOUT) &&
+            (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+            errno = EPIPE;
+            return -1;
+        }
+        if (++stalled > FORK_IPC_SEND_STALL_LIMIT)
+            usleep(FORK_IPC_SEND_BACKOFF_US);
     }
     return 0;
 }
