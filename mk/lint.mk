@@ -18,7 +18,7 @@ define require-tool
 endef
 
 ## Run clang-tidy on all source files
-lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h
+lint: $(BUILD_DIR)/shim_blob.h $(BUILD_DIR)/version.h $(DISPATCH_HEADER)
 	$(call require-tool,$(CLANG_TIDY),brew install llvm -- or set CLANG_TIDY=)
 	@echo "  TIDY    src/"
 	$(Q)$(CLANG_TIDY) $(SRCS) -- $(CFLAGS) -Isrc -I$(BUILD_DIR)

@@ -61,11 +61,6 @@ jobs:
           brew install --quiet $BREW_PKGS
           "$CLANG_TIDY" --version | head -1
 
-      - name: Generate build/dispatch.h, shim_blob.h, version.h
-        # `make lint` depends on these generated headers; building the
-        # full elfuse binary is unnecessary, so just satisfy the deps.
-        run: make build/shim_blob.h build/version.h build/dispatch.h
-
       - name: clang-tidy (make lint)
         run: make lint
 
