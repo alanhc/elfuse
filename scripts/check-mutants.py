@@ -892,8 +892,8 @@ MUTATIONS = [
 # below, but the rest of that file (the shared recipe, MIN_GOALS,
 # FRAMAC_TIMEOUT) is not, so the whole file still belongs here.
 #
-# .github/workflows/main.yml belongs here for the same reason even though it
-# never touches a proof: it is what decides, per CI matrix leg, which target
+# .github/workflows/verify.yml belongs here for the same reason even though
+# it never touches a proof: it is what decides, per CI matrix leg, which target
 # --target names and whether --changed-since runs at all. A change there
 # that breaks the invocation (a mistyped target, a dropped matrix entry, a
 # MUTANT_TARGET that stops reaching the script) would otherwise verify
@@ -911,7 +911,7 @@ HARNESS_FILES = {
     "mk/verify.mk",
     "mk/toolchain.mk",
     "Makefile",
-    ".github/workflows/main.yml",
+    ".github/workflows/verify.yml",
 }
 
 

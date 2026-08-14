@@ -9,7 +9,7 @@ INFER ?= infer
 # name the tool, name the install, fail on purpose. Without this a developer
 # running lint/analyze/infer-uninit gets "make: clang-tidy: No such file or
 # directory / Error 1", which reads like a broken Makefile rather than a
-# missing dependency, on three of the eleven CI jobs.
+# missing dependency.
 define require-tool
 	@command -v $(1) >/dev/null 2>&1 || { \
 		printf "  $(RED)%s not found$(RESET) (%s)\n" "$(1)" "$(2)"; \

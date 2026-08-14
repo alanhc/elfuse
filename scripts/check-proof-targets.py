@@ -5,7 +5,7 @@ Three places name the same set of proved sources, and nothing but this script
 keeps them in agreement:
 
   1. mk/verify.mk's VERIFY_<T>_SRC entries -- the targets themselves.
-  2. .github/workflows/main.yml's verify-mutants matrix -- the CI sharding.
+  2. .github/workflows/verify.yml's verify-mutants matrix -- the CI sharding.
   3. src/proved/ -- the directory the proved headers live in.
 
 The third is the one the directory name rests on. src/proved/ claims its
@@ -14,7 +14,7 @@ some verify-<name> target names it: the Makefile drives the prover, not the
 path. Without this check the directory could hold an unproved file and still
 read as a guarantee, which is worse than no directory at all.
 
-.github/workflows/main.yml's verify-mutants job shards one runner per proof
+.github/workflows/verify.yml's verify-mutants job shards one runner per proof
 target, and its matrix is fromJson of "make print-verify-targets" rather than
 a list of its own. What is checked here is that it stays that way, and that
 the list make generates is the whole list: a VERIFY_<T>_SRC block written
@@ -107,7 +107,7 @@ def workflow_matrix_is_derived():
     matrix faithfully reproduces a target list that silently dropped a block.
     """
     expected = "${{ fromJson(needs.proof-targets.outputs.targets) }}"
-    text = (ROOT / ".github" / "workflows" / "main.yml").read_text()
+    text = (ROOT / ".github" / "workflows" / "verify.yml").read_text()
     # [^\n]* rather than .*, because re.S would run the capture to the end of
     # the file and accept a literal list here on the strength of an unrelated
     # fromJson in a later job.
@@ -115,7 +115,7 @@ def workflow_matrix_is_derived():
     if not m:
         print(
             "  could not find verify-mutants' matrix.target in "
-            ".github/workflows/main.yml; the job may have been renamed or "
+            ".github/workflows/verify.yml; the job may have been renamed or "
             "restructured, so update this check to match",
             file=sys.stderr,
         )
