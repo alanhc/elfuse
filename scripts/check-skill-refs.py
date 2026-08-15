@@ -402,12 +402,16 @@ SELF_TEST_CASES = [
     ),
     (
         "section attributed to the wrong doc",
-        '`docs/internals.md` has it and `docs/testing.md`, section '
+        "`docs/internals.md` has it and `docs/testing.md`, section "
         '"Memory Layout", does not.',
         "no section",
     ),
     ("unknown sibling skill", "See the `elfuse-nope` skill.", "refers to skill"),
-    ("unresolvable shorthand", "Helpers in `fd.c/h` classify it.", "write `fd.c` and `fd.h`"),
+    (
+        "unresolvable shorthand",
+        "Helpers in `fd.c/h` classify it.",
+        "write `fd.c` and `fd.h`",
+    ),
     ("valid repo path", "See `src/core/guest.c`.", None),
     ("valid include-style path", "Include it as `core/guest.h`.", None),
     ("valid system header", "Frama-C cannot model `sys/mount.h`.", None),
@@ -476,7 +480,9 @@ def self_test():
 
     total = len(SELF_TEST_CASES) + 1
     if failures:
-        print(f"  {len(failures)} of {total} self-test case(s) failed:", file=sys.stderr)
+        print(
+            f"  {len(failures)} of {total} self-test case(s) failed:", file=sys.stderr
+        )
         for f in failures:
             print(f"    {f}", file=sys.stderr)
         return 1

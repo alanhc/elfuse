@@ -4,20 +4,24 @@
 # problem at once instead of stopping at the first.
 name: Lint
 
+# No path filter, deliberately, and the only workflow without one. Two things
+# lean on that. proof-scope.py's self-test has to run somewhere a path filter
+# cannot skip, or the mechanism that decides which proofs run could skip its
+# own gate. check-skill-refs.py validates the .md files under .claude/, whose
+# entire input domain the old '**.md' ignore excluded and which build.yml and
+# static-analysis.yml both list as inert, so a documentation-only pull request
+# would otherwise run no CI at all, including the check written for exactly
+# that file.
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
   workflow_dispatch:
+  # A merge queue runs the merged result, not the PR, and merge_group carries
+  # no path filter and no pull_request payload: every check runs in full there.
+  # Without this trigger a queue would merge with nothing having run at all.
+  merge_group:
 
 # Cancel in-progress runs for the same PR; keep main runs going.
 concurrency:
@@ -42,56 +46,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Cache apt packages
-        uses: actions/cache@v6
-        with:
-          path: ~/apt-cache
-          key: apt-${{ runner.os }}-${{ env.LINT_PKGS }}
-
-      - name: Add LLVM apt repo (clang-format-22)
-        # Place the key in /etc/apt/keyrings and bind it via signed-by so
-        # it grants trust only to the LLVM repository, not system-wide.
-        run: |
-          set -euo pipefail
-          sudo install -d -m 0755 /etc/apt/keyrings
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
-            | sudo tee /etc/apt/keyrings/llvm.asc > /dev/null
-          echo "deb [signed-by=/etc/apt/keyrings/llvm.asc] http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
-            | sudo tee /etc/apt/sources.list.d/llvm.list
-
-      - name: Install tools
-        run: |
-          set -euo pipefail
-          mkdir -p ~/apt-cache
-          sudo apt-get update
-          # shellcheck disable=SC2086 -- LINT_PKGS is a space-separated list.
-          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-cache" \
-            $LINT_PKGS
-
+      # The checks needing nothing from LINT_PKGS run first; only clang-format,
+      # shellcheck and cppcheck want it. That ordering buys an earlier
+      # annotation rather than runner minutes, since a failing run still pays
+      # for the install: what skips the install is the content check further
+      # down, not an earlier failure.
+      #
+      # Every step from here on carries "if: !cancelled()", the setup steps
+      # included, because the job's contract at the top of this file is that
+      # one failure does not hide the rest. A default-conditioned setup step
+      # would be skipped by the first pre-apt failure, and the three
+      # tool-dependent checks would then report a missing binary instead of
+      # reporting on the code.
       - name: Trailing newline
         if: ${{ !cancelled() }}
         run: .ci/check-newline.sh
 
-      - name: clang-format
-        if: ${{ !cancelled() }}
-        run: .ci/check-format.sh
-
       - name: Banned APIs / secrets / unsafe pp directives
         if: ${{ !cancelled() }}
         run: .ci/check-security.sh
-
-      - name: shellcheck
-        # Scoped to .ci/ -- tests/ has pre-existing warnings that the
-        # repository's own check-format target already surfaces.
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          mapfile -d '' files < <(git ls-files -z -- '.ci/*.sh')
-          shellcheck --severity=warning "${files[@]}"
-
-      - name: cppcheck
-        if: ${{ !cancelled() }}
-        run: .ci/check-cppcheck.sh
 
       - name: Syscall dispatch table consistency
         # The generator validates dispatch.tbl <-> syscall.c on every run;
@@ -107,3 +80,136 @@ jobs:
         # directory whose name claims it is proved.
         if: ${{ !cancelled() }}
         run: python3 scripts/check-proof-targets.py
+
+      - name: Proof scope self-test
+        # verify.yml builds its matrix from proof-scope.py's answer to "which
+        # proof targets can this diff reach", so that answer decides whether a
+        # proof runs at all. It rests on a hand-kept HARNESS_FILES list and on
+        # include closures, both of which rot quietly. It runs here because
+        # lint.yml is never narrowed, so the check cannot be skipped by the
+        # mechanism it checks.
+        #
+        # The one step before the apt install that needs a binary: the closures
+        # come from "cc -MM", and cc is the runner image's preinstalled gcc,
+        # not a LINT_PKGS entry. An image without one fails this step loudly
+        # ("cannot determine proof-input closures") rather than scoping on a
+        # scan it could not run, so the assumption announces itself. Installing
+        # a compiler here instead would put this check behind the apt step and
+        # cost it the fast failure.
+        if: ${{ !cancelled() }}
+        run: python3 scripts/proof-scope.py --self-test
+
+      - name: Skill cross-references
+        # The .claude/ skills cite files, make targets and sections by name.
+        # Nothing else notices when one is renamed, and a skill that points at
+        # a file which no longer exists is worse than no skill: it reads as
+        # current. This found two dead references to a workflow and a makefile
+        # that the CI split had already removed.
+        if: ${{ !cancelled() }}
+        run: python3 scripts/check-skill-refs.py
+
+      # What follows needs LINT_PKGS, and the three checks that use it read
+      # only C sources, the style file, and the .ci scripts that implement
+      # them. cppcheck alone is 50 of this job's 85 seconds and the install is
+      # another 12, so a pull request touching none of those would otherwise
+      # pay about 70 seconds for three checks with nothing to look at.
+      # The six checks above still run on everything, which is what lets this
+      # workflow carry no path filter at all.
+      #
+      # Whenever the answer is not certain (a push, a merge queue, a base that
+      # cannot be fetched) every check runs. A skipped check here is one whose
+      # inputs are unchanged, never one whose result is unknown.
+      - name: Which inputs changed
+        id: changed
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          run_everything() {
+            echo "c=true" >> "$GITHUB_OUTPUT"
+            echo "sh=true" >> "$GITHUB_OUTPUT"
+            echo "$1; running every check"
+            exit 0
+          }
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then
+            run_everything "no pull_request base to diff against"
+          fi
+          if ! git fetch --no-tags --depth=1 origin "$base"; then
+            run_everything "cannot fetch $base"
+          fi
+          # -z, or git renders a non-ASCII path as a quoted C string under
+          # core.quotePath and the anchored patterns below stop matching it.
+          # A path that stops matching skips a check, which is the direction
+          # this step must not fail in, so the diff failing takes the same
+          # way out as a failed fetch.
+          if ! files=$(git diff --name-only -z "$base" HEAD | tr '\0' '\n'); then
+            run_everything "cannot diff against $base"
+          fi
+          # "c" is not "a .c or .h file changed", it is "an input to
+          # clang-format or cppcheck changed", and those two read more than
+          # the sources: .clang-format is the style clang-format enforces,
+          # .ci/ holds the scripts that ARE the checks, and check-cppcheck.sh
+          # regenerates build/dispatch.h from dispatch.tbl through the
+          # generator before it analyzes anything. A pull request editing only
+          # one of those would otherwise change a check without running it.
+          c=false; sh=false
+          pat='\.(c|h)$|^\.clang-format$|^\.ci/|^src/syscall/dispatch\.tbl$'
+          pat="$pat"'|^scripts/gen-syscall-dispatch\.py$'
+          # A here-string, not a pipeline into grep. Under pipefail a "grep -q"
+          # that matches early exits while the writer still has bytes to push,
+          # the writer takes SIGPIPE, and the pipeline reports non-zero even
+          # though the pattern MATCHED -- so the check would read as "unchanged"
+          # and skip. .ci/check-security.sh carries the same trap at length.
+          # It needs a diff long enough to fill the pipe buffer, which is
+          # exactly the diff that must not skip a check.
+          if grep -qE "$pat" <<< "$files"; then c=true; fi
+          if grep -qE '^\.ci/.*\.sh$' <<< "$files"; then sh=true; fi
+          echo "c=$c" >> "$GITHUB_OUTPUT"
+          echo "sh=$sh" >> "$GITHUB_OUTPUT"
+          echo "C sources changed: $c; .ci shell changed: $sh"
+
+      - name: Cache apt packages
+        if: ${{ !cancelled() && (steps.changed.outputs.c == 'true' || steps.changed.outputs.sh == 'true') }}
+        uses: actions/cache@v6
+        with:
+          path: ~/apt-cache
+          key: apt-${{ runner.os }}-${{ env.LINT_PKGS }}
+
+      - name: Add LLVM apt repo (clang-format-22)
+        if: ${{ !cancelled() && (steps.changed.outputs.c == 'true' || steps.changed.outputs.sh == 'true') }}
+        # Place the key in /etc/apt/keyrings and bind it via signed-by so
+        # it grants trust only to the LLVM repository, not system-wide.
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 /etc/apt/keyrings
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/keyrings/llvm.asc > /dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/llvm.asc] http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+
+      - name: Install tools
+        if: ${{ !cancelled() && (steps.changed.outputs.c == 'true' || steps.changed.outputs.sh == 'true') }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/apt-cache
+          sudo apt-get update
+          # shellcheck disable=SC2086 -- LINT_PKGS is a space-separated list.
+          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-cache" \
+            $LINT_PKGS
+
+      - name: clang-format
+        if: ${{ !cancelled() && steps.changed.outputs.c == 'true' }}
+        run: .ci/check-format.sh
+
+      - name: shellcheck
+        # Scoped to .ci/ -- tests/ has pre-existing warnings that the
+        # repository's own check-format target already surfaces.
+        if: ${{ !cancelled() && steps.changed.outputs.sh == 'true' }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(git ls-files -z -- '.ci/*.sh')
+          shellcheck --severity=warning "${files[@]}"
+
+      - name: cppcheck
+        if: ${{ !cancelled() && steps.changed.outputs.c == 'true' }}
+        run: .ci/check-cppcheck.sh

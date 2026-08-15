@@ -1,6 +1,6 @@
 ---
 name: elfuse-verify
-description: How elfuse validates a change - choosing the lanes for the area you touched, the test matrix, make check, and the Frama-C proof targets declared in mk/analysis.mk, including how to drive the frama-c MCP server on a stuck proof. Use when adding bounds math to src/proved/, writing or repairing ACSL contracts, running or debugging make verify / verify-mutants, touching frama-c-stubs/, adding a test lane, or deciding what to run before calling work done.
+description: How elfuse validates a change - choosing the lanes for the area you touched, the test matrix, make check, and the Frama-C proof targets declared in mk/verify.mk, including how to drive the frama-c MCP server on a stuck proof. Use when adding bounds math to src/proved/, writing or repairing ACSL contracts, running or debugging make verify / verify-mutants, touching frama-c-stubs/, adding a test lane, or deciding what to run before calling work done.
 ---
 
 # Validating an elfuse change
@@ -63,7 +63,7 @@ with `-wp-rte`.
 
 Every `src/proved/` header must have a matching `make verify-<name>` target,
 but the reverse does not hold. A few targets prove a `.c` file directly, each
-for a reason stated in the comment above it in `mk/analysis.mk`; the general
+for a reason stated in the comment above it in `mk/verify.mk`; the general
 one is that the loops in question could only have been described as
 test-covered had they been split into a header.
 
@@ -85,17 +85,33 @@ Apple's 3.81.
 `verify-mutants` accepts `MUTANT_TARGET=<name>`, `MUTANT_JOBS=<n>`, and
 `MUTANT_SINCE=<rev>` for a changed-only run.
 
+`scripts/proof-scope.py` decides which targets a diff can reach, and
+`.github/workflows/verify.yml` builds its jobs from it, so a target the branch
+cannot affect gets no runner. It answers two questions: which targets to prove,
+and, with `--mutation`, which mutation sets to re-run, the second being narrower
+because a file that only schedules the run cannot change whether a target
+rejects a broken source. Every "cannot tell" answer widens back to the whole
+set, and a push to `main` always proves and mutates everything.
+
+Three things follow when adding a target or a proof input. An input reached
+through `-include` or an `-I` the scan does not use is invisible to the closure
+and belongs in `HARNESS_FILES` (or under `STUB_PREFIX`). A file that only picks
+what runs goes in `SCHEDULING_FILES`, and the self-test refuses it if it also
+carries a prover budget or a make invocation. And `proof-scope.py --self-test`,
+run by `.github/workflows/lint.yml`, is what tells you the lists are still
+honest.
+
 ### Adding to src/proved/
 
 Nothing lands there without a proof target -
-`scripts/check-proof-targets.py` (a CI job in `.github/workflows/main.yml`)
+`scripts/check-proof-targets.py` (a CI job in `.github/workflows/lint.yml`)
 fails otherwise. Callers include the header as `proved/<name>.h`.
 
 The routine:
 
 1. Extract the arithmetic into `src/proved/<name>.h` with ACSL contracts.
 2. Add the `VERIFY_<NAME>_SRC` / `VERIFY_<NAME>_MODEL` / `VERIFY_<NAME>_FCTS`
-   variables in `mk/analysis.mk` so the rule template instantiates
+   variables in `mk/verify.mk` so the rule template instantiates
    `verify-<name>`. `typed` is the default choice for a model; see below.
 3. `make verify-<name>` until it discharges with `-wp-rte`.
 4. `make verify-mutants MUTANT_TARGET=<name>` - a proof that cannot reject a
@@ -116,7 +132,7 @@ Supporting gates, all of which run per target:
 
 ### Memory models, and what no model checks
 
-Each target picks its own model via `VERIFY_<NAME>_MODEL` in `mk/analysis.mk`,
+Each target picks its own model via `VERIFY_<NAME>_MODEL` in `mk/verify.mk`,
 and the comment above it says why. Pick the model the code needs, not the
 model a neighbour target uses.
 
@@ -174,7 +190,7 @@ and two files conflict), and `macos-libc.h` for Darwin constants the modeled
 libc omits.
 
 It sits outside `src/` on purpose so a real compile, which resolves through
-`-Isrc`, cannot reach it. Only `FRAMAC_STUB_DIR` in `mk/analysis.mk` does.
+`-Isrc`, cannot reach it. Only `FRAMAC_STUB_DIR` in `mk/verify.mk` does.
 It is tracked in git because every proof target needs it to parse.
 
 A missing declaration fails with "Cannot resolve variable" - that is how the
@@ -204,5 +220,5 @@ so prefer them when the two disagree:
 
 - `docs/testing.md`, section "Validation Strategy By Change Type" - the change
   area to command mapping.
-- `mk/analysis.mk` - the per-target `_SRC` / `_MODEL` / `_FCTS` variables and
+- `mk/verify.mk` - the per-target `_SRC` / `_MODEL` / `_FCTS` variables and
   the comment above each explaining its model choice.

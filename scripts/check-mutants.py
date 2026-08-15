@@ -22,11 +22,9 @@ The recipe runs check-acsl-coverage.py against SCAN, which stays the pristine
 tree rather than the mutated copy. That is the right choice, but it means the
 four entries below that mutate a contract are not coverage-checked.
 
-Scoping a run to a changed diff uses the compiler's own -MM to find each
-target's full include closure, not the hand-maintained VERIFY_*_SCAN list:
-a proved header gaining an include is exactly the kind of change nobody
-remembers to mirror into SCAN, and -MM cannot drift from the preprocessor
-that actually feeds Frama-C.
+Scoping a run to a changed diff lives in proof-scope.py, which answers the
+same question for the CI proof matrix. --changed-since here is that answer
+applied to mutations.
 
 Runs inherit the proof's own per-goal prover timeout, and lowering it for
 mutation runs is unsound however tempting the speedup looks. A broken contract
@@ -50,6 +48,7 @@ Usage:
 """
 
 import argparse
+import collections
 import concurrent.futures
 import os
 import pathlib
@@ -58,25 +57,31 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 # scripts/ filenames are kebab-case per CLAUDE.md, which no plain "import"
-# statement can name, so the shared reader is loaded by path. The alternative
+# statement can name, so a sibling module is loaded by path. The alternative
 # was an underscore in the filename, which the tree does not use anywhere.
-def _load_verify_mk():
+def _load(stem, name):
     import importlib.util
 
-    path = pathlib.Path(__file__).resolve().parent / "verify-mk.py"
-    spec = importlib.util.spec_from_file_location("verify_mk", path)
+    path = pathlib.Path(__file__).resolve().parent / f"{stem}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-verify_mk = _load_verify_mk()
+proof_scope = _load("proof-scope", "proof_scope")
+# Loaded here rather than taken as proof_scope.verify_mk, even though that
+# would save one parse of mk/verify.mk. This table decides which file each
+# mutation copies and mutates, so reaching it through proof-scope.py would make
+# that file a judging input; proof-scope.py's own SCHEDULING_FILES says it is
+# not one, and a diff touching only it therefore runs no mutation leg at all.
+# Two module objects over one silent contradiction.
+verify_mk = _load("verify-mk", "verify_mk")
 BUILD = ROOT / "build" / "mutants"
 # The recipe writes $(BUILD_DIR)/verify-$(NAME).log, and NAME is overridden per
 # run to keep concurrent mutations off a shared log. That path must exist first:
@@ -883,119 +888,6 @@ MUTATIONS = [
 ]
 
 
-# Changing any of these can change a verdict for every target, so a run that
-# sees one move must not skip anything. mk/toolchain.mk sets CC, which
-# check-char-signedness.py compiles with, and the top-level Makefile is what
-# pulls in both it and the mk/ files below to build the "make verify-<target>"
-# a mutation is judged by; the individual VERIFY_*_SRC/_SCAN/
-# _FCTS lines in mk/verify.mk are covered separately by target_inputs()
-# below, but the rest of that file (the shared recipe, MIN_GOALS,
-# FRAMAC_TIMEOUT) is not, so the whole file still belongs here.
-#
-# .github/workflows/verify.yml belongs here for the same reason even though
-# it never touches a proof: it is what decides, per CI matrix leg, which target
-# --target names and whether --changed-since runs at all. A change there
-# that breaks the invocation (a mistyped target, a dropped matrix entry, a
-# MUTANT_TARGET that stops reaching the script) would otherwise verify
-# against whatever proof sources the same PR happens to touch, which is
-# nothing when the PR only edits CI. --target already narrows a full-set
-# fallback to one shard's own mutations (see the --changed-since block
-# below), so this costs each shard its own subset rather than all of them
-# apiece.
-HARNESS_FILES = {
-    "scripts/check-mutants.py",
-    "scripts/verify-mk.py",
-    "scripts/check-wp-result.py",
-    "scripts/check-acsl-coverage.py",
-    "scripts/check-char-signedness.py",
-    "mk/verify.mk",
-    "mk/toolchain.mk",
-    "Makefile",
-    ".github/workflows/verify.yml",
-}
-
-
-def include_closure(cc, src, workdir):
-    """Files @src pulls in transitively, per the compiler, not per SCAN.
-
-    VERIFY_<T>_SCAN is a hand-maintained guess at this, kept in step by
-    whoever adds a header, which is exactly the kind of thing that goes stale
-    silently: a proved header gains an include, nobody updates SCAN, and a
-    mutation touching only the new file is skipped without a diagnostic. -MM
-    asks the same preprocessor that stands between the source and the proof,
-    so the two cannot drift apart from each other.
-
-    Returns None, not a partial answer, when the scan itself cannot be
-    trusted. {src} alone would be a silent narrowing indistinguishable from a
-    correct closure with no includes, which is exactly the failure mode this
-    function exists to close for SCAN; failing quietly here would just move
-    the bug rather than fix it. The caller treats None as grounds to run the
-    full mutation set, same as an unresolvable --changed-since ref.
-    """
-    out = workdir / "closure.d"
-    try:
-        proc = subprocess.run(
-            cc
-            + [
-                "-I",
-                str(ROOT / "src"),
-                "-I",
-                str(ROOT / "build"),
-                "-MM",
-                "-MG",
-                "-MF",
-                str(out),
-                str(ROOT / src),
-            ],
-            cwd=ROOT,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError:
-        # cc itself does not exist or is not executable. A more certain
-        # "cannot trust this scan" signal than a non-zero exit, and it must
-        # fail the same way: return None rather than let the exception
-        # propagate and crash the whole run instead of falling back.
-        return None
-    if proc.returncode != 0 or not out.exists():
-        return None
-    text = out.read_text().replace("\\\n", " ")
-    if ":" not in text:
-        # Malformed -MM output. Same reasoning as a non-zero exit: an empty
-        # dependency list here would look identical to "genuinely no
-        # includes", so it cannot be told apart from data and must not be
-        # trusted as one.
-        return None
-    deps = text.split(":", 1)[1].split()
-    rooted = set()
-    for dep in deps:
-        p = pathlib.Path(dep)
-        rooted.add(str(p.relative_to(ROOT)) if p.is_absolute() else dep)
-    rooted.add(src)
-    return rooted
-
-
-def target_inputs(cc):
-    """{target: {files whose change can alter that target's verdict}} from the
-    compiler's own view of what each proved source includes, or None if any
-    target's closure could not be trusted.
-
-    Returning None for the whole map rather than {src} for the one broken
-    target is deliberate: a caller that gets a partial map back has no way to
-    know which entries are real and which are silently degraded, so the only
-    honest signal is "scope is unknown, verify everything."
-    """
-    out = {}
-    with tempfile.TemporaryDirectory() as tmp:
-        workdir = pathlib.Path(tmp)
-        for target, src in target_sources().items():
-            closure = include_closure(cc, src, workdir)
-            if closure is None:
-                return None
-            out[target] = closure
-    return out
-
-
 def target_sources():
     """VERIFY_<T>_SRC for every target, as {target: path}."""
     return verify_mk.target_sources()
@@ -1161,6 +1053,32 @@ def run_mutation(idx, mutation):
     return "INFRA", "target failed but printed no recognizable verdict"
 
 
+def pack_targets(targets, buckets):
+    """@targets split into at most @buckets groups, longest first.
+
+    GitHub bills a job's wall time rounded up to the minute, and a mutation leg
+    spends about 90 seconds installing Homebrew and restoring a 1 GB opam
+    switch before it proves anything. Seventeen legs pay that seventeen times
+    to do about 51 minutes of work; five pay it five times. Measured on a real
+    full-scope run, that is 85 macOS-minutes against 61.
+
+    Packed by mutation count, which is a rough proxy and known to be rough:
+    netlinkwalk carries three mutations and the slowest prover time in the set,
+    because its control proof alone is 92 seconds locally. A cost table would
+    be exact and would rot the first time a contract changed, so the imbalance
+    stays and costs a few minutes on whichever bucket draws that target.
+    """
+    counts = collections.Counter(m[0] for m in MUTATIONS)
+    order = sorted(targets, key=lambda t: (-counts.get(t, 0), t))
+    if not order:
+        return []
+    packed = [[] for _ in range(min(buckets, len(order)))]
+    for target in order:
+        packed.sort(key=lambda b: sum(counts.get(t, 0) for t in b))
+        packed[0].append(target)
+    return [sorted(b) for b in packed if b]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", help="run only mutations for this target")
@@ -1180,6 +1098,16 @@ def main():
         metavar="REF",
         help="only run mutations whose target source differs from REF",
     )
+    # CI groups the matrix with this rather than one leg per target; see
+    # pack_targets for why, and .github/workflows/verify.yml for the caller.
+    ap.add_argument(
+        "--pack",
+        type=int,
+        metavar="N",
+        help="print the named targets packed into at most N whitespace-"
+        "separated groups, one per line, then exit",
+    )
+    ap.add_argument("targets", nargs="*", help="target names, with --pack")
     ap.add_argument(
         "--jobs",
         type=int,
@@ -1196,6 +1124,27 @@ def main():
     args = ap.parse_args()
     cc = shlex.split(args.cc) or ["cc"]
 
+    if args.targets and not args.pack:
+        # Otherwise "check-mutants.py fuse" runs every mutation in the table
+        # and says nothing about the name it was handed.
+        print(
+            f"target names are only read with --pack; use --target for one "
+            f"target (got {' '.join(args.targets)})",
+            file=sys.stderr,
+        )
+        return 2
+    if args.pack:
+        if args.pack < 1:
+            print(f"--pack must be at least 1, got {args.pack}", file=sys.stderr)
+            return 2
+        # No fallback to the full set when no target is named. The caller is
+        # CI passing the mutation scope, and that scope is empty on most pull
+        # requests; defaulting to everything there would expand a full matrix
+        # at exactly the moment the answer was "nothing to do".
+        for bucket in pack_targets(args.targets, args.pack):
+            print(" ".join(bucket))
+        return 0
+
     # ThreadPoolExecutor raises on max_workers < 1, which would surface as a
     # traceback after the argument was already accepted. Reject it here.
     if args.jobs < 1:
@@ -1210,69 +1159,13 @@ def main():
     ]
     selected = [m for _i, m in selected_pairs]
 
-    if args.changed_since:
-        # Two dots, not three. Three-dot asks git for the merge base, which a
-        # CI shallow clone does not have, and this only ever wanted "which
-        # proved sources differ between these two trees" anyway.
-        diff = subprocess.run(
-            ["git", "diff", "--name-only", args.changed_since, "HEAD"],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if diff.returncode != 0:
-            # Run everything instead of stopping. Scoping is an optimization,
-            # so when it cannot tell what is safe to skip the answer is to do
-            # all of it. Failing the gate here, or skipping silently, both turn
-            # a speed-up into a correctness problem.
-            detail = diff.stderr.strip().splitlines()
-            print(
-                f"  cannot diff against {args.changed_since}, running the full "
-                f"set ({detail[0] if detail else 'no detail'})"
-            )
-        else:
-            touched = set(diff.stdout.split())
-            if touched & HARNESS_FILES:
-                print("  harness or proof config changed; running the full set")
-                touched = None
-            else:
-                inputs = target_inputs(cc)
-                if inputs is None:
-                    # The compiler's include scan itself is what could not be
-                    # trusted, not the diff. Same rule as everywhere else in
-                    # this block: an unknown scope means verify everything.
-                    print(
-                        "  cannot determine proof-input closures, running the "
-                        "full set"
-                    )
-                    touched = None
-                else:
-                    kept = [
-                        (i, m)
-                        for i, m in selected_pairs
-                        if inputs.get(m[0], {m[1]}) & touched
-                    ]
-            skipped = 0 if touched is None else len(selected_pairs) - len(kept)
-            if touched is not None and skipped:
-                print(
-                    f"  skipping {skipped} mutation(s): target source unchanged "
-                    f"since {args.changed_since}"
-                )
-            if touched is not None:
-                selected_pairs, selected = kept, [m for _i, m in kept]
-            if not selected:
-                print("  no proved source changed; nothing to re-verify")
-                return 0
-    if not selected:
-        print(f"no mutations for target {args.target!r}", file=sys.stderr)
-        return 2
-
-    if args.list:
-        for target, _src, function, desc, _old, _new in selected:
-            print(f"  verify-{target:<9} {function:<28} {desc}")
-        return 0
-
+    # Validate before filtering, not after. This is a MUTATIONS-versus-
+    # mk/verify.mk consistency check with nothing to do with any diff, and
+    # running it after the scope filter meant a mutation naming a target the
+    # makefile does not declare could be filtered away before the check that
+    # reports it, which the filter then grew a clause to prevent. Hoisted, the
+    # filter is one membership test and "--list" gets validated too.
+    #
     # A mutation must name its target's own source. Naming an included header
     # instead silently analyzes the wrong file: the run still produces a
     # verdict, and the verdict means nothing.
@@ -1291,6 +1184,35 @@ def main():
         for line in sorted(misdirected):
             print(f"    {line}", file=sys.stderr)
         return 2
+
+    if args.changed_since:
+        # The mutation question, not the proof one: a diff that only moves
+        # the machinery deciding which targets run cannot change whether a
+        # target rejects a broken source. Passing it explicitly keeps a local
+        # MUTANT_SINCE run answering what CI's mutation matrix answers.
+        scope = proof_scope.targets_changed_since(
+            cc, args.changed_since, proof_scope.MUTATION_HARNESS_FILES
+        )
+        if scope is not None:
+            kept = [(i, m) for i, m in selected_pairs if m[0] in scope]
+            skipped = len(selected_pairs) - len(kept)
+            if skipped:
+                print(
+                    f"  skipping {skipped} mutation(s): target source unchanged "
+                    f"since {args.changed_since}"
+                )
+            selected_pairs, selected = kept, [m for _i, m in kept]
+            if not selected:
+                print("  no proved source changed; nothing to re-verify")
+                return 0
+    if not selected:
+        print(f"no mutations for target {args.target!r}", file=sys.stderr)
+        return 2
+
+    if args.list:
+        for target, _src, function, desc, _old, _new in selected:
+            print(f"  verify-{target:<9} {function:<28} {desc}")
+        return 0
 
     shutil.rmtree(BUILD, ignore_errors=True)
     # Clear the logs too, not just the copies: CI uploads this directory as the

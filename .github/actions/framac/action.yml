@@ -1,0 +1,111 @@
+# Frama-C, Alt-Ergo and Z3 on a macOS runner, ready for "make verify".
+#
+# Two jobs in verify.yml need this identically: the one that proves, and each
+# leg of the mutation matrix. Actions has no other way to share steps between
+# jobs, and the alternative is a forty-line copy that drifts the first time
+# either half is touched.
+#
+# The caller still has to "eval $(opam env --switch=...)" in its own run steps,
+# since a composite action cannot export shell state to them. The switch name
+# comes back as an output so nothing has to spell it twice.
+#
+# The toolchain pins live here rather than in the callers. They are inputs with
+# defaults, so a job can still override one, but nothing has to repeat them:
+# two jobs each carrying their own copy is how the proving half and the
+# mutating half end up on different analyzers with no output saying so.
+name: Set up Frama-C
+description: Install Frama-C and the provers, from cache when the pins are unchanged
+
+inputs:
+  framac-version:
+    description: Frama-C version to install
+    # 33.0, checked rather than assumed: the whole set discharges 803 of 803
+    # obligations across all 17 targets on it, with these same two provers, and
+    # the mutation gate still bites on the targets sampled. A proof that stops
+    # discharging on a newer analyzer is a real signal, so the pin exists to
+    # make the version an explicit decision, not to freeze it. Bumping any of
+    # the three is a cold opam build, since the cache key is keyed on all of
+    # them, and that first run is the one at risk of a job timeout.
+    #
+    # Defaults rather than required inputs because both callers want the same
+    # analyzer: proving on one Frama-C while mutating on another is an
+    # inconsistency no output would name.
+    default: "33.0"
+  alt-ergo-version:
+    description: Alt-Ergo version to install
+    default: "2.6.3"
+  z3-version:
+    description: Z3 version to install
+    default: "4.16.0"
+  brew-packages:
+    description: Homebrew packages the opam build needs
+    default: opam gmp pkg-config graphviz llvm@17 zlib
+
+outputs:
+  switch:
+    description: The opam switch name to eval into
+    value: frama-c-elfuse
+
+runs:
+  using: composite
+  steps:
+    - name: Point opam at a cacheable root
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "OPAMROOT=${{ github.workspace }}/.opam" >> "$GITHUB_ENV"
+        echo "OPAMCONFIRMLEVEL=unsafe-yes" >> "$GITHUB_ENV"
+        echo "HOMEBREW_NO_INSTALL_CLEANUP=1" >> "$GITHUB_ENV"
+        echo "HOMEBREW_NO_AUTO_UPDATE=1" >> "$GITHUB_ENV"
+
+    - name: Cache Homebrew downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/Library/Caches/Homebrew/downloads
+        # Keyed on the package list, not just the workflow: changing what gets
+        # installed has to change the key or the cache serves the old set.
+        key: brew-${{ runner.os }}-${{ runner.arch }}-${{ inputs.brew-packages }}
+
+    - name: Install Homebrew packages
+      shell: bash
+      env:
+        BREW_PKGS: ${{ inputs.brew-packages }}
+      run: |
+        set -euo pipefail
+        # BREW_PKGS is a space-separated list, so it must stay unquoted.
+        # shellcheck disable=SC2086
+        brew install --quiet $BREW_PKGS
+
+    # Every job sharing this action shares one key, so a warm cache costs one
+    # restore each. Nothing primes it: on a miss they all build Frama-C and the
+    # provers from source at once, which is the whole cost of bumping any of
+    # the three pins, and the first run after such a bump is the one at risk of
+    # a job timeout. A prime job would trade that for a barrier in front of
+    # every run; the versions move rarely enough that the miss is cheaper.
+    - name: Cache opam switch
+      id: opam-cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.OPAMROOT }}
+        key: opam-${{ runner.os }}-${{ runner.arch }}-frama-c${{ inputs.framac-version }}-ae${{ inputs.alt-ergo-version }}-z3${{ inputs.z3-version }}
+
+    - name: Install Frama-C, Alt-Ergo, Z3
+      if: steps.opam-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        opam init -y --bare --disable-sandboxing
+        opam switch create frama-c-elfuse 4.14.1
+        eval "$(opam env --switch=frama-c-elfuse)"
+        opam install -y \
+          frama-c.${{ inputs.framac-version }} \
+          alt-ergo.${{ inputs.alt-ergo-version }} \
+          z3.${{ inputs.z3-version }}
+
+    - name: Report the toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        eval "$(opam env --switch=frama-c-elfuse)"
+        why3 config detect
+        frama-c -version

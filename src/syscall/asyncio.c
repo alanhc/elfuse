@@ -105,10 +105,10 @@ static void async_deliver(void *udata, int signum)
     if (!async_owner_is_local(snap.fasync_owner_type, snap.fasync_owner))
         return; /* no owner, or a foreign guest pid */
 
-    /* ponytail: owner delivery is process-wide. F_OWNER_TID does not target a
-     * single thread and a foreign guest pid is not forwarded across the fork
-     * IPC boundary. Add per-thread signal queueing + cross-process forwarding
-     * when a real workload needs directed SIGIO.
+    /* Owner delivery is process-wide: F_OWNER_TID does not target a single
+     * thread, and a foreign guest pid is not forwarded across the fork IPC
+     * boundary. Per-thread signal queueing and cross-process forwarding are
+     * what a workload needing directed SIGIO would require.
      */
     signal_queue(signum);
 }
@@ -236,9 +236,9 @@ void fasync_owner_set(int guest_fd,
         fd_table[guest_fd].generation == expect_gen)
         ofd_id = fd_table[guest_fd].ofd_id;
     if (ofd_id) {
-        /* ponytail: O(FD_TABLE_SIZE) scan to reach every alias sharing this
-         * open-file-description. Cold path (F_SETOWN only); an ofd_id->fd index
-         * is the upgrade if it ever shows up in a profile.
+        /* An O(FD_TABLE_SIZE) scan reaches every alias sharing this
+         * open-file-description. Cold path (F_SETOWN only); an ofd_id to fd
+         * index is the upgrade if it ever shows up in a profile.
          */
         for (int i = 0; i < FD_TABLE_SIZE; i++) {
             if (fd_table[i].type == FD_CLOSED || fd_table[i].ofd_id != ofd_id)
@@ -286,9 +286,9 @@ void asyncio_apply(int guest_fd, uint64_t expect_gen, bool on)
         fd_table[guest_fd].generation == expect_gen)
         ofd_id = fd_table[guest_fd].ofd_id;
     if (ofd_id) {
-        /* ponytail: O(FD_TABLE_SIZE) scan to reach every alias sharing this
-         * open-file-description. Cold path (O_ASYNC toggles only); an
-         * ofd_id->fd index is the upgrade if it ever shows up in a profile.
+        /* An O(FD_TABLE_SIZE) scan reaches every alias sharing this
+         * open-file-description. Cold path (O_ASYNC toggles only); an ofd_id to
+         * fd index is the upgrade if it ever shows up in a profile.
          */
         for (int i = 0; i < FD_TABLE_SIZE; i++) {
             if (fd_table[i].type == FD_CLOSED || fd_table[i].ofd_id != ofd_id)
