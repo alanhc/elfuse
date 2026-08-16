@@ -355,6 +355,14 @@ static thread_entry_t *find_thread_for_tid(int64_t tid)
     return thread_find(tid);
 }
 
+/* The one host-user-mode touch of guest memory left outside HOST_SIGBUS_GUARD.
+ *
+ * sys_icache_invalidate would fault the same way a memcpy does if the range sat
+ * in a MAP_SHARED overlay whose file had been truncated. It is left unguarded
+ * deliberately: reaching it requires --gdb, so no guest can drive it, and the
+ * ranges it flushes are code the debugger just wrote, not file-backed data. Do
+ * not treat this as precedent; anything a guest can reach belongs in the pad.
+ */
 static void gdb_invalidate_written_code(uint64_t gva, size_t len)
 {
     size_t flushed = 0;
