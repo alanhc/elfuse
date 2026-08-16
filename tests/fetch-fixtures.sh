@@ -23,6 +23,10 @@
 #
 # Environment:
 #   FORCE=1            Rebuild every stage from scratch.
+#   KERNEL_ALPINE_VERSION=<rel>
+#                      Alpine release the oracle kernel comes from, default
+#                      3.23 (Linux 6.18 LTS). Userland stays on
+#                      ALPINE_VERSION.
 #   INCLUDE_X86_64=1   Also fetch x86_64 userspace for the elfuse-x86_64
 #                      test-matrix mode. Default off; adds ~80 MiB of
 #                      downloads but reuses the same Alpine version pin
@@ -36,6 +40,12 @@ set -euo pipefail
 . "$(dirname "$0")/lib/bash-compat.sh"
 
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
+
+# The oracle kernel resolves from its own Alpine release: 3.23 ships
+# linux-virt 6.18, the LTS line elfuse reports to the guest, while the
+# userland pins stay on ALPINE_VERSION. The linux-virt apk carries the
+# kernel and its lib/modules tree, so both move together.
+KERNEL_ALPINE_VERSION="${KERNEL_ALPINE_VERSION:-3.23}"
 # Empty by default -- the exact point release is resolved from the live releases
 # listing at fetch time (see resolve_minirootfs), then written back here so the
 # x86_64 path reuses the same patch. Set explicitly to pin one.
@@ -46,6 +56,7 @@ CDN_BASE="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}"
 RELEASES="${CDN_BASE}/releases/${ALPINE_ARCH}"
 MAIN_REPO="${CDN_BASE}/main/${ALPINE_ARCH}"
 COMMUNITY_REPO="${CDN_BASE}/community/${ALPINE_ARCH}"
+KERNEL_REPO="https://dl-cdn.alpinelinux.org/alpine/v${KERNEL_ALPINE_VERSION}/main/${ALPINE_ARCH}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURES="${REPO_ROOT}/externals/test-fixtures"
@@ -65,7 +76,7 @@ INITRAMFS="${FIXTURES}/initramfs.cpio.gz"
 # Tuples (not associative arrays) keep this working on bash 3.2 hosts (stock
 # macOS /bin/bash) -- see tests/lib/bash-compat.sh.
 PKGS=(
-    "main:linux-virt"
+    "kernel:linux-virt"
     "main:busybox-static"
     "main:dropbear"
     "main:zlib"
@@ -189,6 +200,7 @@ apk_url()
     case "$repo" in
         main) echo "${MAIN_REPO}/${name}-${version}.apk" ;;
         community) echo "${COMMUNITY_REPO}/${name}-${version}.apk" ;;
+        kernel) echo "${KERNEL_REPO}/${name}-${version}.apk" ;;
         *)
             echo "unknown repo: $repo" >&2
             return 1
@@ -207,6 +219,7 @@ repo_url()
     case "$1" in
         main) echo "$MAIN_REPO" ;;
         community) echo "$COMMUNITY_REPO" ;;
+        kernel) echo "$KERNEL_REPO" ;;
         *)
             echo "unknown repo: $1" >&2
             return 1
@@ -384,7 +397,7 @@ main()
 
         # Extract just the kernel-modules subtree from linux-virt.
         local modstage linux_virt_ver
-        linux_virt_ver="$(pkg_version "main:linux-virt")"
+        linux_virt_ver="$(pkg_version "kernel:linux-virt")"
         modstage="$(mktemp -d)"
         tar xzf "$(apk_path linux-virt "$linux_virt_ver")" \
             -C "$modstage" 'lib/modules' 2> /dev/null
@@ -472,7 +485,7 @@ EOF
     if [ ! -s "${KERNEL_DIR}/vmlinuz-virt" ] || [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ]; then
         log "extract kernel"
         local linux_virt_ver
-        linux_virt_ver="$(pkg_version "main:linux-virt")"
+        linux_virt_ver="$(pkg_version "kernel:linux-virt")"
         rm -rf "${KERNEL_DIR}/work"
         mkdir -p "${KERNEL_DIR}/work"
         tar xzf "$(apk_path linux-virt "$linux_virt_ver")" \
