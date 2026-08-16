@@ -114,9 +114,41 @@ static void test_path_copy(void)
     close(fd);
 }
 
+/* The futex word atomics, which run from host user mode. */
+static void test_futex_word(void)
+{
+    TEST("futex on truncated MAP_SHARED returns EFAULT");
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    int fd = -1;
+    char *p = map_then_truncate(page, &fd);
+    if (!p)
+        return;
+
+    /* FUTEX_WAIT compares before it decides anything, so the read that faults
+     * happens whatever value is passed.
+     *
+     * 0 is deliberately a value the word cannot hold: map_then_truncate leaves
+     * the poison path string at offset 0, so the word reads as "/tmp". A page
+     * that has not actually lost its backing therefore answers EAGAIN and fails
+     * the assertion below, where an expected value that matched would enqueue a
+     * waiter and hang the suite instead.
+     */
+    errno = 0;
+    long rc =
+        syscall(SYS_futex, (int *) p, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+
+    EXPECT_TRUE(rc < 0 && errno == EFAULT,
+                "FUTEX_WAIT should fail with EFAULT after truncate");
+
+    munmap(p, page);
+    close(fd);
+}
+
 int main(void)
 {
     test_path_copy();
+    test_futex_word();
     SUMMARY("test-mmap-sigbus-efault");
     return fails ? 1 : 0;
 }
