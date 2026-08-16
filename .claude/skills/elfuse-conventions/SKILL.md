@@ -134,6 +134,57 @@ module.
 New C tests are `tests/test-<feature>.c` and use the shared harness macros
 rather than rolling their own reporting.
 
+## Comments
+
+Brevity is part of correctness. Default to no comment; a survivor is cut to
+its rationale, usually one to a few dense lines. A block growing toward a
+paragraph stack is rejected even when every sentence is true ("Avoid long
+comments!", PR#290, on a 28-line test header; "Shorten the comments
+slightly.", PR#254, PR#261). An unrequested comment, log line, defensive
+check, or restructuring is a defect to remove, not a favor.
+
+A comment earns its place only for what the code cannot say: rationale, an
+invariant, a boundary condition, a unit, a citation. Delete anything
+restating the statement below it.
+
+- Bad: `slot->refcount = 1; /* set refcount to 1 */`
+- Good: `slot->refcount = 1; /* held by the /dev/fuse fd itself */`
+
+Cite the authority at the point of use: the kernel path, the man page with
+its section, the ELF or FUSE clause, the macOS or glibc behavior forcing a
+host workaround. Code that looks wrong says why it is not, the highest-value
+comment here. Never comment around bad code; rewrite it. Contracts,
+invariants, and lock ordering live once in the owning `.h`; call sites cite
+them. `sigwait()` returns on SIGUSR2 and no "doorbell" rings: a thread,
+flag, or helper is named for its operation, not the manner.
+
+Not in `src/`: attribution, dates, commented-out code, issue-tracker numbers
+(barred from `docs/` and README prose too, PR#40, PR#223; they belong in a
+commit trailer), or `TODO`/`FIXME`; incomplete work belongs in the commit
+message or PR. Editing part of a comment re-opens all of it: re-read the
+block and rewrite what no longer reads cleanly.
+
+Mechanics: `/* */` only in `.c`, `.h`, and `.S`, no `//`, no Doxygen tags;
+multi-line blocks align on ` * `, close with `*/` on its own line, indented
+to the body; American English; `@name` references a parameter in prose. A
+new file opens with title, copyright, SPDX identifier, a blank `*` line,
+then one prose paragraph on what the module is for (`src/syscall/signal.h`
+is the model). `#` comments in shell, Python, and Make obey the same rules.
+Update or delete a comment in the commit that changes its code: a stale
+comment is worse than none, because it is believed. A comment asserting a
+number or a guarantee is the case that rots silently, so recompute it before
+carrying it into an edit; `elfuse-refactor` reads the same rule from the
+reviewer's side.
+
+## docs/
+
+`docs/` describes how the system works now, for a reader who has never seen
+it, as settled fact, and a past decision that still matters reads as
+present-tense rationale ("paths are translated in one place so ..."). No
+workflow reads markdown, so nothing checks any of this against the code; a
+docs claim is only as true as the last person who read it against the
+source.
+
 ## Vendored tools checked out for evaluation
 
 A third-party tool checked out into an untracked directory to be tried out is
@@ -188,17 +239,45 @@ no area tag, no ticket number in the subject. The subject is a sentence about
 behavior. A commit that removes something says what stops happening; a commit
 that adds a proof says what is now proved.
 
-The body is where the reasoning goes, and it is expected to be substantial for
-anything non-mechanical: what the old code claimed, why that was wrong, what
-breaks if you do it the obvious other way. Some commits label body paragraphs
-(`Verified:`, `Coverage:`, `Concurrency:`) when a specific claim needs to be
-findable later. Issue references go at the end as `Fixes #187`, `Closes #156`,
-or the full URL form.
+The body is where the reasoning goes: what the old code claimed, why that
+was wrong, what breaks if you do it the obvious other way. Substantial is
+not the same as long: the target is the shortest faithful account, no
+restating of the diff, no padding to look thorough. Two to four sentences
+carry most commits; a body past roughly 50 lines is the signal to split the
+commit, not to write more. Some commits label body paragraphs (`Verified:`,
+`Coverage:`, `Concurrency:`) when a claim needs to be findable later. Issue
+references go at the end as `Fixes #187`, `Closes #156`, or the URL form.
 
-The ASCII and third-person rules above apply here too: no backticks around
-symbol names, no em dashes, no non-ASCII arrows.
+Subject and body name code objects and mechanisms, so every claim is
+checkable against the diff: "Remove unread probe outputs and unreachable
+arms", never "Drop dead weight from the probe". A diagram replaces prose
+rather than joining it, so interleaved actors, a race window, or a
+byte-layout off-by-one earn a small ASCII diagram inside 72 columns with
+real names, the prose it replaces cut. Verify it as rendered.
+
+The Style rules above bind here: the register classes, ASCII with no
+backticks around symbol names, no em dashes or non-ASCII arrows, and third
+person throughout.
 
 Merge commits keep git's generated subject and are exempt.
+
+## Pull requests
+
+A PR thread is human collaboration, and agent-shaped artifacts are rejected
+on sight: no pasted walkthroughs or summaries ("We are humans. Don't copy
+agent-specific reply here.", PR#116), no severity or status tables ("We're
+here to discuss and improve the software together, not to act as task
+trackers.", PR#90), no re-summarizing the diff git already shows. Close
+addressed threads with "Resolve conversation"; a reply carries the
+correction, the measurement, or nothing. A concise what and why belongs in
+the commit body, not the thread.
+
+The body is intent plus reproduction and commands: for a bug, a minimal
+reproduction with host macOS and SDK version, hardware, and `make check`
+status (PR#21, PR#41); for a performance claim, A/B benchmarks on a named
+machine, same binary with and without the change, median over runs (PR#203).
+Rebase on latest `main` (PR#58). One issue per bug (PR#135); validate
+against a real application, not only a unit smoke test (PR#191).
 
 ## Layout
 
