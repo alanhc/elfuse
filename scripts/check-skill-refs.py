@@ -25,7 +25,7 @@ What is checked, per file:
      longer path. A path inside a fenced block is checked the same way; it
      carries no backticks, so it needs a directory component to be recognized.
   3. "make <target>" names a target the makefiles define, including the
-     verify-<name> targets that mk/analysis.mk instantiates from a template.
+     verify-<name> targets that mk/verify.mk instantiates from a template.
   4. A quoted section name attached to the word "section" exists as a heading
      in the docs file nearest it.
   5. A cross-reference to a sibling skill names a skill that exists. Only
@@ -230,7 +230,7 @@ def resolve(token, paths):
 def make_targets():
     """Static rule names from the makefiles, plus the generated proof targets.
 
-    mk/analysis.mk instantiates verify-<name> from a template, so those names
+    mk/verify.mk instantiates verify-<name> from a template, so those names
     exist only after make expands it. print-verify-targets is the list make
     itself reports, which is what CI consumes.
     """
