@@ -605,6 +605,14 @@ typedef struct {
     char resolved[LINUX_PATH_MAX];
     char display_path[LINUX_PATH_MAX];
     int fd;
+
+    /* resolved holds a materialized temporary that the caller must unlink. The
+     * flag lives beside the buffer it describes because
+     * exec_resolve_guest_host_path clears it on entry and then sets it for
+     * whichever buffer it filled: a flag belonging to some other buffer would
+     * be silently retargeted, losing one temp and unlinking the wrong path.
+     */
+    bool resolved_temp;
 } exec_interp_t;
 
 /* Resolve, open, and parse the PT_INTERP interpreter (headers only) before exec
@@ -616,16 +624,12 @@ typedef struct {
  * 3.
  *
  * On failure the fd, if any, is left in interp for the caller's fail label to
- * close.
- *
- * host_temp belongs to the caller: exec_resolve_interp_host_path sets it when
- * it materializes a temporary, and the caller's cleanup consults it.
+ * close, as is interp->resolved_temp when a temporary was materialized.
  */
 static int64_t exec_preload_interp(const guest_t *g,
                                    const elf_info_t *elf_info,
                                    bool target_is_rosetta,
-                                   exec_interp_t *interp,
-                                   bool *host_temp)
+                                   exec_interp_t *interp)
 {
     if (target_is_rosetta || elf_info->interp_path[0] == '\0')
         return 0;
@@ -633,15 +637,16 @@ static int64_t exec_preload_interp(const guest_t *g,
     bool shm = false;
 
     if (exec_resolve_interp_host_path(elf_info->interp_path, interp->resolved,
-                                      sizeof(interp->resolved), host_temp,
-                                      &shm) < 0) {
+                                      sizeof(interp->resolved),
+                                      &interp->resolved_temp, &shm) < 0) {
         log_error("execve: failed to resolve interpreter: %s",
                   elf_info->interp_path);
         return -LINUX_ENOEXEC;
     }
-    str_copy_trunc(interp->display_path,
-                   *host_temp ? elf_info->interp_path : interp->resolved,
-                   sizeof(interp->display_path));
+    str_copy_trunc(
+        interp->display_path,
+        interp->resolved_temp ? elf_info->interp_path : interp->resolved,
+        sizeof(interp->display_path));
 
     log_debug("execve: pre-validating interpreter: %s", interp->resolved);
 
@@ -1119,8 +1124,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     }
 
     /* Pre-load the interpreter before the point of no return. */
-    err = exec_preload_interp(g, &elf_info, target_is_rosetta, &interp,
-                              &interp_host_temp);
+    err = exec_preload_interp(g, &elf_info, target_is_rosetta, &interp);
     if (err < 0)
         goto fail;
 
@@ -1173,6 +1177,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         if (interp.fd >= 0)
             close(interp.fd);
         free(temp_str);
+        if (interp.resolved_temp)
+            unlink(interp.resolved);
         exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                             path_host_temp, interp_host_buf, interp_host_temp);
         return err;
@@ -1321,6 +1327,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         if (interp.fd >= 0) {
             close(interp.fd);
         }
+        if (interp.resolved_temp)
+            unlink(interp.resolved);
         exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                             path_host_temp, interp_host_buf, interp_host_temp);
         return SYSCALL_EXEC_HAPPENED;
@@ -1651,6 +1659,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         close(exec_fd);
     if (interp.fd >= 0)
         close(interp.fd);
+    if (interp.resolved_temp)
+        unlink(interp.resolved);
     exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                         path_host_temp, interp_host_buf, interp_host_temp);
 
