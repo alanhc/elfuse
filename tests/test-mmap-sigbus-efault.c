@@ -145,10 +145,94 @@ static void test_futex_word(void)
     close(fd);
 }
 
+/* arc4random_buf writing into the guest slab behind getrandom(2). */
+static void test_getrandom_fill(void)
+{
+    TEST("getrandom into truncated MAP_SHARED returns EFAULT");
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    int fd = -1;
+    char *p = map_then_truncate(page, &fd);
+    if (!p)
+        return;
+
+    errno = 0;
+    long rc = syscall(SYS_getrandom, p, (size_t) 64, 0);
+
+    EXPECT_TRUE(rc < 0 && errno == EFAULT,
+                "getrandom should fail with EFAULT after truncate");
+
+    munmap(p, page);
+    close(fd);
+}
+
+/* read/readv on /dev/urandom, the sibling of the getrandom fill. Both are
+ * served by a host-side memcpy under the per-fd entropy cache lock, so both
+ * have to stage through a host buffer rather than take the recovery pad.
+ *
+ * The request is deliberately larger than the shim's inline urandom limit so
+ * the read reaches the host handler instead of being served from EL1.
+ */
+static void test_urandom_read(void)
+{
+    TEST("read(/dev/urandom) into truncated MAP_SHARED returns EFAULT");
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    int fd = -1;
+    char *p = map_then_truncate(page, &fd);
+    if (!p)
+        return;
+
+    int u = open("/dev/urandom", O_RDONLY);
+    if (u < 0) {
+        munmap(p, page);
+        close(fd);
+        FAIL("open /dev/urandom");
+        return;
+    }
+
+    errno = 0;
+    long rc = read(u, p, 2048);
+    EXPECT_TRUE(rc < 0 && errno == EFAULT,
+                "read(/dev/urandom) should fail with EFAULT after truncate");
+
+    struct iovec iov = {.iov_base = p, .iov_len = 2048};
+    errno = 0;
+    rc = readv(u, &iov, 1);
+    EXPECT_TRUE(rc < 0 && errno == EFAULT,
+                "readv(/dev/urandom) should fail with EFAULT after truncate");
+
+    /* Two entries, because one short-circuits to the scalar read path and never
+     * reaches the multi-entry loop that resolves each iov separately. That loop
+     * is its own host kill: it dies with SIGBUS before the staging fix.
+     *
+     * The good page comes first so some bytes move before the vanished one is
+     * reached, which is what makes this a partial transfer rather than an
+     * outright failure. Both outcomes are accepted because the split depends on
+     * how far the kernel got, not on anything elfuse decides; what must not
+     * happen is a full count, which would mean the vanished page was reported
+     * as written.
+     */
+    char scratch[64];
+    struct iovec two[2] = {{.iov_base = scratch, .iov_len = sizeof(scratch)},
+                           {.iov_base = p, .iov_len = 2048}};
+    errno = 0;
+    rc = readv(u, two, 2);
+    EXPECT_TRUE(rc < 0 ? errno == EFAULT
+                       : rc >= 0 && rc < (long) (sizeof(scratch) + 2048),
+                "multi-entry readv must stop at the vanished page");
+
+    close(u);
+    munmap(p, page);
+    close(fd);
+}
+
 int main(void)
 {
     test_path_copy();
     test_futex_word();
+    test_getrandom_fill();
+    test_urandom_read();
     SUMMARY("test-mmap-sigbus-efault");
     return fails ? 1 : 0;
 }
