@@ -4,12 +4,12 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Minimal bench that measures the three labels the guardrail script checks
- * against the TODO ceilings:
+ * Minimal bench that measures the four labels the guardrail script checks:
  *
  *   getpid          (raw SVC; shim identity fast path)
  *   clock_gettime   (vDSO trampoline; see -DGUARD_USE_LIBC_CG below)
  *   read-urandom1   (raw read; shim urandom ring fast path)
+ *   stat-path       (full SVC round trip through guest_read_path)
  *
  * Built twice from this single source:
  *   build/bench-hot-guard       -- static glibc. Compiled without
@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -177,10 +178,38 @@ static long bench_read_urandom1(void *ctx)
     return read(fd, &byte, 1);
 }
 
+/* The path-resolving lane. Every syscall that takes a path pays guest_read_path
+ * (guest_read_str_small, then guest_read_str), and stat pays a
+ * guest_write_small for the result struct on top, so this is the densest
+ * guest-copy caller a one-line bench can reach. The other three cases are all
+ * served by the shim or the vDSO and never touch those helpers, which is how a
+ * 45% regression in them once passed this guardrail unnoticed.
+ */
+static long bench_stat_path(void *ctx)
+{
+    struct stat *st = ctx;
+    return stat("/dev/null", st);
+}
+
 static void run_case(clock_gettime_fn cg,
                      const bench_case_t *bc,
                      unsigned long iters)
 {
+    /* Discard a warmup pass. Without it the first case in the table absorbs
+     * every one-time cost in the run: first-touch faults on the guest stack,
+     * the initial urandom ring fill, and the page tables the path resolver
+     * walks once. getpid runs first and was reading 50 ns warm against 62 to 72
+     * ns cold, a 40% swing on the lane the stat-path ratio divides by, which is
+     * enough to hide a real regression in the numerator.
+     */
+    unsigned long warmup = iters / 20;
+    if (warmup < 1000)
+        warmup = 1000;
+    if (warmup > iters)
+        warmup = iters;
+    for (unsigned long i = 0; i < warmup; i++)
+        (void) bc->fn(bc->ctx);
+
     uint64_t start = monotonic_ns(cg);
     long last = 0;
     for (unsigned long i = 0; i < iters; i++)
@@ -220,10 +249,12 @@ int main(int argc, char **argv)
     }
 
     cg_ctx_t cg_ctx = {.fn = vdso_cg};
+    struct stat stat_buf;
     const bench_case_t cases[] = {
         {"getpid", bench_getpid, NULL},
         {"clock_gettime", bench_clock_gettime, &cg_ctx},
         {"read-urandom1", bench_read_urandom1, &urandomfd},
+        {"stat-path", bench_stat_path, &stat_buf},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)

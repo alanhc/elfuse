@@ -155,6 +155,52 @@ static void test_error_paths(void)
               "zero count failed");
 }
 
+/* Overlapping ranges within one address space.
+ *
+ * sys_process_vm accepts the caller's own pid, so both iovecs can resolve into
+ * the same guest memory and a guest can make them overlap. The host-side copy
+ * has to stay defined there: copying an overlapping range forward is undefined
+ * behavior, not merely a strange result, which is why the copy helper uses
+ * memmove per step.
+ *
+ * This does not try to catch that undefined behavior by its output. Measured
+ * on this host, the forward copy it replaced produced correct leading bytes and
+ * a result that simply differed from memmove, so nothing observable separates
+ * the two reliably; the fix rests on the language rule, not on a reproducer.
+ *
+ * What the case does pin is the part that is specified: the full count comes
+ * back and nothing outside the destination is disturbed. The content of the
+ * overlap is asserted nowhere, because it is unspecified and the reference
+ * kernel matches neither memmove nor a page-wise move.
+ */
+static void test_overlapping_self_copy(void)
+{
+    static char buf[16384], original[16384];
+    const size_t head = 512, span = 8192;
+
+    for (size_t delta = 1; delta <= 64; delta *= 8) {
+        for (size_t i = 0; i < sizeof(buf); i++)
+            buf[i] = (char) (i * 7 + delta);
+        memcpy(original, buf, sizeof(buf));
+
+        char *dst = buf + head + delta;
+        struct iovec dst_iov = {.iov_base = dst, .iov_len = span};
+        struct iovec src_iov = {.iov_base = buf + head, .iov_len = span};
+
+        TEST("process_vm_readv overlapping self copy");
+        EXPECT_EQ(raw_process_vm_readv(getpid(), &dst_iov, 1, &src_iov, 1, 0),
+                  (long) span, "overlapping copy reported short");
+        /* head + delta, not head: the destination starts past the delta gap,
+         * so those bytes are before it too and a stray write there must fail.
+         */
+        EXPECT_TRUE(memcmp(buf, original, head + delta) == 0,
+                    "overlapping copy wrote before the destination");
+        EXPECT_TRUE(memcmp(dst + span, original + head + delta + span,
+                           sizeof(buf) - head - delta - span) == 0,
+                    "overlapping copy wrote past the destination");
+    }
+}
+
 int main(void)
 {
     printf("test-process-vm: process_vm_readv/writev tests\n\n");
@@ -164,6 +210,7 @@ int main(void)
     test_short_copy_on_remote_fault();
     test_short_copy_on_local_fault();
     test_error_paths();
+    test_overlapping_self_copy();
 
     SUMMARY("test-process-vm");
     return fails > 0 ? 1 : 0;

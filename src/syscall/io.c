@@ -348,21 +348,81 @@ static int64_t urandom_fill_iov(int guest_fd,
     return (int64_t) done;
 }
 
-static int64_t validate_iov_total(guest_t *g, uint64_t iov_gva, int iovcnt)
+static int64_t validate_iov_total(guest_t *g,
+                                  uint64_t iov_gva,
+                                  int iovcnt,
+                                  linux_iovec_t *iov)
 {
     if (!iov_count_ok(iovcnt))
         return -LINUX_EINVAL;
 
     uint64_t total = 0;
     for (int i = 0; i < iovcnt; i++) {
-        linux_iovec_t giov;
-        if (guest_read_small(g, iov_gva + (uint64_t) i * sizeof(giov), &giov,
-                             sizeof(giov)) < 0)
+        if (guest_read_small(g, iov_gva + (uint64_t) i * sizeof(*iov), &iov[i],
+                             sizeof(*iov)) < 0)
             return -LINUX_EFAULT;
-        if (!iov_total_add(total, giov.iov_len, &total))
+        if (!iov_total_add(total, iov[i].iov_len, &total))
             return -LINUX_EINVAL;
     }
     return 0;
+}
+
+/* Fill count guest bytes at gva with entropy, staged through a host buffer.
+ *
+ * urandom_fill_iov holds the per-fd cache lock while it copies, so it cannot be
+ * handed a guest pointer: see the lock rule on HOST_SIGBUS_GUARD.
+ *
+ * Returns the byte count transferred, or a negative Linux errno when nothing
+ * moved.
+ */
+static int64_t urandom_fill_guest(guest_t *g,
+                                  int guest_fd,
+                                  uint64_t gva,
+                                  uint64_t count)
+{
+    if (gva > UINT64_MAX - count)
+        return -LINUX_EFAULT;
+
+    uint8_t stage[512];
+    uint64_t done = 0, chunk;
+    while (slice_clamp(count, done, sizeof(stage), &chunk)) {
+        /* Clamp again to the contiguous writable window. Resolving the guest
+         * pointer purely to read its extent, never to dereference, keeps the
+         * short read a mapping boundary has always produced -- see
+         * tests/test-large-io-boundary.c -- instead of turning a straddling
+         * request into EFAULT.
+         */
+        uint64_t avail = 0;
+        if (!guest_ptr_bound(g, gva + done, &avail, MEM_PERM_W, chunk))
+            return done > 0 ? (int64_t) done : -LINUX_EFAULT;
+        if (avail < chunk)
+            chunk = avail;
+
+        /* Keep the chunk inside one guest page. A page is the granularity at
+         * which backing vanishes, so a chunk that cannot straddle one either
+         * lands whole or faults whole, and the count below is never short of
+         * what actually reached the guest. avail runs to the end of the region
+         * and can cross many pages, so without this the write could report less
+         * progress than it made.
+         */
+        uint64_t to_page_end =
+            GUEST_PAGE_SIZE - ((gva + done) & (GUEST_PAGE_SIZE - 1));
+        if (chunk > to_page_end)
+            chunk = to_page_end;
+        if (chunk == 0)
+            break;
+
+        struct iovec iov = {.iov_base = stage, .iov_len = (size_t) chunk};
+        int64_t got = urandom_fill_iov(guest_fd, &iov, 1);
+        if (got <= 0)
+            return done > 0 ? (int64_t) done : got;
+        if (guest_write(g, gva + done, stage, (size_t) got) < 0)
+            return done > 0 ? (int64_t) done : -LINUX_EFAULT;
+        done += (uint64_t) got;
+        if ((uint64_t) got < chunk)
+            break;
+    }
+    return (int64_t) done;
 }
 
 static int64_t urandom_read(guest_t *g,
@@ -377,15 +437,9 @@ static int64_t urandom_read(guest_t *g,
         return urandom_fill_iov(guest_fd, &empty, 1);
     }
 
-    uint64_t avail = 0;
-    void *dst = guest_ptr_bound(g, buf_gva, &avail, MEM_PERM_W, count);
-    if (!dst)
-        return -LINUX_EFAULT;
-    if (count > avail)
-        count = avail;
-
-    struct iovec iov = {.iov_base = dst, .iov_len = (size_t) count};
-    int64_t rc = urandom_fill_iov(guest_fd, &iov, 1);
+    int64_t rc = urandom_fill_guest(g, guest_fd, buf_gva, count);
+    if (rc < 0)
+        return rc;
 
     /* This slow path runs when the shim's identity-class fast path could not
      * serve the read: either the request was larger than the shim's inline
@@ -1443,15 +1497,49 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         int64_t err = urandom_check_readable(fd);
         if (err < 0)
             return err;
-        err = validate_iov_total(g, iov_gva, iovcnt);
-        if (err < 0)
+        if (!iov_count_ok(iovcnt))
+            return -LINUX_EINVAL;
+
+        linux_iovec_t stack_giov[SYSCALL_IOV_STACK_MAX];
+        linux_iovec_t *giov = stack_giov;
+        linux_iovec_t *heap_giov = NULL;
+        if (iovcnt > SYSCALL_IOV_STACK_MAX) {
+            heap_giov = malloc((size_t) iovcnt * sizeof(*giov));
+            if (!heap_giov)
+                return -LINUX_ENOMEM;
+            giov = heap_giov;
+        }
+        err = validate_iov_total(g, iov_gva, iovcnt, giov);
+        if (err < 0) {
+            free(heap_giov);
             return err;
-        host_iov_buf_t host_iov;
-        err = host_iov_prepare(g, iov_gva, iovcnt, MEM_PERM_W, &host_iov);
-        if (err < 0)
-            return err;
-        int64_t ret = urandom_fill_iov(fd, host_iov.iov, iovcnt);
-        host_iov_free(&host_iov);
+        }
+
+        /* Stage every entry through a host buffer for the reason spelled out on
+         * urandom_fill_guest: a resolved guest pointer would be written under
+         * the per-fd cache lock, where a vanished MAP_SHARED page kills the
+         * host instead of reporting EFAULT.
+         */
+        int64_t ret = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            if (giov[i].iov_len == 0)
+                continue;
+            int64_t got =
+                urandom_fill_guest(g, fd, giov[i].iov_base, giov[i].iov_len);
+            if (got < 0) {
+                ret = ret > 0 ? ret : got;
+                break;
+            }
+            ret += got;
+
+            /* A short entry means the guest buffer ran out mid-way; POSIX
+             * requires the transfer to stop there rather than pack the tail of
+             * entry i into entry i+1.
+             */
+            if ((uint64_t) got < giov[i].iov_len)
+                break;
+        }
+        free(heap_giov);
 
         /* Mirror sys_read's slow-path refill so a readv consumer that drains
          * the shim ring leaves it ready for the next call, instead of forcing
@@ -1903,10 +1991,21 @@ static int64_t process_vm_copy(guest_t *g,
         if (chunk == 0)
             return copied > 0 ? (int64_t) copied : -LINUX_EFAULT;
 
-        memmove(dst, src, (size_t) chunk);
-        copied += chunk;
-        lo += chunk;
-        ro += chunk;
+        /* Both ends are guest memory touched from host user mode, so either
+         * side can be a vanished MAP_SHARED overlay page. Linux reports a
+         * partial transfer here, or EFAULT when nothing moved.
+         *
+         * The copy reports its own progress rather than being wrapped in a bare
+         * guard: chunk runs to the end of the contiguous region and can be
+         * megabytes, so treating a fault as "this whole chunk moved nothing"
+         * would drop everything the copy had already written.
+         */
+        size_t moved = guest_host_copy_partial(dst, src, (size_t) chunk);
+        copied += moved;
+        lo += moved;
+        ro += moved;
+        if (moved < (size_t) chunk)
+            return copied > 0 ? (int64_t) copied : -LINUX_EFAULT;
     }
 }
 

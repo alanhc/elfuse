@@ -774,6 +774,8 @@ run_unit_tests()
     test_check "$runner" "test-guard-page" "PASS" "$bindir/test-guard-page"
     test_rc "$runner" "test-mmap-hint" 0 "$bindir/test-mmap-hint"
 
+    test_rc "$runner" "test-mmap-sigbus-efault" 0 "$bindir/test-mmap-sigbus-efault"
+
     printf "\nLow-base ET_EXEC memory regression\n"
     test_rc "$runner" "test-lowbase-mem-200000" 0 "$bindir/test-lowbase-mem-200000"
     test_rc "$runner" "test-lowbase-mem-300000" 0 "$bindir/test-lowbase-mem-300000"
@@ -1347,8 +1349,8 @@ run_suite()
 # observed counts diverge. apple-unknown is the fallback row for SoC strings the
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|242|0"
-    "qemu-aarch64|224|0"
+    "elfuse-aarch64|243|0"
+    "qemu-aarch64|225|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

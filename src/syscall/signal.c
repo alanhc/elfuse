@@ -16,6 +16,11 @@
  */
 
 #include <stdbool.h>
+#include <errno.h>
+#include <signal.h>
+#include <mach/arm/thread_status.h>
+#include <sys/ucontext.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +61,7 @@ _Static_assert(sizeof(linux_rt_sigframe_t) + SIGFRAME_ALIGN - 1 <=
 /* Signal state (module-level, process-wide). */
 static signal_state_t sig_state;
 static _Thread_local int termination_wait_status;
+static _Thread_local host_sigbus_recovery_t host_sigbus_recovery;
 
 /* Per-thread pending fault info. When a synchronous fault (BRK, segfault, etc.)
  * needs to deliver a signal, the caller sets this before
@@ -97,6 +103,106 @@ static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 4 */
  */
 #include <stdatomic.h>
 static _Atomic uint64_t sig_pending_hint = 0;
+
+/* Disposition SIGBUS had before the recovery pad took it over. Restored, rather
+ * than assuming SIG_DFL, so an unguarded fault still reaches whatever the
+ * process had installed.
+ */
+static struct sigaction host_sigbus_prev;
+
+/* Where a recovered fault resumes. The kernel enters this on handler return, so
+ * it is never called directly and runs in ordinary thread context rather than
+ * on the handler's.
+ *
+ * The jump has to happen here rather than in the handler. Jumping straight out
+ * of a signal handler never returns through the wrapper a sanitizer installs
+ * around it, so ThreadSanitizer's per-thread signal bookkeeping is left
+ * inconsistent: measured, the first recovered SIGBUS worked and the second one
+ * deadlocked. Returning normally and letting the kernel resume here keeps that
+ * bookkeeping balanced, and has the side benefit that the thread-local read
+ * below happens outside handler context.
+ */
+static void host_sigbus_resume(void)
+{
+    host_sigbus_recovery.armed = 0;
+    _longjmp(host_sigbus_recovery.env, 1);
+}
+
+static void host_sigbus_handler(int signo, siginfo_t *info, void *ucontext)
+{
+    /* A null si_addr means the signal was sent rather than raised by an access:
+     * measured on Darwin, a hardware fault carries the faulting address and an
+     * external kill -BUS carries 0. si_code cannot make this call, since both
+     * report 1 and sys/signal.h marks BUS_ADRERR and BUS_OBJERR NOTIMP. A
+     * genuine fault at address 0 would be SIGSEGV, not SIGBUS.
+     *
+     * This is decided before the armed check, not after. A kill -BUS that lands
+     * while some thread happens to be inside a guard is not that thread's page
+     * fault, and recovering from it would swallow the signal and hand the
+     * guarded copy a spurious EFAULT.
+     */
+    bool fault = info && info->si_addr;
+
+    if (fault && host_sigbus_recovery.armed && ucontext) {
+        /* Redirect the interrupted context instead of jumping from here; see
+         * host_sigbus_resume. The faulting instruction is never re-executed
+         * because the resume address replaces it.
+         */
+        ucontext_t *uc = ucontext;
+        arm_thread_state64_set_pc_fptr(uc->uc_mcontext->__ss,
+                                       host_sigbus_resume);
+        return;
+    }
+
+    /* Sent signals are re-raised so a kill -BUS still kills on the first one.
+     * raise() is async-signal-safe; signal() is not, which is why the
+     * disposition goes back through sigaction().
+     */
+    sigaction(signo, &host_sigbus_prev, NULL);
+    if (!fault) {
+        raise(signo);
+        return;
+    }
+
+    /* A genuine fault outside any guard is a host bug. Returning re-executes
+     * the faulting instruction against the restored disposition, so the process
+     * dies on the original siginfo with si_addr and the faulting PC intact,
+     * which is the whole point of getting here.
+     *
+     * The restore is process-wide while the pad is per-thread, so for the few
+     * microseconds until this thread re-faults, a guarded fault on another
+     * thread would meet the restored disposition rather than recover. That
+     * cannot change whether the process dies, only which of the two faults the
+     * crash report names.
+     */
+}
+
+static void host_sigbus_install_once(void)
+{
+    struct sigaction sa = {0};
+    sa.sa_sigaction = host_sigbus_handler;
+    sigemptyset(&sa.sa_mask);
+
+    /* SA_NODEFER keeps SIGBUS unblocked inside the handler so the recovery pad
+     * can use the mask-free _setjmp/_longjmp pair. Without it the mask saved by
+     * sigsetjmp would be the only way back to an unblocked state, at the cost
+     * of two sigprocmask traps per guest memory copy.
+     */
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    if (sigaction(SIGBUS, &sa, &host_sigbus_prev) < 0)
+        log_error("sigaction(SIGBUS) failed: %s", strerror(errno));
+}
+
+static void host_sigbus_install(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, host_sigbus_install_once);
+}
+
+host_sigbus_recovery_t *signal_host_sigbus_recovery(void)
+{
+    return &host_sigbus_recovery;
+}
 
 /* Guest ITIMER_REAL emulation. Signal emulation keeps the guest's ITIMER_REAL
  * internally rather than forwarding to the host setitimer(), because macOS
@@ -324,6 +430,7 @@ static _Atomic(guest_t *) attention_guest;
 
 void signal_init(void)
 {
+    host_sigbus_install();
     memset(&sig_state, 0, sizeof(sig_state));
 
     /* Clear the attention singleton on every init pass. Bootstrap and the

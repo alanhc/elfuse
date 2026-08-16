@@ -578,10 +578,20 @@ static inline int guest_read_path(guest_t *g,
                                   size_t long_sz,
                                   const char **out)
 {
-    if (guest_read_str_small(g, gva, short_buf, short_sz) >= 0) {
+    int rc = guest_read_str_small(g, gva, short_buf, short_sz);
+    if (rc >= 0) {
         *out = short_buf;
         return 0;
     }
+
+    /* -2 means a host SIGBUS on the guest page rather than running out of
+     * short_buf. Retrying the same address through the long buffer would only
+     * fault again. guest_read_str_small reports it for both its own fast path
+     * and the boundary-crossing fallback it delegates to.
+     */
+    if (rc == -2)
+        return -LINUX_EFAULT;
+
     if (guest_read_str(g, gva, long_buf, long_sz) >= 0) {
         *out = long_buf;
         return 0;

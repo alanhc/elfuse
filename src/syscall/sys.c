@@ -24,6 +24,8 @@
 
 #include "utils.h"
 
+#include "proved/slice.h"
+
 #include "core/shim-globals.h"
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
@@ -207,19 +209,16 @@ int64_t sys_getrandom(guest_t *g,
     if (buf_gva > UINT64_MAX - buflen)
         return -LINUX_EFAULT;
 
-    uint64_t offset = 0;
-    while (offset < buflen) {
-        uint64_t remaining = buflen - offset, avail = 0;
-        void *dst =
-            guest_ptr_bound(g, buf_gva + offset, &avail, MEM_PERM_W, remaining);
-        if (!dst)
+    /* arc4random_buf takes a libc lock, so it cannot be handed a guest pointer:
+     * see the lock rule on HOST_SIGBUS_GUARD. Stage, then let guest_write do
+     * the copy inside the pad.
+     */
+    uint8_t stage[512];
+    uint64_t offset = 0, chunk;
+    while (slice_clamp(buflen, offset, sizeof(stage), &chunk)) {
+        arc4random_buf(stage, (size_t) chunk);
+        if (guest_write(g, buf_gva + offset, stage, (size_t) chunk) < 0)
             return -LINUX_EFAULT;
-
-        size_t chunk = (size_t) remaining;
-        if (avail < chunk)
-            chunk = (size_t) avail;
-
-        arc4random_buf(dst, chunk);
         offset += chunk;
     }
 
