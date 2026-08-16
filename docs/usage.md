@@ -287,6 +287,10 @@ from targeted ABI translation and emulation at the syscall boundary.
 That has a few direct implications:
 
 - `/proc` and `/dev` are compatibility surfaces, not passthrough mounts.
+- `uname` and `/proc/version` report Linux 6.18 LTS, a stable floor for
+  version-gated feature detection; the implemented syscall set is
+  `src/syscall/dispatch.tbl`. See [internals.md](internals.md), section
+  "Reported Kernel Identity".
 - macOS and Linux file, socket, and signal semantics are normalized in the host
   syscall layer.
 - Behavior is strongest for normal command-line tools, language runtimes, test

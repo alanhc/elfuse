@@ -189,6 +189,9 @@ do.
   mask); the host scheduler picks the actual CPU.
 - `/proc`, `/dev`, and mount data are synthetic compatibility views,
   not host pass-throughs.
+- `uname` and `/proc/version` report Linux 6.18 LTS, a floor for
+  version-gated userspace; `src/syscall/dispatch.tbl` states what is
+  implemented.
 
 ## License
 
