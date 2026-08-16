@@ -1991,10 +1991,21 @@ static int64_t process_vm_copy(guest_t *g,
         if (chunk == 0)
             return copied > 0 ? (int64_t) copied : -LINUX_EFAULT;
 
-        memmove(dst, src, (size_t) chunk);
-        copied += chunk;
-        lo += chunk;
-        ro += chunk;
+        /* Both ends are guest memory touched from host user mode, so either
+         * side can be a vanished MAP_SHARED overlay page. Linux reports a
+         * partial transfer here, or EFAULT when nothing moved.
+         *
+         * The copy reports its own progress rather than being wrapped in a bare
+         * guard: chunk runs to the end of the contiguous region and can be
+         * megabytes, so treating a fault as "this whole chunk moved nothing"
+         * would drop everything the copy had already written.
+         */
+        size_t moved = guest_host_copy_partial(dst, src, (size_t) chunk);
+        copied += moved;
+        lo += moved;
+        ro += moved;
+        if (moved < (size_t) chunk)
+            return copied > 0 ? (int64_t) copied : -LINUX_EFAULT;
     }
 }
 

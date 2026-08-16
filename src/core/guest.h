@@ -1084,6 +1084,15 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max);
  */
 int guest_read_str_small(const guest_t *g, uint64_t gva, char *dst, size_t max);
 
+/* Copy between two resolved host pointers with host SIGBUS recovery armed.
+ *
+ * Returns the number of bytes that landed, which is len when nothing faulted
+ * and less when a backing page vanished partway. Callers reporting a partial
+ * transfer use this instead of guest_host_memcpy, which can only say whether
+ * the whole copy survived.
+ */
+size_t guest_host_copy_partial(void *dst, const void *src, size_t len);
+
 /* Build L0->L1->L2 page tables from an array of memory regions. Uses 2MiB block
  * descriptors.
  *

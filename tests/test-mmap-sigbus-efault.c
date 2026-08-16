@@ -227,12 +227,40 @@ static void test_urandom_read(void)
     close(fd);
 }
 
+/* The host-side memmove in process_vm_readv, guest memory on both ends. */
+static void test_process_vm_readv(void)
+{
+    TEST("process_vm_readv from truncated MAP_SHARED returns EFAULT");
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    int fd = -1;
+    char *p = map_then_truncate(page, &fd);
+    if (!p)
+        return;
+
+    char dst[64];
+    struct iovec local = {.iov_base = dst, .iov_len = sizeof(dst)};
+    struct iovec remote = {.iov_base = p, .iov_len = sizeof(dst)};
+
+    errno = 0;
+    long rc = syscall(SYS_process_vm_readv, (long) getpid(), &local, 1UL,
+                      &remote, 1UL, 0UL);
+
+    /* ENOSYS is an acceptable outcome: the point is that elfuse survives. */
+    EXPECT_TRUE(rc < 0 && (errno == EFAULT || errno == ENOSYS),
+                "process_vm_readv should fail rather than kill the host");
+
+    munmap(p, page);
+    close(fd);
+}
+
 int main(void)
 {
     test_path_copy();
     test_futex_word();
     test_getrandom_fill();
     test_urandom_read();
+    test_process_vm_readv();
     SUMMARY("test-mmap-sigbus-efault");
     return fails ? 1 : 0;
 }

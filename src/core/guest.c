@@ -76,6 +76,53 @@ static int guest_host_memcpy(void *dst, const void *src, size_t len)
     return faulted ? -1 : 0;
 }
 
+/* Copy between two already-resolved host pointers with the pad armed, returning
+ * how many bytes landed.
+ *
+ * guest_host_memcpy can only say whether the whole copy survived, so a caller
+ * reporting a partial transfer had to fall back to the count from before the
+ * copy and lose whatever the faulting copy had already moved. Stepping bounds
+ * that, but only if a step cannot itself be torn: each one is cut at the next
+ * page boundary on whichever side reaches one first, so it lies within a single
+ * page at both ends. A page is the granularity at which backing vanishes, so
+ * such a step either lands whole or faults whole, and done is exact rather than
+ * approximate. A flat stride would not do: unaligned against the real
+ * boundaries by up to a page, it could tear and lose what it had written.
+ *
+ * The unit is the guest page rather than the host's 16 KiB, so the granularity
+ * holds whichever side vanished. done is volatile because it is the one value
+ * read after the jump.
+ *
+ * Exact has one exception, and it is a race rather than a miscount: a truncate
+ * landing while a step is mid-copy can take the page after part of that step
+ * has been written, and those bytes go unreported. The error is bounded by one
+ * page and is always an under-report, which callers absorb because a short
+ * count means resume-from-here and re-copying is idempotent. si_addr cannot
+ * close it: nothing specifies the order memmove touches its range in, so the
+ * faulting address does not say how much of the step had landed.
+ */
+size_t guest_host_copy_partial(void *dst, const void *src, size_t len)
+{
+    volatile size_t done = 0;
+    bool faulted;
+    uintptr_t d = (uintptr_t) dst, s = (uintptr_t) src;
+
+    HOST_SIGBUS_GUARD(
+        faulted, while (done < len) {
+            size_t to_d =
+                GUEST_PAGE_SIZE - ((d + done) & (GUEST_PAGE_SIZE - 1));
+            size_t to_s =
+                GUEST_PAGE_SIZE - ((s + done) & (GUEST_PAGE_SIZE - 1));
+            size_t unit = to_d < to_s ? to_d : to_s;
+            if (unit > len - done)
+                unit = len - done;
+            memmove((uint8_t *) dst + done, (const uint8_t *) src + done, unit);
+            done += unit;
+        });
+    (void) faulted;
+    return done;
+}
+
 static const void *guest_host_memchr(const void *src,
                                      int c,
                                      size_t len,
