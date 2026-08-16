@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/utsname.h>
 
 #include "test-harness.h"
 #include "test-util.h"
@@ -108,6 +109,20 @@ int main(void)
             EXPECT_TRUE(!strncmp(buf, "Linux version", 13), "wrong prefix");
         } else
             FAIL("read failed");
+    }
+
+    /* /proc/version and uname(2) describe one kernel, so the release the
+     * banner carries has to be the release uname reports.
+     */
+    TEST("/proc/version matches uname");
+    {
+        char buf[512];
+        struct utsname uts;
+        ssize_t n = read_file_nul("/proc/version", buf, sizeof(buf));
+        if (n > 0 && uname(&uts) == 0)
+            EXPECT_TRUE(strstr(buf, uts.release), "release disagrees");
+        else
+            FAIL("read or uname failed");
     }
 
     /* /proc/filesystems: should contain at least one fs type */

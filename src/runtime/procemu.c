@@ -2736,11 +2736,11 @@ int proc_intercept_open(const guest_t *g,
     /* /proc/version -> synthetic kernel version string */
     if (!strcmp(path, "/proc/version")) {
         return proc_emit_literal(
-            "Linux version 6.17.0-20-generic "
-            "(buildd@bos03-arm64-051) "
+            "Linux version " GUEST_KERNEL_RELEASE
+            " (buildd@bos03-arm64-051) "
             "(aarch64-linux-gnu-gcc (Ubuntu 15.2.0-4ubuntu4) "
-            "15.2.0, GNU ld (GNU Binutils for Ubuntu) 2.45) "
-            "#20-Ubuntu SMP PREEMPT_DYNAMIC\n");
+            "15.2.0, GNU ld (GNU Binutils for Ubuntu) "
+            "2.45) " GUEST_KERNEL_VERSION "\n");
     }
 
     /* /proc/filesystems, /proc/self/mountinfo, /proc/mounts, /etc/mtab. */

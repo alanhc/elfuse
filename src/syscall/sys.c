@@ -44,8 +44,8 @@ static const linux_utsname_t cached_uname = {
     /* Kernel version: match the lima aarch64 VM kernel to avoid version-gated
      * feature detection mismatches in userspace.
      */
-    .release = "6.17.0-20-generic",
-    .version = "#20-Ubuntu SMP PREEMPT_DYNAMIC",
+    .release = GUEST_KERNEL_RELEASE,
+    .version = GUEST_KERNEL_VERSION,
     .machine = "aarch64",
     .domainname = "(none)",
 };

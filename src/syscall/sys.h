@@ -15,6 +15,12 @@
 #include <stdint.h>
 #include "core/guest.h"
 
+/* Guest-visible kernel identity, shared by uname(2) and /proc/version so the
+ * two cannot drift apart. tests/test-proc.c pins them to each other.
+ */
+#define GUEST_KERNEL_RELEASE "6.17.0-20-generic"
+#define GUEST_KERNEL_VERSION "#20-Ubuntu SMP PREEMPT_DYNAMIC"
+
 /* System info syscall handlers. */
 
 int64_t sys_uname(guest_t *g, uint64_t buf_gva);
