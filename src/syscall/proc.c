@@ -3574,6 +3574,7 @@ static bool vcpu_handle_bad_exception(guest_t *g,
  * Both modes check proc_exit_group_requested so the main thread also reacts to
  * exit_group called by a worker.
  */
+/* NOLINTNEXTLINE(readability-function-size) */
 int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                              hv_vcpu_exit_t *vexit,
                              guest_t *g,

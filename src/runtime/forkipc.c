@@ -82,6 +82,7 @@ void fork_notify_vfork_exec(void)
     fork_child_vfork_notify_fd = -1;
 }
 
+/* NOLINTNEXTLINE(readability-function-size) */
 int fork_child_main(int ipc_fd,
                     int vfork_notify_fd,
                     bool verbose,
@@ -1478,6 +1479,7 @@ static int fork_snapshot_shm_via_clonefile(int src_fd)
     return clone_fd;
 }
 
+/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_clone(hv_vcpu_t vcpu,
                   guest_t *g,
                   uint64_t flags,

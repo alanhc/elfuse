@@ -24,6 +24,7 @@ Checks: >
   misc-redundant-expression,
   performance-*,
   -performance-no-int-to-ptr,
+  readability-function-size,
   readability-inconsistent-declaration-parameter-name
 
 WarningsAsErrors: ''
@@ -31,3 +32,35 @@ HeaderFilterRegex: 'src/.*\.h$'
 CheckOptions:
   - key: bugprone-unsafe-functions.ReportMoreUnsafeFunctions
     value: false
+  # A ceiling, not a target. Nothing else in the tree measures how big a
+  # function has grown, so a syscall body could and did reach four figures
+  # without any gate noticing.
+  #
+  # With the eleven NOLINT suppressions in place the check reports nothing on
+  # this tree today, and all eleven are load-bearing: clang-tidy accounts for
+  # exactly eleven NOLINT suppressions on a full run. That is not the same as
+  # 400 being a comfortable margin. Eleven further functions already exceed
+  # 250 lines by this check's own counting, which includes comments and blank
+  # lines, so the next function to cross 400 is more likely to be one of those
+  # than anything newly written. Expect this to land on existing code first.
+  #
+  # Advisory, like every other check here: WarningsAsErrors is empty and the
+  # tidy CI job says out loud that it logs rather than gates, so this reports
+  # a new oversized function, it does not stop one. Making it a real gate
+  # means naming it in WarningsAsErrors, which is a policy change and not one
+  # this threshold makes on its own.
+  #
+  # The other size axes stay off (-1) because the line count is the one that
+  # correlates with a body no reader can hold at once.
+  - key: readability-function-size.LineThreshold
+    value: 400
+  - key: readability-function-size.StatementThreshold
+    value: -1
+  - key: readability-function-size.BranchThreshold
+    value: -1
+  - key: readability-function-size.ParameterThreshold
+    value: -1
+  - key: readability-function-size.NestingThreshold
+    value: -1
+  - key: readability-function-size.VariableThreshold
+    value: -1

@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions that are not guessable from the code - the seven-rule commit message style, ASCII-only source comments, kebab-case filenames, the type and return conventions at the ABI boundary, the untracked root working docs, and externals/ being evaluation-only. Use when drafting a commit message or PR description, adding a new file or a new type, or touching anything under externals/.
+description: elfuse conventions that are not guessable from the code - the seven-rule commit message style, ASCII-only source comments, kebab-case filenames, the type and return conventions at the ABI boundary, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
 ---
 
 # elfuse conventions
@@ -48,7 +48,9 @@ Filenames use kebab-case, never underscore. Symbol names use snake_case.
 ## Code
 
 The conventions below are the ones that come from this project being a Linux
-ABI reimplementation rather than an ordinary C program.
+ABI reimplementation rather than an ordinary C program. They settle what a
+declaration looks like, not whether the function should exist; for judging and
+cleaning code that already works, `elfuse-refactor` is the calibration set.
 
 Fixed-width types for anything the guest defines: guest addresses, Linux ABI
 structures, binary layouts, protocol fields, page-table entries. Host-side
@@ -85,20 +87,27 @@ module.
 New C tests are `tests/test-<feature>.c` and use the shared harness macros
 rather than rolling their own reporting.
 
-## externals/
+## Vendored tools checked out for evaluation
 
-Tools vendored under `externals/` (`ls externals/` for what is actually
-checked out locally) are for evaluation and discovery.
+A third-party tool checked out into an untracked directory to be tried out is
+for evaluation and discovery only. Nothing in the build may come to depend on
+it: no make target, no script, no CI job, and no documented workflow step. It
+is absent from a fresh clone, so anything that reaches for it breaks for the
+next person and cannot run in CI.
 
-`externals/` is gitignored, so anything that depends on it breaks on a fresh
-clone and cannot run in CI. That single fact settles every case: no make
-target, no script, no CI job, no documented workflow step may reference it.
-
-Run such a tool by hand from a scratch directory and leave any fixes to the
-tool inside its own checkout. Record the outcome in the root working docs,
+Run such a tool by hand from a scratch directory and leave any fixes to it
+inside its own checkout. Record the outcome in the root working docs,
 including when the answer was "evaluated, not integrated" - a rejected
 evaluation is worth writing down so the next person does not repeat it. If the
 output is worth keeping, land the finding in tree, not the tool.
+
+Being untracked is not itself the test, and reading it that way gets the rule
+backwards. The test fixtures are untracked too, and the build depends on them
+on purpose: a make variable points at them, `make distclean` removes them, CI
+restores them from a cache before the lanes that need them, and
+`docs/testing.md` documents the paths the suites resolve. What makes that legitimate is that a tracked script fetches them, so
+a fresh clone can reproduce the tree it needs. An evaluation checkout has no
+such script, and that is the difference.
 
 ## Commit messages
 

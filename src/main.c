@@ -219,6 +219,7 @@ static int host_dc_zva_assert(void)
 #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
 #define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
 
+/* NOLINTNEXTLINE(readability-function-size) */
 int main(int argc, char **argv)
 {
     log_init();

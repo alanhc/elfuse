@@ -402,22 +402,105 @@ invalid:
     return -LINUX_EFAULT;
 }
 
+/* The source VMA metadata mremap carries into the new mapping, plus the
+ * duplicated backing descriptors the move owns until a region accepts them. A
+ * range split at the inherited/private boundary becomes two regions and so
+ * needs a second descriptor.
+ *
+ * The three mremap paths (grow in place, move, fixed move) each built this by
+ * hand and each repeated the same two-descriptor release on every failure exit.
+ * Keeping the descriptors here is what lets mremap_track_dispose be the single
+ * place that releases them, so a new failure exit cannot leak one by forgetting
+ * half of the pair.
+ */
+typedef struct {
+    int prot;
+    int flags;
+    uint64_t offset;
+    uint64_t inherited_size;
+    uint64_t vma_id;
+    int backing_fd;
+    int tail_backing_fd;
+    char name[sizeof(((guest_region_t *) 0)->name)];
+} mremap_track_t;
+
+/* Release whatever descriptors the tracker still owns. Idempotent, so a failure
+ * exit may call it after ownership has already moved to a region.
+ */
+static void mremap_track_dispose(mremap_track_t *track)
+{
+    close_keep_errno(track->backing_fd);
+    close_keep_errno(track->tail_backing_fd);
+    track->backing_fd = -1;
+    track->tail_backing_fd = -1;
+}
+
+/* Whether the range splits at the inherited/private boundary, which is what
+ * makes it two regions holding two descriptors rather than one of each.
+ */
+static bool mremap_track_splits(const mremap_track_t *track, uint64_t new_size)
+{
+    return track->inherited_size > 0 && track->inherited_size < new_size;
+}
+
+/* Snapshot src_reg and duplicate the descriptors the new mapping will own.
+ * Returns false with every descriptor already released, so the caller only has
+ * to report ENOMEM.
+ *
+ * inherited_size is normalized here rather than at the point of use: the
+ * source's inherited prefix only accumulates across regions that carry
+ * inherited_at_fork, so a zero prefix and a not-inherited source are the same
+ * fact and the tracker records it once.
+ */
+static bool mremap_track_init(mremap_track_t *track,
+                              const guest_region_t *src_reg,
+                              uint64_t old_off,
+                              uint64_t inherited_size,
+                              uint64_t new_size,
+                              uint64_t vma_id)
+{
+    memset(track, 0, sizeof(*track));
+    track->prot = src_reg->prot;
+    track->flags = src_reg->flags;
+    track->offset = src_reg->offset + (old_off - src_reg->start);
+    track->inherited_size = src_reg->inherited_at_fork ? inherited_size : 0;
+    track->vma_id = vma_id;
+    track->tail_backing_fd = -1;
+    track->backing_fd = dup_region_backing_fd(src_reg);
+    if (src_reg->backing_fd >= 0 && track->backing_fd < 0)
+        return false;
+    str_copy_trunc(track->name, src_reg->name, sizeof(track->name));
+
+    if (mremap_track_splits(track, new_size) && track->backing_fd >= 0) {
+        track->tail_backing_fd = dup(track->backing_fd);
+        if (track->tail_backing_fd < 0) {
+            mremap_track_dispose(track);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Takes ownership of both tracker descriptors on entry, so every exit below,
+ * including the failures, has already accounted for them.
+ */
 static int add_mremap_region(guest_t *g,
                              uint64_t start,
                              uint64_t old_size,
                              uint64_t new_size,
-                             int prot,
-                             int flags,
-                             uint64_t offset,
-                             const char *name,
-                             int backing_fd,
-                             bool inherited_at_fork,
-                             uint64_t inherited_size,
-                             int tail_backing_fd,
-                             uint64_t vma_id)
+                             mremap_track_t *track)
 {
-    if (!inherited_at_fork)
-        inherited_size = 0;
+    int prot = track->prot;
+    int flags = track->flags;
+    uint64_t offset = track->offset;
+    uint64_t vma_id = track->vma_id;
+    uint64_t inherited_size = track->inherited_size;
+    const char *name = track->name[0] ? track->name : NULL;
+    int backing_fd = track->backing_fd;
+    int tail_backing_fd = track->tail_backing_fd;
+    track->backing_fd = -1;
+    track->tail_backing_fd = -1;
+
     if (inherited_size > old_size)
         inherited_size = old_size;
     if (inherited_size > new_size)
@@ -805,6 +888,7 @@ static bool high_va_replaceable_gpa_base(guest_t *g,
     return true;
 }
 
+/* NOLINTNEXTLINE(readability-function-size) */
 static int64_t sys_mmap_high_va(guest_t *g,
                                 uint64_t addr,
                                 uint64_t length,
@@ -1622,6 +1706,57 @@ static void dispose_region_snapshots(region_snapshot_t **snaps_ptr, int *n_ptr)
     }
     if (n_ptr)
         *n_ptr = 0;
+}
+
+/* Everything a relocating mremap owns while it is in flight: the tracker, the
+ * before-images it may have to restore, the private copy of the region array,
+ * and the two reserved removal descriptors.
+ *
+ * It exists because the relocating path has eighteen exits and each of them
+ * used to hand-release its own subset in its own order. Releasing a subset is
+ * the failure mode worth designing out: every one of these primitives is
+ * already idempotent and clears what it releases, so one call that releases all
+ * of them is correct at every exit, and a nineteenth exit cannot leak by
+ * forgetting one.
+ */
+typedef struct {
+    mremap_track_t track;
+    region_snapshot_t *source_snaps;
+    region_snapshot_t *dest_snaps;
+    int source_nsnaps;
+    int dest_nsnaps;
+    region_array_txn_t txn;
+    int source_remove_fd;
+    int dest_remove_fd;
+} mremap_move_t;
+
+static void mremap_move_init(mremap_move_t *move)
+{
+    memset(move, 0, sizeof(*move));
+    move->track.backing_fd = -1;
+    move->track.tail_backing_fd = -1;
+    move->source_remove_fd = -1;
+    move->dest_remove_fd = -1;
+}
+
+/* Release whatever the move still owns, in any state.
+ *
+ * Rolling the region array back is deliberately not here. Before the array
+ * transaction is committed a failing exit has to roll it back, and after the
+ * commit it must not, so that choice stays at the exit that knows which side of
+ * the commit it is on. This only finishes the transaction, which is safe either
+ * way.
+ */
+static void mremap_move_dispose(mremap_move_t *move)
+{
+    dispose_region_snapshots(&move->dest_snaps, &move->dest_nsnaps);
+    dispose_region_snapshots(&move->source_snaps, &move->source_nsnaps);
+    finish_region_array_txn(&move->txn);
+    mremap_track_dispose(&move->track);
+    close_keep_errno(move->source_remove_fd);
+    move->source_remove_fd = -1;
+    close_keep_errno(move->dest_remove_fd);
+    move->dest_remove_fd = -1;
 }
 
 static int capture_region_snapshots(guest_t *g,
@@ -2520,6 +2655,7 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
     return (int64_t) guest_ipa(g, g->brk_current);
 }
 
+/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,
                  uint64_t length,
@@ -3335,6 +3471,7 @@ int64_t sys_mmap(guest_t *g,
 
 /* sys_mremap. */
 
+/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_mremap(guest_t *g,
                    uint64_t old_addr,
                    uint64_t old_size,
@@ -3492,61 +3629,34 @@ int64_t sys_mremap(guest_t *g,
          * metadata. The overlap check above prevents this case, but capturing
          * first is still the safe ordering.
          */
-        const guest_region_t *old_reg = src_reg;
-        int prot =
-            old_reg ? old_reg->prot : (LINUX_PROT_READ | LINUX_PROT_WRITE);
-        int track_flags = old_reg ? old_reg->flags
-                                  : (LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS);
-        uint64_t track_offset =
-            old_reg ? old_reg->offset + (old_off - old_reg->start) : 0;
-        int track_backing_fd = dup_region_backing_fd(old_reg);
-        if (old_reg && old_reg->backing_fd >= 0 && track_backing_fd < 0)
+        mremap_move_t move;
+        mremap_move_init(&move);
+        if (!mremap_track_init(&move.track, src_reg, old_off,
+                               source_inherited_size, new_size,
+                               source_vma_id)) {
+            mremap_move_dispose(&move);
             return finish_mremap(&source, -LINUX_ENOMEM);
-        int tail_backing_fd = -1;
-        if (source_inherited_size > 0 && source_inherited_size < new_size &&
-            track_backing_fd >= 0) {
-            tail_backing_fd = dup(track_backing_fd);
-            if (tail_backing_fd < 0) {
-                close(track_backing_fd);
-                return finish_mremap(&source, -LINUX_ENOMEM);
-            }
         }
         bool source_overlay = mremap_source_has_overlay(&source);
-        bool source_backing_ro = old_reg && old_reg->backing_ro;
-        bool source_inherited_at_fork = old_reg && old_reg->inherited_at_fork;
-        int added_regions =
-            source_inherited_size > 0 && source_inherited_size < new_size ? 2
-                                                                          : 1;
+        bool source_backing_ro = src_reg->backing_ro;
+        int added_regions = mremap_track_splits(&move.track, new_size) ? 2 : 1;
         if (!region_has_capacity_after_removes(g, removed, 2, added_regions)) {
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+            mremap_move_dispose(&move);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
-        char track_name[sizeof(old_reg->name)] = {0};
 
         /* Heap-allocated to avoid blowing the ~512 KiB default macOS thread
          * stack: each region_snapshot_t array is GUEST_MAX_REGIONS *
          * sizeof(region_snapshot_t), so two of them on the stack would be close
-         * to a megabyte. Freed via dispose_region_snapshots on every exit path
-         * below.
+         * to a megabyte. Released by mremap_move_dispose on every exit path
+         * below, including the successful one.
          */
-        region_snapshot_t *source_snaps = NULL;
-        region_snapshot_t *dest_snaps = NULL;
-        int source_nsnaps = 0, dest_nsnaps = 0;
-        if (old_reg)
-            str_copy_trunc(track_name, old_reg->name, sizeof(track_name));
 
-        source_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*source_snaps));
-        dest_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*dest_snaps));
-        if (!source_snaps || !dest_snaps) {
-            free(source_snaps);
-            free(dest_snaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+        move.source_snaps =
+            malloc(GUEST_MAX_REGIONS * sizeof(*move.source_snaps));
+        move.dest_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*move.dest_snaps));
+        if (!move.source_snaps || !move.dest_snaps) {
+            mremap_move_dispose(&move);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
 
@@ -3555,56 +3665,35 @@ int64_t sys_mremap(guest_t *g,
          * successful source capture if destination capture or the preflight
          * shared-file flush fails afterward.
          */
-        region_array_txn_t capture_txn;
-        int capture_txn_err = begin_region_array_txn(g, &capture_txn);
+        int capture_txn_err = begin_region_array_txn(g, &move.txn);
         if (capture_txn_err < 0) {
-            free(source_snaps);
-            free(dest_snaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+            mremap_move_dispose(&move);
             return finish_mremap(&source, capture_txn_err);
         }
 
-        source_nsnaps = capture_region_snapshots(
-            g, old_off, old_off + old_size, source_snaps, GUEST_MAX_REGIONS);
-        if (source_nsnaps < 0) {
-            rollback_region_array_txn(g, &capture_txn);
-            finish_region_array_txn(&capture_txn);
-            free(source_snaps);
-            free(dest_snaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
-            return finish_mremap(&source, source_nsnaps);
+        move.source_nsnaps =
+            capture_region_snapshots(g, old_off, old_off + old_size,
+                                     move.source_snaps, GUEST_MAX_REGIONS);
+        if (move.source_nsnaps < 0) {
+            int snapshot_err = move.source_nsnaps;
+            rollback_region_array_txn(g, &move.txn);
+            mremap_move_dispose(&move);
+            return finish_mremap(&source, snapshot_err);
         }
-        int rebind_err =
-            rebind_mremap_source_backings(&source, source_snaps, source_nsnaps);
+        int rebind_err = rebind_mremap_source_backings(
+            &source, move.source_snaps, move.source_nsnaps);
         if (rebind_err < 0) {
-            rollback_region_array_txn(g, &capture_txn);
-            finish_region_array_txn(&capture_txn);
-            dispose_region_snapshots(&source_snaps, &source_nsnaps);
-            free(dest_snaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+            rollback_region_array_txn(g, &move.txn);
+            mremap_move_dispose(&move);
             return finish_mremap(&source, rebind_err);
         }
-        dest_nsnaps = capture_region_snapshots(g, new_off, new_off + new_size,
-                                               dest_snaps, GUEST_MAX_REGIONS);
-        if (dest_nsnaps < 0) {
-            rollback_region_array_txn(g, &capture_txn);
-            finish_region_array_txn(&capture_txn);
-            dispose_region_snapshots(&source_snaps, &source_nsnaps);
-            free(dest_snaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
-            return finish_mremap(&source, dest_nsnaps);
+        move.dest_nsnaps = capture_region_snapshots(
+            g, new_off, new_off + new_size, move.dest_snaps, GUEST_MAX_REGIONS);
+        if (move.dest_nsnaps < 0) {
+            int snapshot_err = move.dest_nsnaps;
+            rollback_region_array_txn(g, &move.txn);
+            mremap_move_dispose(&move);
+            return finish_mremap(&source, snapshot_err);
         }
 
         /* Reserve the backing descriptors needed by both removals before any
@@ -3613,61 +3702,30 @@ int64_t sys_mremap(guest_t *g,
          * final metadata shape while the outer transaction can still roll it
          * back if either reservation fails.
          */
-        int source_remove_fd = -1;
-        int dest_remove_fd = -1;
         if (guest_region_remove_prepare(g, old_off, old_off + old_size,
-                                        &source_remove_fd) < 0 ||
+                                        &move.source_remove_fd) < 0 ||
             guest_region_remove_prepare(g, new_off, new_off + new_size,
-                                        &dest_remove_fd) < 0) {
-            if (source_remove_fd >= 0)
-                close(source_remove_fd);
-            if (dest_remove_fd >= 0)
-                close(dest_remove_fd);
-            rollback_region_array_txn(g, &capture_txn);
-            finish_region_array_txn(&capture_txn);
-            dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
-            dispose_region_snapshots(&source_snaps, &source_nsnaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+                                        &move.dest_remove_fd) < 0) {
+            rollback_region_array_txn(g, &move.txn);
+            mremap_move_dispose(&move);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
 
         int64_t flush_err = flush_mremap_source_shared(g, &source);
         if (flush_err < 0) {
-            rollback_region_array_txn(g, &capture_txn);
-            finish_region_array_txn(&capture_txn);
-            dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
-            dispose_region_snapshots(&source_snaps, &source_nsnaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
-            if (source_remove_fd >= 0)
-                close(source_remove_fd);
-            if (dest_remove_fd >= 0)
-                close(dest_remove_fd);
+            rollback_region_array_txn(g, &move.txn);
+            mremap_move_dispose(&move);
             return finish_mremap(&source, flush_err);
         }
-        finish_region_array_txn(&capture_txn);
+        finish_region_array_txn(&move.txn);
 
         if (source_overlay) {
             int cleanup_err =
                 cleanup_overlays_in_range(g, old_off, old_off + old_size);
             if (cleanup_err < 0) {
-                (void) restore_snapshot_overlays_in_place(g, source_snaps,
-                                                          source_nsnaps);
-                dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
-                dispose_region_snapshots(&source_snaps, &source_nsnaps);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (tail_backing_fd >= 0)
-                    close(tail_backing_fd);
-                if (source_remove_fd >= 0)
-                    close(source_remove_fd);
-                if (dest_remove_fd >= 0)
-                    close(dest_remove_fd);
+                (void) restore_snapshot_overlays_in_place(g, move.source_snaps,
+                                                          move.source_nsnaps);
+                mremap_move_dispose(&move);
                 return finish_mremap(&source, cleanup_err);
             }
         }
@@ -3676,63 +3734,27 @@ int64_t sys_mremap(guest_t *g,
             cleanup_overlays_in_range(g, new_off, new_off + new_size);
         if (cleanup_err < 0) {
             int restore_err = restore_snapshot_overlays_in_place(
-                g, source_snaps, source_nsnaps);
+                g, move.source_snaps, move.source_nsnaps);
             if (restore_err < 0) {
-                dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
-                dispose_region_snapshots(&source_snaps, &source_nsnaps);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (tail_backing_fd >= 0)
-                    close(tail_backing_fd);
-                if (source_remove_fd >= 0)
-                    close(source_remove_fd);
-                if (dest_remove_fd >= 0)
-                    close(dest_remove_fd);
+                mremap_move_dispose(&move);
                 return finish_mremap(&source, restore_err);
             }
-            (void) restore_snapshot_overlays_in_place(g, dest_snaps,
-                                                      dest_nsnaps);
-            dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
-            dispose_region_snapshots(&source_snaps, &source_nsnaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
-            if (source_remove_fd >= 0)
-                close(source_remove_fd);
-            if (dest_remove_fd >= 0)
-                close(dest_remove_fd);
+            (void) restore_snapshot_overlays_in_place(g, move.dest_snaps,
+                                                      move.dest_nsnaps);
+            mremap_move_dispose(&move);
             return finish_mremap(&source, cleanup_err);
         }
 
-        if (mremap_extend_range(g, new_off, new_size, prot) < 0) {
+        if (mremap_extend_range(g, new_off, new_size, move.track.prot) < 0) {
             int restore_err = restore_snapshot_overlays_in_place(
-                g, source_snaps, source_nsnaps);
+                g, move.source_snaps, move.source_nsnaps);
             if (restore_err < 0) {
-                dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
-                dispose_region_snapshots(&source_snaps, &source_nsnaps);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (tail_backing_fd >= 0)
-                    close(tail_backing_fd);
-                if (source_remove_fd >= 0)
-                    close(source_remove_fd);
-                if (dest_remove_fd >= 0)
-                    close(dest_remove_fd);
+                mremap_move_dispose(&move);
                 return finish_mremap(&source, restore_err);
             }
-            (void) restore_snapshot_overlays_in_place(g, dest_snaps,
-                                                      dest_nsnaps);
-            dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
-            dispose_region_snapshots(&source_snaps, &source_nsnaps);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
-            if (source_remove_fd >= 0)
-                close(source_remove_fd);
-            if (dest_remove_fd >= 0)
-                close(dest_remove_fd);
+            (void) restore_snapshot_overlays_in_place(g, move.dest_snaps,
+                                                      move.dest_nsnaps);
+            mremap_move_dispose(&move);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
 
@@ -3740,8 +3762,8 @@ int64_t sys_mremap(guest_t *g,
          * preparation is complete.
          */
         guest_region_remove_reserved(g, new_off, new_off + new_size,
-                                     dest_remove_fd);
-        dest_remove_fd = -1;
+                                     move.dest_remove_fd);
+        move.dest_remove_fd = -1;
 
         /* Copy each logical source segment according to its own backing state.
          * The destination receives a private snapshot at mremap time (no
@@ -3749,7 +3771,7 @@ int64_t sys_mremap(guest_t *g,
          * subsequent writes consistent.
          */
         uint64_t copy_len = old_size < new_size ? old_size : new_size;
-        if (prot == LINUX_PROT_NONE) {
+        if (move.track.prot == LINUX_PROT_NONE) {
             memset((uint8_t *) g->host_base + new_off, 0, new_size);
         } else {
             if (source_overlay)
@@ -3758,11 +3780,11 @@ int64_t sys_mremap(guest_t *g,
                 copy_mremap_source(g, new_off, old_off, copy_len, &source);
             if (copy_err < 0) {
                 int restore_err = restore_snapshot_overlays_in_place(
-                    g, source_snaps, source_nsnaps);
+                    g, move.source_snaps, move.source_nsnaps);
                 if (restore_err < 0)
                     copy_err = restore_err;
-                restore_err =
-                    restore_region_snapshots(g, dest_snaps, dest_nsnaps);
+                restore_err = restore_region_snapshots(g, move.dest_snaps,
+                                                       move.dest_nsnaps);
 
                 /* Re-establish the destination's page-table state to match the
                  * regions we just restored. mremap_extend_range above had
@@ -3772,19 +3794,15 @@ int64_t sys_mremap(guest_t *g,
                  * restore) says nothing is mapped.
                  */
                 int pt_err = restore_snapshot_page_tables(
-                    g, new_off, new_off + new_size, dest_snaps, dest_nsnaps);
+                    g, new_off, new_off + new_size, move.dest_snaps,
+                    move.dest_nsnaps);
                 if (pt_err < 0 && restore_err >= 0)
                     restore_err = pt_err;
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (tail_backing_fd >= 0)
-                    close(tail_backing_fd);
-                if (source_remove_fd >= 0)
-                    close(source_remove_fd);
-                dispose_region_snapshots(&source_snaps, &source_nsnaps);
-                dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
-                if (restore_err < 0)
+                if (restore_err < 0) {
+                    mremap_move_dispose(&move);
                     return finish_mremap(&source, restore_err);
+                }
+                mremap_move_dispose(&move);
                 return finish_mremap(&source, copy_err);
             }
         }
@@ -3798,8 +3816,8 @@ int64_t sys_mremap(guest_t *g,
             memset(host_ptr_for_gpa(g, src_gpa_base + (old_off - src_start)), 0,
                    old_size);
             guest_region_remove_reserved(g, old_off, old_off + old_size,
-                                         source_remove_fd);
-            source_remove_fd = -1;
+                                         move.source_remove_fd);
+            move.source_remove_fd = -1;
             guest_invalidate_ptes(g, old_off, old_off + old_size);
             if (old_off < g->mmap_rw_gap_hint)
                 g->mmap_rw_gap_hint = old_off;
@@ -3807,20 +3825,16 @@ int64_t sys_mremap(guest_t *g,
                 g->mmap_rx_gap_hint = old_off;
         }
 
-        if (add_mremap_region(g, new_off, old_size, new_size, prot, track_flags,
-                              track_offset, track_name[0] ? track_name : NULL,
-                              track_backing_fd, source_inherited_at_fork,
-                              source_inherited_size, tail_backing_fd,
-                              source_vma_id) < 0) {
-            (void) restore_region_snapshots(g, dest_snaps, dest_nsnaps);
-            dispose_region_snapshots(&source_snaps, &source_nsnaps);
-            dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
+        if (add_mremap_region(g, new_off, old_size, new_size, &move.track) <
+            0) {
+            (void) restore_region_snapshots(g, move.dest_snaps,
+                                            move.dest_nsnaps);
+            mremap_move_dispose(&move);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
         if (source_backing_ro)
             mark_region_backing_ro(g, new_off, new_off + new_size);
-        dispose_region_snapshots(&source_snaps, &source_nsnaps);
-        dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
+        mremap_move_dispose(&move);
         return finish_mremap(&source, (int64_t) guest_ipa(g, new_off));
     }
 
@@ -3855,64 +3869,28 @@ int64_t sys_mremap(guest_t *g,
             if (can_grow) {
                 remove_range_t removed = {old_off, old_off + old_size};
                 /* Extend in place */
-                const guest_region_t *old_reg = src_reg;
-                int prot = old_reg ? old_reg->prot
-                                   : (LINUX_PROT_READ | LINUX_PROT_WRITE);
-                int track_flags =
-                    old_reg ? old_reg->flags
-                            : (LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS);
-                uint64_t track_offset =
-                    old_reg ? old_reg->offset + (old_off - old_reg->start) : 0;
-                int track_backing_fd = dup_region_backing_fd(old_reg);
-                int tail_backing_fd = -1;
-                if (source_inherited_size > 0 &&
-                    source_inherited_size < new_size && track_backing_fd >= 0) {
-                    tail_backing_fd = dup(track_backing_fd);
-                    if (tail_backing_fd < 0) {
-                        close(track_backing_fd);
-                        return finish_mremap(&source, -LINUX_ENOMEM);
-                    }
-                }
-                bool old_backing_ro = old_reg && old_reg->backing_ro;
-                bool old_inherited_at_fork =
-                    old_reg && old_reg->inherited_at_fork;
-                int added_regions = source_inherited_size > 0 &&
-                                            source_inherited_size < new_size
-                                        ? 2
-                                        : 1;
+                mremap_track_t track;
+                if (!mremap_track_init(&track, src_reg, old_off,
+                                       source_inherited_size, new_size,
+                                       source_vma_id))
+                    return finish_mremap(&source, -LINUX_ENOMEM);
+                bool old_backing_ro = src_reg->backing_ro;
+                int added_regions =
+                    mremap_track_splits(&track, new_size) ? 2 : 1;
                 if (!region_has_capacity_after_removes(g, &removed, 1,
                                                        added_regions)) {
-                    if (track_backing_fd >= 0)
-                        close(track_backing_fd);
-                    if (tail_backing_fd >= 0)
-                        close(tail_backing_fd);
-                    return finish_mremap(&source, -LINUX_ENOMEM);
-                }
-                if (old_reg && old_reg->backing_fd >= 0 &&
-                    track_backing_fd < 0) {
-                    if (tail_backing_fd >= 0)
-                        close(tail_backing_fd);
+                    mremap_track_dispose(&track);
                     return finish_mremap(&source, -LINUX_ENOMEM);
                 }
                 int source_remove_fd = -1;
                 if (guest_region_remove_prepare(g, old_off, old_off + old_size,
                                                 &source_remove_fd) < 0) {
-                    if (track_backing_fd >= 0)
-                        close(track_backing_fd);
-                    if (tail_backing_fd >= 0)
-                        close(tail_backing_fd);
+                    mremap_track_dispose(&track);
                     return finish_mremap(&source, -LINUX_ENOMEM);
                 }
-                char track_name[sizeof(old_reg->name)] = {0};
-                if (old_reg)
-                    str_copy_trunc(track_name, old_reg->name,
-                                   sizeof(track_name));
-
-                if (mremap_extend_range(g, grow_off, grow_len, prot) < 0) {
-                    if (track_backing_fd >= 0)
-                        close(track_backing_fd);
-                    if (tail_backing_fd >= 0)
-                        close(tail_backing_fd);
+                if (mremap_extend_range(g, grow_off, grow_len, track.prot) <
+                    0) {
+                    mremap_track_dispose(&track);
                     if (source_remove_fd >= 0)
                         close(source_remove_fd);
                     return finish_mremap(&source, -LINUX_ENOMEM);
@@ -3923,12 +3901,8 @@ int64_t sys_mremap(guest_t *g,
                 /* Update region tracking: remove old, add extended */
                 guest_region_remove_reserved(g, old_off, old_off + old_size,
                                              source_remove_fd);
-                if (add_mremap_region(g, old_off, old_size, new_size, prot,
-                                      track_flags, track_offset,
-                                      track_name[0] ? track_name : NULL,
-                                      track_backing_fd, old_inherited_at_fork,
-                                      source_inherited_size, tail_backing_fd,
-                                      source_vma_id) < 0)
+                if (add_mremap_region(g, old_off, old_size, new_size, &track) <
+                    0)
                     return finish_mremap(&source, -LINUX_ENOMEM);
                 mark_mremap_source_overlay_metadata(g, &source);
                 if (old_backing_ro)
@@ -3953,32 +3927,13 @@ int64_t sys_mremap(guest_t *g,
             return finish_mremap(&source, -LINUX_ENOMEM);
 
         /* Allocate a new region and move */
-        const guest_region_t *old_reg = src_reg;
-        int prot =
-            old_reg ? old_reg->prot : (LINUX_PROT_READ | LINUX_PROT_WRITE);
-        int track_flags = old_reg ? old_reg->flags
-                                  : (LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS);
-        uint64_t track_offset =
-            old_reg ? old_reg->offset + (old_off - old_reg->start) : 0;
-        int track_backing_fd = dup_region_backing_fd(old_reg);
-        if (old_reg && old_reg->backing_fd >= 0 && track_backing_fd < 0)
+        mremap_track_t track;
+        if (!mremap_track_init(&track, src_reg, old_off, source_inherited_size,
+                               new_size, source_vma_id))
             return finish_mremap(&source, -LINUX_ENOMEM);
-        int tail_backing_fd = -1;
-        if (source_inherited_size > 0 && source_inherited_size < new_size &&
-            track_backing_fd >= 0) {
-            tail_backing_fd = dup(track_backing_fd);
-            if (tail_backing_fd < 0) {
-                close(track_backing_fd);
-                return finish_mremap(&source, -LINUX_ENOMEM);
-            }
-        }
         bool source_overlay = mremap_source_has_overlay(&source);
-        bool source_backing_ro = old_reg && old_reg->backing_ro;
-        bool source_inherited_at_fork = old_reg && old_reg->inherited_at_fork;
-        char track_name[sizeof(old_reg->name)] = {0};
-        if (old_reg)
-            str_copy_trunc(track_name, old_reg->name, sizeof(track_name));
-        int needs_exec = (prot & LINUX_PROT_EXEC) != 0;
+        bool source_backing_ro = src_reg->backing_ro;
+        int needs_exec = (track.prot & LINUX_PROT_EXEC) != 0;
 
         uint64_t new_off;
 
@@ -3987,7 +3942,7 @@ int64_t sys_mremap(guest_t *g,
          * not narrow segment-table growth. Stay at host-page alignment.
          */
         size_t mremap_align = host_page_size_cached();
-        if (needs_exec && !(prot & LINUX_PROT_WRITE))
+        if (needs_exec && !(track.prot & LINUX_PROT_WRITE))
             new_off = find_free_gap(g, new_size, MMAP_RX_BASE, g->mmap_limit,
                                     mremap_align);
         else
@@ -3995,41 +3950,27 @@ int64_t sys_mremap(guest_t *g,
                                     mremap_align);
 
         if (new_off == UINT64_MAX) {
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+            mremap_track_dispose(&track);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
 
         remove_range_t removed = {old_off, old_off + old_size};
-        int added_regions =
-            source_inherited_size > 0 && source_inherited_size < new_size ? 2
-                                                                          : 1;
+        int added_regions = mremap_track_splits(&track, new_size) ? 2 : 1;
         if (!region_has_capacity_after_removes(g, &removed, 1, added_regions)) {
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+            mremap_track_dispose(&track);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
 
         int64_t flush_err = flush_mremap_source_shared(g, &source);
         if (flush_err < 0) {
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+            mremap_track_dispose(&track);
             return finish_mremap(&source, flush_err);
         }
 
         int source_remove_fd = -1;
         if (guest_region_remove_prepare(g, old_off, old_off + old_size,
                                         &source_remove_fd) < 0) {
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+            mremap_track_dispose(&track);
             return finish_mremap(&source, -LINUX_ENOMEM);
         }
 
@@ -4039,10 +3980,7 @@ int64_t sys_mremap(guest_t *g,
             if (cleanup_err < 0) {
                 int restore_err =
                     restore_mremap_source_overlays_in_place(g, &source);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (tail_backing_fd >= 0)
-                    close(tail_backing_fd);
+                mremap_track_dispose(&track);
                 if (source_remove_fd >= 0)
                     close(source_remove_fd);
                 if (restore_err < 0)
@@ -4051,24 +3989,18 @@ int64_t sys_mremap(guest_t *g,
             }
         }
 
-        if (mremap_extend_range(g, new_off, new_size, prot) < 0) {
+        if (mremap_extend_range(g, new_off, new_size, track.prot) < 0) {
             if (source_overlay) {
                 int restore_err =
                     restore_mremap_source_overlays_in_place(g, &source);
                 if (restore_err < 0) {
-                    if (track_backing_fd >= 0)
-                        close(track_backing_fd);
-                    if (tail_backing_fd >= 0)
-                        close(tail_backing_fd);
+                    mremap_track_dispose(&track);
                     if (source_remove_fd >= 0)
                         close(source_remove_fd);
                     return finish_mremap(&source, restore_err);
                 }
             }
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            if (tail_backing_fd >= 0)
-                close(tail_backing_fd);
+            mremap_track_dispose(&track);
             if (source_remove_fd >= 0)
                 close(source_remove_fd);
             return finish_mremap(&source, -LINUX_ENOMEM);
@@ -4078,7 +4010,7 @@ int64_t sys_mremap(guest_t *g,
          * zero the extension. The new range is a fresh gap and receives no live
          * overlay.
          */
-        if (prot == LINUX_PROT_NONE) {
+        if (track.prot == LINUX_PROT_NONE) {
             memset((uint8_t *) g->host_base + new_off, 0, new_size);
         } else {
             if (source_overlay)
@@ -4094,10 +4026,7 @@ int64_t sys_mremap(guest_t *g,
                  */
                 (void) restore_mremap_source_overlays_in_place(g, &source);
                 guest_invalidate_ptes(g, new_off, new_off + new_size);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (tail_backing_fd >= 0)
-                    close(tail_backing_fd);
+                mremap_track_dispose(&track);
                 if (source_remove_fd >= 0)
                     close(source_remove_fd);
                 return finish_mremap(&source, copy_err);
@@ -4120,11 +4049,7 @@ int64_t sys_mremap(guest_t *g,
             g->mmap_rx_gap_hint = old_off;
 
         /* Track new region */
-        if (add_mremap_region(g, new_off, old_size, new_size, prot, track_flags,
-                              track_offset, track_name[0] ? track_name : NULL,
-                              track_backing_fd, source_inherited_at_fork,
-                              source_inherited_size, tail_backing_fd,
-                              source_vma_id) < 0)
+        if (add_mremap_region(g, new_off, old_size, new_size, &track) < 0)
             return finish_mremap(&source, -LINUX_ENOMEM);
         if (source_backing_ro)
             mark_region_backing_ro(g, new_off, new_off + new_size);

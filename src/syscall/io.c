@@ -546,6 +546,77 @@ static int64_t rosetta_vz_ioctl(guest_t *g, uint64_t request, uint64_t arg)
 
 /* termios flag translation helpers. */
 
+/* Which Linux bit means which macOS bit is one fact per flag word, and both
+ * directions need it. Stating it once as a table and walking that table forward
+ * or backward is what keeps the pair consistent: the two directions used to be
+ * written out separately, so a bit added to one could silently miss the other,
+ * and nothing would have failed.
+ *
+ * A bit with no counterpart is simply absent from the table, which drops it in
+ * both directions. Where that asymmetry is deliberate the wrapper says so.
+ */
+typedef struct {
+    uint32_t linux_bit;
+    tcflag_t mac_bit;
+} termios_flag_pair_t;
+
+static tcflag_t termios_flags_to_mac(uint32_t lf,
+                                     const termios_flag_pair_t *map,
+                                     size_t count)
+{
+    tcflag_t mf = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (lf & map[i].linux_bit)
+            mf |= map[i].mac_bit;
+    }
+    return mf;
+}
+
+static uint32_t termios_flags_to_linux(tcflag_t mf,
+                                       const termios_flag_pair_t *map,
+                                       size_t count)
+{
+    uint32_t lf = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (mf & map[i].mac_bit)
+            lf |= map[i].linux_bit;
+    }
+    return lf;
+}
+
+/* CSIZE is a multi-bit field rather than independent bits, and its Linux CS5
+ * encoding is zero, so it cannot ride the bit tables above: a zero mask never
+ * matches. Same idea, matched on the field value.
+ */
+typedef struct {
+    uint32_t linux_value;
+    tcflag_t mac_value;
+} termios_field_pair_t;
+
+static tcflag_t termios_field_to_mac(uint32_t lf,
+                                     uint32_t linux_mask,
+                                     const termios_field_pair_t *map,
+                                     size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if ((lf & linux_mask) == map[i].linux_value)
+            return map[i].mac_value;
+    }
+    return 0;
+}
+
+static uint32_t termios_field_to_linux(tcflag_t mf,
+                                       tcflag_t mac_mask,
+                                       const termios_field_pair_t *map,
+                                       size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if ((mf & mac_mask) == map[i].mac_value)
+            return map[i].linux_value;
+    }
+    return 0;
+}
+
 /* Linux aarch64 c_iflag bits (from asm-generic/termbits-common.h). Low 9 bits
  * (IGNBRK..ICRNL) match macOS exactly. Bits from 0x200 onward differ: Linux
  * IUCLC=0x200 has no macOS equivalent; Linux IXON=0x400/IXOFF=0x1000 vs macOS
@@ -557,40 +628,27 @@ static int64_t rosetta_vz_ioctl(guest_t *g, uint64_t request, uint64_t arg)
 #define LINUX_IMAXBEL 0x2000 /* same value on both */
 #define LINUX_IUTF8 0x4000   /* same value on both */
 
+/* IUCLC (Linux 0x200) has no macOS equivalent and is absent on purpose. */
+static const termios_flag_pair_t iflag_map[] = {
+    {0x800, IXANY}, /* same value on both */
+    {LINUX_IXON, IXON},       {LINUX_IXOFF, IXOFF},
+    {LINUX_IMAXBEL, IMAXBEL}, {LINUX_IUTF8, IUTF8},
+};
+
 /* Translate Linux c_iflag to macOS c_iflag. */
 static tcflag_t linux_iflag_to_mac(uint32_t lf)
 {
-    tcflag_t mf = lf & LINUX_IFLAG_LOW_MASK; /* IGNBRK..ICRNL identical */
-    /* IXANY=0x800 is the same on both; pass through */
-    if (lf & 0x800)
-        mf |= IXANY;
-    if (lf & LINUX_IXON)
-        mf |= IXON; /* Linux 0x400 -> macOS 0x200 */
-    if (lf & LINUX_IXOFF)
-        mf |= IXOFF; /* Linux 0x1000 -> macOS 0x400 */
-    if (lf & LINUX_IMAXBEL)
-        mf |= IMAXBEL;
-    if (lf & LINUX_IUTF8)
-        mf |= IUTF8;
-    /* IUCLC (Linux 0x200) has no macOS equivalent; drop it */
-    return mf;
+    /* IGNBRK..ICRNL are identical, so the low bits pass through untranslated.
+     */
+    return (lf & LINUX_IFLAG_LOW_MASK) |
+           termios_flags_to_mac(lf, iflag_map, ARRAY_SIZE(iflag_map));
 }
 
 /* Translate macOS c_iflag to Linux c_iflag. */
 static uint32_t mac_iflag_to_linux(tcflag_t mf)
 {
-    uint32_t lf = mf & LINUX_IFLAG_LOW_MASK; /* IGNBRK..ICRNL identical */
-    if (mf & IXANY)
-        lf |= 0x800;
-    if (mf & IXON)
-        lf |= LINUX_IXON;
-    if (mf & IXOFF)
-        lf |= LINUX_IXOFF;
-    if (mf & IMAXBEL)
-        lf |= LINUX_IMAXBEL;
-    if (mf & IUTF8)
-        lf |= LINUX_IUTF8;
-    return lf;
+    return (uint32_t) (mf & LINUX_IFLAG_LOW_MASK) |
+           termios_flags_to_linux(mf, iflag_map, ARRAY_SIZE(iflag_map));
 }
 
 /* Linux aarch64 c_oflag bits (asm-generic/termbits-common.h + termbits.h). Only
@@ -609,48 +667,25 @@ static uint32_t mac_iflag_to_linux(tcflag_t mf)
 #define LINUX_OFDEL 0x080  /* macOS OFDEL=0x020000 */
 /* Linux NLDLY/CRDLY/TABDLY/BSDLY/VTDLY/FFDLY have no macOS equivalents */
 
+/* OLCUC (Linux 0x002) and the delay fields NLDLY, CRDLY, TABDLY, BSDLY, VTDLY,
+ * and FFDLY have no macOS equivalents and are absent on purpose.
+ */
+static const termios_flag_pair_t oflag_map[] = {
+    {LINUX_OPOST, OPOST}, {LINUX_ONLCR, ONLCR},   {LINUX_OCRNL, OCRNL},
+    {LINUX_ONOCR, ONOCR}, {LINUX_ONLRET, ONLRET}, {LINUX_OFILL, OFILL},
+    {LINUX_OFDEL, OFDEL},
+};
+
 /* Translate Linux c_oflag to macOS c_oflag. */
 static tcflag_t linux_oflag_to_mac(uint32_t lf)
 {
-    tcflag_t mf = 0;
-    if (lf & LINUX_OPOST)
-        mf |= OPOST;
-    /* LINUX_OLCUC (0x002) has no macOS equivalent; drop it */
-    if (lf & LINUX_ONLCR)
-        mf |= ONLCR;
-    if (lf & LINUX_OCRNL)
-        mf |= OCRNL;
-    if (lf & LINUX_ONOCR)
-        mf |= ONOCR;
-    if (lf & LINUX_ONLRET)
-        mf |= ONLRET;
-    if (lf & LINUX_OFILL)
-        mf |= OFILL;
-    if (lf & LINUX_OFDEL)
-        mf |= OFDEL;
-    /* NLDLY, CRDLY, TABDLY, BSDLY, VTDLY, FFDLY: no macOS equivalents */
-    return mf;
+    return termios_flags_to_mac(lf, oflag_map, ARRAY_SIZE(oflag_map));
 }
 
 /* Translate macOS c_oflag to Linux c_oflag. */
 static uint32_t mac_oflag_to_linux(tcflag_t mf)
 {
-    uint32_t lf = 0;
-    if (mf & OPOST)
-        lf |= LINUX_OPOST;
-    if (mf & ONLCR)
-        lf |= LINUX_ONLCR;
-    if (mf & OCRNL)
-        lf |= LINUX_OCRNL;
-    if (mf & ONOCR)
-        lf |= LINUX_ONOCR;
-    if (mf & ONLRET)
-        lf |= LINUX_ONLRET;
-    if (mf & OFILL)
-        lf |= LINUX_OFILL;
-    if (mf & OFDEL)
-        lf |= LINUX_OFDEL;
-    return lf;
+    return termios_flags_to_linux(mf, oflag_map, ARRAY_SIZE(oflag_map));
 }
 
 /* Linux aarch64 c_cflag bits (asm-generic/termbits.h). All standard flags
@@ -703,79 +738,37 @@ static speed_t linux_cbaud_to_speed(uint32_t cbaud)
     return 0;
 }
 
+/* CSIZE: Linux CS5=0x00, CS6=0x10, CS7=0x20, CS8=0x30
+ *        macOS CS5=0x00, CS6=0x100, CS7=0x200, CS8=0x300
+ */
+static const termios_field_pair_t csize_map[] = {
+    {LINUX_CS5, CS5},
+    {LINUX_CS6, CS6},
+    {LINUX_CS7, CS7},
+    {LINUX_CS8, CS8},
+};
+
+/* CBAUD and CBAUDEX are absent on purpose: the baud rate travels in the
+ * c_ispeed and c_ospeed fields, not in c_cflag.
+ */
+static const termios_flag_pair_t cflag_map[] = {
+    {LINUX_CSTOPB, CSTOPB}, {LINUX_CREAD, CREAD}, {LINUX_PARENB, PARENB},
+    {LINUX_PARODD, PARODD}, {LINUX_HUPCL, HUPCL}, {LINUX_CLOCAL, CLOCAL},
+};
+
 /* Translate Linux c_cflag to macOS c_cflag. */
 static tcflag_t linux_cflag_to_mac(uint32_t lf)
 {
-    tcflag_t mf = 0;
-
-    /* CSIZE: Linux CS5=0x00, CS6=0x10, CS7=0x20, CS8=0x30
-     *        macOS CS5=0x00, CS6=0x100, CS7=0x200, CS8=0x300
-     */
-    switch (lf & LINUX_CSIZE) {
-    case LINUX_CS5:
-        mf |= CS5;
-        break;
-    case LINUX_CS6:
-        mf |= CS6;
-        break;
-    case LINUX_CS7:
-        mf |= CS7;
-        break;
-    case LINUX_CS8:
-        mf |= CS8;
-        break;
-    default:
-        break;
-    }
-    if (lf & LINUX_CSTOPB)
-        mf |= CSTOPB;
-    if (lf & LINUX_CREAD)
-        mf |= CREAD;
-    if (lf & LINUX_PARENB)
-        mf |= PARENB;
-    if (lf & LINUX_PARODD)
-        mf |= PARODD;
-    if (lf & LINUX_HUPCL)
-        mf |= HUPCL;
-    if (lf & LINUX_CLOCAL)
-        mf |= CLOCAL;
-    /* CBAUD/CBAUDEX: drop (baud rate comes from c_ispeed/c_ospeed fields) */
-    return mf;
+    return termios_field_to_mac(lf, LINUX_CSIZE, csize_map,
+                                ARRAY_SIZE(csize_map)) |
+           termios_flags_to_mac(lf, cflag_map, ARRAY_SIZE(cflag_map));
 }
 
 /* Translate macOS c_cflag to Linux c_cflag. */
 static uint32_t mac_cflag_to_linux(tcflag_t mf)
 {
-    uint32_t lf = 0;
-    switch (mf & CSIZE) {
-    case CS5:
-        lf |= LINUX_CS5;
-        break;
-    case CS6:
-        lf |= LINUX_CS6;
-        break;
-    case CS7:
-        lf |= LINUX_CS7;
-        break;
-    case CS8:
-        lf |= LINUX_CS8;
-        break;
-    default:
-        break;
-    }
-    if (mf & CSTOPB)
-        lf |= LINUX_CSTOPB;
-    if (mf & CREAD)
-        lf |= LINUX_CREAD;
-    if (mf & PARENB)
-        lf |= LINUX_PARENB;
-    if (mf & PARODD)
-        lf |= LINUX_PARODD;
-    if (mf & HUPCL)
-        lf |= LINUX_HUPCL;
-    if (mf & CLOCAL)
-        lf |= LINUX_CLOCAL;
-    return lf;
+    return termios_field_to_linux(mf, CSIZE, csize_map, ARRAY_SIZE(csize_map)) |
+           termios_flags_to_linux(mf, cflag_map, ARRAY_SIZE(cflag_map));
 }
 
 /* Linux aarch64 c_lflag bits (asm-generic/termbits.h). Virtually every flag has
@@ -799,79 +792,26 @@ static uint32_t mac_cflag_to_linux(tcflag_t mf)
 #define LINUX_IEXTEN 0x08000
 #define LINUX_EXTPROC 0x10000
 
-/* Translate Linux c_lflag to macOS c_lflag. */
+/* Translate Linux c_lflag to macOS c_lflag. XCASE (Linux 0x004) has no macOS
+ * equivalent and is absent on purpose.
+ */
+static const termios_flag_pair_t lflag_map[] = {
+    {LINUX_ISIG, ISIG},       {LINUX_ICANON, ICANON}, {LINUX_ECHO, ECHO},
+    {LINUX_ECHOE, ECHOE},     {LINUX_ECHOK, ECHOK},   {LINUX_ECHONL, ECHONL},
+    {LINUX_NOFLSH, NOFLSH},   {LINUX_TOSTOP, TOSTOP}, {LINUX_ECHOCTL, ECHOCTL},
+    {LINUX_ECHOPRT, ECHOPRT}, {LINUX_ECHOKE, ECHOKE}, {LINUX_FLUSHO, FLUSHO},
+    {LINUX_PENDIN, PENDIN},   {LINUX_IEXTEN, IEXTEN}, {LINUX_EXTPROC, EXTPROC},
+};
+
 static tcflag_t linux_lflag_to_mac(uint32_t lf)
 {
-    tcflag_t mf = 0;
-    if (lf & LINUX_ISIG)
-        mf |= ISIG;
-    if (lf & LINUX_ICANON)
-        mf |= ICANON;
-    /* LINUX_XCASE (0x004) has no macOS equivalent; drop it */
-    if (lf & LINUX_ECHO)
-        mf |= ECHO;
-    if (lf & LINUX_ECHOE)
-        mf |= ECHOE;
-    if (lf & LINUX_ECHOK)
-        mf |= ECHOK;
-    if (lf & LINUX_ECHONL)
-        mf |= ECHONL;
-    if (lf & LINUX_NOFLSH)
-        mf |= NOFLSH;
-    if (lf & LINUX_TOSTOP)
-        mf |= TOSTOP;
-    if (lf & LINUX_ECHOCTL)
-        mf |= ECHOCTL;
-    if (lf & LINUX_ECHOPRT)
-        mf |= ECHOPRT;
-    if (lf & LINUX_ECHOKE)
-        mf |= ECHOKE;
-    if (lf & LINUX_FLUSHO)
-        mf |= FLUSHO;
-    if (lf & LINUX_PENDIN)
-        mf |= PENDIN;
-    if (lf & LINUX_IEXTEN)
-        mf |= IEXTEN;
-    if (lf & LINUX_EXTPROC)
-        mf |= EXTPROC;
-    return mf;
+    return termios_flags_to_mac(lf, lflag_map, ARRAY_SIZE(lflag_map));
 }
 
 /* Translate macOS c_lflag to Linux c_lflag. */
 static uint32_t mac_lflag_to_linux(tcflag_t mf)
 {
-    uint32_t lf = 0;
-    if (mf & ISIG)
-        lf |= LINUX_ISIG;
-    if (mf & ICANON)
-        lf |= LINUX_ICANON;
-    if (mf & ECHO)
-        lf |= LINUX_ECHO;
-    if (mf & ECHOE)
-        lf |= LINUX_ECHOE;
-    if (mf & ECHOK)
-        lf |= LINUX_ECHOK;
-    if (mf & ECHONL)
-        lf |= LINUX_ECHONL;
-    if (mf & NOFLSH)
-        lf |= LINUX_NOFLSH;
-    if (mf & TOSTOP)
-        lf |= LINUX_TOSTOP;
-    if (mf & ECHOCTL)
-        lf |= LINUX_ECHOCTL;
-    if (mf & ECHOPRT)
-        lf |= LINUX_ECHOPRT;
-    if (mf & ECHOKE)
-        lf |= LINUX_ECHOKE;
-    if (mf & FLUSHO)
-        lf |= LINUX_FLUSHO;
-    if (mf & PENDIN)
-        lf |= LINUX_PENDIN;
-    if (mf & IEXTEN)
-        lf |= LINUX_IEXTEN;
-    if (mf & EXTPROC)
-        lf |= LINUX_EXTPROC;
-    return lf;
+    return termios_flags_to_linux(mf, lflag_map, ARRAY_SIZE(lflag_map));
 }
 
 /* read/write and positional variants. */
@@ -2073,6 +2013,7 @@ int64_t sys_process_vm_writev(guest_t *g,
 
 /* terminal I/O. */
 
+/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
 {
     /* FIOCLEX/FIONCLEX are the ioctl form of fcntl(F_SETFD): they set/clear the

@@ -507,6 +507,194 @@ static int check_exec_permission(const struct stat *st)
     return -LINUX_EACCES;
 }
 
+/* Close the fds marked CLOEXEC, removing them from the shared table under
+ * fd_lock and cleaning up type-specific host resources after the unlock.
+ * Cleanup acquires sfd_lock or inotify_lock, which must NOT be held under
+ * fd_lock (lock ordering: fd_lock(3) < sfd_lock(5a) < inotify_lock(7)).
+ *
+ * Two passes: count first, then heap-allocate. That avoids placing a ~236 KiB
+ * VLA on the stack (FD_TABLE_SIZE * sizeof(fd_entry_t+int)).
+ *
+ * This reads nothing from the exec in progress, which is what lets it sit
+ * outside sys_execve rather than inline in its post-PNR half.
+ */
+static void exec_close_cloexec_fds(void)
+{
+    int cloexec_count = 0;
+    pthread_mutex_lock(&fd_lock);
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        if (fd_table[i].type != FD_CLOSED &&
+            (fd_table[i].linux_flags & LINUX_O_CLOEXEC))
+            cloexec_count++;
+    }
+
+    struct cloexec_entry {
+        int fd;
+        fd_entry_t snap;
+    };
+    struct cloexec_entry *cloexec_list = NULL;
+    if (cloexec_count > 0) {
+        cloexec_list =
+            malloc((size_t) cloexec_count * sizeof(struct cloexec_entry));
+        if (!cloexec_list) {
+            /* OOM during exec: fall back to fixed-size batches so cleanup still
+             * runs outside fd_lock.
+             *
+             * Each batch rescans from slot 0 rather than carrying a cursor
+             * across the unlocked window, and the loop ends on the first pass
+             * that finds nothing. That is deliberate: the window drops
+             * fd_lock, so a cursor that only moves forward would never
+             * re-examine a slot it had already passed. Every pass marks what
+             * it takes closed, so the candidate set shrinks and the loop
+             * terminates. The repeated scanning is bounded by the table size
+             * times the batch count and only happens once malloc has already
+             * failed, which is a trade this path can afford.
+             */
+            struct cloexec_entry batch[32];
+            for (;;) {
+                int batch_count = 0;
+                for (int scan = 0; scan < FD_TABLE_SIZE &&
+                                   batch_count < (int) (ARRAY_SIZE(batch));
+                     scan++) {
+                    if (fd_table[scan].type == FD_CLOSED ||
+                        !(fd_table[scan].linux_flags & LINUX_O_CLOEXEC))
+                        continue;
+                    batch[batch_count].fd = scan;
+                    batch[batch_count].snap = fd_table[scan];
+                    batch_count++;
+                    fd_mark_closed_unlocked(scan);
+                }
+                if (batch_count == 0)
+                    break;
+                pthread_mutex_unlock(&fd_lock);
+                for (int j = 0; j < batch_count; j++)
+                    fd_cleanup_entry(batch[j].fd, &batch[j].snap);
+                pthread_mutex_lock(&fd_lock);
+            }
+            cloexec_count = 0;
+        } else {
+            int n = 0;
+            for (int i = 0; i < FD_TABLE_SIZE; i++) {
+                if (fd_table[i].type != FD_CLOSED &&
+                    (fd_table[i].linux_flags & LINUX_O_CLOEXEC)) {
+                    cloexec_list[n].fd = i;
+                    cloexec_list[n].snap = fd_table[i];
+                    n++;
+                    fd_mark_closed_unlocked(i);
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&fd_lock);
+
+    /* fd_cleanup_entry may close host fds, DIR*, epoll/kqueue state, or inotify
+     * state, so keep it outside fd_lock.
+     */
+    for (int j = 0; j < cloexec_count; j++)
+        fd_cleanup_entry(cloexec_list[j].fd, &cloexec_list[j].snap);
+    free(cloexec_list);
+}
+
+/* What the PT_INTERP probe produces. The values move together: the caller's
+ * failure path closes the fd, and the post-PNR mapping needs the parsed headers
+ * plus both spellings of the path, so they are one thing rather than five
+ * locals threaded down the length of sys_execve.
+ */
+typedef struct {
+    elf_info_t info;
+    char resolved[LINUX_PATH_MAX];
+    char display_path[LINUX_PATH_MAX];
+    int fd;
+
+    /* resolved holds a materialized temporary that the caller must unlink. The
+     * flag lives beside the buffer it describes because
+     * exec_resolve_guest_host_path clears it on entry and then sets it for
+     * whichever buffer it filled: a flag belonging to some other buffer would
+     * be silently retargeted, losing one temp and unlinking the wrong path.
+     */
+    bool resolved_temp;
+} exec_interp_t;
+
+/* Resolve, open, and parse the PT_INTERP interpreter (headers only) before exec
+ * crosses the point of no return, so a bad interpreter is a recoverable ENOEXEC
+ * instead of a fatal exit. elf_map_segments_fd runs later, post-PNR.
+ *
+ * x86_64 targets do not pre-load their PT_INTERP: Rosetta is statically linked
+ * and loads the target binary, and any guest-side dynamic linker, itself via fd
+ * 3.
+ *
+ * On failure the fd, if any, is left in interp for the caller's fail label to
+ * close, as is interp->resolved_temp when a temporary was materialized.
+ */
+static int64_t exec_preload_interp(const guest_t *g,
+                                   const elf_info_t *elf_info,
+                                   bool target_is_rosetta,
+                                   exec_interp_t *interp)
+{
+    if (target_is_rosetta || elf_info->interp_path[0] == '\0')
+        return 0;
+
+    bool shm = false;
+
+    if (exec_resolve_interp_host_path(elf_info->interp_path, interp->resolved,
+                                      sizeof(interp->resolved),
+                                      &interp->resolved_temp, &shm) < 0) {
+        log_error("execve: failed to resolve interpreter: %s",
+                  elf_info->interp_path);
+        return -LINUX_ENOEXEC;
+    }
+    str_copy_trunc(
+        interp->display_path,
+        interp->resolved_temp ? elf_info->interp_path : interp->resolved,
+        sizeof(interp->display_path));
+
+    log_debug("execve: pre-validating interpreter: %s", interp->resolved);
+
+    interp->fd = exec_open_image(interp->resolved, shm);
+    if (interp->fd < 0) {
+        log_error("execve: failed to open interpreter: %s", interp->resolved);
+        return linux_errno();
+    }
+
+    struct stat interp_st;
+    if (fstat(interp->fd, &interp_st) < 0) {
+        return linux_errno();
+    }
+    chown_overlay_apply(&interp_st);
+
+    int64_t err = check_exec_permission(&interp_st);
+    if (err < 0) {
+        return err;
+    }
+
+    if (elf_load_fd(interp->fd, interp->resolved, &interp->info) < 0) {
+        log_error("execve: failed to load interpreter: %s", interp->resolved);
+        return -LINUX_ENOEXEC;
+    }
+
+    if (interp->info.e_machine != EM_AARCH64) {
+        log_error("execve: interpreter has unsupported machine type %u: %s",
+                  interp->info.e_machine, interp->resolved);
+        return -LINUX_ENOEXEC;
+    }
+
+    /* Bound the interpreter's extent here, the same way the executable's is
+     * bounded above. Without this the only thing that rejects an over-large
+     * interpreter is elf_map_segments_fd, which runs after the point of no
+     * return where the sole remaining option is exit(128). A guest able to
+     * write its own sysroot could kill elfuse on demand by patching a PT_LOAD
+     * in ld-musl; Linux returns ENOEXEC and the caller survives.
+     */
+    if (interp->info.load_max > UINT64_MAX - g->interp_base ||
+        interp->info.load_max + g->interp_base > g->guest_size) {
+        log_error("execve: interpreter extends beyond guest memory: %s",
+                  interp->resolved);
+        return -LINUX_ENOEXEC;
+    }
+    return 0;
+}
+
+/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_execve(hv_vcpu_t vcpu,
                    guest_t *g,
                    uint64_t path_gva,
@@ -551,7 +739,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     size_t envp_buf_size = 0;
     size_t running_bytes = 0;
     int exec_fd = -1;
-    int interp_fd = -1;
+    exec_interp_t interp;
+    memset(&interp, 0, sizeof(interp));
+    interp.fd = -1;
 
 
     char *temp_str = malloc(131072);
@@ -933,88 +1123,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         goto fail;
     }
 
-    /* Pre-load interpreter (headers only) for dynamic binaries. This validates
-     * the interpreter exists and is a valid ELF before exec crosses the point
-     * of no return. elf_map_segments() happens post-PNR.
-     */
-    elf_info_t interp_info;
-    memset(&interp_info, 0, sizeof(interp_info));
-    char interp_resolved[LINUX_PATH_MAX];
-    char interp_display_path[LINUX_PATH_MAX];
-    interp_resolved[0] = '\0';
-    interp_display_path[0] = '\0';
-
-    /* x86_64 targets do not pre-load their PT_INTERP. Rosetta is statically
-     * linked and loads the target binary (and any guest-side dynamic linker)
-     * itself via fd 3, so the aarch64-only interpreter pre-load below is
-     * skipped for rosetta exec.
-     */
-    bool interp_shm = false;
-    if (!target_is_rosetta && elf_info.interp_path[0] != '\0') {
-        if (exec_resolve_interp_host_path(elf_info.interp_path, interp_resolved,
-                                          sizeof(interp_resolved),
-                                          &interp_host_temp, &interp_shm) < 0) {
-            log_error("execve: failed to resolve interpreter: %s",
-                      elf_info.interp_path);
-            err = -LINUX_ENOEXEC;
-            goto fail;
-        }
-        str_copy_trunc(
-            interp_display_path,
-            interp_host_temp ? elf_info.interp_path : interp_resolved,
-            sizeof(interp_display_path));
-
-        log_debug("execve: pre-validating interpreter: %s", interp_resolved);
-
-        interp_fd = exec_open_image(interp_resolved, interp_shm);
-        if (interp_fd < 0) {
-            log_error("execve: failed to open interpreter: %s",
-                      interp_resolved);
-            err = linux_errno();
-            goto fail;
-        }
-
-        struct stat interp_st;
-        if (fstat(interp_fd, &interp_st) < 0) {
-            err = linux_errno();
-            goto fail;
-        }
-        chown_overlay_apply(&interp_st);
-
-        err = check_exec_permission(&interp_st);
-        if (err < 0) {
-            goto fail;
-        }
-
-        if (elf_load_fd(interp_fd, interp_resolved, &interp_info) < 0) {
-            log_error("execve: failed to load interpreter: %s",
-                      interp_resolved);
-            err = -LINUX_ENOEXEC;
-            goto fail;
-        }
-
-        if (interp_info.e_machine != EM_AARCH64) {
-            log_error("execve: interpreter has unsupported machine type %u: %s",
-                      interp_info.e_machine, interp_resolved);
-            err = -LINUX_ENOEXEC;
-            goto fail;
-        }
-
-        /* Bound the interpreter's extent here, the same way the executable's is
-         * bounded above. Without this the only thing that rejects an over-large
-         * interpreter is elf_map_segments_fd, which runs after the point of no
-         * return where the sole remaining option is exit(128). A guest able to
-         * write its own sysroot could kill elfuse on demand by patching a
-         * PT_LOAD in ld-musl; Linux returns ENOEXEC and the caller survives.
-         */
-        if (interp_info.load_max > UINT64_MAX - g->interp_base ||
-            interp_info.load_max + g->interp_base > g->guest_size) {
-            log_error("execve: interpreter extends beyond guest memory: %s",
-                      interp_resolved);
-            err = -LINUX_ENOEXEC;
-            goto fail;
-        }
-    }
+    /* Pre-load the interpreter before the point of no return. */
+    err = exec_preload_interp(g, &elf_info, target_is_rosetta, &interp);
+    if (err < 0)
+        goto fail;
 
     /* Past pre-PNR validation. Fall through to point of no return. The fail
      * label below handles all pre-PNR error paths.
@@ -1062,9 +1174,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     fail:
         if (exec_fd >= 0)
             close(exec_fd);
-        if (interp_fd >= 0)
-            close(interp_fd);
+        if (interp.fd >= 0)
+            close(interp.fd);
         free(temp_str);
+        if (interp.resolved_temp)
+            unlink(interp.resolved);
         exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                             path_host_temp, interp_host_buf, interp_host_temp);
         return err;
@@ -1076,84 +1190,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * fatally, matching the Linux kernel's behavior (SIGKILL after exec PNR).
      */
 
-    /* Close CLOEXEC fds by first removing them from the shared table under
-     * fd_lock, then cleaning up type-specific host resources after unlock.
-     * Cleanup acquires sfd_lock or inotify_lock, which must NOT be held under
-     * fd_lock (lock ordering: fd_lock(3) < sfd_lock(5a) < inotify_lock(7)).
-     *
-     * Two passes: count first, then heap-allocate. Avoids placing a ~100KiB VLA
-     * on the stack (FD_TABLE_SIZE * sizeof(fd_entry_t+int)).
-     */
-    int cloexec_count = 0;
-    pthread_mutex_lock(&fd_lock);
-    for (int i = 0; i < FD_TABLE_SIZE; i++) {
-        if (fd_table[i].type != FD_CLOSED &&
-            (fd_table[i].linux_flags & LINUX_O_CLOEXEC))
-            cloexec_count++;
-    }
-
-    struct cloexec_entry {
-        int fd;
-        fd_entry_t snap;
-    };
-    struct cloexec_entry *cloexec_list = NULL;
-    bool fd_lock_held = true;
-    if (cloexec_count > 0) {
-        cloexec_list =
-            malloc((size_t) cloexec_count * sizeof(struct cloexec_entry));
-        if (!cloexec_list) {
-            /* OOM during exec: fall back to fixed-size batches so cleanup still
-             * runs outside fd_lock.
-             */
-            struct cloexec_entry batch[32];
-            int scan = 0;
-            while (scan < FD_TABLE_SIZE) {
-                int batch_count = 0;
-                for (; scan < FD_TABLE_SIZE &&
-                       batch_count < (int) (ARRAY_SIZE(batch));
-                     scan++) {
-                    if (fd_table[scan].type == FD_CLOSED ||
-                        !(fd_table[scan].linux_flags & LINUX_O_CLOEXEC))
-                        continue;
-                    batch[batch_count].fd = scan;
-                    batch[batch_count].snap = fd_table[scan];
-                    batch_count++;
-                    fd_table[scan].dir = NULL;
-                    fd_mark_closed_unlocked(scan);
-                }
-                pthread_mutex_unlock(&fd_lock);
-                fd_lock_held = false;
-                for (int j = 0; j < batch_count; j++)
-                    fd_cleanup_entry(batch[j].fd, &batch[j].snap);
-                if (scan < FD_TABLE_SIZE) {
-                    pthread_mutex_lock(&fd_lock);
-                    fd_lock_held = true;
-                }
-            }
-            cloexec_count = 0;
-        } else {
-            int n = 0;
-            for (int i = 0; i < FD_TABLE_SIZE; i++) {
-                if (fd_table[i].type != FD_CLOSED &&
-                    (fd_table[i].linux_flags & LINUX_O_CLOEXEC)) {
-                    cloexec_list[n].fd = i;
-                    cloexec_list[n].snap = fd_table[i];
-                    n++;
-                    fd_table[i].dir = NULL;
-                    fd_mark_closed_unlocked(i);
-                }
-            }
-        }
-    }
-    if (fd_lock_held)
-        pthread_mutex_unlock(&fd_lock);
-
-    /* fd_cleanup_entry may close host fds, DIR*, epoll/kqueue state, or inotify
-     * state, so keep it outside fd_lock.
-     */
-    for (int j = 0; j < cloexec_count; j++)
-        fd_cleanup_entry(cloexec_list[j].fd, &cloexec_list[j].snap);
-    free(cloexec_list);
+    exec_close_cloexec_fds();
 
     /* Past this point the old image is gone; later failures are fatal like a
      * kernel exec failure after its point of no return.
@@ -1287,9 +1324,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         if (exec_fd >= 0) {
             close(exec_fd);
         }
-        if (interp_fd >= 0) {
-            close(interp_fd);
+        if (interp.fd >= 0) {
+            close(interp.fd);
         }
+        if (interp.resolved_temp)
+            unlink(interp.resolved);
         exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                             path_host_temp, interp_host_buf, interp_host_temp);
         return SYSCALL_EXEC_HAPPENED;
@@ -1320,7 +1359,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
     if (elf_info.interp_path[0] != '\0') {
         interp_base = g->interp_base;
-        if (elf_map_segments_fd(&interp_info, interp_fd, interp_resolved,
+        if (elf_map_segments_fd(&interp.info, interp.fd, interp.resolved,
                                 g->host_base, g->guest_size,
                                 (elf_window_t) {0, interp_base}, infra_lo,
                                 infra_hi) < 0) {
@@ -1333,8 +1372,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         log_debug(
             "execve: interpreter at base=0x%llx, entry=0x%llx, %d segments",
             (unsigned long long) interp_base,
-            (unsigned long long) (interp_info.entry + interp_base),
-            interp_info.num_segments);
+            (unsigned long long) (interp.info.entry + interp_base),
+            interp.info.num_segments);
     }
 
     /* memcpy wrote executable bytes through D-cache; invalidate I-cache before
@@ -1347,11 +1386,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             sys_icache_invalidate(host_addr, elf_info.segments[i].memsz);
         }
     }
-    for (int i = 0; i < interp_info.num_segments; i++) {
-        if (interp_info.segments[i].flags & PF_X) {
+    for (int i = 0; i < interp.info.num_segments; i++) {
+        if (interp.info.segments[i].flags & PF_X) {
             void *host_addr = (uint8_t *) g->host_base +
-                              interp_info.segments[i].gpa + interp_base;
-            sys_icache_invalidate(host_addr, interp_info.segments[i].memsz);
+                              interp.info.segments[i].gpa + interp_base;
+            sys_icache_invalidate(host_addr, interp.info.segments[i].memsz);
         }
     }
     sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base, shim_size);
@@ -1433,14 +1472,14 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* Interpreter segments use the same permission translation, shifted by
      * interp_base. Same fatal-overflow rule as the executable's segments.
      */
-    for (int i = 0; i < interp_info.num_segments; i++) {
+    for (int i = 0; i < interp.info.num_segments; i++) {
         if (nregions >= MAX_REGIONS)
             goto too_many_regions;
         regions[nregions++] = (mem_region_t) {
-            .gpa_start = interp_info.segments[i].gpa + interp_base,
-            .gpa_end = interp_info.segments[i].gpa +
-                       interp_info.segments[i].memsz + interp_base,
-            .perms = elf_pf_to_prot(interp_info.segments[i].flags)};
+            .gpa_start = interp.info.segments[i].gpa + interp_base,
+            .gpa_end = interp.info.segments[i].gpa +
+                       interp.info.segments[i].memsz + interp_base,
+            .perms = elf_pf_to_prot(interp.info.segments[i].flags)};
     }
 
     /* brk region (RW). Pre-mapped up to MMAP_RX_BASE. */
@@ -1504,17 +1543,17 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                          LINUX_MAP_PRIVATE, elf_info.segments[i].offset, path);
     }
 
-    /* interp_resolved was computed before guest_reset so no filesystem lookup
+    /* interp.resolved was computed before guest_reset so no filesystem lookup
      * is needed after the point of no return.
      */
-    if (interp_info.num_segments > 0) {
-        for (int i = 0; i < interp_info.num_segments; i++) {
-            guest_region_add(g, interp_info.segments[i].gpa + interp_base,
-                             interp_info.segments[i].gpa +
-                                 interp_info.segments[i].memsz + interp_base,
-                             elf_pf_to_prot(interp_info.segments[i].flags),
-                             LINUX_MAP_PRIVATE, interp_info.segments[i].offset,
-                             interp_display_path);
+    if (interp.info.num_segments > 0) {
+        for (int i = 0; i < interp.info.num_segments; i++) {
+            guest_region_add(g, interp.info.segments[i].gpa + interp_base,
+                             interp.info.segments[i].gpa +
+                                 interp.info.segments[i].memsz + interp_base,
+                             elf_pf_to_prot(interp.info.segments[i].flags),
+                             LINUX_MAP_PRIVATE, interp.info.segments[i].offset,
+                             interp.display_path);
         }
     }
 
@@ -1567,7 +1606,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         }
         g->start_stack = sp;
 
-        entry_point = (interp_base != 0) ? (interp_info.entry + interp_base)
+        entry_point = (interp_base != 0) ? (interp.info.entry + interp_base)
                                          : (elf_info.entry + elf_load_base);
 
         /* Publish the guest-visible path so /proc/self/exe remains stable
@@ -1618,8 +1657,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     free(temp_str);
     if (exec_fd >= 0)
         close(exec_fd);
-    if (interp_fd >= 0)
-        close(interp_fd);
+    if (interp.fd >= 0)
+        close(interp.fd);
+    if (interp.resolved_temp)
+        unlink(interp.resolved);
     exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
                         path_host_temp, interp_host_buf, interp_host_temp);
 
