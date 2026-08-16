@@ -2244,6 +2244,7 @@ static int proc_open_mounts_node(const char *path)
     return PROC_NOT_INTERCEPTED;
 }
 
+/* NOLINTNEXTLINE(readability-function-size) */
 int proc_intercept_open(const guest_t *g,
                         const char *path,
                         int linux_flags,

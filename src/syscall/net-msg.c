@@ -411,6 +411,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
     return ret;
 }
 
+/* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 {
     if (fd_get_type(fd) == FD_NETLINK)
