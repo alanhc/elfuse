@@ -2733,14 +2733,13 @@ int proc_intercept_open(const guest_t *g,
     if (!strcmp(path, "/proc/sys/kernel/randomize_va_space"))
         return proc_emit_literal("2\n");
 
-    /* /proc/version -> synthetic kernel version string */
+    /* /proc/version -> synthetic banner in the kernel's proc_version_show
+     * format; the builder and compiler fields are fixed strings.
+     */
     if (!strcmp(path, "/proc/version")) {
         return proc_emit_literal(
             "Linux version " GUEST_KERNEL_RELEASE
-            " (buildd@bos03-arm64-051) "
-            "(aarch64-linux-gnu-gcc (Ubuntu 15.2.0-4ubuntu4) "
-            "15.2.0, GNU ld (GNU Binutils for Ubuntu) "
-            "2.45) " GUEST_KERNEL_VERSION "\n");
+            " (elfuse@elfuse) (elfuse) " GUEST_KERNEL_VERSION "\n");
     }
 
     /* /proc/filesystems, /proc/self/mountinfo, /proc/mounts, /etc/mtab. */

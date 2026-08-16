@@ -40,10 +40,6 @@ static int cached_ngroups = -1;
 static const linux_utsname_t cached_uname = {
     .sysname = "Linux",
     .nodename = "elfuse",
-
-    /* Kernel version: match the lima aarch64 VM kernel to avoid version-gated
-     * feature detection mismatches in userspace.
-     */
     .release = GUEST_KERNEL_RELEASE,
     .version = GUEST_KERNEL_VERSION,
     .machine = "aarch64",
