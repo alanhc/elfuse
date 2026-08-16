@@ -104,7 +104,8 @@ static void sysinfo_init_cached_host_state(void)
     size_t ms_len = sizeof(memsize);
     int mib_mem[2] = {CTL_HW, HW_MEMSIZE};
     if (sysctl(mib_mem, 2, &memsize, &ms_len, NULL, 0) == 0) {
-        const uint64_t vm_ram_cap = 4094595072ULL; /* Match Lima VZ 4GiB VM */
+        const uint64_t vm_ram_cap =
+            4094595072ULL; /* totalram cap captured from a 4 GiB VZ VM */
         cached_real_memsize = memsize;
         cached_totalram = (memsize > vm_ram_cap) ? vm_ram_cap : memsize;
     }
