@@ -1063,13 +1063,24 @@ int guest_write_small(guest_t *g, uint64_t gva, const void *src, size_t len);
 
 /* Read a null-terminated string from guest memory. Copies up to max-1 bytes +
  * NUL into dst.
- * Returns string length or -1 if out of bounds / unterminated.
+ *
+ * Returns the string length, -1 if out of bounds or unterminated, or -2 when a
+ * host SIGBUS hit a vanished MAP_SHARED page. The two failures differ only for
+ * a caller deciding whether to retry: a -1 can be worth another attempt with a
+ * bigger buffer, a -2 never is. Both are negative, so a caller testing < 0 need
+ * not care.
  */
 int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max);
 
 /* Optimized guest string read for short, contiguous paths. Uses a direct guest
  * pointer when a full max-1-byte window is readable, otherwise falls back to
  * guest_read_str() for boundary-safe scanning.
+ *
+ * Returns the string length, -1 when the fast window did not apply and the
+ * fallback also failed, or -2 when either took a host SIGBUS on a vanished
+ * MAP_SHARED page. A caller holding a larger buffer can retry a -1 but never a
+ * -2: the same address faults again. The fallback propagates its own -2, so a
+ * path that straddles a page boundary is not retried either.
  */
 int guest_read_str_small(const guest_t *g, uint64_t gva, char *dst, size_t max);
 

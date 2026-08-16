@@ -109,6 +109,7 @@ test-fork-synthetic-fd
 [section] Guard page / mmap edge cases
 test-guard-page
 test-mmap-hint
+test-mmap-sigbus-efault
 
 [section] mremap tests
 test-mremap

@@ -47,6 +47,7 @@
 #include "runtime/futex.h"  /* futex_interrupt_request */
 #include "runtime/thread.h" /* thread_destroy_all_vcpus */
 #include "syscall/proc.h"   /* proc_request_exit_group */
+#include "syscall/signal.h"
 #include "syscall/wakeup-pipe.h"
 
 /* Per-vCPU pending TLBI request. Zero-initialized in every host pthread by
@@ -63,6 +64,30 @@ _Thread_local tlbi_request_t cpu_tlbi_req;
 bool g_tlbi_range_supported = false;
 
 static void guest_region_clear(guest_t *g);
+
+/* Copy across the guest slab boundary with host SIGBUS recovery armed.
+ *
+ * Returns -1 when the backing page vanished under a live MAP_SHARED overlay.
+ */
+static int guest_host_memcpy(void *dst, const void *src, size_t len)
+{
+    bool faulted;
+    HOST_SIGBUS_GUARD(faulted, memcpy(dst, src, len));
+    return faulted ? -1 : 0;
+}
+
+static const void *guest_host_memchr(const void *src,
+                                     int c,
+                                     size_t len,
+                                     bool *faulted)
+{
+    /* found is read only on the non-faulted path, so it never survives a
+     * _longjmp, which is what would leave a non-volatile local indeterminate.
+     */
+    const void *found = NULL;
+    HOST_SIGBUS_GUARD(*faulted, found = memchr(src, c, len));
+    return *faulted ? NULL : found;
+}
 
 /* Page table descriptor bits. */
 #define PT_VALID (1ULL << 0)
@@ -1632,10 +1657,13 @@ static inline int guest_copy(const guest_t *g,
         size_t chunk = len - copied;
         if (chunk > avail)
             chunk = avail;
-        if (required_perms == MEM_PERM_R)
-            memcpy((uint8_t *) dst + copied, ptr, chunk);
-        else
-            memcpy(ptr, (const uint8_t *) src + copied, chunk);
+        if (required_perms == MEM_PERM_R) {
+            if (guest_host_memcpy((uint8_t *) dst + copied, ptr, chunk) < 0)
+                return -1;
+        } else if (guest_host_memcpy(ptr, (const uint8_t *) src + copied,
+                                     chunk) < 0) {
+            return -1;
+        }
         copied += chunk;
     }
     return 0;
@@ -1651,8 +1679,7 @@ int guest_read_small(const guest_t *g, uint64_t gva, void *dst, size_t len)
     uint64_t avail = 0;
     void *src = guest_ptr_bound(g, gva, &avail, MEM_PERM_R, (uint64_t) len);
     if (src && avail >= len) {
-        memcpy(dst, src, len);
-        return 0;
+        return guest_host_memcpy(dst, src, len);
     }
 
     return guest_read(g, gva, dst, len);
@@ -1668,8 +1695,7 @@ int guest_write_small(guest_t *g, uint64_t gva, const void *src, size_t len)
     uint64_t avail = 0;
     void *dst = guest_ptr_bound(g, gva, &avail, MEM_PERM_W, (uint64_t) len);
     if (dst && avail >= len) {
-        memcpy(dst, src, len);
-        return 0;
+        return guest_host_memcpy(dst, src, len);
     }
 
     return guest_write(g, gva, src, len);
@@ -1680,6 +1706,12 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max)
     if (max == 0)
         return -1;
     size_t copied = 0, limit = max - 1;
+
+    /* Separated from the other ways out, because a caller that retries with a
+     * bigger buffer must not retry a fault: the same address faults again. Both
+     * still return negative, so a caller testing < 0 is unaffected.
+     */
+    bool faulted = false;
 
     while (copied < limit) {
         if (gva > UINT64_MAX - copied)
@@ -1693,18 +1725,26 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max)
         size_t remain = limit - copied, chunk = avail < remain ? avail : remain;
         const char *src = (const char *) ptr;
 
-        const void *nul = memchr(src, '\0', chunk);
+        const void *nul = guest_host_memchr(src, '\0', chunk, &faulted);
+        if (faulted)
+            break;
         if (nul) {
             size_t slen = (const char *) nul - src;
-            memcpy(dst + copied, src, slen + 1);
+            if (guest_host_memcpy(dst + copied, src, slen + 1) < 0) {
+                faulted = true;
+                break;
+            }
             return (int) (copied + slen);
         }
-        memcpy(dst + copied, src, chunk);
+        if (guest_host_memcpy(dst + copied, src, chunk) < 0) {
+            faulted = true;
+            break;
+        }
         copied += chunk;
     }
 
     dst[copied] = '\0';
-    return -1;
+    return faulted ? -2 : -1;
 }
 
 int guest_read_str_small(const guest_t *g, uint64_t gva, char *dst, size_t max)
@@ -1717,11 +1757,22 @@ int guest_read_str_small(const guest_t *g, uint64_t gva, char *dst, size_t max)
     const char *src =
         guest_ptr_bound(g, gva, &avail, MEM_PERM_R, (uint64_t) limit);
     if (src && avail >= limit) {
-        const char *nul = memchr(src, '\0', limit);
+        bool faulted;
+        const char *nul = guest_host_memchr(src, '\0', limit, &faulted);
         if (nul) {
             size_t slen = (size_t) (nul - src);
-            memcpy(dst, src, slen + 1);
+            if (guest_host_memcpy(dst, src, slen + 1) < 0) {
+                /* Terminate as guest_read_str does on its own failure path, so
+                 * no caller can read the partially copied bytes as a string.
+                 */
+                dst[0] = '\0';
+                return -2;
+            }
             return (int) slen;
+        }
+        if (faulted) {
+            dst[0] = '\0';
+            return -2;
         }
     }
 
