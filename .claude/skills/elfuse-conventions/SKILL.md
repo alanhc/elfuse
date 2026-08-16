@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions that are not guessable from the code - the seven-rule commit message style, ASCII-only source comments, kebab-case filenames, the type and return conventions at the ABI boundary, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
+description: elfuse conventions that are not guessable from the code: the seven-rule commit message style, ASCII-only source comments, kebab-case filenames, the type and return conventions at the ABI boundary, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
 ---
 
 # elfuse conventions
@@ -28,15 +28,64 @@ gets.
 
 ## Style
 
-Source comments and commit messages are ASCII only, no markdown syntax: no em
-dashes, no inline backticks, no non-ASCII arrows. Use `-`, `--`, or `:`
-instead of an em dash. Write code, path, and symbol references as plain text
-(EPOLL_CTL_MOD, tests/foo.c).
+Source comments and commit messages are ASCII only, with no markdown syntax:
+no inline backticks, no non-ASCII arrows. Write code, path, and symbol
+references as plain text (EPOLL_CTL_MOD, tests/foo.c). Markdown files are
+exempt and use normal GitHub Markdown, so do not strip backticks out of a
+`.md` file in its name.
 
-This rule covers `src/` comments, `tests/` comments, and commit messages.
-Markdown files are exempt and use normal GitHub Markdown: the working docs,
-`AGENTS.md`, and these skill files. Do not strip backticks out of a `.md` file
-in the name of this rule.
+The em dash (U+2014) is banned on every surface, markdown included: comments,
+commit messages, `docs/`, these skill files, PR bodies, and review replies.
+In an otherwise-ASCII tree it is the clearest mark of machine-written prose,
+rejected on sight (PR#209). The stand-in is ` -- ` (spaced double hyphen),
+used sparingly: reword first (commas, a period, or a colon usually serve),
+and more than one in a paragraph means restructure. Write the character as
+its codepoint, never the glyph, so `grep -rnP '\x{2014}'` stays a clean
+check; `-P` with the codepoint is required, since `grep $'\u2014'`
+matches nothing and reports a false all-clear.
+
+The rest of the machine register is banned on the same surfaces. State the
+fact and stop:
+
+- Describe the thing, not the change: no "previously", "now we", "we
+  refined", or "fixed", and no history of prior attempts or review rounds.
+  A decision that still matters is present-tense rationale.
+- Inflation words ("delve", "seamless", "robust", "leverage") and empty
+  pivots ("it's worth noting"): a sentence that survives deleting the phrase
+  never needed it.
+- Coined vocabulary, figurative accounting, and anthropomorphism: every
+  noun for a mechanism is an identifier in the tree or the standard term
+  from a man page, ELF or FUSE clause, or kernel source, and a value is
+  computed, cached, discarded, or re-derived. Name the flag or function
+  carrying the fact; a coined word cannot be grepped later.
+- Trailing "-ing" glosses (", ensuring ..."): the tail names a checkable
+  mechanism or goes.
+- Negative parallelism ("not X, but Y"): say Y. Copula avoidance ("serves
+  as", "acts as"): write "is".
+- Rule-of-three padding, stacked transitions ("Moreover"), wrap-ups ("In
+  conclusion"), hedge stacking ("could potentially"): cut; one hedge at
+  most, for real uncertainty.
+- Signposting, prompt echo, and the closing verdict: no announcement of what
+  the text is about to do ("This commit will", "Below we describe"), no
+  first line restating the subject or the PR title, and no closing sentence
+  grading the change ("this makes the code more maintainable"). The last
+  sentence carries a fact.
+- Effort and flattery: "carefully reviewed", "comprehensive", "thoroughly
+  tested", "Great catch", "You're absolutely right". Effort is not a
+  finding; name what ran and what it reported.
+- Formatting as emphasis in docs and PR text: bolded bullet-header runs
+  where a paragraph belongs, decorative rules, emoji.
+- Machine artifacts, defects on sight: zero-width and bidi characters,
+  homoglyphs, non-standard spaces, unfilled placeholders, leaked citation
+  markup. Legitimate Unicode lives in `docs/` (the casefold tables), so scan
+  the invisible class only, with a planted positive:
+
+  ```
+  grep -rnP '[\x{00A0}\x{200B}-\x{200F}\x{202A}-\x{202F}\x{2060}\x{FEFF}]' src/ tests/ docs/
+  ```
+
+Every class above binds every surface, so the sections below name only
+their own instance of one.
 
 Comments and commit messages are third-person: name the subject (the caller,
 this function) or use imperative phrasing.
