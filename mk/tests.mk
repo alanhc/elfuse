@@ -35,7 +35,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-absock-names test-absock-cleanup \
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
-        test-wakeup-pipe-host \
+        test-wakeup-pipe-host test-guest-env-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
@@ -168,7 +168,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-vcpu-run-hooks-host test-identity-override-host \
         test-teardown-live-vcpu-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
-        test-dynamic-array-host test-string-builder-host test-wakeup-pipe-host)
+        test-dynamic-array-host test-string-builder-host \
+        test-wakeup-pipe-host test-guest-env-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -186,6 +187,7 @@ $(call run-host-unit,test-absock-names-host,absock derived-name unit test)
 $(call run-host-unit,test-dynamic-array-host,dynamic array unit test)
 $(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
+$(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)
@@ -236,7 +238,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage test-config \
 	$(call run-lane,test-case-collision-fallback,case collisions on a folding sysroot)
 	$(call run-lane,test-fuse-alpine,Alpine sysroot FUSE validation)
 	$(call run-lane,test-timeout-disable,timeout=0 validation)
-	$(call run-lane,test-launch-flags,launch flag rejection)
+	$(call run-lane,test-launch-flags,launch flags)
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
 
@@ -1027,9 +1029,10 @@ test-timeout-disable: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@$(ELFUSE_BIN) --timeout 0 $(TEST_DIR)/test-hello > /dev/null
 
 ## Verify --user / --workdir / --fakeroot reject contradictory requests before
-## guest bring-up.
-test-launch-flags: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
-	@bash tests/test-launch-flags.sh $(ELFUSE_BIN) $(TEST_DIR)/test-hello
+## guest bring-up, and that --env / --clear-env reach the guest's environ.
+test-launch-flags: $(ELFUSE_BIN) $(TEST_HELLO_DEP) $(TEST_ENV_DEPS)
+	@bash tests/test-launch-flags.sh $(ELFUSE_BIN) $(TEST_DIR)/test-hello \
+	    $(TEST_DIR)/test-env-dump $(TEST_DIR)/test-cat
 
 ## Check the --help and argument-error usage synopses against each other
 test-usage-synopsis: $(ELFUSE_BIN)
@@ -1486,6 +1489,10 @@ test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 ## Run the wakeup pipe concurrency unit test natively on the host
 test-wakeup-pipe-host: $(BUILD_DIR)/test-wakeup-pipe-host
 	$(BUILD_DIR)/test-wakeup-pipe-host
+
+## Run the guest environment merge cross product
+test-guest-env-host: $(BUILD_DIR)/test-guest-env-host
+	$(BUILD_DIR)/test-guest-env-host
 
 # Volume naming probe
 ## Report how the filesystem treats filenames (regenerates docs/filenames.md tables)
