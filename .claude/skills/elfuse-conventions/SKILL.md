@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions that are not guessable from the code - the seven-rule commit message style, ASCII-only source comments, kebab-case filenames, the type and return conventions at the ABI boundary, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
+description: elfuse conventions that are not guessable from the code: the seven-rule commit message style, ASCII-only source comments, kebab-case filenames, the type and return conventions at the ABI boundary, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
 ---
 
 # elfuse conventions
@@ -18,27 +18,74 @@ reads as authoritative.
 
 ## Working docs
 
-The repo root carries per-developer working docs that are deliberately
-untracked: `CLAUDE.md`, `spec.md`, and a few others alongside them. Never
-`git add`, commit, stage, gitignore, or delete any of them. They stay
-untracked but visible in `git status`. This applies to `CLAUDE.md` itself.
-
-`spec.md` holds the full coding conventions and wins where it and this file
-disagree, but it does not survive a fresh clone. That is why the load-bearing
-subset is duplicated below rather than referenced: on a clean checkout, `docs/`
-and these skills are all a contributor gets.
+A contributor may keep untracked working docs at the repo root or under
+`.claude/`; which ones exist differs per clone. Never `git add`, commit,
+stage, gitignore, or delete another person's: untracked but visible in
+`git status` is deliberate. None of them survive a fresh clone, so nothing
+here defers to one; the load-bearing conventions are written out below,
+because on a clean checkout `docs/` and these skills are all a contributor
+gets.
 
 ## Style
 
-Source comments and commit messages are ASCII only, no markdown syntax: no em
-dashes, no inline backticks, no non-ASCII arrows. Use `-`, `--`, or `:`
-instead of an em dash. Write code, path, and symbol references as plain text
-(EPOLL_CTL_MOD, tests/foo.c).
+Source comments and commit messages are ASCII only, with no markdown syntax:
+no inline backticks, no non-ASCII arrows. Write code, path, and symbol
+references as plain text (EPOLL_CTL_MOD, tests/foo.c). Markdown files are
+exempt and use normal GitHub Markdown, so do not strip backticks out of a
+`.md` file in its name.
 
-This rule covers `src/` comments, `tests/` comments, and commit messages.
-Markdown files are exempt and use normal GitHub Markdown: the working docs,
-`AGENTS.md`, and these skill files. Do not strip backticks out of a `.md` file
-in the name of this rule.
+The em dash (U+2014) is banned on every surface, markdown included: comments,
+commit messages, `docs/`, these skill files, PR bodies, and review replies.
+In an otherwise-ASCII tree it is the clearest mark of machine-written prose,
+rejected on sight (PR#209). The stand-in is ` -- ` (spaced double hyphen),
+used sparingly: reword first (commas, a period, or a colon usually serve),
+and more than one in a paragraph means restructure. Write the character as
+its codepoint, never the glyph, so `grep -rnP '\x{2014}'` stays a clean
+check; `-P` with the codepoint is required, since `grep $'\u2014'`
+matches nothing and reports a false all-clear.
+
+The rest of the machine register is banned on the same surfaces. State the
+fact and stop:
+
+- Describe the thing, not the change: no "previously", "now we", "we
+  refined", or "fixed", and no history of prior attempts or review rounds.
+  A decision that still matters is present-tense rationale.
+- Inflation words ("delve", "seamless", "robust", "leverage") and empty
+  pivots ("it's worth noting"): a sentence that survives deleting the phrase
+  never needed it.
+- Coined vocabulary, figurative accounting, and anthropomorphism: every
+  noun for a mechanism is an identifier in the tree or the standard term
+  from a man page, ELF or FUSE clause, or kernel source, and a value is
+  computed, cached, discarded, or re-derived. Name the flag or function
+  carrying the fact; a coined word cannot be grepped later.
+- Trailing "-ing" glosses (", ensuring ..."): the tail names a checkable
+  mechanism or goes.
+- Negative parallelism ("not X, but Y"): say Y. Copula avoidance ("serves
+  as", "acts as"): write "is".
+- Rule-of-three padding, stacked transitions ("Moreover"), wrap-ups ("In
+  conclusion"), hedge stacking ("could potentially"): cut; one hedge at
+  most, for real uncertainty.
+- Signposting, prompt echo, and the closing verdict: no announcement of what
+  the text is about to do ("This commit will", "Below we describe"), no
+  first line restating the subject or the PR title, and no closing sentence
+  grading the change ("this makes the code more maintainable"). The last
+  sentence carries a fact.
+- Effort and flattery: "carefully reviewed", "comprehensive", "thoroughly
+  tested", "Great catch", "You're absolutely right". Effort is not a
+  finding; name what ran and what it reported.
+- Formatting as emphasis in docs and PR text: bolded bullet-header runs
+  where a paragraph belongs, decorative rules, emoji.
+- Machine artifacts, defects on sight: zero-width and bidi characters,
+  homoglyphs, non-standard spaces, unfilled placeholders, leaked citation
+  markup. Legitimate Unicode lives in `docs/` (the casefold tables), so scan
+  the invisible class only, with a planted positive:
+
+  ```
+  grep -rnP '[\x{00A0}\x{200B}-\x{200F}\x{202A}-\x{202F}\x{2060}\x{FEFF}]' src/ tests/ docs/
+  ```
+
+Every class above binds every surface, so the sections below name only
+their own instance of one.
 
 Comments and commit messages are third-person: name the subject (the caller,
 this function) or use imperative phrasing.
@@ -86,6 +133,57 @@ module.
 
 New C tests are `tests/test-<feature>.c` and use the shared harness macros
 rather than rolling their own reporting.
+
+## Comments
+
+Brevity is part of correctness. Default to no comment; a survivor is cut to
+its rationale, usually one to a few dense lines. A block growing toward a
+paragraph stack is rejected even when every sentence is true ("Avoid long
+comments!", PR#290, on a 28-line test header; "Shorten the comments
+slightly.", PR#254, PR#261). An unrequested comment, log line, defensive
+check, or restructuring is a defect to remove, not a favor.
+
+A comment earns its place only for what the code cannot say: rationale, an
+invariant, a boundary condition, a unit, a citation. Delete anything
+restating the statement below it.
+
+- Bad: `slot->refcount = 1; /* set refcount to 1 */`
+- Good: `slot->refcount = 1; /* held by the /dev/fuse fd itself */`
+
+Cite the authority at the point of use: the kernel path, the man page with
+its section, the ELF or FUSE clause, the macOS or glibc behavior forcing a
+host workaround. Code that looks wrong says why it is not, the highest-value
+comment here. Never comment around bad code; rewrite it. Contracts,
+invariants, and lock ordering live once in the owning `.h`; call sites cite
+them. `sigwait()` returns on SIGUSR2 and no "doorbell" rings: a thread,
+flag, or helper is named for its operation, not the manner.
+
+Not in `src/`: attribution, dates, commented-out code, issue-tracker numbers
+(barred from `docs/` and README prose too, PR#40, PR#223; they belong in a
+commit trailer), or `TODO`/`FIXME`; incomplete work belongs in the commit
+message or PR. Editing part of a comment re-opens all of it: re-read the
+block and rewrite what no longer reads cleanly.
+
+Mechanics: `/* */` only in `.c`, `.h`, and `.S`, no `//`, no Doxygen tags;
+multi-line blocks align on ` * `, close with `*/` on its own line, indented
+to the body; American English; `@name` references a parameter in prose. A
+new file opens with title, copyright, SPDX identifier, a blank `*` line,
+then one prose paragraph on what the module is for (`src/syscall/signal.h`
+is the model). `#` comments in shell, Python, and Make obey the same rules.
+Update or delete a comment in the commit that changes its code: a stale
+comment is worse than none, because it is believed. A comment asserting a
+number or a guarantee is the case that rots silently, so recompute it before
+carrying it into an edit; `elfuse-refactor` reads the same rule from the
+reviewer's side.
+
+## docs/
+
+`docs/` describes how the system works now, for a reader who has never seen
+it, as settled fact, and a past decision that still matters reads as
+present-tense rationale ("paths are translated in one place so ..."). No
+workflow reads markdown, so nothing checks any of this against the code; a
+docs claim is only as true as the last person who read it against the
+source.
 
 ## Vendored tools checked out for evaluation
 
@@ -141,17 +239,45 @@ no area tag, no ticket number in the subject. The subject is a sentence about
 behavior. A commit that removes something says what stops happening; a commit
 that adds a proof says what is now proved.
 
-The body is where the reasoning goes, and it is expected to be substantial for
-anything non-mechanical: what the old code claimed, why that was wrong, what
-breaks if you do it the obvious other way. Some commits label body paragraphs
-(`Verified:`, `Coverage:`, `Concurrency:`) when a specific claim needs to be
-findable later. Issue references go at the end as `Fixes #187`, `Closes #156`,
-or the full URL form.
+The body is where the reasoning goes: what the old code claimed, why that
+was wrong, what breaks if you do it the obvious other way. Substantial is
+not the same as long: the target is the shortest faithful account, no
+restating of the diff, no padding to look thorough. Two to four sentences
+carry most commits; a body past roughly 50 lines is the signal to split the
+commit, not to write more. Some commits label body paragraphs (`Verified:`,
+`Coverage:`, `Concurrency:`) when a claim needs to be findable later. Issue
+references go at the end as `Fixes #187`, `Closes #156`, or the URL form.
 
-The ASCII and third-person rules above apply here too: no backticks around
-symbol names, no em dashes, no non-ASCII arrows.
+Subject and body name code objects and mechanisms, so every claim is
+checkable against the diff: "Remove unread probe outputs and unreachable
+arms", never "Drop dead weight from the probe". A diagram replaces prose
+rather than joining it, so interleaved actors, a race window, or a
+byte-layout off-by-one earn a small ASCII diagram inside 72 columns with
+real names, the prose it replaces cut. Verify it as rendered.
+
+The Style rules above bind here: the register classes, ASCII with no
+backticks around symbol names, no em dashes or non-ASCII arrows, and third
+person throughout.
 
 Merge commits keep git's generated subject and are exempt.
+
+## Pull requests
+
+A PR thread is human collaboration, and agent-shaped artifacts are rejected
+on sight: no pasted walkthroughs or summaries ("We are humans. Don't copy
+agent-specific reply here.", PR#116), no severity or status tables ("We're
+here to discuss and improve the software together, not to act as task
+trackers.", PR#90), no re-summarizing the diff git already shows. Close
+addressed threads with "Resolve conversation"; a reply carries the
+correction, the measurement, or nothing. A concise what and why belongs in
+the commit body, not the thread.
+
+The body is intent plus reproduction and commands: for a bug, a minimal
+reproduction with host macOS and SDK version, hardware, and `make check`
+status (PR#21, PR#41); for a performance claim, A/B benchmarks on a named
+machine, same binary with and without the change, median over runs (PR#203).
+Rebase on latest `main` (PR#58). One issue per bug (PR#135); validate
+against a real application, not only a unit smoke test (PR#191).
 
 ## Layout
 
@@ -159,9 +285,10 @@ All source under `src/`, artifacts under `build/`. The build passes `-Isrc`,
 so headers are included as `core/guest.h`, `syscall/internal.h`,
 `proved/gva.h`.
 
-Reports and analyses go in `claudedocs/` (ignored via `.git/info/exclude`,
-which is local to the clone, so never `git add` it), tests in `tests/`,
-scripts in `scripts/`.
+Tests in `tests/`, scripts in `scripts/`. Reports and analyses stay out of
+the tree: keep them in a scratch directory or in a repo-root directory the
+clone excludes through `.git/info/exclude`, never through `.gitignore`, which
+would push one person's habit onto everybody.
 
 Build and toolchain requirements are in `docs/testing.md`, section "Build
 Requirements". They belong to a machine, not to this convention set.

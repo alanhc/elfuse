@@ -4,7 +4,7 @@
 
 ## Display this help message
 help:
-	@printf "$(BLUE)elfuse — aarch64-linux ELF executor on macOS Apple Silicon$(RESET)\n\n"
+	@printf "$(BLUE)elfuse: aarch64-linux ELF executor on macOS Apple Silicon$(RESET)\n\n"
 	@printf "$(GREEN)Usage:$(RESET) make <target> [SIGN_IDENTITY=\"...\"]\n\n"
 	@printf "$(GREEN)Targets:$(RESET)\n"
 	@awk '/^[a-zA-Z\-\_0-9%:\\]+:/ { \
