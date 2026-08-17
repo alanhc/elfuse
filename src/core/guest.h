@@ -1055,6 +1055,20 @@ int guest_read_small(const guest_t *g, uint64_t gva, void *dst, size_t len);
  */
 int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len);
 
+/* Bounds-checked copy from host buffer into guest memory, reporting how many
+ * bytes landed.
+ *
+ * A caller whose return value is a byte count uses this instead of
+ * guest_write(), which reports only whether the whole copy survived: a copy
+ * that faults or leaves the mapping partway still places the bytes before that
+ * point, and they are in guest memory whatever the caller reports. The count is
+ * exact to the bound guest_host_copy_partial() documents.
+ */
+size_t guest_write_partial(guest_t *g,
+                           uint64_t gva,
+                           const void *src,
+                           size_t len);
+
 /* Optimized host-to-guest copy for small fixed-size outputs. Uses a direct
  * guest pointer when the full range is contiguous and writable, otherwise falls
  * back to guest_write() for boundary-crossing safety.

@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include "core/guest.h"
+#include "syscall/linux-wire.h" /* linux_iovec_t */
 
 /* Linux address families. */
 #define LINUX_AF_UNSPEC 0
@@ -226,6 +227,16 @@ int64_t netlink_read(int guest_fd,
                      uint64_t count);
 
 int64_t netlink_send(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t len);
+
+/* Vectored forms of the two above, taking the guest iovec array they stage.
+ * One netlink request, and one response, spans the whole iovec: the send
+ * gathers every entry into one request and the receive fills every entry from
+ * one response, so neither stops at the first entry the way the scalar special
+ * fds do.
+ */
+int64_t netlink_writev(int guest_fd, guest_t *g, uint64_t iov_gva, int iovcnt);
+
+int64_t netlink_readv(int guest_fd, guest_t *g, uint64_t iov_gva, int iovcnt);
 
 int64_t netlink_recv(int guest_fd,
                      guest_t *g,

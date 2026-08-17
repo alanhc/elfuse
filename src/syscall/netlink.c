@@ -112,6 +112,13 @@ typedef struct {
 #define MAX_NETLINK_FDS 16
 #define NETLINK_BUF_SIZE 8192
 
+/* Ceiling on one staged request. Linux bounds a send by sk_sndbuf and reports
+ * EMSGSIZE past it; this is that refusal against a fixed buffer. The largest
+ * request nl_process_request() reads is an RTM_GETLINK carrying an IFLA_IFNAME
+ * filter, an nlmsghdr and an ifinfomsg and an attribute holding IFNAMSIZ.
+ */
+#define NETLINK_REQ_MAX 512
+
 typedef struct {
     bool in_use;
     int guest_fd;                  /* Guest fd number */
@@ -621,9 +628,80 @@ static int nl_process_request(netlink_state_t *ns,
     return (ret < 0) ? -LINUX_EIO : 0;
 }
 
-int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
+/* A staged guest iovec vector, on the caller's stack for the common count. */
+typedef struct {
+    linux_iovec_t stack[SYSCALL_IOV_STACK_MAX];
+    linux_iovec_t *iov;
+    linux_iovec_t *heap; /* non-NULL only when iov was heap-allocated */
+} nl_iov_buf_t;
+
+/* Stage the iovcnt guest iovec entries at iov_gva into buf.
+ *
+ * Both directions want the entries themselves rather than the resolved host
+ * pointers host_iov_prepare() builds, since one netlink request and one
+ * response each span the whole vector and are staged through ns->buf.
+ *
+ * Returns 0, or a negative Linux errno. Pair every return with nl_iov_free().
+ * iovcnt is bounded by the caller, whose spelling decides what an empty vector
+ * means.
+ */
+static int64_t nl_iov_stage(guest_t *g,
+                            uint64_t iov_gva,
+                            int iovcnt,
+                            nl_iov_buf_t *buf)
 {
-    (void) flags;
+    buf->iov = buf->stack;
+    buf->heap = NULL;
+    if (iovcnt > SYSCALL_IOV_STACK_MAX) {
+        buf->heap = malloc((size_t) iovcnt * sizeof(*buf->heap));
+        if (!buf->heap)
+            return -LINUX_ENOMEM;
+        buf->iov = buf->heap;
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        uint64_t entry_gva = iov_gva + (uint64_t) i * sizeof(*buf->iov);
+        if (guest_read_small(g, entry_gva, &buf->iov[i], sizeof(*buf->iov)) < 0)
+            return -LINUX_EFAULT;
+        if (!iov_total_add(total, buf->iov[i].iov_len, &total))
+            return -LINUX_EINVAL;
+    }
+    return 0;
+}
+
+static void nl_iov_free(nl_iov_buf_t *buf)
+{
+    free(buf->heap);
+    buf->heap = NULL;
+}
+
+/* Bound msg_iovlen, which is uint64_t on Linux, before the int narrowing, so a
+ * 64-bit value whose low 32 bits fall inside the cap cannot slip past it.
+ * sys_sendmsg and sys_recvmsg refuse the same count the same way.
+ */
+static int64_t nl_msg_iovcnt(const linux_msghdr_t *mhdr, int *iovcnt)
+{
+    if (mhdr->msg_iovlen > SYSCALL_IOV_MAX)
+        return -LINUX_EINVAL;
+    *iovcnt = (int) mhdr->msg_iovlen;
+    return 0;
+}
+
+/* The send half of sendmsg(2), sendto(2), write(2) and writev(2) on a netlink
+ * socket.
+ *
+ * One request spans the whole iovec, so it is gathered before it is parsed.
+ * A gathered length between one byte and one nlmsghdr transfers and does
+ * nothing: the loop in netlink_rcv_skb() is entered only from
+ * nlmsg_total_size(0) bytes up, and the send reports the byte count rather
+ * than an error. Measured against Linux 6.18 under qemu-aarch64.
+ */
+static int64_t netlink_send_iov(int guest_fd,
+                                guest_t *g,
+                                const linux_iovec_t *iov,
+                                int iovcnt)
+{
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns = nl_find(guest_fd);
     if (!ns) {
@@ -632,40 +710,57 @@ int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
     }
 
     int64_t result;
-
-    /* Parse the linux_msghdr_t to get the iovec */
-    linux_msghdr_t mhdr;
-    if (guest_read_small(g, msg_gva, &mhdr, sizeof(mhdr)) < 0) {
-        result = -LINUX_EFAULT;
-        goto out;
+    uint64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len > UINT64_MAX - total) {
+            result = -LINUX_EINVAL;
+            goto out;
+        }
+        total += iov[i].iov_len;
     }
 
-    if (mhdr.msg_iovlen == 0) {
-        result = -LINUX_EINVAL;
-        goto out;
-    }
-
-    struct {
-        uint64_t iov_base, iov_len;
-    } iov;
-    if (guest_read_small(g, mhdr.msg_iov, &iov, sizeof(iov)) < 0) {
-        result = -LINUX_EFAULT;
-        goto out;
-    }
-
-    if (iov.iov_len < (uint64_t) NLMSG_HDRLEN) {
-        result = -LINUX_EINVAL;
-        goto out;
-    }
-
-    /* Copy the whole request: the dispatcher inspects filter attributes past
-     * the fixed nlmsghdr.
+    /* Linux's netlink_sendmsg() refuses an empty message before it builds an
+     * skb, which is what a sendmsg or a write of nothing reports. No entries at
+     * all sums to nothing too. The writev spelling never arrives here empty:
+     * do_readv_writev() returns on a zero total above the socket, and
+     * netlink_writev() carries that rule.
      */
-    uint8_t req[512];
-    size_t rlen = (iov.iov_len < sizeof(req)) ? iov.iov_len : sizeof(req);
-    if (guest_read(g, iov.iov_base, req, rlen) < 0) {
-        result = -LINUX_EFAULT;
+    if (total == 0) {
+        result = -LINUX_ENODATA;
         goto out;
+    }
+
+    /* Ahead of the read, the order netlink_sendmsg() checks its length in: an
+     * oversized send is refused whatever its buffers hold.
+     */
+    if (total > NETLINK_REQ_MAX) {
+        result = -LINUX_EMSGSIZE;
+        goto out;
+    }
+
+    if (total < (uint64_t) NLMSG_HDRLEN) {
+        result = (int64_t) total;
+        goto out;
+    }
+
+    /* Every entry is read, so total is the byte count that was validated and
+     * parsed, and an unmapped entry anywhere in the vector is EFAULT rather
+     * than a report of bytes nothing looked at. An entry of no length reads
+     * nothing and validates nothing, which is what Linux does with it.
+     *
+     * A total of NLMSG_HDRLEN or more rules out an empty vector, so the loop
+     * always runs. req is zeroed anyway: cppcheck reads the loop as skippable
+     * and calls the parse below an uninitialized read.
+     */
+    uint8_t req[NETLINK_REQ_MAX] = {0};
+    size_t rlen = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (guest_read(g, iov[i].iov_base, req + rlen,
+                       (size_t) iov[i].iov_len) < 0) {
+            result = -LINUX_EFAULT;
+            goto out;
+        }
+        rlen += (size_t) iov[i].iov_len;
     }
 
     bool was_empty = ns->buf_pos >= ns->buf_len;
@@ -674,47 +769,62 @@ int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
         if (was_empty && ns->buf_pos < ns->buf_len)
             netlink_signal_readable(ns);
     }
-    result = (ret < 0) ? ret : (int64_t) iov.iov_len;
+    result = (ret < 0) ? ret : (int64_t) total;
 
 out:
     pthread_mutex_unlock(&nl_lock);
     return result;
 }
 
-/* sendto(2) on a netlink socket: a flat request buffer (no msghdr). */
 int64_t netlink_send(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t len)
 {
-    pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
-    if (!ns) {
-        pthread_mutex_unlock(&nl_lock);
-        return -LINUX_EBADF;
-    }
+    linux_iovec_t one = {.iov_base = buf_gva, .iov_len = len};
+    return netlink_send_iov(guest_fd, g, &one, 1);
+}
 
-    int64_t result;
-    if (len < (uint64_t) NLMSG_HDRLEN) {
-        result = -LINUX_EINVAL;
-        goto out;
-    }
+int64_t netlink_writev(int guest_fd, guest_t *g, uint64_t iov_gva, int iovcnt)
+{
+    if (!iov_count_ok(iovcnt))
+        return -LINUX_EINVAL;
 
-    uint8_t req[512];
-    size_t rlen = (len < sizeof(req)) ? len : sizeof(req);
-    if (guest_read(g, buf_gva, req, rlen) < 0) {
-        result = -LINUX_EFAULT;
-        goto out;
-    }
-
-    bool was_empty = ns->buf_pos >= ns->buf_len;
-    int ret = nl_process_request(ns, req, rlen);
+    nl_iov_buf_t buf;
+    int64_t ret = nl_iov_stage(g, iov_gva, iovcnt, &buf);
     if (ret == 0) {
-        if (was_empty && ns->buf_pos < ns->buf_len)
-            netlink_signal_readable(ns);
-    }
-    result = (ret < 0) ? ret : (int64_t) len;
+        uint64_t total = 0;
+        for (int i = 0; i < iovcnt; i++)
+            total += buf.iov[i].iov_len; /* nl_iov_stage bounds the sum */
 
-out:
-    pthread_mutex_unlock(&nl_lock);
-    return result;
+        /* A vectored write carrying nothing stops in do_readv_writev() before
+         * the socket is reached, so it reports 0 where write(2) of nothing
+         * reports ENODATA. Measured against Linux 6.18 under qemu-aarch64.
+         */
+        ret = total == 0 ? 0 : netlink_send_iov(guest_fd, g, buf.iov, iovcnt);
+    }
+    nl_iov_free(&buf);
+    return ret;
+}
+
+int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
+{
+    (void) flags;
+    linux_msghdr_t mhdr;
+    if (guest_read_small(g, msg_gva, &mhdr, sizeof(mhdr)) < 0)
+        return -LINUX_EFAULT;
+
+    int iovcnt;
+    int64_t ret = nl_msg_iovcnt(&mhdr, &iovcnt);
+    if (ret < 0)
+        return ret;
+
+    /* ___sys_sendmsg() carries an empty vector down to the socket rather than
+     * answering it, so netlink_send_iov() decides this one too.
+     */
+    nl_iov_buf_t buf;
+    ret = nl_iov_stage(g, mhdr.msg_iov, iovcnt, &buf);
+    if (ret == 0)
+        ret = netlink_send_iov(guest_fd, g, buf.iov, iovcnt);
+    nl_iov_free(&buf);
+    return ret;
 }
 
 /* Block until the netlink receive buffer has data. Called with nl_lock held.
@@ -820,8 +930,86 @@ static void nl_write_kernel_src(guest_t *g,
     guest_write_small(g, namelen_gva, &namelen, sizeof(namelen));
 }
 
-/* recvfrom(2) on a netlink socket: drain whole messages; write back a kernel
- * sockaddr_nl (nl_pid 0) when src is requested.
+/* The receive half of recvmsg(2), recvfrom(2), read(2) and readv(2) on a
+ * netlink socket: drain whole messages, filling every entry in turn.
+ *
+ * One response spans the whole iovec, so a first entry too small for it does
+ * not cap the transfer. nl_complete_span() bounds every spelling alike, so none
+ * of them hands out a message split across two calls.
+ *
+ * Returns the byte count, or a negative Linux errno. Takes nl_lock and releases
+ * it before returning. flags carries MSG_DONTWAIT; pass 0 for read(2), which
+ * only honors O_NONBLOCK.
+ */
+static int64_t netlink_recv_iov(int guest_fd,
+                                guest_t *g,
+                                const linux_iovec_t *iov,
+                                int iovcnt,
+                                int flags)
+{
+    pthread_mutex_lock(&nl_lock);
+    netlink_state_t *ns = nl_find(guest_fd);
+    if (!ns) {
+        pthread_mutex_unlock(&nl_lock);
+        return -LINUX_EBADF;
+    }
+
+    uint64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (iov[i].iov_len > UINT64_MAX - total) {
+            pthread_mutex_unlock(&nl_lock);
+            return -LINUX_EINVAL;
+        }
+        total += iov[i].iov_len;
+    }
+
+    if (total == 0) {
+        pthread_mutex_unlock(&nl_lock);
+        return 0;
+    }
+
+    int64_t werr = nl_wait_readable_locked(ns, guest_fd, flags);
+    if (werr < 0)
+        return werr;
+
+    size_t avail = ns->buf_len - ns->buf_pos;
+    size_t to_copy = (avail < total) ? avail : (size_t) total;
+    size_t msg_end = nl_complete_span(ns, to_copy);
+
+    size_t done = 0;
+    for (int i = 0; i < iovcnt && done < msg_end; i++) {
+        size_t remain = msg_end - done;
+        size_t chunk =
+            (iov[i].iov_len < remain) ? (size_t) iov[i].iov_len : remain;
+        if (chunk == 0)
+            continue;
+
+        /* The count is what landed, not whole entries: guest memory is copied
+         * chunk by chunk and a chunk that faults still places the bytes ahead
+         * of it, which is what copy_to_iter() counts.
+         */
+        size_t moved = guest_write_partial(g, iov[i].iov_base,
+                                           ns->buf + ns->buf_pos, chunk);
+        ns->buf_pos += moved;
+        done += moved;
+        if (moved < chunk) {
+            pthread_mutex_unlock(&nl_lock);
+            /* Bytes already placed are transferred; reporting EFAULT over them
+             * would lose them, since buf_pos has moved past.
+             */
+            return done ? (int64_t) done : -LINUX_EFAULT;
+        }
+    }
+
+    if (ns->buf_pos >= ns->buf_len)
+        netlink_clear_readable(ns);
+
+    pthread_mutex_unlock(&nl_lock);
+    return (int64_t) done;
+}
+
+/* recvfrom(2) on a netlink socket: write back a kernel sockaddr_nl (nl_pid 0)
+ * when src is requested.
  */
 int64_t netlink_recv(int guest_fd,
                      guest_t *g,
@@ -831,43 +1019,11 @@ int64_t netlink_recv(int guest_fd,
                      uint64_t src_gva,
                      uint64_t addrlen_gva)
 {
-    pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
-    if (!ns) {
-        pthread_mutex_unlock(&nl_lock);
-        return -LINUX_EBADF;
-    }
-
-    if (len == 0) {
-        pthread_mutex_unlock(&nl_lock);
-        return 0;
-    }
-
-    /* Wait for data to become available, blocking on the host pipe read end
-     * unless MSG_DONTWAIT or O_NONBLOCK is set.
-     */
-    int64_t werr = nl_wait_readable_locked(ns, guest_fd, flags);
-    if (werr < 0)
-        return werr;
-
-    size_t avail = ns->buf_len - ns->buf_pos;
-    size_t to_copy = (avail < len) ? avail : len;
-    size_t msg_end = nl_complete_span(ns, to_copy);
-
-    if (guest_write(g, buf_gva, ns->buf + ns->buf_pos, msg_end) < 0) {
-        pthread_mutex_unlock(&nl_lock);
-        return -LINUX_EFAULT;
-    }
-    ns->buf_pos += msg_end;
-
-    if (ns->buf_pos >= ns->buf_len)
-        netlink_clear_readable(ns);
-
-    if (src_gva && addrlen_gva)
+    linux_iovec_t one = {.iov_base = buf_gva, .iov_len = len};
+    int64_t ret = netlink_recv_iov(guest_fd, g, &one, 1, flags);
+    if (ret >= 0 && src_gva && addrlen_gva)
         nl_write_kernel_src(g, src_gva, addrlen_gva);
-
-    pthread_mutex_unlock(&nl_lock);
-    return (int64_t) msg_end;
+    return ret;
 }
 
 /* getsockname(2) on a netlink socket: returns the bound/auto-assigned pid. */
@@ -905,113 +1061,53 @@ int64_t netlink_getsockname(int guest_fd,
 
 int64_t netlink_recvmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
 {
-    pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
-    if (!ns) {
-        pthread_mutex_unlock(&nl_lock);
-        return -LINUX_EBADF;
-    }
-
-    /* Parse msghdr to get iovec */
     linux_msghdr_t mhdr;
-    if (guest_read_small(g, msg_gva, &mhdr, sizeof(mhdr)) < 0) {
-        pthread_mutex_unlock(&nl_lock);
+    if (guest_read_small(g, msg_gva, &mhdr, sizeof(mhdr)) < 0)
         return -LINUX_EFAULT;
-    }
 
-    if (mhdr.msg_iovlen == 0) {
-        pthread_mutex_unlock(&nl_lock);
-        return 0;
-    }
+    int iovcnt;
+    int64_t ret = nl_msg_iovcnt(&mhdr, &iovcnt);
+    if (ret < 0)
+        return ret;
 
-    struct {
-        uint64_t iov_base, iov_len;
-    } iov;
-    if (guest_read_small(g, mhdr.msg_iov, &iov, sizeof(iov)) < 0) {
-        pthread_mutex_unlock(&nl_lock);
-        return -LINUX_EFAULT;
-    }
+    nl_iov_buf_t buf;
+    ret = nl_iov_stage(g, mhdr.msg_iov, iovcnt, &buf);
+    if (ret == 0)
+        ret = netlink_recv_iov(guest_fd, g, buf.iov, iovcnt, flags);
+    nl_iov_free(&buf);
+    if (ret < 0)
+        return ret;
 
-    if (iov.iov_len == 0) {
-        pthread_mutex_unlock(&nl_lock);
-        return 0;
-    }
-
-    /* Wait for data to become available, blocking on the host pipe read end
-     * unless MSG_DONTWAIT or O_NONBLOCK is set.
-     */
-    int64_t werr = nl_wait_readable_locked(ns, guest_fd, flags);
-    if (werr < 0)
-        return werr;
-
-    size_t avail = ns->buf_len - ns->buf_pos;
-    size_t to_copy = (avail < iov.iov_len) ? avail : iov.iov_len;
-    size_t msg_end = nl_complete_span(ns, to_copy);
-
-    if (guest_write(g, iov.iov_base, ns->buf + ns->buf_pos, msg_end) < 0) {
-        pthread_mutex_unlock(&nl_lock);
-        return -LINUX_EFAULT;
-    }
-
-    ns->buf_pos += msg_end;
-
-    if (ns->buf_pos >= ns->buf_len)
-        netlink_clear_readable(ns);
-
-    /* Write back sockaddr_nl if caller provided msg_name. msg_namelen sits at
-     * offset 8 in the msghdr (after the 8-byte msg_name pointer).
-     */
     if (mhdr.msg_name && mhdr.msg_namelen >= sizeof(sockaddr_nl_t))
-        nl_write_kernel_src(g, mhdr.msg_name, msg_gva + 8);
+        nl_write_kernel_src(g, mhdr.msg_name,
+                            msg_gva + offsetof(linux_msghdr_t, msg_namelen));
 
-    /* Clear msg_flags and msg_controllen */
     int32_t zero_flags = 0;
     guest_write_small(g, msg_gva + offsetof(linux_msghdr_t, msg_flags),
                       &zero_flags, sizeof(zero_flags));
     uint64_t zero_controllen = 0;
     guest_write_small(g, msg_gva + offsetof(linux_msghdr_t, msg_controllen),
                       &zero_controllen, sizeof(zero_controllen));
+    return ret;
+}
 
-    pthread_mutex_unlock(&nl_lock);
-    return (int64_t) msg_end;
+int64_t netlink_readv(int guest_fd, guest_t *g, uint64_t iov_gva, int iovcnt)
+{
+    if (!iov_count_ok(iovcnt))
+        return -LINUX_EINVAL;
+
+    nl_iov_buf_t buf;
+    int64_t ret = nl_iov_stage(g, iov_gva, iovcnt, &buf);
+    if (ret == 0)
+        ret = netlink_recv_iov(guest_fd, g, buf.iov, iovcnt, 0);
+    nl_iov_free(&buf);
+    return ret;
 }
 
 int64_t netlink_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 {
-    pthread_mutex_lock(&nl_lock);
-    netlink_state_t *ns = nl_find(guest_fd);
-    if (!ns) {
-        pthread_mutex_unlock(&nl_lock);
-        return -LINUX_EBADF;
-    }
-
-    if (count == 0) {
-        pthread_mutex_unlock(&nl_lock);
-        return 0;
-    }
-
-    /* Wait for data to become available, blocking on the host pipe read end
-     * unless O_NONBLOCK is set. read(2) has no per-call MSG_DONTWAIT.
-     */
-    int64_t werr = nl_wait_readable_locked(ns, guest_fd, 0);
-    if (werr < 0)
-        return werr;
-
-    size_t avail = ns->buf_len - ns->buf_pos;
-    size_t to_copy = (avail < count) ? avail : count;
-
-    if (guest_write(g, buf_gva, ns->buf + ns->buf_pos, to_copy) < 0) {
-        pthread_mutex_unlock(&nl_lock);
-        return -LINUX_EFAULT;
-    }
-
-    ns->buf_pos += to_copy;
-
-    if (ns->buf_pos >= ns->buf_len)
-        netlink_clear_readable(ns);
-
-    pthread_mutex_unlock(&nl_lock);
-    return (int64_t) to_copy;
+    linux_iovec_t one = {.iov_base = buf_gva, .iov_len = count};
+    return netlink_recv_iov(guest_fd, g, &one, 1, 0);
 }
 
 static void netlink_close(int guest_fd)
