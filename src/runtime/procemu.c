@@ -1995,31 +1995,37 @@ out:
     return proc_finish_maps_output(result, &entries, &builder);
 }
 
-/* Emit /proc/meminfo from host sysctl (HW_MEMSIZE) plus mach vm_statistics64,
- * approximating the Linux fields macOS does not expose.
+/* Emit /proc/meminfo from the guest-visible memory figures plus mach
+ * vm_statistics64, approximating the Linux fields macOS does not expose.
+ *
+ * MemTotal and MemFree come from sys_guest_ram_bytes()/sys_guest_ram_free()
+ * rather than from a host sample taken here, so this file and sysinfo(2) read
+ * one snapshot rather than two: a guest reading both back to back, as busybox
+ * free does, sees figures that were measured together. They used to describe
+ * two different machines outright, never mind two instants -- meminfo reported
+ * the host's real memory while sysinfo capped it at a hardcoded 4GiB -- and
+ * that guest underflowed. busybox free takes total and free from sysinfo and
+ * buff/cache from here, so a Cached larger than the sysinfo total made
+ * used = total - free - cached wrap into a 24-digit figure.
  *
  * Returns a host fd, or -1. Split out of proc_intercept_open to keep that
  * dispatcher readable.
  */
 static int proc_open_meminfo(void)
 {
-    int64_t physmem = 0;
-    size_t sz = sizeof(physmem);
-    int mib[2] = {CTL_HW, HW_MEMSIZE};
-    sysctl(mib, 2, &physmem, &sz, NULL, 0);
-    uint64_t total_kb = (uint64_t) physmem / 1024;
+    uint64_t total_kb = sys_guest_ram_bytes() / 1024;
+    uint64_t free_kb = sys_guest_ram_free() / 1024;
 
-    /* Query host vm_statistics for accurate free/active/inactive. Falls back to
+    /* Query host vm_statistics for accurate active/inactive. Falls back to
      * approximations if the mach call fails.
      */
-    uint64_t free_kb, avail_kb, buffers_kb, cached_kb;
+    uint64_t avail_kb, buffers_kb, cached_kb;
     vm_statistics64_data_t vm_stat = {0};
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     uint64_t page_size = 4096;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
                           (host_info64_t) &vm_stat, &count) == KERN_SUCCESS) {
         host_page_size(mach_host_self(), (vm_size_t *) &page_size);
-        free_kb = (uint64_t) vm_stat.free_count * page_size / 1024;
         uint64_t inactive_kb =
             (uint64_t) vm_stat.inactive_count * page_size / 1024;
         uint64_t purgeable_kb =
@@ -2031,18 +2037,30 @@ static int proc_open_meminfo(void)
         cached_kb = inactive_kb + purgeable_kb;
         buffers_kb = 0; /* macOS does not expose buffer cache separately */
     } else {
-        free_kb = total_kb / 2;
         avail_kb = total_kb * 3 / 4;
         buffers_kb = total_kb / 20;
         cached_kb = total_kb / 4;
     }
 
-    /* Saturating subtraction. On macOS free + cached (inactive + purgeable) can
-     * exceed physical total, which would unsigned-underflow these derived
-     * fields into absurd values.
+    /* Cached has to fit in what MemFree leaves, not merely be smaller than the
+     * total. The Mach counters do not partition: a purgeable page is also
+     * counted in inactive, so free + inactive + purgeable can exceed physical
+     * memory however the total is derived. A guest computing
+     * used = total - free - cached wraps on that excess, which is the failure
+     * reporting one total is meant to end. Cached gives up the precision rather
+     * than MemFree, since MemFree is what sysinfo reports as freeram and the
+     * two have to keep matching. free_kb needs no clamp of its own: it comes
+     * from sys_guest_ram_free(), which is already held below the total.
+     */
+    if (cached_kb > total_kb - free_kb)
+        cached_kb = total_kb - free_kb;
+
+    /* Active is now an exact remainder -- the clamp above makes free + cached
+     * fit inside the total. AnonPages still saturates, because Buffers is not
+     * part of that clamp and the fallback branch above sets it non-zero.
      */
     uint64_t fc_kb = free_kb + cached_kb;
-    uint64_t active_kb = total_kb > fc_kb ? total_kb - fc_kb : 0;
+    uint64_t active_kb = total_kb - fc_kb;
     uint64_t anon_kb =
         total_kb > fc_kb + buffers_kb ? total_kb - fc_kb - buffers_kb : 0;
 

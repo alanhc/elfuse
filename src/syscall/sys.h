@@ -60,6 +60,23 @@ int64_t sys_prlimit64(guest_t *g,
                       uint64_t new_gva,
                       uint64_t old_gva);
 
+/* Guest-visible physical memory, shared by every surface that reports it.
+ *
+ * A guest that reads two surfaces subtracts one against the other, and there
+ * the underflow happens beyond any saturating arithmetic elfuse does on its own
+ * side. busybox free is exactly this reader: it takes total and free from
+ * sysinfo(2) and buff/cache from /proc/meminfo, then computes
+ * used = total - free - cached. So the total and the free both have to come
+ * from here rather than being sampled once per surface.
+ *
+ * sys_guest_ram_bytes() is the total to report as MemTotal/totalram: the host's
+ * real memory, or a plausible stand-in if the sysctl fails, never zero.
+ * sys_guest_ram_free() is the matching free figure, taken from the same cached
+ * snapshot sysinfo(2) reports and guaranteed not to exceed the total.
+ */
+uint64_t sys_guest_ram_bytes(void);
+uint64_t sys_guest_ram_free(void);
+
 /* Snapshot/restore the guest-visible RLIMIT_NOFILE across the posix_spawn
  * fork boundary. The host limit is internal capacity and is deliberately not
  * exposed through these helpers.

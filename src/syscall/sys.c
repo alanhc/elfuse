@@ -47,6 +47,14 @@ static const linux_utsname_t cached_uname = {
 };
 static const uint8_t cached_affinity_mask[256] = {1}, zero_block[256] = {0};
 
+/* Physical memory to report when sysctl(HW_MEMSIZE) fails. Reporting zero is
+ * not an option: a guest computing used = total - free - cached against a zero
+ * total wraps, which is the failure sys_guest_ram_bytes() exists to prevent.
+ * The figure is one captured from a 4 GiB VZ VM, so the fallback describes a
+ * machine that plausibly exists.
+ */
+#define GUEST_RAM_FALLBACK_BYTES 4094595072ULL
+
 /* sysinfo cache.
  *
  * Process-scoped by intent: the cache mirrors the host's view (totalram from
@@ -59,7 +67,7 @@ static const uint8_t cached_affinity_mask[256] = {1}, zero_block[256] = {0};
 static pthread_once_t sysinfo_once = PTHREAD_ONCE_INIT;
 static pthread_rwlock_t sysinfo_lock = PTHREAD_RWLOCK_INITIALIZER;
 static time_t cached_boottime_sec = 0;
-static uint64_t cached_totalram = 0, cached_real_memsize = 0;
+static uint64_t cached_totalram = 0;
 static uint64_t cached_page_size = 0;
 static mach_port_t cached_host_port = MACH_PORT_NULL;
 static time_t cached_sysinfo_sec = -1;
@@ -103,12 +111,9 @@ static void sysinfo_init_cached_host_state(void)
     uint64_t memsize = 0;
     size_t ms_len = sizeof(memsize);
     int mib_mem[2] = {CTL_HW, HW_MEMSIZE};
-    if (sysctl(mib_mem, 2, &memsize, &ms_len, NULL, 0) == 0) {
-        const uint64_t vm_ram_cap =
-            4094595072ULL; /* totalram cap captured from a 4 GiB VZ VM */
-        cached_real_memsize = memsize;
-        cached_totalram = (memsize > vm_ram_cap) ? vm_ram_cap : memsize;
-    }
+    if (sysctl(mib_mem, 2, &memsize, &ms_len, NULL, 0) != 0 || memsize == 0)
+        memsize = GUEST_RAM_FALLBACK_BYTES;
+    cached_totalram = memsize;
 
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size > 0)
@@ -127,24 +132,18 @@ static void sysinfo_refresh_cached_locked(time_t now_sec)
     if (cached_boottime_sec != 0)
         cached_sysinfo.uptime = now_sec - cached_boottime_sec;
 
-    /* Free RAM from vm_statistics64. Scale proportionally if totalram is
-     * capped.
+    /* Free RAM from vm_statistics64, held below the total unconditionally so
+     * that every reader of the pair -- here and /proc/meminfo -- can subtract
+     * one from the other without checking.
      */
     vm_statistics64_data_t vmstat = {0};
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     if (cached_host_port != MACH_PORT_NULL &&
         host_statistics64(cached_host_port, HOST_VM_INFO64,
                           (host_info64_t) &vmstat, &count) == KERN_SUCCESS) {
-        uint64_t real_free = (uint64_t) vmstat.free_count * cached_page_size;
-        if (cached_real_memsize > 0 &&
-            cached_real_memsize > cached_sysinfo.totalram) {
-            uint64_t scaled_free = real_free;
-            scaled_free *= cached_sysinfo.totalram;
-            scaled_free /= cached_real_memsize;
-            cached_sysinfo.freeram = scaled_free;
-        } else {
-            cached_sysinfo.freeram = real_free;
-        }
+        uint64_t free_bytes = (uint64_t) vmstat.free_count * cached_page_size;
+        cached_sysinfo.freeram =
+            free_bytes > cached_totalram ? cached_totalram : free_bytes;
     }
 
     /* Load averages (x 65536 for fixed-point). */
@@ -156,6 +155,50 @@ static void sysinfo_refresh_cached_locked(time_t now_sec)
     }
 
     cached_sysinfo_sec = now_sec;
+}
+
+/* Copy out the cached sysinfo, refreshing it first if it has aged past a
+ * second. Every guest-visible memory figure comes through here, so that a guest
+ * reading two surfaces back to back reads one snapshot rather than two samples.
+ */
+static void sysinfo_snapshot(linux_sysinfo_t *out)
+{
+    pthread_once(&sysinfo_once, sysinfo_init_cached_host_state);
+    time_t now_sec = time(NULL);
+
+    if (thread_is_single_active()) {
+        if (cached_sysinfo_sec != now_sec)
+            sysinfo_refresh_cached_locked(now_sec);
+        *out = cached_sysinfo;
+        return;
+    }
+
+    pthread_rwlock_rdlock(&sysinfo_lock);
+    if (cached_sysinfo_sec == now_sec) {
+        *out = cached_sysinfo;
+        pthread_rwlock_unlock(&sysinfo_lock);
+        return;
+    }
+    pthread_rwlock_unlock(&sysinfo_lock);
+
+    pthread_rwlock_wrlock(&sysinfo_lock);
+    if (cached_sysinfo_sec != now_sec)
+        sysinfo_refresh_cached_locked(now_sec);
+    *out = cached_sysinfo;
+    pthread_rwlock_unlock(&sysinfo_lock);
+}
+
+uint64_t sys_guest_ram_bytes(void)
+{
+    pthread_once(&sysinfo_once, sysinfo_init_cached_host_state);
+    return cached_totalram;
+}
+
+uint64_t sys_guest_ram_free(void)
+{
+    linux_sysinfo_t si;
+    sysinfo_snapshot(&si);
+    return si.freeram; /* mem_unit is 1, so freeram is already bytes */
 }
 
 static int get_cached_linux_groups(void)
@@ -543,34 +586,11 @@ int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva)
 
 int64_t sys_sysinfo(guest_t *g, uint64_t info_gva)
 {
-    pthread_once(&sysinfo_once, sysinfo_init_cached_host_state);
-    time_t now_sec = time(NULL);
-
-    if (thread_is_single_active()) {
-        if (cached_sysinfo_sec != now_sec)
-            sysinfo_refresh_cached_locked(now_sec);
-        if (guest_write_small(g, info_gva, &cached_sysinfo,
-                              sizeof(cached_sysinfo)) < 0)
-            return -LINUX_EFAULT;
-        return 0;
-    } else {
-        linux_sysinfo_t si;
-        pthread_rwlock_rdlock(&sysinfo_lock);
-        if (cached_sysinfo_sec == now_sec) {
-            si = cached_sysinfo;
-            pthread_rwlock_unlock(&sysinfo_lock);
-        } else {
-            pthread_rwlock_unlock(&sysinfo_lock);
-            pthread_rwlock_wrlock(&sysinfo_lock);
-            if (cached_sysinfo_sec != now_sec)
-                sysinfo_refresh_cached_locked(now_sec);
-            si = cached_sysinfo;
-            pthread_rwlock_unlock(&sysinfo_lock);
-        }
-        if (guest_write_small(g, info_gva, &si, sizeof(si)) < 0)
-            return -LINUX_EFAULT;
-        return 0;
-    }
+    linux_sysinfo_t si;
+    sysinfo_snapshot(&si);
+    if (guest_write_small(g, info_gva, &si, sizeof(si)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
 }
 
 /* Resource limits. */
