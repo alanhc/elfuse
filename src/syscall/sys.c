@@ -40,12 +40,8 @@ static int cached_ngroups = -1;
 static const linux_utsname_t cached_uname = {
     .sysname = "Linux",
     .nodename = "elfuse",
-
-    /* Kernel version: match the lima aarch64 VM kernel to avoid version-gated
-     * feature detection mismatches in userspace.
-     */
-    .release = "6.17.0-20-generic",
-    .version = "#20-Ubuntu SMP PREEMPT_DYNAMIC",
+    .release = GUEST_KERNEL_RELEASE,
+    .version = GUEST_KERNEL_VERSION,
     .machine = "aarch64",
     .domainname = "(none)",
 };
@@ -108,7 +104,8 @@ static void sysinfo_init_cached_host_state(void)
     size_t ms_len = sizeof(memsize);
     int mib_mem[2] = {CTL_HW, HW_MEMSIZE};
     if (sysctl(mib_mem, 2, &memsize, &ms_len, NULL, 0) == 0) {
-        const uint64_t vm_ram_cap = 4094595072ULL; /* Match Lima VZ 4GiB VM */
+        const uint64_t vm_ram_cap =
+            4094595072ULL; /* totalram cap captured from a 4 GiB VZ VM */
         cached_real_memsize = memsize;
         cached_totalram = (memsize > vm_ram_cap) ? vm_ram_cap : memsize;
     }

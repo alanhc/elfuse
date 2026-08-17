@@ -398,7 +398,8 @@ int main(void)
         if (setpgid(0, 0) == -1 && errno == EPERM)
             PASS();
         else if (setpgid(0, 0) == 0)
-            PASS(); /* Also acceptable (lima/native may behave differently) */
+            PASS(); /* not the session leader when a launcher owns the session
+                     */
         else
             FAIL("setpgid unexpected result");
     }

@@ -795,6 +795,47 @@ under `/proc`, `/dev`, and a few Linux-expected compatibility files:
 - Guest cwd handling preserves a virtual `/proc` working directory even
   though the host operates on synthetic backing directories.
 
+### Reported Kernel Identity
+
+Two surfaces tell the guest which kernel it is running on: `uname(2)`, served
+from a static `linux_utsname_t` in `src/syscall/sys.c`, and `/proc/version`,
+emitted as a literal by `src/runtime/procemu.c`. Both spell the release
+through `GUEST_KERNEL_RELEASE` and `GUEST_KERNEL_VERSION` in
+`src/syscall/sys.h`, so the two cannot disagree; `tests/test-proc.c` asserts
+that the release `uname` reports appears in the `/proc/version` banner.
+
+The reported release is `6.18.0`, the 6.18 LTS baseline; it tracks no test
+image. `elfuse` emits no `/proc/sys/kernel/osrelease`, so glibc's
+`dl_discover_osversion` falls back to `uname(2)` and reads this value at
+every dynamic startup. It refuses a kernel only when the release is below its
+build-time floor, so a high baseline is the safe side.
+
+The release feeds version-gated feature detection. `src/syscall/dispatch.tbl`
+is the implemented set with two exceptions: `pidfd_getfd` and `userfaultfd`
+are registered there, but their handlers in `src/syscall/syscall.c` return
+`-ENOSYS`, and `tests/test-pidfd.c` and `tests/test-userfaultfd.c` pin them
+at that stub. Anything absent from the table gets `-ENOSYS` from the dispatch
+default, whatever number `uname` prints. Calls a 6.18 kernel provides that
+are absent: `io_uring_*`, `mseal`, `cachestat`, `process_madvise`,
+`listmount`/`statmount`, `landlock_*`, and `file_getattr`/`file_setattr`.
+Guests probe for a syscall and handle `ENOSYS`.
+
+The `LINUX_2.6.39` tag in the synthetic vDSO (`src/core/vdso.c`) is the
+frozen ELF symbol-version name the real arm64 vDSO exports; a genuine 6.18
+kernel emits it too.
+
+Three things read the release automatically. `tests/test-proc.c` runs on both
+the elfuse and the qemu aarch64 lane and checks only that the banner and
+`uname` agree, so on the qemu lane it pins the real Alpine kernel to itself.
+`tests/test-comprehensive.c` asserts the release is at least 6.18 behind a
+`uts.nodename == "elfuse"` gate, which holds on the elfuse lanes and not on
+the qemu lane, whose initramfs hostname is `elfuse-qemu`. The third reader is
+silent: `build/bench-hot-guard-glibc` is the one aarch64 glibc binary in
+`make check`, built only when the cross-toolchain sysroot is present, and a
+release below glibc's floor would abort its startup rather than fail an
+assertion. The Alpine tree `tests/fetch-fixtures.sh` builds is musl
+throughout and does no version gating.
+
 `/proc/self/smaps` and `/proc/<pid>/smaps` are generated from the same tracked
 VMA list as `/proc/self/maps`. The complete field set currently emitted for
 each VMA is the maps header followed by these 24 fields, in this order:

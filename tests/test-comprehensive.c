@@ -49,6 +49,15 @@ int main(int argc, char *argv[])
     /* x86_64 test binary: uname returns "x86_64" */
     CHECK(!strcmp(uts.machine, "x86_64"), "machine == x86_64");
 #endif
+    /* elfuse pins its reported release to the 6.18 LTS baseline. Under the
+     * qemu reference lane the kernel is a real one and reports its own.
+     */
+    if (!strcmp(uts.nodename, "elfuse")) {
+        int major = 0, minor = 0;
+        CHECK(sscanf(uts.release, "%d.%d", &major, &minor) == 2,
+              "release parses");
+        CHECK(major > 6 || (major == 6 && minor >= 18), "release >= 6.18");
+    }
 
     /* 4. PID */
     CHECK(getpid() > 0, "getpid > 0");

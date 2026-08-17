@@ -3169,8 +3169,8 @@ static void vcpu_handle_mrs_trap(hv_vcpu_t vcpu,
 
     uint64_t value = 0;
 
-    /* ID register emulation: return VZ-sanitized values matching a real VZ
-     * (Lima) VM BEFORE trying HVF. HVF's hv_vcpu_get_sys_reg succeeds for ID
+    /* ID register emulation: return VZ-sanitized values BEFORE trying HVF.
+     * HVF's hv_vcpu_get_sys_reg succeeds for ID
      * registers but returns raw hardware values, which include features the
      * hypervisor does not actually virtualize.
      *

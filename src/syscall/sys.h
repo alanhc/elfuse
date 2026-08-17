@@ -15,6 +15,15 @@
 #include <stdint.h>
 #include "core/guest.h"
 
+/* Guest-visible kernel identity for uname(2) and /proc/version;
+ * tests/test-proc.c pins the two surfaces to each other. The release names
+ * the 6.18 LTS baseline and tracks no test image; syscall/dispatch.tbl
+ * states what elfuse implements. glibc rejects only a release below its
+ * build-time floor, so a high floor is the safe side.
+ */
+#define GUEST_KERNEL_RELEASE "6.18.0"
+#define GUEST_KERNEL_VERSION "#1 SMP PREEMPT_DYNAMIC"
+
 /* System info syscall handlers. */
 
 int64_t sys_uname(guest_t *g, uint64_t buf_gva);
