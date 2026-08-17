@@ -1005,6 +1005,15 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (type == FD_EVENTFD)
         return eventfd_write(fd, g, buf_gva, count);
 
+    /* Linux accepts write() on a netlink socket as sendto() with no explicit
+     * destination, and iproute2-style senders use it in place of sendto. The
+     * host fd behind a netlink guest fd is the read end of the readiness pipe,
+     * so falling through would write to a read-only pipe end and report EBADF
+     * for a request the emulation can answer.
+     */
+    if (type == FD_NETLINK)
+        return netlink_send(fd, g, buf_gva, count);
+
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
     if (err < 0)
@@ -1411,6 +1420,8 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 {
     if (iovcnt == 0)
         return vec_zero_iovcnt(fd, false, false);
+    if (fd_get_type(fd) == FD_NETLINK)
+        return netlink_readv(fd, g, iov_gva, iovcnt);
     if (iovcnt == 1) {
         linux_iovec_t giov;
         int64_t err = single_guest_iov(g, iov_gva, &giov);
@@ -1564,6 +1575,11 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 {
     if (iovcnt == 0)
         return vec_zero_iovcnt(fd, true, false);
+    /* Ahead of the single-entry shortcut: a one-entry writev of nothing reports
+     * 0, while the write(2) the shortcut would reach reports ENODATA.
+     */
+    if (fd_get_type(fd) == FD_NETLINK)
+        return netlink_writev(fd, g, iov_gva, iovcnt);
     if (iovcnt == 1) {
         linux_iovec_t giov;
         int64_t err = single_guest_iov(g, iov_gva, &giov);
@@ -1577,7 +1593,8 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
      * iovs) because the data is at giov.iov_base which is only giov.iov_len
      * bytes. eventfd expects exactly 8 bytes.
      */
-    if (fd_get_type(fd) == FD_EVENTFD) {
+    int wtype = fd_get_type(fd);
+    if (wtype == FD_EVENTFD) {
         if (iovcnt <= 0)
             return -LINUX_EINVAL;
         linux_iovec_t giov;

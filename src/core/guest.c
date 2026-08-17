@@ -1737,6 +1737,31 @@ int guest_write(guest_t *g, uint64_t gva, const void *src, size_t len)
     return guest_copy(g, gva, NULL, src, len, MEM_PERM_W);
 }
 
+size_t guest_write_partial(guest_t *g,
+                           uint64_t gva,
+                           const void *src,
+                           size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        uint64_t avail;
+        void *dst = gva_resolve_perm(g, gva + done, &avail, MEM_PERM_W,
+                                     (uint64_t) (len - done));
+        if (!dst)
+            return done;
+
+        size_t chunk = len - done;
+        if (chunk > avail)
+            chunk = avail;
+        size_t moved =
+            guest_host_copy_partial(dst, (const uint8_t *) src + done, chunk);
+        done += moved;
+        if (moved < chunk)
+            return done;
+    }
+    return done;
+}
+
 int guest_write_small(guest_t *g, uint64_t gva, const void *src, size_t len)
 {
     uint64_t avail = 0;
