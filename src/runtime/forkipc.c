@@ -604,14 +604,21 @@ static void resolve_clone_stack_range(const guest_t *g,
     if (sp_off == 0 || sp_off > g->guest_size)
         return;
 
+    /* The region array is mutated under mmap_lock by any concurrent mmap or
+     * munmap, and clone does not otherwise take it. Reading it unlocked is a
+     * data race on g->regions and g->nregions, reported by ThreadSanitizer as
+     * soon as a sibling allocates while another thread clones. Neither caller
+     * holds a lock here, and mmap_lock is order 1, so taking it is safe.
+     */
+    pthread_mutex_lock(&mmap_lock);
     const guest_region_t *r = guest_region_find(g, sp_off - 1);
-    if (!r)
-        return;
-
-    if (start_out)
-        *start_out = r->start;
-    if (end_out)
-        *end_out = r->end;
+    if (r) {
+        if (start_out)
+            *start_out = r->start;
+        if (end_out)
+            *end_out = r->end;
+    }
+    pthread_mutex_unlock(&mmap_lock);
 }
 
 /* Forward declaration: worker entry runs after sys_clone_thread */
