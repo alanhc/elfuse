@@ -2485,8 +2485,16 @@ int signal_rt_sigreturn(hv_vcpu_t vcpu, guest_t *g)
      */
     pthread_mutex_lock(&sig_lock);
     uint64_t *blocked = thread_blocked_ptr();
-    *blocked = frame.uc.uc_sigmask;
-    *blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
+
+    /* Published in one release store, not built up in place. sig_lock only
+     * serializes the writers; thread_signal_deliverable reads this field
+     * lock-free from the run loop, so a plain two-step update is a data race
+     * that ThreadSanitizer reports and that can expose the intermediate value.
+     * signal_restore_blocked publishes the same field the same way.
+     */
+    uint64_t restored_mask = frame.uc.uc_sigmask &
+                             ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
+    __atomic_store_n(blocked, restored_mask, __ATOMIC_RELEASE);
     if (current_thread) {
         uint64_t restored_sp = frame.uc.uc_mcontext.sp;
         if (current_thread->altstack_sp &&
