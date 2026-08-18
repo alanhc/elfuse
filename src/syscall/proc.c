@@ -2832,6 +2832,19 @@ int64_t sys_waitid(guest_t *g,
             return waitid_zero_siginfo(g, infop_gva);
         }
 
+        /* Same teardown check sys_wait4 makes, and for the same reason: a
+         * thread parked here answers neither an exit_group nor the execve
+         * de_thread otherwise, so it outlives the bounded join and pushes
+         * sys_execve onto its post-PNR exit. A leader parked here also never
+         * reaches the run loop to service an execve handed to it. Placed after
+         * the reap and WNOHANG answers above so a completed wait is still
+         * reported in preference to the interrupt.
+         */
+        if (thread_stop_requested()) {
+            pthread_mutex_unlock(&pid_lock);
+            return -LINUX_EINTR;
+        }
+
         /* Blocking: wait on condvar (100ms timeout as safety net) */
         struct timespec ts;
         timespec_deadline_in_ms(&ts, 100);
