@@ -29,6 +29,7 @@
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
+#include "runtime/thread.h" /* thread_stop_requested */
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
@@ -2425,9 +2426,10 @@ int64_t fuse_dev_read(int guest_fd,
          * thread_join_workers' poll cap and touches guest memory (the reply
          * frame write below) on an eventual delayed wake, well after
          * guest_destroy may have unmapped it. Poll in bounded quanta and bail
-         * out once exit_group is requested.
+         * out once the thread is told to leave the guest, which is exit_group
+         * or an execve tearing this thread down.
          */
-        if (proc_exit_group_requested()) {
+        if (thread_stop_requested()) {
             pthread_mutex_unlock(&session->lock);
             pthread_mutex_lock(&fuse_lock);
             fuse_session_put_locked(session);

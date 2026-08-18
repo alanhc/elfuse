@@ -604,14 +604,21 @@ static void resolve_clone_stack_range(const guest_t *g,
     if (sp_off == 0 || sp_off > g->guest_size)
         return;
 
+    /* The region array is mutated under mmap_lock by any concurrent mmap or
+     * munmap, and clone does not otherwise take it. Reading it unlocked is a
+     * data race on g->regions and g->nregions, reported by ThreadSanitizer as
+     * soon as a sibling allocates while another thread clones. Neither caller
+     * holds a lock here, and mmap_lock is order 1, so taking it is safe.
+     */
+    pthread_mutex_lock(&mmap_lock);
     const guest_region_t *r = guest_region_find(g, sp_off - 1);
-    if (!r)
-        return;
-
-    if (start_out)
-        *start_out = r->start;
-    if (end_out)
-        *end_out = r->end;
+    if (r) {
+        if (start_out)
+            *start_out = r->start;
+        if (end_out)
+            *end_out = r->end;
+    }
+    pthread_mutex_unlock(&mmap_lock);
 }
 
 /* Forward declaration: worker entry runs after sys_clone_thread */
@@ -1703,6 +1710,13 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     }
     int ipc_sock = sock_fds[0];
 
+    mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
+    guest_region_t *regions_snapshot = NULL;
+    guest_region_t preannounced_snapshot[GUEST_MAX_PREANNOUNCED];
+    int snapshot_shm_fd = -1;
+    bool siblings_quiesced = false;
+    int64_t fail_rc = -LINUX_ENOMEM;
+
     /* Quiesce sibling vCPUs for snapshot consistency. In multithreaded guests,
      * sibling vCPUs may be actively mutating guest memory during the fork
      * snapshot (CoW or legacy IPC copy). Without quiescing them, the child
@@ -1710,16 +1724,15 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * structures. This matches POSIX fork semantics where only the calling
      * thread survives.
      */
-    thread_quiesce_siblings();
-
-    mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
-    guest_region_t *regions_snapshot = NULL;
-    guest_region_t preannounced_snapshot[GUEST_MAX_PREANNOUNCED];
-
-    /* APFS clone fd for the CoW snapshot sent to the child. Declared up front
-     * so early goto fail_snapshot exits do not read an uninitialized local.
-     */
-    int snapshot_shm_fd = -1;
+    if (!thread_quiesce_siblings()) {
+        /* An execve is reaping this thread. The snapshot would run without the
+         * quiet it needs, and the child would outlive a parent that is already
+         * gone, so refuse the fork instead.
+         */
+        fail_rc = -LINUX_EINTR;
+        goto fail_snapshot;
+    }
+    siblings_quiesced = true;
 
     /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd into
      * memfd-backed overlay regions. The conversion seeds a private temp file
@@ -1991,7 +2004,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * backing fds. Keep siblings quiesced until that send completes so a
      * concurrent munmap/remap cannot close or recycle the captured fd numbers.
      */
-    thread_resume_siblings();
+    if (siblings_quiesced)
+        thread_resume_siblings();
     mmap_fork_commit_anon_shared(&anon_shared_txn);
 
     close(ipc_sock);
@@ -2057,7 +2071,8 @@ fail_snapshot:
             "clone: anon-shared rollback partial failure (%d); parent "
             "may have stale memfd-backed regions",
             abort_rc);
-    thread_resume_siblings();
+    if (siblings_quiesced)
+        thread_resume_siblings();
     close(ipc_sock);
     if (vfork_notify_fds[0] >= 0)
         close(vfork_notify_fds[0]);
@@ -2080,7 +2095,7 @@ fail_snapshot:
     if (reaped < 0)
         log_warn("clone: failed to reap fork-child pid=%d: %s",
                  (int) child_host_pid, strerror(errno));
-    return -LINUX_ENOMEM;
+    return fail_rc;
 }
 
 /* clone3: extended clone with clone_args struct. */

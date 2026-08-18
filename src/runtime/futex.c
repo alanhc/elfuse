@@ -585,14 +585,14 @@ static int64_t futex_os_sync_wait(guest_t *g,
             efault_retries = 0;
         }
 
-        if (proc_exit_group_requested() || futex_interrupt_consume())
+        if (thread_stop_requested() || futex_interrupt_consume())
             return -LINUX_EINTR;
 
         /* Drain any expired guest itimer so its SIGALRM / SIGVTALRM / SIGPROF
          * queues into sig_state.pending; without this poke, a guest with all
          * threads parked in futex_wait would never advance the timers.
          */
-        signal_check_timer();
+        signal_check_timer_real();
 
         /* Return EINTR only when a real deliverable signal is queued for this
          * thread. POSIX callers (e.g. glibc sem_wait, foot's render worker)
@@ -730,7 +730,7 @@ static int64_t futex_wait(guest_t *g,
                 break;
             }
             pthread_cond_timedwait(&waiter.cond, &b->lock, &quantum);
-            if (proc_exit_group_requested() || futex_interrupt_consume()) {
+            if (thread_stop_requested() || futex_interrupt_consume()) {
                 ret = -LINUX_EINTR;
                 break;
             }
@@ -747,7 +747,7 @@ static int64_t futex_wait(guest_t *g,
              * (4).
              */
             pthread_mutex_unlock(&b->lock);
-            signal_check_timer();
+            signal_check_timer_real();
             bool sig_ready = signal_pending() != 0;
             pthread_mutex_lock(&b->lock);
 
@@ -768,7 +768,7 @@ static int64_t futex_wait(guest_t *g,
         timespec_deadline_in_ms(&poll_ts, 100);
         pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
 
-        if (proc_exit_group_requested() || futex_interrupt_consume()) {
+        if (thread_stop_requested() || futex_interrupt_consume()) {
             ret = -LINUX_EINTR;
             break;
         }
@@ -782,7 +782,7 @@ static int64_t futex_wait(guest_t *g,
          * landed in the window.
          */
         pthread_mutex_unlock(&b->lock);
-        signal_check_timer();
+        signal_check_timer_real();
         bool sig_ready = signal_pending() != 0;
         pthread_mutex_lock(&b->lock);
 
@@ -1333,7 +1333,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
                 if (!expired) {
                     pthread_cond_timedwait(&waiter.cond, &b->lock, &quantum);
                     if (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE) &&
-                        proc_exit_group_requested()) {
+                        thread_stop_requested()) {
                         /* Mirror the no-timeout exit_group path below. */
                         bucket_unlink_locked(b, &waiter);
                         pthread_mutex_unlock(&b->lock);
@@ -1349,7 +1349,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
                      * signal_check_timer/signal_pending touch sig_lock (4).
                      */
                     pthread_mutex_unlock(&b->lock);
-                    signal_check_timer();
+                    signal_check_timer_real();
                     bool sig_ready = signal_pending() != 0;
                     pthread_mutex_lock(&b->lock);
 
@@ -1385,7 +1385,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
                 timespec_deadline_in_ms(&poll_ts, 100);
                 pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
 
-                if (proc_exit_group_requested()) {
+                if (thread_stop_requested()) {
                     /* Dequeue and return */
                     bucket_unlink_locked(b, &waiter);
                     pthread_mutex_unlock(&b->lock);
@@ -1401,7 +1401,7 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
                  * signal_pending touch sig_lock (4).
                  */
                 pthread_mutex_unlock(&b->lock);
-                signal_check_timer();
+                signal_check_timer_real();
                 bool sig_ready = signal_pending() != 0;
                 pthread_mutex_lock(&b->lock);
 
@@ -1892,7 +1892,7 @@ int64_t sys_futex_waitv(guest_t *g,
         if (result_idx >= 0)
             break;
 
-        if (proc_exit_group_requested()) {
+        if (thread_stop_requested()) {
             result_idx = -LINUX_EINTR;
             break;
         }

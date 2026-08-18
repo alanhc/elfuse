@@ -3,21 +3,21 @@
 # Copyright 2026 elfuse contributors
 # Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
-#
 # shellcheck shell=bash
 # shellcheck disable=SC2034
 
 # shellcheck source=tests/lib/bash-compat.sh
 . "$(dirname "${BASH_SOURCE[0]}")/bash-compat.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/hang-sample.sh"
 
 : "${TEST_LABEL_WIDTH:=14}"
 : "${TEST_TIMEOUT:=10}"
 
 # Resolve a working 'timeout' binary. macOS doesn't ship one, so fall back to
 # GNU coreutils' gtimeout. Wrap as a function so callers keep using the bare
-# name 'timeout'. Resolution order: TIMEOUT_BIN env override, 'timeout' on
-# PATH, 'gtimeout' on PATH, then Homebrew's stable opt symlinks for ARM and
-# Intel macOS (the install prefix differs between the two).
+# name 'timeout'. Resolution order: TIMEOUT_BIN env override, 'timeout' on PATH,
+# 'gtimeout' on PATH, then Homebrew's stable opt symlinks for ARM and Intel
+# macOS (the install prefix differs between the two).
 if [ -n "${TIMEOUT_BIN:-}" ]; then
     timeout()
     {
@@ -48,15 +48,15 @@ elif ! command -v timeout > /dev/null 2>&1; then
     unset _timeout_bin _candidate
 fi
 
-# epoch_us is provided by bash-compat.sh: it picks the lowest-cost
-# microsecond clock the host supports ($EPOCHREALTIME on bash 5.0+,
-# 'date +%s %N' on macOS 14+/GNU coreutils, python3, perl, or a
-# whole-second fallback). run() uses it to disambiguate the guest
-# timeout(1) returning rc=124 from the harness watchdog firing at
-# TEST_TIMEOUT; SECONDS resolution would mistake either case at short
-# caps.
+# epoch_us is provided by bash-compat.sh: it picks the lowest-cost microsecond
+# clock the host supports ($EPOCHREALTIME on bash 5.0+, 'date +%s %N' on macOS
+# 14+/GNU coreutils, python3, perl, or a whole-second fallback). run() uses it
+# to disambiguate the guest timeout(1) returning rc=124 from the harness
+# watchdog firing at TEST_TIMEOUT; SECONDS resolution would mistake either case
+# at short caps.
 
 if [ -t 1 ]; then
+
     # Use ANSI-C quoting so the variables hold real ESC bytes, not the literal
     # 4-char "\033" sequence. Without this, callers that pass colors as printf
     # %s arguments (e.g. tests/test-busybox.sh) emit the escape sequence as
@@ -103,8 +103,9 @@ test_report()
 test_excerpt()
 {
     local output="$1"
-    # The closing lines carry the actual assertion failure; the opening line
-    # is usually just an elfuse WARN banner.
+
+    # The closing lines carry the actual assertion failure; the opening line is
+    # usually just an elfuse WARN banner.
     printf "%s\n" "$output" | tail -10 | cut -c -200 | sed 's/^/  /'
 }
 
@@ -135,21 +136,21 @@ run()
         return
     fi
 
-    # Wrap every invocation in 'timeout' so a hanging guest tool cannot
-    # freeze the entire suite. run_pipe and run_timeout already do this;
-    # the omission here used to let a deadlocked elfuse syscall path
-    # hang make check forever.
+    # Wrap every invocation in 'timeout' so a hanging guest tool cannot freeze
+    # the entire suite. run_pipe and run_timeout already do this; the omission
+    # here used to let a deadlocked elfuse syscall path hang make check forever.
     #
-    # GNU timeout reports rc=124 on its own timeout, but coreutils-suite
-    # also runs the guest's own timeout(1) with expect_rc=124. Exit code
-    # alone cannot tell the two apart, so wall-clock elapsed time is
-    # used as an out-of-band marker: a harness firing means elapsed is
-    # at or above TEST_TIMEOUT, while the guest case completes well
-    # under it. epoch_us (from bash-compat.sh) gives microsecond
-    # resolution; comparing seconds alone via SECONDS could undercount
-    # by almost a full second and let a real harness timeout slip
+    # GNU timeout reports rc=124 on its own timeout, but coreutils-suite also
+    # runs the guest's own timeout(1) with expect_rc=124. Exit code alone cannot
+    # tell the two apart, so wall-clock elapsed time is used as an out-of-band
+    # marker: a harness firing means elapsed is at or above TEST_TIMEOUT, while
+    # the guest case completes well under it. epoch_us (from bash-compat.sh)
+    # gives microsecond resolution; comparing seconds alone via SECONDS could
+    # undercount by almost a full second and let a real harness timeout slip
     # through as a guest-OK at small TEST_TIMEOUT values.
     local start_us end_us elapsed_us limit_us
+    hang_sample_arm "$tool" "$TEST_TIMEOUT" \
+        "${BUILD_DIR:-build}/test-timeouts/$(basename "$tool")-hang.txt"
     start_us=$(epoch_us)
     if output=$(timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} \
         "$(test_tool_path "$tool")" "$@" 2>&1); then
@@ -164,6 +165,7 @@ run()
     if [ "$rc" -eq 124 ] && [ "$elapsed_us" -ge "$limit_us" ]; then
         harness_timed_out=1
     fi
+    hang_sample_finish "$harness_timed_out"
 
     if [ "$harness_timed_out" -eq 1 ]; then
         test_report fail "$tool" " (timeout after ${TEST_TIMEOUT}s)"
@@ -197,14 +199,21 @@ run_check()
         return
     fi
 
-    # See run() for the timeout-vs-expected ordering rationale. run_check
-    # has no explicit expect_rc parameter (zero is implied), so any rc=124
-    # here is treated as a harness timeout.
+    # See run() for the timeout-vs-expected ordering rationale. run_check has no
+    # explicit expect_rc parameter (zero is implied), so any rc=124 here is
+    # treated as a harness timeout.
+    hang_sample_arm "$tool" "$TEST_TIMEOUT" \
+        "${BUILD_DIR:-build}/test-timeouts/$(basename "$tool")-hang.txt"
     if output=$(timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} \
         "$(test_tool_path "$tool")" "$@" 2>&1); then
         rc=0
     else
         rc=$?
+    fi
+    if [ "$rc" -eq 124 ]; then
+        hang_sample_finish 1
+    else
+        hang_sample_finish 0
     fi
 
     if [ "$rc" -eq 124 ]; then
@@ -257,11 +266,18 @@ run_pipe()
         return
     fi
 
+    hang_sample_arm "$tool" "$TEST_TIMEOUT" \
+        "${BUILD_DIR:-build}/test-timeouts/$(basename "$tool")-hang.txt"
     if output=$(printf '%s' "$input" \
         | timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} "$(test_tool_path "$tool")" "$@" 2>&1); then
         rc=0
     else
         rc=$?
+    fi
+    if [ "$rc" -eq 124 ]; then
+        hang_sample_finish 1
+    else
+        hang_sample_finish 0
     fi
 
     if [ "$rc" -ne 0 ]; then
@@ -278,6 +294,12 @@ run_pipe()
     fi
 }
 
+# Deliberately does not arm the hang sampler. Its callers pass their own cap and
+# an expected rc, and the coreutils suite expects rc=124 from the guest's own
+# timeout(1), so a 124 here does not mean the harness watchdog fired. run()
+# tells the two apart with elapsed wall time; this wrapper has no such marker,
+# and a sampler armed on a timeout the caller intends to hit would collect on
+# every pass.
 run_timeout()
 {
     local secs="$1"

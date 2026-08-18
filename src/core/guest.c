@@ -761,10 +761,7 @@ void guest_destroy(guest_t *g)
      */
     if (!proc_exit_group_requested())
         proc_request_exit_group(0);
-    futex_interrupt_request();
-    wakeup_pipe_signal();
-    thread_interrupt_all();
-    thread_wake_exit_waiters();
+    thread_wake_all_blocked();
     thread_join_workers();
 
     /* Destroy the main vCPU (owned by this thread) before tearing down the VM.

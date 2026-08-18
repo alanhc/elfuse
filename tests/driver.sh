@@ -97,6 +97,12 @@ TEST_LIST="$SCRIPT_DIR/manifest.txt"
 
 # shellcheck source=tests/test-config.sh
 source "$SCRIPT_DIR/test-config.sh"
+source "$SCRIPT_DIR/lib/hang-sample.sh"
+
+# Capture a stack sample from a test about to hit the watchdog. A hang that only
+# reproduces under suite load is otherwise reported as a bare "timeout after Ns"
+# with nothing to diagnose. Runs detached, reads only, writes under build/. Set
+# TEST_SAMPLE_TIMEOUTS=0 to turn it off.
 
 case "$ELFUSE" in
     /*) ;;
@@ -368,6 +374,9 @@ for i in "${filtered_idx[@]}"; do
     # "${array[@]}". Host-limit annotations live in the manifest. Keep this
     # execution path generic so adding another constrained test does not require
     # a name-qualified branch here.
+    hang_sample_arm "$binary" "$TIMEOUT" \
+        "$TESTDIR_ABS/test-timeouts/$(basename "$binary")-hang.txt"
+
     if host_nofile=$(elfuse_test_host_nofile "$TEST_LIST" "$name"); then
         if [ -n "$host_nofile" ]; then
             if output=$(ulimit -n "$host_nofile" \
@@ -386,6 +395,12 @@ for i in "${filtered_idx[@]}"; do
     else
         output="invalid host_nofile test annotation"
         rc=125
+    fi
+
+    if [ "$rc" -eq 124 ]; then
+        hang_sample_finish 1
+    else
+        hang_sample_finish 0
     fi
 
     if evaluate_result "$rc" "$expected" "$stdout_pat" "$output"; then

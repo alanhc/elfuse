@@ -1,4 +1,5 @@
-/* elfuse VM launch: bring-up + GDB + run loop + teardown
+/*
+ * elfuse VM launch: bring-up + GDB + run loop + teardown
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -8,8 +9,8 @@
  * struct, leaving CLI concerns (option parsing, sysroot provisioning, the
  * shebang loop) in main().
  *
- * shim_blob.h is included here, not in src/main.c, so the static
- * shim_bin / shim_bin_len blob has a single object definition site.
+ * shim_blob.h is included here, not in src/main.c, so the static shim_bin /
+ * shim_bin_len blob has a single object definition site.
  */
 
 #include "launch.h"
@@ -59,14 +60,16 @@ int elfuse_launch(const launch_args_t *args)
     guest_t g;
     bool guest_initialized = false;
     guest_bootstrap_t boot;
+
     /* Local copy of the temp flag (ownership contract in launch.h): the
-     * caller's launch_args_t is const, and the flag must drop once the
-     * unlink happens.
+     * caller's launch_args_t is const, and the flag must drop once the unlink
+     * happens.
      */
     bool elf_host_temp = args->elf_host_temp;
-    /* The guest-visible entrypoint path is argv[0]; elf_path is the
-     * resolved host path to that binary. They differ when path
-     * translation or a FUSE-materialized temp is involved.
+
+    /* The guest-visible entrypoint path is argv[0]; elf_path is the resolved
+     * host path to that binary. They differ when path translation or a
+     * FUSE-materialized temp is involved.
      */
     const char *elf_guest_path = (args->guest_argc > 0 && args->guest_argv)
                                      ? args->guest_argv[0]
@@ -97,9 +100,8 @@ int elfuse_launch(const launch_args_t *args)
             shim_bin_len, args->verbose, &guest_initialized, &boot) < 0)
         goto fail;
 
-    /* A FUSE-materialized temp has been loaded; drop it once the guest
-     * has its own mapping, unless Rosetta still needs the reopenable
-     * host path.
+    /* A FUSE-materialized temp has been loaded; drop it once the guest has its
+     * own mapping, unless Rosetta still needs the reopenable host path.
      */
     if (elf_host_temp && !g.is_rosetta) {
         unlink(args->elf_path);
@@ -130,8 +132,8 @@ int elfuse_launch(const launch_args_t *args)
         proc_set_sysroot_casefold(false);
     }
 
-    /* Placed after the casefold probe so path_translate_at() sees the
-     * sysroot's real case behavior.
+    /* Placed after the casefold probe so path_translate_at() sees the sysroot's
+     * real case behavior.
      */
     if (args->cwd_guest && args->cwd_guest[0] != '\0') {
         path_translation_t tx;
@@ -141,6 +143,7 @@ int elfuse_launch(const launch_args_t *args)
                       args->cwd_guest, strerror(errno));
             goto fail;
         }
+
         /* A shm leaf needs sys_chdir's O_NOFOLLOW fd and virtual-cwd publish;
          * entering it here would add a holder of the never-follow invariant
          * dev_shm_resolve_path() enumerates. Refuse instead.
@@ -150,6 +153,7 @@ int elfuse_launch(const launch_args_t *args)
                       args->cwd_guest);
             goto fail;
         }
+
         /* proc_resolve_sysroot_path() falls back to the host spelling for a
          * path the sysroot does not hold, which would start the guest in a
          * same-named host directory outside the tree --workdir named.
@@ -161,6 +165,7 @@ int elfuse_launch(const launch_args_t *args)
                           args->cwd_guest);
                 goto fail;
             }
+
             /* Same carve-out as path_dirent_dir_holds_escapes(): "--sysroot /"
              * owns every host path, but path_prefix_match on a bare separator
              * accepts "/" alone.
@@ -187,8 +192,8 @@ int elfuse_launch(const launch_args_t *args)
         0)
         goto fail;
 
-    /* GDB setup must happen before the first run so entry-stop and
-     * hardware breakpoints can affect the initial vCPU.
+    /* GDB setup must happen before the first run so entry-stop and hardware
+     * breakpoints can affect the initial vCPU.
      */
     if (args->gdb_port > 0) {
         if (gdb_stub_init(args->gdb_port, &g) < 0) {
@@ -207,15 +212,15 @@ int elfuse_launch(const launch_args_t *args)
 
     /* Tear down debugger state before joining workers: a worker parked in
      * gdb_stub_handle_stop() stays active (not deactivated) until this
-     * broadcasts resume_cond, so joining first would just time out and
-     * detach it while it is still paused.
+     * broadcasts resume_cond, so joining first would just time out and detach
+     * it while it is still paused.
      */
     gdb_stub_shutdown();
 
     /* Join worker vCPU threads before guest_destroy unmaps the guest slab: a
      * sibling still mid-iteration in its own run loop would fault on freed
-     * guest memory and crash the host with SIGSEGV, masking the real exit
-     * code. The join is a no-op once workers have wound down (the common
+     * guest memory and crash the host with SIGSEGV, masking the real exit code.
+     * The join is a no-op once workers have wound down (the common
      * single-threaded case).
      *
      * vcpu_run_loop can also return via a bare break (alarm timeout 124, a
@@ -228,36 +233,29 @@ int elfuse_launch(const launch_args_t *args)
      */
     if (!proc_exit_group_requested())
         proc_request_exit_group(0);
-    futex_interrupt_request();
-    wakeup_pipe_signal();
-    thread_interrupt_all();
-    /* Workers parked on internal condvars (fork barrier, ptrace stop/wait)
-     * see neither the pipe nor the vCPU kick; broadcast so they re-check the
-     * exit-group flag and terminate before the join below gives up on them.
-     */
-    thread_wake_exit_waiters();
+    thread_wake_all_blocked();
     thread_join_workers();
 
-    /* Diagnostic counter dump runs before guest_destroy so the
-     * shim_data mapping is still valid. ELFUSE_SHIM_STATS is the gate;
-     * an unset variable produces no output.
+    /* Diagnostic counter dump runs before guest_destroy so the shim_data
+     * mapping is still valid. ELFUSE_SHIM_STATS is the gate; an unset variable
+     * produces no output.
      */
     if (shim_globals_stats_enabled())
         shim_globals_counters_dump(&g);
 
-    /* Dump the startup histogram before guest_destroy so any
-     * cleanup-path syscalls (closing host fds, unmapping the slab) do
-     * not appear in the captured set. The dump is a no-op when
-     * ELFUSE_STARTUP_TRACE=syscalls was not requested.
+    /* Dump the startup histogram before guest_destroy so any cleanup-path
+     * syscalls (closing host fds, unmapping the slab) do not appear in the
+     * captured set. The dump is a no-op when ELFUSE_STARTUP_TRACE=syscalls was
+     * not requested.
      */
     syscall_hist_dump();
 
     /* Give back any pty slaves this process still holds before the guest
-     * teardown below. The guest's stdio slaves are closed by the kernel,
-     * not by the guest, so they never pass through the per-fd close hook; a
-     * master in another process would otherwise wait forever for a hangup
-     * this exit should have produced. Bring-up failures skip this: the fail
-     * path is only reachable before the run loop, so no slave exists yet.
+     * teardown below. The guest's stdio slaves are closed by the kernel, not by
+     * the guest, so they never pass through the per-fd close hook; a master in
+     * another process would otherwise wait forever for a hangup this exit
+     * should have produced. Bring-up failures skip this: the fail path is only
+     * reachable before the run loop, so no slave exists yet.
      */
     proc_pty_release_process_slaves();
 
@@ -274,9 +272,9 @@ int elfuse_launch(const launch_args_t *args)
     return exit_code;
 
 fail:
-    /* Bring-up failed: unwind whatever exists so far, including the temp
-     * unlink this side owns past the prepare call (contract in launch.h).
-     * Staged --user credentials are dropped too (proc.h).
+    /* Bring-up failed: unwind whatever exists so far, including the temp unlink
+     * this side owns past the prepare call (contract in launch.h). Staged
+     * --user credentials are dropped too (proc.h).
      */
     proc_clear_initial_ids();
     if (guest_initialized)

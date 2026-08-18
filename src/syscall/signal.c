@@ -1191,11 +1191,28 @@ static int check_one_timer(guest_itimer_t *timer, const struct timeval *now)
     return 1; /* expired */
 }
 
-void signal_check_timer(void)
+/* cpu_timers selects whether ITIMER_VIRTUAL and ITIMER_PROF are advanced along
+ * with ITIMER_REAL. All three are measured against the monotonic clock here,
+ * which is an approximation for the two that Linux charges to CPU time, and it
+ * only holds where the guest was actually running. A caller parked in a host
+ * wait burns no guest CPU, so advancing them there would expire a virtual timer
+ * out of wall clock the guest never spent.
+ *
+ * This narrows that error, it does not remove it. The expiry stays an absolute
+ * monotonic instant, so a wait that spans it still leaves it expired, and the
+ * next full check delivers SIGVTALRM or SIGPROF for time the guest did not
+ * execute. Skipping the check inside the wait only stops the signal landing
+ * while the thread is parked. Removing the error needs guest CPU-time
+ * accounting, so that a wait can hold both timers rather than merely decline to
+ * read them, and elfuse tracks no such clock today. ITIMER_REAL is exact either
+ * way, because wall clock is what it counts.
+ */
+static void signal_check_timers(bool cpu_timers)
 {
     if (!__atomic_load_n(&guest_itimer.active, __ATOMIC_ACQUIRE) &&
-        !__atomic_load_n(&guest_itimer_virt.active, __ATOMIC_ACQUIRE) &&
-        !__atomic_load_n(&guest_itimer_prof.active, __ATOMIC_ACQUIRE))
+        (!cpu_timers ||
+         (!__atomic_load_n(&guest_itimer_virt.active, __ATOMIC_ACQUIRE) &&
+          !__atomic_load_n(&guest_itimer_prof.active, __ATOMIC_ACQUIRE))))
         return;
 
     struct timeval now = monotonic_now();
@@ -1204,10 +1221,12 @@ void signal_check_timer(void)
     pthread_mutex_lock(&sig_lock);
     if (check_one_timer(&guest_itimer, &now))
         sig_real = LINUX_SIGALRM;
-    if (check_one_timer(&guest_itimer_virt, &now))
-        sig_virt = 26; /* SIGVTALRM */
-    if (check_one_timer(&guest_itimer_prof, &now))
-        sig_prof = 27; /* SIGPROF */
+    if (cpu_timers) {
+        if (check_one_timer(&guest_itimer_virt, &now))
+            sig_virt = 26; /* SIGVTALRM */
+        if (check_one_timer(&guest_itimer_prof, &now))
+            sig_prof = 27; /* SIGPROF */
+    }
     pthread_mutex_unlock(&sig_lock);
 
     if (sig_real)
@@ -1216,6 +1235,17 @@ void signal_check_timer(void)
         signal_queue(sig_virt);
     if (sig_prof)
         signal_queue(sig_prof);
+}
+
+void signal_check_timer(void)
+{
+    signal_check_timers(true);
+}
+
+/* For a caller about to block, or already looping in a retry wait. */
+void signal_check_timer_real(void)
+{
+    signal_check_timers(false);
 }
 
 /* Set/get ITIMER_VIRTUAL (which=1) or ITIMER_PROF (which=2) */
@@ -1530,7 +1560,7 @@ int64_t signal_rt_sigsuspend(guest_t *g, uint64_t mask_gva, uint64_t sigsetsize)
          * runs on the way back out.
          */
         bool woke = false;
-        while (!proc_exit_group_requested()) {
+        while (!thread_stop_requested()) {
             /* Drain any expired guest itimer so its SIGALRM / SIGVTALRM /
              * SIGPROF queues into the pending set. Nothing else advances the
              * timers while this thread is parked here, and sigsuspend() waiting
@@ -1738,8 +1768,8 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
         if (has_timeout && remaining_ns <= 0)
             return -LINUX_EAGAIN;
 
-        /* Exit if the process is tearing down. */
-        if (proc_exit_group_requested())
+        /* Exit if the process, or just this thread, is tearing down. */
+        if (thread_stop_requested())
             return -LINUX_EINTR;
 
         /* If a non-waited, guest-visible signal is pending, return -EINTR.

@@ -339,6 +339,16 @@ bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu,
  */
 void thread_interrupt_all(void);
 
+/* Wake every thread parked anywhere it cannot see a teardown flag: futex
+ * waiters, poll/epoll/read parks on the wakeup pipe, vCPUs inside hv_vcpu_run,
+ * and the internal condvars. The four wakes are always needed together, so
+ * exit_group teardown (guest_destroy, main's run-loop exit) and execve
+ * de_thread share this rather than each keeping its own list. Callers that mean
+ * process teardown must set the exit-group flag first, per
+ * thread_wake_exit_waiters below.
+ */
+void thread_wake_all_blocked(void);
+
 /* Wake workers parked on internal condvars (fork barrier, ptrace stop/wait) so
  * exit_group teardown reaches them within a bounded time. hv_vcpus_exit only
  * interrupts threads inside hv_vcpu_run, and the wakeup pipe / futex interrupt
@@ -362,9 +372,14 @@ int thread_signal_deliverable(uint64_t sigbit);
 
 /* Quiesce all sibling vCPUs for fork snapshot consistency. Calls hv_vcpus_exit
  * on all active threads except the caller, then waits until they are all
- * blocked on the fork barrier. Caller must NOT hold thread_lock.
+ * blocked on the fork barrier. Caller must NOT hold thread_lock. Hold every
+ * sibling outside guest code until thread_resume_siblings.
+ * Returns false without arming, and without any need to resume, when an execve
+ * teardown is reaping: the caller is one of the threads being reaped, and the
+ * barrier it would arm is one nobody would release. Callers must abandon the
+ * operation the quiet was for.
  */
-void thread_quiesce_siblings(void);
+bool thread_quiesce_siblings(void);
 
 /* Resume sibling vCPUs after fork snapshot is complete. Clears the quiesce flag
  * and broadcasts the fork condvar.
@@ -385,6 +400,56 @@ int thread_fork_barrier_check(void);
  * active for wait4 (vm-clone bring-up failure) must call it explicitly.
  */
 void thread_fork_release_counted_locked(thread_entry_t *t);
+
+/* execve de_thread helpers. */
+
+/* True when an execve on another thread is tearing this one down. Callers that
+ * already tested proc_exit_group_requested use this; everything else wants
+ * thread_stop_requested below.
+ */
+int thread_exec_stop_requested(void);
+
+/* The leader has an execve handed to it and must leave whatever it is parked in
+ * to run it. Published by the exec layer, read by thread_stop_requested, so the
+ * hot-path predicate stays inside runtime/.
+ */
+void thread_set_leader_work_pending(bool pending);
+bool thread_leader_work_pending(void);
+
+/* True when the calling thread must leave guest execution: a process-wide
+ * exit_group was requested, or an execve is tearing this thread down. Every
+ * blocking wait in a guest syscall re-checks this and returns EINTR so the run
+ * loop can wind the thread down; a thread that only polled the exit-group flag
+ * would keep the exec'ing thread parked in thread_exec_de_thread until the join
+ * cap expired.
+ */
+int thread_stop_requested(void);
+
+/* True when the caller is the thread group leader (the main host thread, the
+ * one whose run loop returning tears the process down). de_thread cannot
+ * destroy the leader, so an execve from any other thread is handed to it and
+ * runs on its vCPU; see exec_handoff_to_leader.
+ */
+bool thread_current_is_leader(void);
+
+/* Drop the exec'ing thread's robust list and clear_child_tid, as Linux
+ * begin_new_exec() does: both name addresses in the image that just went away.
+ * Call from sys_execve after guest_reset.
+ */
+void thread_reset_for_exec(void);
+
+/* Destroy every sibling guest thread on behalf of an execve, Linux de_thread().
+ * Call from the exec'ing thread at the point of no return, BEFORE guest_reset:
+ * siblings wind down against the old image, so their CLEARTID and robust-list
+ * writes still land on the memory their guest expects.
+ *
+ * Returns the number of siblings still live, which is 0 unless one outlived the
+ * bounded join. A non-zero return means guest memory MUST NOT be reset: that
+ * thread still holds registers into the old image and would resume into the
+ * zeroed one. The caller is past the point of no return, so its only safe
+ * response is a diagnosed fatal exit.
+ */
+int thread_exec_de_thread(void);
 
 /* Ptrace helpers. */
 

@@ -30,7 +30,6 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/resource.h> /* struct rusage, for wait4 rusage population */
-#include <sys/sysctl.h>
 #include <libproc.h>
 
 #include "debug/log.h"
@@ -41,8 +40,11 @@
 #include "core/vdso.h"
 
 #include "runtime/futex.h"
+#include "runtime/thread.h"
 
 #include "syscall/abi.h"
+#include "syscall/exec.h"
+#include "syscall/io.h" /* io_retry_backoff */
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
 #include "syscall/net.h"
@@ -2161,6 +2163,7 @@ static bool proc_wait_selector_matches(const proc_entry_t *entry,
 static int64_t proc_wait_autoreap_children(int pid, int options)
 {
     int64_t caller_pgid = proc_get_pgid();
+    unsigned backoff = 0;
     for (;;) {
         bool found = false;
         bool still_active = false;
@@ -2235,9 +2238,10 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
             return -LINUX_ECHILD;
         if (options & 1) /* WNOHANG */
             return 0;
-        if (proc_exit_group_requested())
-            return -LINUX_EINTR;
-        usleep(1000);
+
+        int64_t wait_rc = io_retry_backoff(&backoff);
+        if (wait_rc < 0)
+            return wait_rc;
     }
 }
 
@@ -2442,7 +2446,7 @@ int64_t sys_wait4(guest_t *g,
              * wait quanta. The errno is never guest-visible: the run loop
              * breaks on the exit-group flag before returning to the guest.
              */
-            if (proc_exit_group_requested()) {
+            if (thread_stop_requested()) {
                 pthread_mutex_unlock(&pid_lock);
                 return -LINUX_EINTR;
             }
@@ -2491,7 +2495,7 @@ int64_t sys_wait4(guest_t *g,
                     return sys_wait4(g, pid, status_gva, options, rusage_gva);
                 if (mac_options & WNOHANG)
                     return 0;
-                if (proc_exit_group_requested())
+                if (thread_stop_requested())
                     return -LINUX_EINTR;
                 usleep(1000);
                 return sys_wait4(g, pid, status_gva, options, rusage_gva);
@@ -2520,7 +2524,7 @@ int64_t sys_wait4(guest_t *g,
                     ret = wait4(host_pid, &status, mac_options | WNOHANG, &ru);
                     if (ret != 0)
                         break;
-                    if (proc_exit_group_requested())
+                    if (thread_stop_requested())
                         return -LINUX_EINTR;
                     struct timespec ts;
                     timespec_deadline_in_ms(&ts, 100);
@@ -3612,6 +3616,32 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
             exit_code = proc_exit_group_code();
             break;
         }
+
+        /* An execve on a sibling thread is tearing this one down. Leaving the
+         * loop takes it through the normal worker exit path (robust list,
+         * CLEARTID, own-vCPU destroy) against the still-intact old image; the
+         * exec'ing thread waits for that before guest_reset. The main thread is
+         * exempt because it owns process teardown: returning from its run loop
+         * destroys the guest, which is exactly what the exec'ing thread still
+         * needs. This gates re-entry into hv_vcpu_run, so one check per
+         * iteration is enough; every path back here is non-blocking for a
+         * stopping worker, whose waits now return EINTR.
+         */
+        if (!is_main && thread_exec_stop_requested()) {
+            exit_code = 0;
+            break;
+        }
+
+        /* A non-leader execve is handed here: the leader owns process teardown,
+         * so it is the only thread that can survive one. Running it at the top
+         * of the loop puts the rebuilt EL0 state in place before the vCPU is
+         * resumed, whether this thread was preempted in guest code or is
+         * returning from its own syscall (sys_execve sets the X8=2 frame-drop
+         * marker either way).
+         */
+        if (thread_current_is_leader() && thread_leader_work_pending())
+            exec_run_handoff(vcpu, g, verbose);
+
         if (hooks && hooks->tick) {
             int tick_ret = hooks->tick(g, hooks->opaque);
             if (tick_ret != 0) {
@@ -4211,6 +4241,17 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
             }
             if (proc_exit_group_requested()) {
                 exit_code = proc_exit_group_code();
+                break;
+            }
+
+            /* An execve tearing this thread down wins over everything below:
+             * the GDB stop parks on an unbounded condvar with no teardown
+             * predicate, and the ptrace stop and signal delivery both touch
+             * guest memory the exec is about to reset. Reaching any of them
+             * here would outlive the join cap in thread_exec_de_thread.
+             */
+            if (!is_main && thread_exec_stop_requested()) {
+                exit_code = 0;
                 break;
             }
 

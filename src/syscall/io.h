@@ -25,6 +25,7 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count);
 int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count);
 void urandom_fd_cleanup(int guest_fd);
 void urandom_fd_reset_cache(int guest_fd);
+
 /* Initialize the per-fd urandom cache locks. Must run before any guest thread
  * enters sys_read or sys_readv on /dev/urandom. Called from syscall_init
  * alongside the other subsystem init hooks.
@@ -40,6 +41,30 @@ void io_init(void);
  * by hv_vcpus_exit + the wakeup pipe.
  */
 int64_t io_wait_fd_or_interrupted(int host_fd, short events);
+
+/* Backoff bounds for io_retry_backoff. These replace a blocking host call that
+ * returned the instant the resource freed, so the ceiling is the added latency
+ * a guest pays after the holder releases: 2 ms costs at most 500 wakeups/s on a
+ * thread that is otherwise asleep, and keeps the worst case an order of
+ * magnitude below what the execve teardown budget (200 ms of pokes plus a
+ * 500 ms join) would tolerate. The floor is short because the common case is a
+ * lock held for microseconds; io_retry_backoff yields once before sleeping at
+ * all, which catches a holder that releases inside the same quantum.
+ */
+#define IO_RETRY_BACKOFF_START_US 50
+#define IO_RETRY_BACKOFF_MAX_US 2000
+
+/* One backoff step for a host call that has no interruptible form: semop,
+ * flock, fcntl F_SETLKW, and a blocking FIFO open. None of them participates in
+ * the wakeup pipe, and hv_vcpus_exit does not reach a thread outside
+ * hv_vcpu_run, so a thread parked inside one is invisible to every teardown
+ * wake. Callers loop over the non-blocking form of the operation and call this
+ * between attempts instead.
+ *
+ * Returns 0 when the caller should retry, or -LINUX_EINTR when teardown needs
+ * this thread out of the guest. *backoff_us must start at 0.
+ */
+int64_t io_retry_backoff(unsigned *backoff_us);
 
 int64_t sys_pread64(guest_t *g,
                     int fd,
