@@ -546,3 +546,9 @@ void signal_get_itimer_virt(int which,
  * the vCPU loop after each syscall.
  */
 void signal_check_timer(void);
+
+/* ITIMER_REAL only. A blocking wait must not advance ITIMER_VIRTUAL or
+ * ITIMER_PROF: those are charged to guest CPU time, and a thread parked in a
+ * host call spends none.
+ */
+void signal_check_timer_real(void);

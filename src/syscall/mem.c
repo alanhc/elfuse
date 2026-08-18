@@ -1193,7 +1193,10 @@ populate_existing:
          * to concurrent readers until the region tables commit (or the fail
          * path restores the bytes).
          */
-        thread_quiesce_siblings();
+        if (!thread_quiesce_siblings()) {
+            ret = -LINUX_EINTR; /* Being reaped; abandon the overlay */
+            goto fail;
+        }
         siblings_quiesced = true;
         memcpy(replaced_bytes_snap, map_host, length);
     }
@@ -2341,7 +2344,8 @@ static int hvf_apply_file_overlay(guest_t *g,
 {
     if (!overlay_fd_writable(fd))
         return -LINUX_EACCES;
-    thread_quiesce_siblings();
+    if (!thread_quiesce_siblings())
+        return -LINUX_EINTR; /* Being reaped; abandon the overlay */
     int err = hvf_apply_file_overlay_quiesced(g, ipa, len, fd, file_off);
     thread_resume_siblings();
     return err;
@@ -2399,7 +2403,8 @@ static int hvf_remove_file_overlay_quiesced(guest_t *g,
  */
 static int hvf_remove_file_overlay(guest_t *g, uint64_t ipa, uint64_t len)
 {
-    thread_quiesce_siblings();
+    if (!thread_quiesce_siblings())
+        return -LINUX_EINTR; /* Being reaped; abandon the overlay */
     int err = hvf_remove_file_overlay_quiesced(g, ipa, len);
     thread_resume_siblings();
     return err;

@@ -84,6 +84,8 @@ test-dev-shm-paths
 test-thread                    # diff=skip
 test-pthread
 test-thread-churn
+test-threaded-exec
+test-threaded-exec worker
 test-simd-clone                # diff=skip
 
 [section] Stress tests

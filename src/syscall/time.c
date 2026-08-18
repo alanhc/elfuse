@@ -116,7 +116,7 @@ static int64_t interruptible_sleep_ns(guest_t *g,
                                       bool write_rem)
 {
     while (remaining_ns > 0) {
-        if (proc_exit_group_requested() || signal_pending()) {
+        if (thread_stop_requested() || signal_pending()) {
             if (write_rem &&
                 write_remaining_sleep(g, rem_gva, remaining_ns) < 0)
                 return -LINUX_EFAULT;

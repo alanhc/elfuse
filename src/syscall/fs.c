@@ -46,6 +46,7 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
 #include "syscall/fuse.h"
 #include "syscall/fs.h"
 #include "syscall/internal.h"
+#include "syscall/io.h"  /* io_retry_backoff */
 #include "syscall/net.h" /* absock_unregister_fd */
 #include "syscall/path.h"
 #include "syscall/poll.h" /* epoll_dup_fd */
@@ -512,6 +513,77 @@ static int64_t reject_unsupported_fuse_path_op(const path_translation_t *tx)
 
 /* open/close. */
 
+
+/* openat, without parking the vCPU thread in a host call no teardown wake
+ * reaches. A write-only open of a FIFO with no reader blocks until one arrives;
+ * O_NONBLOCK reports that state as ENXIO instead, which is unambiguous (no
+ * other file type produces it here), so poll for the reader and restore the
+ * blocking flag once the open succeeds. The guest-visible result is the same.
+ *
+ * The read-only side keeps the blocking open, which is a known teardown hazard
+ * rather than an oversight: a thread parked in it is reachable by no teardown
+ * wake, so an execve de_thread running concurrently counts it as a thread that
+ * would not leave and takes its fatal path. It cannot be emulated the same way
+ * as the write side: an O_RDONLY | O_NONBLOCK open of a FIFO succeeds
+ * immediately whether or not a writer exists, and macOS poll() reports revents
+ * == 0 on the read end in every state (measured), so there is nothing to wait
+ * on that would reproduce "return once a writer arrives". Lifting it needs the
+ * open to run on a thread that owns no vCPU.
+ */
+static int open_nonblocking_writer(int dirfd,
+                                   const char *path,
+                                   int flags,
+                                   mode_t mode)
+{
+    bool guest_wants_nonblock = (flags & O_NONBLOCK) != 0;
+    bool may_block_for_reader =
+        !guest_wants_nonblock && (flags & O_ACCMODE) == O_WRONLY;
+
+    if (!may_block_for_reader) {
+        return (dirfd == AT_FDCWD) ? open(path, flags, mode)
+                                   : openat(dirfd, path, flags, mode);
+    }
+
+    unsigned backoff = 0;
+    for (;;) {
+        int fd = (dirfd == AT_FDCWD)
+                     ? open(path, flags | O_NONBLOCK, mode)
+                     : openat(dirfd, path, flags | O_NONBLOCK, mode);
+        if (fd >= 0) {
+            /* Restore the blocking mode the guest asked for. Nothing observed
+             * the O_NONBLOCK window: no guest-visible I/O has run on this fd.
+             */
+            if (fd_update_status_flag(fd, O_NONBLOCK, false) < 0) {
+                /* The guest asked for a blocking fd; handing it a non-blocking
+                 * one would surface as spurious EAGAIN later.
+                 */
+                close_keep_errno(fd);
+                return -1;
+            }
+            return fd;
+        }
+        if (errno != ENXIO)
+            return -1;
+
+        /* ENXIO also means "special file, no device configured", which is
+         * permanent: retrying it would spin forever. Only a FIFO can become
+         * openable later, when a reader arrives.
+         */
+        struct stat st;
+        int strc = (dirfd == AT_FDCWD) ? stat(path, &st)
+                                       : fstatat(dirfd, path, &st, 0);
+        if (strc != 0 || !S_ISFIFO(st.st_mode)) {
+            errno = ENXIO;
+            return -1;
+        }
+
+        if (io_retry_backoff(&backoff) < 0) {
+            errno = EINTR;
+            return -1;
+        }
+    }
+}
+
 int64_t sys_openat_path(guest_t *g,
                         int dirfd,
                         const char *pathp,
@@ -529,7 +601,8 @@ int64_t sys_openat_path(guest_t *g,
     int flags = translate_open_flags(linux_flags);
     if (!tx.fuse_path && tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD &&
         pathp[0] != '/' && !proc_get_sysroot()) {
-        int host_fd = openat(AT_FDCWD, tx.host_path, flags, mode);
+        int host_fd =
+            open_nonblocking_writer(AT_FDCWD, tx.host_path, flags, mode);
         if (host_fd < 0)
             return linux_errno();
 
@@ -596,7 +669,8 @@ int64_t sys_openat_path(guest_t *g,
     }
 
     if (dirfd == LINUX_AT_FDCWD) {
-        int host_fd = open(tx.host_path, flags, mode);
+        int host_fd =
+            open_nonblocking_writer(AT_FDCWD, tx.host_path, flags, mode);
         if (host_fd < 0)
             return linux_errno();
 
@@ -618,7 +692,8 @@ int64_t sys_openat_path(guest_t *g,
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
 
-    int host_fd = openat(dir_ref.fd, tx.host_path, flags, mode);
+    int host_fd =
+        open_nonblocking_writer(dir_ref.fd, tx.host_path, flags, mode);
     host_fd_ref_close(&dir_ref);
     if (host_fd < 0)
         return linux_errno();
@@ -1115,12 +1190,17 @@ int64_t sys_dup3(int oldfd, int newfd, int linux_flags)
  * Use guest_read/guest_write (not guest_ptr) to safely handle structs that span
  * 2MiB page table block boundaries.
  */
-static int64_t fcntl_flock_op(guest_t *g,
-                              host_fd_ref_t *host_ref,
-                              uint64_t arg,
-                              int mac_cmd,
-                              bool is_getlk,
-                              bool is_ofd)
+/* Read the guest's struct flock once and translate it to the host's.
+ *
+ * Split out so a waiting command can decode before it starts polling: rereading
+ * guest memory on every retry lets another thread change the request underneath
+ * the wait, which would silently switch which region is being locked, turn a
+ * lock into an unlock, or fail with EFAULT after the mapping went away.
+ */
+static int64_t fcntl_flock_decode(guest_t *g,
+                                  uint64_t arg,
+                                  bool is_ofd,
+                                  struct flock *out)
 {
     uint8_t lflock[32]; /* Linux struct flock is 32 bytes on aarch64 */
     if (guest_read_small(g, arg, lflock, sizeof(lflock)) < 0)
@@ -1165,13 +1245,27 @@ static int64_t fcntl_flock_op(guest_t *g,
         return -LINUX_EINVAL;
     }
 
-    struct flock mac_fl = {
+    *out = (struct flock) {
         .l_start = l_start,
         .l_len = l_len,
         .l_pid = 0,
         .l_type = mac_type,
         .l_whence = l_whence, /* SEEK_SET=0, SEEK_CUR=1, SEEK_END=2 same */
     };
+    return 0;
+}
+
+static int64_t fcntl_flock_op(guest_t *g,
+                              host_fd_ref_t *host_ref,
+                              uint64_t arg,
+                              int mac_cmd,
+                              bool is_getlk,
+                              bool is_ofd)
+{
+    struct flock mac_fl;
+    int64_t decoded = fcntl_flock_decode(g, arg, is_ofd, &mac_fl);
+    if (decoded < 0)
+        return decoded;
 
     if (fcntl(host_ref->fd, mac_cmd, &mac_fl) < 0)
         return linux_errno();
@@ -1214,6 +1308,11 @@ static int64_t fcntl_flock_op(guest_t *g,
         int64_t gpid = proc_host_to_guest_pid((pid_t) mac_fl.l_pid);
         rp = (gpid > 0) ? (int32_t) gpid : (int32_t) mac_fl.l_pid;
     }
+
+    /* The decode reads into its own buffer, so the GETLK answer needs one of
+     * its own to pack into.
+     */
+    uint8_t lflock[32];
     memset(lflock, 0, sizeof(lflock));
     memcpy(lflock + 0, &rt, 2);
     memcpy(lflock + 2, &rw, 2);
@@ -1223,6 +1322,45 @@ static int64_t fcntl_flock_op(guest_t *g,
     if (guest_write_small(g, arg, lflock, sizeof(lflock)) < 0)
         return -LINUX_EFAULT;
     return 0;
+}
+
+/* F_SETLKW / F_OFD_SETLKW, without parking the vCPU thread in a host call that
+ * no teardown wake reaches. Polls the non-waiting command instead: macOS
+ * reports a conflicting lock as EAGAIN, and POSIX allows EACCES for the same
+ * condition, so both mean "retry". One thing polling cannot recover: F_SETLK
+ * does no deadlock detection, so a guest that deadlocks on POSIX record locks
+ * waits here instead of one participant getting EDEADLK. waiting is false for
+ * the GETLK and SETLK commands, which never block and pass straight through.
+ */
+static int64_t fcntl_flock_wait(guest_t *g,
+                                host_fd_ref_t *host_ref,
+                                uint64_t arg,
+                                int mac_cmd,
+                                bool is_getlk,
+                                bool is_ofd,
+                                bool waiting)
+{
+    if (!waiting)
+        return fcntl_flock_op(g, host_ref, arg, mac_cmd, is_getlk, is_ofd);
+
+    struct flock mac_fl;
+    int64_t decoded = fcntl_flock_decode(g, arg, is_ofd, &mac_fl);
+    if (decoded < 0)
+        return decoded;
+
+    int poll_cmd = is_ofd ? F_OFD_SETLK : F_SETLK;
+    unsigned backoff = 0;
+    for (;;) {
+        if (fcntl(host_ref->fd, poll_cmd, &mac_fl) == 0)
+            return 0;
+        int64_t rc = linux_errno();
+        if (rc != -LINUX_EAGAIN && rc != -LINUX_EACCES)
+            return rc;
+
+        int64_t wait_rc = io_retry_backoff(&backoff);
+        if (wait_rc < 0)
+            return wait_rc;
+    }
 }
 
 int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
@@ -1409,8 +1547,8 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         if (host_fd_ref_open(fd, &host_ref) < 0)
             return -LINUX_EBADF;
         int mac_cmd = (cmd == 5) ? F_GETLK : (cmd == 6) ? F_SETLK : F_SETLKW;
-        int64_t rc =
-            fcntl_flock_op(g, &host_ref, arg, mac_cmd, cmd == 5, false);
+        int64_t rc = fcntl_flock_wait(g, &host_ref, arg, mac_cmd, cmd == 5,
+                                      false, cmd == 7);
         host_fd_ref_close(&host_ref);
         return rc;
     }
@@ -1424,8 +1562,8 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         int mac_cmd = (cmd == 36)   ? F_OFD_GETLK
                       : (cmd == 37) ? F_OFD_SETLK
                                     : F_OFD_SETLKW;
-        int64_t rc =
-            fcntl_flock_op(g, &host_ref, arg, mac_cmd, cmd == 36, true);
+        int64_t rc = fcntl_flock_wait(g, &host_ref, arg, mac_cmd, cmd == 36,
+                                      true, cmd == 38);
         host_fd_ref_close(&host_ref);
         return rc;
     }

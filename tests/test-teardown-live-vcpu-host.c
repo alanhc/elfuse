@@ -31,14 +31,23 @@
 
 #include "runtime/thread.h"
 
-#include "debug/log.h"    /* log_impl prototype */
-#include "syscall/proc.h" /* proc_exit_group_requested prototype */
+#include "debug/log.h"           /* log_impl prototype */
+#include "runtime/futex.h"       /* futex_interrupt_request prototype */
+#include "syscall/exec.h"        /* exec_handoff_wake_waiters prototype */
+#include "syscall/proc.h"        /* proc_exit_group_requested prototype */
+#include "syscall/wakeup-pipe.h" /* wakeup_pipe_signal prototype */
 
 /* thread.c externs not exercised by the code paths under test. */
 int proc_exit_group_requested(void)
 {
     return 0;
 }
+
+void futex_interrupt_request(void) {}
+
+void wakeup_pipe_signal(void) {}
+
+void exec_handoff_wake_waiters(void) {}
 
 void signal_refresh_pending_hint(void) {}
 

@@ -28,6 +28,7 @@
 #include "debug/log.h"
 
 #include "runtime/futex.h"
+#include "runtime/thread.h" /* thread_stop_requested */
 
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
@@ -58,6 +59,36 @@ typedef struct {
     short revents;
     host_fd_ref_t ref;
 } pselect_req_t;
+
+/* Longest a host wait may run before its caller re-checks the interrupt
+ * conditions. A wait armed with the guest's whole timeout does not watch the
+ * wakeup pipe and cannot be woken by thread_wake_all_blocked, so a teardown or
+ * an execve handoff would wait out the guest's timeout instead of the slice.
+ */
+#define POLL_WAKE_SLICE_MS 200
+
+static int64_t poll_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Milliseconds left of a finite wait, never negative. deadline_ms is -1 for a
+ * wait with no deadline, which reports the full slice every time.
+ */
+static int poll_slice_ms(int64_t deadline_ms)
+{
+    if (deadline_ms < 0)
+        return POLL_WAKE_SLICE_MS;
+
+    int64_t remaining = deadline_ms - poll_now_ms();
+    if (remaining <= 0)
+        return 0;
+    return remaining < POLL_WAKE_SLICE_MS ? (int) remaining
+                                          : POLL_WAKE_SLICE_MS;
+}
+
 
 static inline void host_fd_refs_close(host_fd_ref_t *refs, uint32_t n)
 {
@@ -181,14 +212,18 @@ int64_t sys_ppoll(guest_t *g,
         mask_installed = true;
     }
 
-    /* For indefinite polls, add the wakeup pipe so exit_group/futex/signal
-     * requests can interrupt threads blocked in host poll(). Without this,
-     * host-blocked threads cannot be interrupted by hv_vcpus_exit() because
-     * they're not in hv_vcpu_run().
+    /* Add the wakeup pipe so exit_group/futex/signal requests can interrupt a
+     * thread blocked in host poll(). Without this, host-blocked threads cannot
+     * be interrupted by hv_vcpus_exit() because they're not in hv_vcpu_run().
+     *
+     * Every wait gets it, not just an indefinite one: a finite wait that only
+     * watched the guest's own fds would sit out its whole timeout before
+     * noticing a teardown, and an execve de_thread waiting on that thread
+     * counts it as one that would not leave.
      */
     bool added_wakeup = false;
     int wake_fd = wakeup_pipe_read_fd();
-    if (timeout_ms < 0 && wake_fd >= 0 && nfds < 256) {
+    if (wake_fd >= 0 && nfds < 256) {
         host_fds[nfds].fd = wake_fd;
         host_fds[nfds].events = POLLIN;
         host_fds[nfds].revents = 0;
@@ -204,25 +239,31 @@ int64_t sys_ppoll(guest_t *g,
     if (invalid_count > 0)
         poll_timeout_ms = 0;
 
+    /* A finite wait runs to this deadline in slices; an unbounded one has none
+     * and re-arms forever. A zero timeout is a poll, not a wait, and keeps its
+     * single non-blocking call.
+     */
+    int64_t deadline_ms =
+        poll_timeout_ms > 0 ? poll_now_ms() + poll_timeout_ms : -1;
+
     int ret;
 ppoll_retry:
     do {
-        ret = poll(host_fds, nfds + added_wakeup,
-                   poll_timeout_ms < 0 ? 200 : poll_timeout_ms);
+        int slice = poll_timeout_ms == 0 ? 0 : poll_slice_ms(deadline_ms);
+        ret = poll(host_fds, nfds + added_wakeup, slice);
 
         /* Check for process/thread interrupts after waking. */
-        if (proc_exit_group_requested() || futex_interrupt_consume() ||
+        if (thread_stop_requested() || futex_interrupt_consume() ||
             signal_pending_interruption(NULL)) {
             ret = -1;
             errno = EINTR;
             break;
         }
 
-        /* If poll emulation used a short timeout (200ms) on an infinite poll
-         * and nothing happened, loop back. If the caller had a real timeout,
-         * poll emulation only called poll once with that timeout, so break. An
-         * infinite poll re-arms on a 200ms slice; break out when a master has
-         * hung up, since the host will never make that fd ready.
+        /* Nothing happened within the slice, so re-arm: an indefinite wait
+         * forever, a finite one until its deadline. Only a zero timeout, which
+         * is a poll rather than a wait, gets a single call. Break out when a
+         * master has hung up, since the host will never make that fd ready.
          */
         if (ret == 0) {
             bool hup_pending = false;
@@ -233,7 +274,8 @@ ppoll_retry:
             if (hup_pending)
                 break;
         }
-    } while (ret == 0 && poll_timeout_ms < 0);
+    } while (ret == 0 && poll_timeout_ms != 0 &&
+             (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0));
 
     /* POSIX poll() ignores entries with fd < 0 and resets revents to 0, so
      * re-stamp POLLNVAL on the invalid slots and credit them to the return
@@ -272,7 +314,8 @@ ppoll_retry:
         wakeup_pipe_drain();
         if (ret > 0)
             ret--;
-        if (ret == 0 && poll_timeout_ms < 0)
+        if (ret == 0 && poll_timeout_ms != 0 &&
+            (deadline_ms < 0 || poll_slice_ms(deadline_ms) > 0))
             goto ppoll_retry;
     }
 
@@ -497,6 +540,7 @@ int64_t sys_pselect6(guest_t *g,
      * requests can interrupt.
      */
     bool added_wakeup = false;
+
     /* One read of the pipe fd for the whole call: the FD_SET here and the
      * FD_ISSET/FD_CLR after the wait must name the same descriptor.
      */
@@ -595,7 +639,7 @@ pselect_retry:
                           has_timeout ? &ts : &poll_ts, NULL);
         }
 
-        if (proc_exit_group_requested() || futex_interrupt_consume() ||
+        if (thread_stop_requested() || futex_interrupt_consume() ||
             signal_pending_interruption(NULL)) {
             ret = -1;
             errno = EINTR;
@@ -1432,7 +1476,7 @@ int64_t sys_epoll_pwait(guest_t *g,
          * exit_group still wins outright: the process is going away and there
          * is nothing to deliver events to.
          */
-        bool interrupted = proc_exit_group_requested();
+        bool interrupted = thread_stop_requested();
         if (!interrupted && nready <= 0)
             interrupted =
                 futex_interrupt_consume() || signal_pending_interruption(NULL);

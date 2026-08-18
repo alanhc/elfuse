@@ -41,7 +41,8 @@
 #include "syscall/inotify.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
-#include "syscall/proc.h" /* proc_exit_group_requested */
+#include "runtime/thread.h" /* thread_stop_requested */
+#include "syscall/proc.h"   /* proc_exit_group_requested */
 
 static void inotify_close(int guest_fd);
 
@@ -912,7 +913,7 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
                     break;
                 if (nev < 0 && errno != EINTR)
                     return linux_errno();
-                if (proc_exit_group_requested())
+                if (thread_stop_requested())
                     return -LINUX_EINTR;
             }
             if (nev <= 0)

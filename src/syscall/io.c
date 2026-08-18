@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -191,6 +192,44 @@ static int64_t linux_siocgifhwaddr(guest_t *g, uint64_t arg)
     return 0;
 }
 
+int64_t io_retry_backoff(unsigned *backoff_us)
+{
+    /* Materialize an expired guest interval timer first. ITIMER_REAL is virtual
+     * and only becomes a pending SIGALRM when this runs, and the syscall
+     * epilogue that would otherwise do it cannot run while the caller is
+     * looping here. Without this a guest whose alarm fires during a contended
+     * lock waits for the lock rather than for the signal. The interruptible fd
+     * wait below does the same thing for the same reason.
+     */
+    signal_check_timer_real();
+
+    /* Teardown, or a signal Linux would have delivered: semop, flock and
+     * F_SETLKW are all interruptible, and the blocking host calls these replace
+     * were reachable by neither. signal_pending_interruption already filters
+     * SIG_IGN, default-ignore, and SA_RESTART, so it cannot manufacture an
+     * EINTR the guest would not have seen.
+     */
+    if (thread_stop_requested() || signal_pending_interruption(NULL))
+        return -LINUX_EINTR;
+
+    /* First miss: yield rather than sleep. A lock or semaphore released inside
+     * the current scheduling quantum is the common case, and a sleep would turn
+     * it into a timer round trip that macOS rounds up well past the request.
+     */
+    if (*backoff_us == 0) {
+        sched_yield();
+        *backoff_us = IO_RETRY_BACKOFF_START_US;
+        return 0;
+    }
+
+    unsigned us = *backoff_us;
+    usleep(us);
+
+    us *= 2;
+    *backoff_us = us > IO_RETRY_BACKOFF_MAX_US ? IO_RETRY_BACKOFF_MAX_US : us;
+    return 0;
+}
+
 int64_t io_wait_fd_or_interrupted(int host_fd, short events)
 {
     int wake_fd = wakeup_pipe_read_fd();
@@ -209,12 +248,12 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
          * epilogue, which cannot run while this thread is parked here. The
          * futex wait loops do the same.
          */
-        signal_check_timer();
+        signal_check_timer_real();
 
         /* Ignored/default-ignore signals do not interrupt; restartable handlers
          * still need to run promptly through the syscall epilogue.
          */
-        if (proc_exit_group_requested() || futex_interrupt_consume() ||
+        if (thread_stop_requested() || futex_interrupt_consume() ||
             signal_pending_interruption(NULL))
             return -LINUX_EINTR;
 

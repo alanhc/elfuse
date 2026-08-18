@@ -11,6 +11,8 @@
  */
 
 #include <stdbool.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,10 +35,12 @@
 
 #include "runtime/forkipc.h"
 #include "runtime/futex.h"
+#include "runtime/thread.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/chown-overlay.h"
 #include "syscall/exec.h"
+#include "syscall/wakeup-pipe.h" /* wakeup_pipe_signal */
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
@@ -542,13 +546,13 @@ static void exec_close_cloexec_fds(void)
              *
              * Each batch rescans from slot 0 rather than carrying a cursor
              * across the unlocked window, and the loop ends on the first pass
-             * that finds nothing. That is deliberate: the window drops
-             * fd_lock, so a cursor that only moves forward would never
-             * re-examine a slot it had already passed. Every pass marks what
-             * it takes closed, so the candidate set shrinks and the loop
-             * terminates. The repeated scanning is bounded by the table size
-             * times the batch count and only happens once malloc has already
-             * failed, which is a trade this path can afford.
+             * that finds nothing. That is deliberate: the window drops fd_lock,
+             * so a cursor that only moves forward would never re-examine a slot
+             * it had already passed. Every pass marks what it takes closed, so
+             * the candidate set shrinks and the loop terminates. The repeated
+             * scanning is bounded by the table size times the batch count and
+             * only happens once malloc has already failed, which is a trade
+             * this path can afford.
              */
             struct cloexec_entry batch[32];
             for (;;) {
@@ -694,6 +698,244 @@ static int64_t exec_preload_interp(const guest_t *g,
     return 0;
 }
 
+
+/* execve handoff to the thread group leader.
+ *
+ * One slot, because two threads racing to replace the same image have no
+ * meaningful joint outcome: the second waits for the first, and if the first
+ * succeeded the second never wakes as a running thread (de_thread reaps it).
+ * Linux serializes the same window on cred_guard_mutex. EMPTY -> PUBLISHED ->
+ * TAKEN -> (EMPTY on success, DONE on failure). A successful exec never reaches
+ * DONE: the requester is reaped by de_thread and has no one to report to.
+ */
+typedef enum {
+    HANDOFF_EMPTY = 0,
+    HANDOFF_PUBLISHED,
+    HANDOFF_TAKEN,
+    HANDOFF_DONE,
+} exec_handoff_state_t;
+
+static struct {
+    exec_handoff_state_t state;
+    int64_t result;
+    uint64_t path_gva, argv_gva, envp_gva;
+
+    /* Copied, not borrowed: on success the requester is reaped by de_thread and
+     * its pthread stack is freed while the leader is still inside sys_execve.
+     */
+    char host_path[LINUX_PATH_MAX]; /* empty when the caller passed none */
+    uint64_t blocked_mask; /* requester's signal mask, adopted by the leader */
+} exec_handoff;
+
+static pthread_mutex_t exec_handoff_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t exec_handoff_cond = PTHREAD_COND_INITIALIZER;
+
+/* The state is the truth; the flag thread_stop_requested polls is its lock-free
+ * mirror, since that predicate runs in blocking waits where taking this mutex
+ * would be wrong. Move them together so they cannot drift. Caller holds the
+ * lock.
+ */
+static void exec_handoff_set_state(exec_handoff_state_t st)
+{
+    exec_handoff.state = st;
+    thread_set_leader_work_pending(st == HANDOFF_PUBLISHED);
+}
+
+void exec_handoff_wake_waiters(void)
+{
+    pthread_mutex_lock(&exec_handoff_lock);
+    pthread_cond_broadcast(&exec_handoff_cond);
+    pthread_mutex_unlock(&exec_handoff_lock);
+}
+
+/* Block until the slot reaches want. Returns false when thread_stop_requested
+ * broke the wait instead, which for the requester means the exec it asked for
+ * already succeeded and de_thread is reaping it. Caller holds the lock; the
+ * bounded quantum is a safety net under the wake in thread_wake_all_blocked.
+ */
+static bool exec_handoff_wait_for(exec_handoff_state_t want)
+{
+    while (exec_handoff.state != want && !thread_stop_requested()) {
+        struct timespec ts;
+        timespec_deadline_in_ms(&ts, 100);
+        pthread_cond_timedwait(&exec_handoff_cond, &exec_handoff_lock, &ts);
+
+        /* Re-poke while the request is still unclaimed. The leader is woken
+         * once at publish, and a kick that lands between two hv_vcpu_run calls
+         * is lost; without this the requester waits forever and the leader
+         * runs on none the wiser. The wake set broadcasts this same condvar,
+         * so the lock has to come off around it.
+         */
+        if (exec_handoff.state == HANDOFF_PUBLISHED) {
+            pthread_mutex_unlock(&exec_handoff_lock);
+            thread_wake_all_blocked();
+            pthread_mutex_lock(&exec_handoff_lock);
+        }
+    }
+    return exec_handoff.state == want;
+}
+
+/* Requester side: publish the request, wake the leader, and block until it
+ * reports back or this thread is torn down.
+ *
+ * Returns the errno the guest should see, or SYSCALL_EXEC_HAPPENED if the exec
+ * succeeded (in which case this thread is already being reaped and the value
+ * only has to keep the dispatcher from writing X0).
+ */
+static int64_t exec_handoff_to_leader(uint64_t path_gva,
+                                      uint64_t argv_gva,
+                                      uint64_t envp_gva,
+                                      const char *host_path)
+{
+    pthread_mutex_lock(&exec_handoff_lock);
+
+    /* Wait for the slot. A concurrent handoff either fails (freeing the slot)
+     * or succeeds, in which case thread_stop_requested breaks this wait.
+     */
+    if (!exec_handoff_wait_for(HANDOFF_EMPTY)) {
+        pthread_mutex_unlock(&exec_handoff_lock);
+        return -LINUX_EINTR;
+    }
+
+    exec_handoff_set_state(HANDOFF_PUBLISHED);
+    exec_handoff.path_gva = path_gva;
+    exec_handoff.argv_gva = argv_gva;
+    exec_handoff.envp_gva = envp_gva;
+    /* An empty string is the "no host_path" marker, so the flag the buffer
+     * would otherwise need stays derivable from the buffer itself.
+     */
+    exec_handoff.host_path[0] = '\0';
+    if (host_path && str_copy_trunc(exec_handoff.host_path, host_path,
+                                    sizeof(exec_handoff.host_path)) >=
+                         sizeof(exec_handoff.host_path)) {
+        exec_handoff_set_state(HANDOFF_EMPTY);
+        pthread_cond_broadcast(&exec_handoff_cond);
+        pthread_mutex_unlock(&exec_handoff_lock);
+        return -LINUX_ENAMETOOLONG;
+    }
+    exec_handoff.blocked_mask = current_thread ? current_thread->blocked : 0;
+    pthread_mutex_unlock(&exec_handoff_lock);
+
+    /* Release mmap_lock, which this thread's sc_execve wrapper holds, for the
+     * whole wait: the leader needs it to run the exec, and the teardown that
+     * reaps this thread needs it free. Re-taken before returning so the
+     * wrapper's unlock stays balanced, and by then the leader has released it
+     * around its own teardown.
+     */
+    pthread_mutex_unlock(&mmap_lock);
+
+    /* The leader may be parked in a blocking syscall. thread_stop_requested is
+     * true for it while a request is pending, so its wait returns EINTR and its
+     * run loop reaches the service point.
+     */
+    thread_wake_all_blocked();
+
+    pthread_mutex_lock(&exec_handoff_lock);
+    bool reported = exec_handoff_wait_for(HANDOFF_DONE);
+
+    int64_t result;
+    if (!reported) {
+        /* Torn down: the exec succeeded and de_thread is reaping this thread.
+         * Leave the slot to the leader, which clears it.
+         */
+        result = -LINUX_EINTR;
+    } else {
+        result = exec_handoff.result;
+        exec_handoff_set_state(HANDOFF_EMPTY);
+        pthread_cond_broadcast(&exec_handoff_cond);
+    }
+    pthread_mutex_unlock(&exec_handoff_lock);
+
+    pthread_mutex_lock(&mmap_lock);
+    return result;
+}
+
+
+/* Drop any handoff state on behalf of the image being replaced. A requester
+ * blocked in the slot is reaped by de_thread and never returns to read it, so
+ * the new image must not inherit an occupied slot.
+ */
+static void exec_handoff_reset(void)
+{
+    pthread_mutex_lock(&exec_handoff_lock);
+    exec_handoff_set_state(HANDOFF_EMPTY);
+    pthread_cond_broadcast(&exec_handoff_cond);
+    pthread_mutex_unlock(&exec_handoff_lock);
+}
+
+int64_t exec_run_handoff(hv_vcpu_t vcpu, guest_t *g, bool verbose)
+{
+    uint64_t path_gva, argv_gva, envp_gva;
+    char host_path_buf[LINUX_PATH_MAX];
+    const char *host_path = NULL;
+    uint64_t saved_mask = 0;
+
+    pthread_mutex_lock(&exec_handoff_lock);
+    if (exec_handoff.state != HANDOFF_PUBLISHED) {
+        pthread_mutex_unlock(&exec_handoff_lock);
+        return 0;
+    }
+    exec_handoff_set_state(HANDOFF_TAKEN);
+    path_gva = exec_handoff.path_gva;
+    argv_gva = exec_handoff.argv_gva;
+    envp_gva = exec_handoff.envp_gva;
+    if (exec_handoff.host_path[0]) {
+        str_copy_trunc(host_path_buf, exec_handoff.host_path,
+                       sizeof(host_path_buf));
+        host_path = host_path_buf;
+    }
+
+    /* Moving out of PUBLISHED also clears the pending mirror, which is what
+     * stops thread_stop_requested from returning EINTR to the very thread now
+     * servicing the request: sys_execve can itself block on a FUSE-backed
+     * binary.
+     */
+
+    /* Linux keeps the exec'ing thread's signal mask across execve, and that
+     * thread is the one the new image inherits from. The leader runs the
+     * syscall in its place, so it adopts the mask too.
+     */
+    uint64_t adopt_mask = exec_handoff.blocked_mask;
+    pthread_mutex_unlock(&exec_handoff_lock);
+
+    /* Adopt the requester's mask, which is what the new image inherits on
+     * Linux. Through the signal module rather than by storing to the field:
+     * every other writer holds sig_lock (order 4), and
+     * thread_signal_deliverable reads it lock-free against them.
+     */
+    saved_mask = signal_save_blocked();
+    signal_set_blocked(adopt_mask);
+
+    /* sys_execve is written to run with mmap_lock held, which on the direct
+     * path its sc_execve wrapper takes. This path comes from the run loop, so
+     * take it here instead.
+     */
+    pthread_mutex_lock(&mmap_lock);
+    int64_t rc =
+        sys_execve(vcpu, g, path_gva, argv_gva, envp_gva, verbose, host_path);
+    pthread_mutex_unlock(&mmap_lock);
+
+    pthread_mutex_lock(&exec_handoff_lock);
+    if (rc == SYSCALL_EXEC_HAPPENED) {
+        /* The requester is being reaped by de_thread and will never read this.
+         * Free the slot so the new image can execve again.
+         */
+        exec_handoff_set_state(HANDOFF_EMPTY);
+    } else {
+        /* The exec failed before its point of no return, so this thread goes
+         * back to being itself: the requester's mask belonged to the image that
+         * never got loaded.
+         */
+        signal_restore_blocked(saved_mask);
+        exec_handoff.result = rc;
+        exec_handoff_set_state(HANDOFF_DONE);
+    }
+    pthread_cond_broadcast(&exec_handoff_cond);
+    pthread_mutex_unlock(&exec_handoff_lock);
+
+    return rc == SYSCALL_EXEC_HAPPENED ? SYSCALL_EXEC_HAPPENED : 0;
+}
+
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_execve(hv_vcpu_t vcpu,
                    guest_t *g,
@@ -703,6 +945,25 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                    bool verbose,
                    const char *host_path)
 {
+    /* Not the leader: hand the whole syscall to it. See exec_handoff_to_leader
+     * for why the leader has to be the one that survives.
+     */
+    if (!thread_current_is_leader())
+        return exec_handoff_to_leader(path_gva, argv_gva, envp_gva, host_path);
+
+    /* Linux gives the exec'ing task a new mm and leaves a CLONE_VM child on the
+     * old one. elfuse has a single guest slab, so guest_reset would zero the
+     * memory that child is executing. Refuse while one is live, for the same
+     * reason and with the same recoverable errno as above.
+     */
+    if (thread_count_active_vm_clones() > 0) {
+        log_error(
+            "execve with %d live CLONE_VM child(ren) is not supported; "
+            "they share the guest memory guest_reset would zero",
+            thread_count_active_vm_clones());
+        return -LINUX_ENOSYS;
+    }
+
     /* Copy guest execve inputs before any state-reset point of no return. A
      * provided host_path (from execveat resolution) is used directly for the
      * exec open, but the guest-visible identity in path must carry the guest
@@ -1131,6 +1392,52 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* Past pre-PNR validation. Fall through to point of no return. The fail
      * label below handles all pre-PNR error paths.
      */
+
+    /* Linux de_thread(): the siblings die before the new image exists, and
+     * before commit_creds, so ordering it first here matches begin_new_exec and
+     * keeps the credential commit below from reaching a thread that Linux would
+     * already have destroyed. It also has to precede the CLOEXEC sweep and
+     * guest_reset: a sibling parked in read() on a fd about to close, or still
+     * executing the old image's code, winds down against the memory and fd
+     * table its guest still expects.
+     */
+    /* Both callers hold mmap_lock (order 1) across the whole syscall, and the
+     * teardown must not run under it: a sibling blocked in
+     * pthread_mutex_lock(&mmap_lock) inside sc_brk, sc_mmap, sc_munmap,
+     * sc_mprotect, or its own deferred stack unmap is reachable by none of the
+     * teardown wakes, so it can never reach a stop check and the join below
+     * would always time out. Measured before this release: four siblings
+     * looping on mmap/munmap took the fatal path every time.
+     *
+     * Dropping it here is safe because nothing in the teardown touches guest
+     * memory or the region table, and re-acquiring cannot contend: by the time
+     * it returns 0 no other guest thread is left to hold it.
+     */
+    pthread_mutex_unlock(&mmap_lock);
+    int survivors = thread_exec_de_thread();
+    pthread_mutex_lock(&mmap_lock);
+
+    /* The refusal above is a snapshot: a sibling could have created a CLONE_VM
+     * child in the window between it and here. de_thread neither reaps nor
+     * waits for one (Linux leaves it on the old mm), so count it now, when
+     * every thread that could have created one is gone. guest_reset would
+     * otherwise zero the shim data holding its EL1 stack and unmap host memory
+     * under a live foreign vCPU.
+     */
+    survivors += thread_count_active_vm_clones();
+    if (survivors > 0) {
+        /* A sibling outlived the bounded join, so it still holds registers into
+         * the image guest_reset is about to zero. Past the point of no return
+         * the only safe answer is the same diagnosed exit the other post-reset
+         * failures take.
+         */
+        log_fatal(
+            "execve failed after point of no return: "
+            "%d guest thread(s) survived de_thread",
+            survivors);
+        exit(128);
+    }
+
     /* Commit credentials right before the Point of No Return. Saved UID/GID are
      * refreshed from the final effective IDs.
      *
@@ -1142,11 +1449,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * the gate afterwards, so this elevates the whole process tree from here
      * on, not just the image being loaded.
      *
-     * elfuse never tears sibling guest threads down at exec, so a sibling that
-     * outlives this call keeps the credentials committed here for the rest of
-     * the process lifetime -- a multithreaded guest that execs the marked
-     * binary from one thread hands root to every thread that was already
-     * running. The gate is published after the IDs because no permission check
+     * The gate is published after the IDs because no permission check
      * grants on the gate alone: proc-identity.c pairs it with "emu_euid == 0 ||
      * fakeroot", and sys_getgroups and capget require both. Publishing it last
      * can therefore only narrow the window, never open one.
@@ -1223,6 +1526,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      */
     proc_clear_exit_group();
     futex_interrupt_clear();
+    thread_reset_for_exec();
+    exec_handoff_reset();
 
     /* POSIX exec signal semantics: Handlers set to SIG_DFL (except SIG_IGN
      * stays SIG_IGN), pending signals preserved, and signal mask preserved.

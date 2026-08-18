@@ -26,6 +26,7 @@
 #include "syscall/sysvipc.h"
 #include "syscall/linux-wire.h"
 #include "syscall/internal.h"
+#include "syscall/io.h" /* io_retry_backoff */
 #include "syscall/mem.h"
 
 /* Linux SysV IPC constants. */
@@ -405,6 +406,101 @@ int64_t sys_semget(guest_t *g, int32_t key, int nsems, int semflg)
     return id;
 }
 
+/* Largest set this can walk; semctl GETALL fills a caller array. */
+#define SEMOP_MAX_SEMS 1024
+
+/* Outcomes of the walk below that are not an operation index. */
+#define SEMOP_BLOCKER_NONE (-1)    /* Every operation could proceed */
+#define SEMOP_BLOCKER_UNKNOWN (-2) /* The values could not be read */
+
+/* Semaphores in the set, or SEMOP_BLOCKER_UNKNOWN.
+ *
+ * Split from the walk because a set cannot be resized, so this is read once per
+ * semop rather than once per retry: the walk runs again on every pass of the
+ * polling loop, and re-asking the kernel for a constant on each one is a
+ * syscall spent to learn nothing.
+ */
+static int semop_read_nsems(int semid)
+{
+    struct semid_ds info;
+    if (semctl(semid, 0, IPC_STAT, &info) < 0)
+        return SEMOP_BLOCKER_UNKNOWN;
+
+    int nsems = (int) info.sem_nsems;
+    if (nsems <= 0 || nsems > SEMOP_MAX_SEMS)
+        return SEMOP_BLOCKER_UNKNOWN;
+    return nsems;
+}
+
+/* Index of the operation that cannot proceed against the current values.
+ *
+ * This repeats the walk the kernel makes before it decides to block: a positive
+ * operation always proceeds, a zero operation needs the value already at zero,
+ * and a negative one needs enough units to take. Linux answers EAGAIN when the
+ * operation it stopped on carries IPC_NOWAIT, and blocks otherwise, so which
+ * one stopped it is the whole question.
+ *
+ * Returns SEMOP_BLOCKER_NONE when nothing blocked, and SEMOP_BLOCKER_UNKNOWN
+ * when the values could not be read, which a set granting alter but not read
+ * permission does while its operations still apply.
+ *
+ * The caller keeps waiting on either, rather than answering EAGAIN from a
+ * result it cannot back up. That trade has a cost worth naming: a mixed set on
+ * a set it may alter but not read never gets the refusal Linux would have given
+ * it, and waits instead. Answering EAGAIN there would be inventing a refusal in
+ * every other case the probe cannot read, which is the more common one.
+ *
+ * nsems is resolved once per semop by the caller, since a set cannot be
+ * resized. The values are re-read on every pass, because those are what move.
+ *
+ * They can move between this read and the failed semop it explains, so the
+ * operation named here can differ from the one the host actually stopped on.
+ * Usually that costs a retry: applying the set is still one atomic host call,
+ * and the next pass re-reads. The case it gets wrong is a set whose true
+ * blocker carries IPC_NOWAIT while a concurrent change makes a blocking
+ * operation look like the blocker, where the caller waits and Linux would have
+ * answered EAGAIN. It resolves as soon as one pass reads a consistent set.
+ */
+static int semop_first_blocker(int semid,
+                               const struct sembuf *sops,
+                               unsigned nsops,
+                               int nsems)
+{
+    unsigned short vals[SEMOP_MAX_SEMS];
+    if (nsems <= 0 || semctl(semid, 0, GETALL, vals) < 0)
+        return SEMOP_BLOCKER_UNKNOWN;
+
+    /* Widened because a positive operation may carry the running value past
+     * what a semaphore can hold, and the walk only needs the comparisons to
+     * stay honest until it reaches the operation that stops it.
+     */
+    int cur[SEMOP_MAX_SEMS];
+    for (int i = 0; i < nsems; i++)
+        cur[i] = (int) vals[i];
+
+    for (unsigned i = 0; i < nsops; i++) {
+        int num = sops[i].sem_num;
+        if (num < 0 || num >= nsems) {
+            /* Out of range: the host semop owns that error */
+            return SEMOP_BLOCKER_UNKNOWN;
+        }
+
+        int op = sops[i].sem_op;
+        if (op > 0) {
+            cur[num] += op;
+        } else if (op == 0) {
+            if (cur[num] != 0)
+                return (int) i;
+        } else {
+            if (cur[num] < -op)
+                return (int) i;
+            cur[num] += op;
+        }
+    }
+
+    return SEMOP_BLOCKER_NONE;
+}
+
 int64_t sys_semop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops)
 {
     if (nsops == 0 || nsops > 256)
@@ -417,10 +513,49 @@ int64_t sys_semop(guest_t *g, int semid, uint64_t sops_gva, unsigned nsops)
     if (guest_read(g, sops_gva, sops, len) < 0)
         return -LINUX_EFAULT;
 
-    if (semop(semid, sops, nsops) < 0)
-        return linux_errno();
+    /* Every set polls, mixed or not. A blocking semop parks the vCPU thread in
+     * a host call no teardown wake reaches, so nothing here may enter one, and
+     * a set that mixes IPC_NOWAIT with blocking operations would otherwise have
+     * to. The copy carries the flag on every operation so the host still
+     * applies the set atomically or not at all; sops keeps the guest's own
+     * flags, which is what decides whether a refusal is owed to the caller now.
+     */
+    struct sembuf poll_sops[256];
+    bool any_nowait = false;
+    for (unsigned i = 0; i < nsops; i++) {
+        poll_sops[i] = sops[i];
+        poll_sops[i].sem_flg |= IPC_NOWAIT;
+        if (sops[i].sem_flg & IPC_NOWAIT)
+            any_nowait = true;
+    }
 
-    return 0;
+    /* Resolved on the first probe, which only a set carrying IPC_NOWAIT ever
+     * makes, so an all-blocking set pays nothing for it.
+     */
+    int nsems = 0;
+
+    unsigned backoff = 0;
+    for (;;) {
+        if (semop(semid, poll_sops, nsops) == 0)
+            return 0;
+        if (errno != EAGAIN)
+            return linux_errno();
+
+        /* The set did not apply. Linux owes EAGAIN only when the operation that
+         * stopped it is itself IPC_NOWAIT; when a blocking one stopped it the
+         * caller waits, whatever flags the rest of the set carries.
+         */
+        if (any_nowait) {
+            if (nsems == 0)
+                nsems = semop_read_nsems(semid);
+            int blocker = semop_first_blocker(semid, sops, nsops, nsems);
+            if (blocker >= 0 && (sops[blocker].sem_flg & IPC_NOWAIT))
+                return -LINUX_EAGAIN;
+        }
+        int64_t wait_rc = io_retry_backoff(&backoff);
+        if (wait_rc < 0)
+            return wait_rc;
+    }
 }
 
 int64_t sys_semctl(guest_t *g, int semid, int semnum, int cmd, uint64_t arg)

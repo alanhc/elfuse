@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Run aarch64 test suites under both elfuse and self-contained QEMU.
 #
 # Copyright 2026 elfuse contributors
@@ -23,6 +24,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURES="${REPO_ROOT}/externals/test-fixtures"
+
 # Allow tests to point the translator probe at a missing path to exercise the
 # non-Rosetta-host skip path without uninstalling the translator.
 : "${MATRIX_ROSETTA_TRANSLATOR:=/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta}"
@@ -240,6 +242,7 @@ stage_sysroot_fixtures()
     local guest_rel="/tmp/matrix-coreutils.$$"
     local host_dir="${sysroot}${guest_rel}"
     mkdir -p "$host_dir"
+
     # Copy the fixtures setup_fixtures already authored rather than re-creating
     # their content here, so the two stay in sync from one definition.
     cp "$TEST_TMPDIR/hello.txt" "$TEST_TMPDIR/unsorted.txt" \
@@ -261,23 +264,23 @@ unstage_sysroot_fixtures()
 
 # Generic test helpers.
 
-# The qemu reference lane runs the portable matrix tests against the real
-# Alpine linux-virt kernel. Add a test's name here only if it asserts
-# elfuse-specific behavior a real kernel does not honor; it still runs in
-# elfuse-aarch64 mode and in 'make check'.
+# The qemu reference lane runs the portable matrix tests against the real Alpine
+# linux-virt kernel. Add a test's name here only if it asserts elfuse-specific
+# behavior a real kernel does not honor; it still runs in elfuse-aarch64 mode
+# and in 'make check'.
 #
 # The two oom_adj/oom_score_adj sendfile-and-copy_file_range-interception
 # subtests that used to make test-io-opt diverge here were split out into
-# tests/test-oom-proc.c (make check only, not part of this matrix at all) --
-# see that file's header comment. test-io-opt itself is now pure portable
-# sendfile/fsync/fallocate/copy_file_range coverage and runs against qemu
-# like any other test.
+# tests/test-oom-proc.c (make check only, not part of this matrix at all) -- see
+# that file's header comment. test-io-opt itself is now pure portable
+# sendfile/fsync/fallocate/copy_file_range coverage and runs against qemu like
+# any other test.
 #
 # The entries below were added when run_unit_tests grew to cover the rest of
 # tests/manifest.txt ("make check"). Each was verified against a live
 # qemu-aarch64 boot before being listed here -- see the per-entry comment for
-# the observed divergence. Do not add a test here just because it *might*
-# behave differently; confirm it first the same way.
+# the observed divergence. Do not add a test here just because it *might* behave
+# differently; confirm it first the same way.
 QEMU_SKIP="
     test-session
     test-pidfd
@@ -307,6 +310,7 @@ QEMU_SKIP="
     test-proc-fidelity
     test-proc-smap
 "
+
 # test-session: getpgid/getsid/setsid assume the test is its own session and
 #   process-group leader, true when elfuse launches it directly but not when
 #   sshd execs it non-interactively -- a launcher artifact, not an elfuse
@@ -493,6 +497,7 @@ run_summary_suite()
     if [ -n "$fields" ]; then
         local suite_pass=0 suite_fail=0 suite_skip=0 suite_total=0
         read -r suite_pass suite_fail suite_skip suite_total <<< "$fields"
+
         # Force decimal: a sub-suite that ever emits a zero-padded count ('08',
         # '09') would otherwise trip bash's "invalid octal" error inside
         # $((...)) and abort the matrix under 'set -e'.
@@ -542,6 +547,7 @@ test_check()
         report_timeout "$label"
         return
     fi
+
     # Require a clean exit before trusting the regex. A crashing tool can still
     # emit the expected substring on stdout before dying, and the earlier "regex
     # match alone passes" behavior would have reported that as OK -- the same
@@ -611,6 +617,7 @@ test_pipe()
         report_timeout "$label"
         return
     fi
+
     # See test_check for the rc=0 precondition rationale: a non-zero exit must
     # surface as FAIL even when the regex matches, otherwise a crashing pipeline
     # that happens to print the expected substring would be reported OK.
@@ -638,10 +645,10 @@ test_pipe()
 # elfuse's guest-IPA infra reserve, and test-oom-proc, documented in its own
 # header). test-mremap-tail-emfile is listed here as an elfuse-lane regression
 # and marked QEMU_SKIP because its host-reserve assertion has no Linux analogue.
-# There is no "core" vs "extended" split here; everything below runs
-# in both elfuse-aarch64 and qemu-aarch64 modes, and genuine, understood
-# divergences from the qemu reference kernel are called out via QEMU_SKIP with
-# a comment rather than silently dropped from this list.
+# There is no "core" vs "extended" split here; everything below runs in both
+# elfuse-aarch64 and qemu-aarch64 modes, and genuine, understood divergences
+# from the qemu reference kernel are called out via QEMU_SKIP with a comment
+# rather than silently dropped from this list.
 run_unit_tests()
 {
     local runner="$1" bindir="$2"
@@ -751,6 +758,9 @@ run_unit_tests()
     test_check "$runner" "test-simd-clone" "0 failed" "$bindir/test-simd-clone"
     test_check "$runner" "test-stress" "0 failed" "$bindir/test-stress"
     test_rc "$runner" "test-thread-churn" 0 "$bindir/test-thread-churn"
+    test_rc "$runner" "test-threaded-exec" 0 "$bindir/test-threaded-exec"
+    test_rc "$runner" "test-threaded-exec-worker" 0 \
+        "$bindir/test-threaded-exec" worker
     test_rc "$runner" "test-mprotect-mt" 0 "$bindir/test-mprotect-mt"
 
     printf "\nNegative tests\n"
@@ -837,6 +847,7 @@ run_unit_tests()
     printf "\nCredential/identity emulation\n"
     test_rc "$runner" "test-credentials" 0 "$bindir/test-credentials"
     test_rc "$runner" "test-credentials-fakeroot" 0 --fakeroot "$bindir/test-credentials"
+
     # Arm the opt-in transition on the test binary itself: it re-execs its own
     # path to cross into fakeroot, and a copy of itself to prove the negative.
     # The assignment prefix scopes the variable to this one call, so an
@@ -926,6 +937,7 @@ run_unit_tests()
 run_coreutils_tests()
 {
     local runner="$1" bindir="$2"
+
     # Exec-child targets (env/nice/... run "<dir>/true") must resolve inside the
     # guest. Native/static runs address them by the same host path they launch
     # from; a --sysroot run overrides this with the binary's guest path via
@@ -975,6 +987,7 @@ run_coreutils_tests()
     test_rc "$runner" "timeout" 0 "$bindir/timeout" 5 "$guest_bindir/true"
 
     printf "\nCoreutils encoding%s\n" "$_COREUTILS_SUFFIX"
+
     # The if/then form contains require_binary's exit status so missing binaries
     # do not propagate as a function-exit-1 under 'set -e'. The earlier '&&
     # test_check' chain failed the matrix script outright whenever the LAST
@@ -1109,6 +1122,7 @@ run_static_tests()
         test_check "$runner" "bash echo" "hello" "$bindir/bash" -c "echo hello"
         test_pipe "$runner" "bash subshell" "sub=25" "" "$bindir/bash" -c 'echo "sub=$(echo $((5*5)))"'
     fi
+
     # lua has two acceptable names; prefer 5.4, then fall back to plain lua, and
     # skip with accounting if neither is present.
     if [ -e "$bindir/lua5.4" ]; then
@@ -1214,6 +1228,7 @@ run_suite()
     run_busybox_tests "$runner" "$GUEST_BUSYBOX"
 
     if [ -d "$GUEST_STATIC_BINS" ]; then
+
         # run_elfuse auto-adds --sysroot for binaries under GUEST_SYSROOT or the
         # dyn-bin dir (see its case), so tree/find/diff here run chrooted and
         # must read the fixtures from inside the sysroot, same as the dynamic
@@ -1249,6 +1264,7 @@ run_suite()
             _COREUTILS_SUFFIX=" (musl dyn)"
             _SYSROOT="$GUEST_SYSROOT"
             if [ "$mode" = "elfuse-aarch64" ]; then
+
                 # dyn-bin binaries symlink to the rootfs /bin multiplexer, so
                 # their guest path under --sysroot is /bin.
                 _COREUTILS_GUEST_BINDIR="/bin"
@@ -1433,6 +1449,7 @@ detect_x86_64_host_class()
 # now passes there (observed on the self-hosted runner and in local captures);
 # the qemu row in EXPECTED_BASELINES therefore pins exactly zero failures.
 KNOWN_FAILURES_QEMU_AARCH64=""
+
 # elfuse-x86_64: rosetta limitations documented in the upstream hyper-linux
 # audit. test-signal-thread fails because rosetta shadows signal state
 # internally (SA_RESETHAND not reset); test-thread / test-stress hang on
@@ -1451,6 +1468,7 @@ verify_expected_counts()
 
     local exp_min="" exp_fail=""
     if ! expected_baseline_get "$key" exp_min exp_fail; then
+
         # No recorded baseline for this key (experimental local mode, or an
         # x86_64 host class the detector did not classify). Stay silent so the
         # matrix runner remains usable as a smoke probe.

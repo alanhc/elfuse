@@ -22,9 +22,17 @@
 
 #include "runtime/thread.h"
 #include "debug/log.h"
-#include "core/guest.h"   /* guest_t (shim_data_base/ipa_base), BLOCK_2MIB */
-#include "hvutil.h"       /* vcpu_get_gpr, vcpu_get_sysreg */
-#include "syscall/proc.h" /* proc_exit_group_requested */
+#include "core/guest.h"    /* guest_t (shim_data_base/ipa_base), BLOCK_2MIB */
+#include "hvutil.h"        /* vcpu_get_gpr, vcpu_get_sysreg */
+#include "runtime/futex.h" /* futex_interrupt_request */
+
+/* Only for the handoff wake below. The hot-path predicate no longer reaches
+ * into the syscall layer: exec.c publishes it here through
+ * thread_set_leader_work_pending.
+ */
+#include "syscall/exec.h"
+#include "syscall/proc.h"        /* proc_exit_group_requested */
+#include "syscall/wakeup-pipe.h" /* wakeup_pipe_signal */
 
 /* From syscall/signal.h, included here directly to avoid pulling in the full
  * signal header (macOS defines sa_handler as a macro that conflicts with the
@@ -65,7 +73,24 @@ static bool fork_quiesce_active = false; /* True while a fork is in progress */
 static int fork_quiesced_count = 0;      /* Siblings blocked on barrier */
 static int fork_target_count = 0;        /* Number of siblings to quiesce */
 static pthread_cond_t fork_cond = PTHREAD_COND_INITIALIZER;
+
+/* Signalled when a deferred stack-unmap transaction clears. Declared here
+ * rather than beside its users because thread_wake_exit_waiters, earlier in the
+ * file, has to broadcast it too.
+ */
+static pthread_cond_t deferred_stack_unmap_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t fork_all_quiesced_cond = PTHREAD_COND_INITIALIZER;
+
+/* Signalled when a quiesce window closes, so an execve teardown can wait for
+ * one already open instead of tearing siblings out of it.
+ */
+static pthread_cond_t fork_window_closed_cond = PTHREAD_COND_INITIALIZER;
+
+/* Defined with the rest of the execve teardown state further down; declared
+ * here because thread_quiesce_siblings, above it, refuses to arm while a
+ * teardown is running.
+ */
+static _Atomic bool exec_de_thread_active;
 
 /* Iterate every slot. */
 #define THREAD_FOR_EACH(t) \
@@ -695,15 +720,31 @@ int thread_signal_deliverable(uint64_t sigbit)
 
 /* Fork quiesce. */
 
-static pthread_cond_t deferred_stack_unmap_cond = PTHREAD_COND_INITIALIZER;
-
-void thread_quiesce_siblings(void)
+bool thread_quiesce_siblings(void)
 {
     hv_vcpu_t vcpus[MAX_THREADS];
     int count = 0;
     int targets = 0;
 
     pthread_mutex_lock(&thread_lock);
+
+    /* Refuse while an execve teardown is reaping. The caller is one of the
+     * threads being reaped, and a window armed now would park its siblings in a
+     * barrier that only the caller can release, which it will not do because it
+     * is about to leave the guest itself. Refusing keeps the teardown and the
+     * quiesce windows from overlapping at all, which is what lets the barrier
+     * below block unconditionally: a sibling parked there is never one this
+     * teardown is waiting for.
+     *
+     * Read under thread_lock, and thread_exec_de_thread publishes it under the
+     * same lock after draining any window already open, so the two orderings
+     * are the only ones possible: either this arms first and the teardown waits
+     * for it, or the teardown publishes first and this refuses.
+     */
+    if (atomic_load_explicit(&exec_de_thread_active, memory_order_acquire)) {
+        pthread_mutex_unlock(&thread_lock);
+        return false;
+    }
 
     /* Count every active sibling. Startup siblings may not have published a
      * vCPU yet, but once they do they check the barrier before guest entry.
@@ -722,7 +763,7 @@ void thread_quiesce_siblings(void)
 
     if (targets == 0) {
         pthread_mutex_unlock(&thread_lock);
-        return;
+        return true; /* Nothing to quiet, so the window is trivially held */
     }
 
     /* Arm the barrier */
@@ -758,6 +799,8 @@ void thread_quiesce_siblings(void)
         }
     }
     pthread_mutex_unlock(&thread_lock);
+
+    return true;
 }
 
 void thread_resume_siblings(void)
@@ -774,6 +817,11 @@ void thread_resume_siblings(void)
     THREAD_FOR_EACH (t)
         t->fork_counted = false;
     pthread_cond_broadcast(&fork_cond);
+
+    /* An execve teardown parked in thread_exec_de_thread is waiting for exactly
+     * this.
+     */
+    pthread_cond_broadcast(&fork_window_closed_cond);
     pthread_mutex_unlock(&thread_lock);
 }
 
@@ -798,28 +846,73 @@ int thread_fork_barrier_check(void)
             pthread_cond_signal(&fork_all_quiesced_cond);
     }
 
-    /* Block until fork is complete. Bail out on exit_group: the resume
-     * broadcast comes from the forking thread, whose progress the teardown path
-     * does not control, so waiting for it would leave this park outside the
-     * bounded-wake guarantee. thread_wake_exit_waiters broadcasts fork_cond
-     * after the flag is set; the caller's run loop re-checks
-     * proc_exit_group_requested and exits.
+    /* Block until the window closes. An execve teardown deliberately does not
+     * break this wait: the whole point of the barrier is that no other thread
+     * mutates guest memory while the forker copies it, and a sibling released
+     * here would run its exit path, which writes clear_child_tid, walks the
+     * robust list and unmaps its stack. The child would receive a torn image.
+     *
+     * Unlike Linux, where fork() takes a copy-on-write snapshot that later
+     * sibling writes cannot reach, the copy here is not atomic against a
+     * running thread, so the quiet is load-bearing rather than advisory.
+     *
+     * Nothing deadlocks behind that, because a teardown and a window never
+     * overlap. thread_exec_de_thread drains a window already open before it
+     * publishes the teardown, and thread_quiesce_siblings refuses to arm a new
+     * one once it has. Both sides of that handshake run under thread_lock, so
+     * the thread that releases this barrier is never one the teardown is
+     * waiting on. exit_group is still honored: that is process death, and no
+     * snapshot outlives it.
      */
-    while (fork_quiesce_active && !proc_exit_group_requested())
-        pthread_cond_wait(&fork_cond, &thread_lock);
+    while (fork_quiesce_active && !proc_exit_group_requested()) {
+        if (!thread_exec_stop_requested()) {
+            pthread_cond_wait(&fork_cond, &thread_lock);
+            continue;
+        }
+
+        struct timespec deadline;
+        timespec_deadline_in_ms(&deadline, 200);
+        if (pthread_cond_timedwait(&fork_cond, &thread_lock, &deadline) ==
+            ETIMEDOUT)
+            break;
+    }
 
     pthread_mutex_unlock(&thread_lock);
     return 1;
+}
+
+void thread_wake_all_blocked(void)
+{
+    /* hv_vcpus_exit only reaches threads inside hv_vcpu_run, so the futex
+     * interrupt covers futex waiters, the wakeup pipe covers poll/epoll/read
+     * parks, and thread_wake_exit_waiters covers the internal condvars (fork
+     * barrier, ptrace stop/wait). Every teardown caller needs all four; what
+     * differs between them is only why they are tearing down.
+     */
+    futex_interrupt_request();
+    wakeup_pipe_signal();
+    thread_interrupt_all();
+    thread_wake_exit_waiters();
+    exec_handoff_wake_waiters();
 }
 
 void thread_wake_exit_waiters(void)
 {
     pthread_mutex_lock(&thread_lock);
 
-    /* Fork barrier: siblings parked in thread_fork_barrier_check. Their wait
-     * loop re-checks proc_exit_group_requested on wake.
+    /* Fork barrier: siblings parked in thread_fork_barrier_check. Only
+     * exit_group releases them, since an execve teardown waits for the window
+     * to close rather than breaking it; the broadcast is what makes them
+     * re-check on process death.
      */
     pthread_cond_broadcast(&fork_cond);
+
+    /* Deferred stack-unmap transactions: a thread waiting for another one's
+     * transaction to clear parks on this condvar, which nothing else wakes.
+     * Without the broadcast it sleeps through an execve teardown and is then
+     * counted as a thread that would not leave.
+     */
+    pthread_cond_broadcast(&deferred_stack_unmap_cond);
 
     /* Ptrace parks: tracers blocked in thread_ptrace_wait (ptrace_cond) and
      * tracees blocked in thread_ptrace_stop (resume_cond). Scan every slot with
@@ -836,6 +929,223 @@ void thread_wake_exit_waiters(void)
     }
 
     pthread_mutex_unlock(&thread_lock);
+}
+
+/* execve de_thread. */
+
+/* Set while an execve is tearing its siblings down. Linux destroys every
+ * sibling in de_thread() before mapping the new image; elfuse has to do the
+ * same before guest_reset zeroes the memory those siblings are still running
+ * on.
+ *
+ * A flag rather than a survivor pointer because sys_execve hands a non-leader
+ * caller to the leader before the point of no return, so the thread that runs
+ * the teardown is always slot 0 and "am I the survivor" is "am I the leader".
+ *
+ * Two flags rather than one because the leader has to leave its blocking wait
+ * for the handoff too, and that is the opposite of being torn down. Both are
+ * read by every blocking wait, so they are plain atomics rather than
+ * thread_lock state. _Atomic is spelled as a qualifier, never as _Atomic(T):
+ * frama-c-stubs defines the keyword away so the analyzer can parse this file,
+ * and the specifier form leaves a stray parenthesized type behind.
+ */
+static _Atomic bool exec_leader_work_pending;
+
+void thread_set_leader_work_pending(bool pending)
+{
+    atomic_store_explicit(&exec_leader_work_pending, pending,
+                          memory_order_release);
+}
+
+bool thread_leader_work_pending(void)
+{
+    return atomic_load_explicit(&exec_leader_work_pending,
+                                memory_order_acquire);
+}
+
+int thread_exec_stop_requested(void)
+{
+    /* The flag first, so the common case (no execve in flight) never reaches
+     * current_thread: on Darwin every _Thread_local read goes through the TLV
+     * descriptor thunk, which is an indirect call, not a register read.
+     */
+    if (!atomic_load_explicit(&exec_de_thread_active, memory_order_acquire))
+        return 0;
+
+    /* No table entry (the preemption thread, the GDB stub, the rosettad
+     * bridge): runs no guest code and is nobody's sibling. The leader is the
+     * thread running the teardown. And a CLONE_VM child is a distinct task with
+     * its own tgid, which Linux execve leaves alone: reaping it would publish a
+     * bogus exit(0) to the parent's wait4 and let its exit path request a
+     * process-wide exit_group in the middle of the exec.
+     */
+    return current_thread && !thread_current_is_leader() &&
+           !current_thread->is_vm_clone;
+}
+
+int thread_stop_requested(void)
+{
+    if (thread_exec_stop_requested() || proc_exit_group_requested())
+        return 1;
+
+    /* A non-leader execve is handed to the leader, which can only pick it up
+     * from its run loop. Break it out of whatever it is parked in so the
+     * handoff does not wait on an unrelated blocking syscall. Every other
+     * thread ignores this: the requester is blocked in the handoff itself, and
+     * a third thread has no part in it.
+     */
+    return thread_leader_work_pending() && thread_current_is_leader();
+}
+
+/* Whether an execve teardown will reap this slot: not the caller, not the main
+ * thread's (slot 0 is never torn down; it owns process teardown), and not a
+ * CLONE_VM child (a separate task that execve leaves alone). Counting every
+ * active thread instead would wait, and then report, on threads that were never
+ * going to leave. Caller must hold thread_lock.
+ */
+static bool thread_is_joinable_sibling(const thread_entry_t *t)
+{
+    return t != current_thread && t != &thread_table[0] && !t->is_vm_clone;
+}
+
+static int thread_count_joinable_siblings(void)
+{
+    int n = 0;
+
+    pthread_mutex_lock(&thread_lock);
+    THREAD_FOR_EACH_ACTIVE (t) {
+        if (thread_is_joinable_sibling(t))
+            n++;
+    }
+    pthread_mutex_unlock(&thread_lock);
+
+    return n;
+}
+
+bool thread_current_is_leader(void)
+{
+    return current_thread == &thread_table[0];
+}
+
+int thread_exec_de_thread(void)
+{
+    if (!current_thread || thread_count_joinable_siblings() == 0)
+        return 0;
+
+    /* Let an open quiesce window close before reaping anything.
+     *
+     * The two cannot overlap. A sibling parked in the fork barrier owes the
+     * forker its quiet until the snapshot is done, so the teardown must not
+     * pull it out; but if the teardown were already running, the forker would
+     * be a thread being reaped, and the barrier would never be released. Doing
+     * the wait here, before the teardown is published, keeps the forker outside
+     * it: it finishes and calls thread_resume_siblings, which is what wakes
+     * this.
+     *
+     * Bounded, because the alternative to giving up is a teardown that cannot
+     * finish. The cap covers a fork snapshot with margin. Past it the window is
+     * treated as stuck and the teardown proceeds, which is the pre-existing
+     * race rather than a new one.
+     */
+    pthread_mutex_lock(&thread_lock);
+    if (fork_quiesce_active) {
+        struct timespec deadline;
+        timespec_deadline_in_ms(&deadline, 1000);
+        while (fork_quiesce_active) {
+            if (pthread_cond_timedwait(&fork_window_closed_cond, &thread_lock,
+                                       &deadline) == ETIMEDOUT) {
+                log_warn("execve: fork snapshot still open, reaping anyway");
+                break;
+            }
+        }
+    }
+    atomic_store_explicit(&exec_de_thread_active, true, memory_order_release);
+    pthread_mutex_unlock(&thread_lock);
+
+    /* Siblings leave the guest through their normal exit path (robust list,
+     * CLEARTID, own-vCPU destroy), which still runs against the pre-reset image
+     * because this returns only once they are gone. futex_interrupt stays set;
+     * execve clears it after guest_reset.
+     */
+    thread_wake_all_blocked();
+
+    /* wakeup_pipe_drain takes every queued byte, so a sibling that reaches
+     * poll() after another one drained sits out its own 200 ms recheck no
+     * matter how many bytes the wake wrote. Re-poke while they wind down, which
+     * costs a threaded execve milliseconds instead of a poll quantum per parked
+     * sibling (measured: 38 s to 2.5 s over 200 threaded execs). The join below
+     * still bounds the wait if a sibling never arrives.
+     */
+    for (int i = 0; i < 200 && thread_count_joinable_siblings() > 0; i++) {
+        /* The whole wake set, not just the pipe: a sibling in a tight compute
+         * loop is reachable only by hv_vcpus_exit, and one kick that lands
+         * between two hv_vcpu_run calls is lost. Re-issuing costs nothing here
+         * and removes the dependence on a single kick landing.
+         */
+        thread_wake_all_blocked();
+        usleep(1000);
+    }
+
+    /* Name who is still here before the bounded join runs, so a teardown that
+     * ends fatally says which thread held it up rather than only how many did.
+     */
+    if (thread_count_joinable_siblings() > 0) {
+        pthread_mutex_lock(&thread_lock);
+        THREAD_FOR_EACH_ACTIVE (t) {
+            if (thread_is_joinable_sibling(t))
+                log_warn("execve: tid=%lld has not left the guest yet",
+                         (long long) t->guest_tid);
+        }
+        pthread_mutex_unlock(&thread_lock);
+    }
+
+    thread_join_workers();
+
+    /* thread_join_workers is bounded, so a sibling parked in a host call that
+     * never re-checked can outlive the cap and be detached. One such call is
+     * still reachable from guest code: the read side of a blocking FIFO open,
+     * which macOS gives nothing to poll on (see open_nonblocking_writer in
+     * syscall/fs.c). semop, fcntl F_SETLKW and flock used to belong on this
+     * list and no longer do; each polls a non-blocking form now.
+     *
+     * The caller must not reset guest memory under a straggler: it still holds
+     * that thread's registers and would resume into the zeroed image. Report
+     * the count and let sys_execve apply its post-PNR policy.
+     */
+    int left = thread_count_joinable_siblings();
+
+    /* Cleared last. A straggler that wakes after this reads false and resumes,
+     * which is only safe because the caller treats a non-zero return as fatal.
+     */
+    atomic_store_explicit(&exec_de_thread_active, false, memory_order_release);
+
+    return left;
+}
+
+void thread_reset_for_exec(void)
+{
+    if (!current_thread)
+        return;
+
+    /* Linux begin_new_exec() drops both: the robust list and clear_child_tid
+     * are addresses in the image that just went away. Carrying them across the
+     * reset makes this thread's eventual exit walk a list, and write a zero
+     * word plus a futex wake, at whatever the new image happens to have put
+     * there. Nothing is marked FUTEX_OWNER_DIED on the way out because no
+     * thread survives that could observe it.
+     */
+    current_thread->robust_list_head = 0;
+    current_thread->clear_child_tid = 0;
+
+    /* rseq goes the same way, as rseq_execve does. Left registered, the address
+     * belongs to the old image while the new one cannot register its own:
+     * sc_rseq answers EBUSY for a thread that already has one, and the
+     * preemption and signal paths would abort against the stale critical
+     * section.
+     */
+    current_thread->rseq_gva = 0;
+    current_thread->rseq_len = 0;
+    current_thread->rseq_signature = 0;
 }
 
 /* Ptrace helpers. */
@@ -873,6 +1183,16 @@ retry:
         if (rs >= re || re <= start || rs >= end)
             continue;
         if (t->deferred_stack_unmap_busy > 0) {
+            /* Give up rather than wait when this thread is leaving the guest.
+             * The caller reports the failure to its guest, which never reads it
+             * because the run loop winds the thread down first, and an execve
+             * teardown that waited here instead would count this thread as one
+             * that refused to leave.
+             */
+            if (thread_stop_requested()) {
+                pthread_mutex_unlock(&thread_lock);
+                return -1;
+            }
             pthread_cond_wait(&deferred_stack_unmap_cond, &thread_lock);
             goto retry;
         }
@@ -1163,9 +1483,9 @@ int thread_ptrace_stop(thread_entry_t *t, int sig)
      * tracer signals resume_cond, and a tracer that exits (or calls exit_group
      * itself) will never CONT this stop. thread_wake_exit_waiters broadcasts
      * resume_cond; returning 0 sends the caller back to its run loop, which
-     * re-checks proc_exit_group_requested.
+     * re-checks thread_stop_requested.
      */
-    while (t->ptrace_stopped && !proc_exit_group_requested())
+    while (t->ptrace_stopped && !thread_stop_requested())
         pthread_cond_wait(&t->resume_cond, &thread_lock);
 
     /* Apply register changes if tracer wrote via SETREGSET */
@@ -1220,13 +1540,13 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
     pthread_mutex_lock(&thread_lock);
 
     for (;;) {
-        /* exit_group teardown: the stop/exit notifications that would signal
-         * ptrace_cond stop arriving once workers are being torn down.
+        /* exit_group or execve teardown: the stop/exit notifications that would
+         * signal ptrace_cond stop arriving once workers are being torn down.
          *
          * Return 0 ("no matching children") so the caller falls through and its
          * blocking paths re-check proc_exit_group_requested.
          */
-        if (proc_exit_group_requested()) {
+        if (thread_stop_requested()) {
             pthread_mutex_unlock(&thread_lock);
             return 0;
         }

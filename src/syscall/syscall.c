@@ -1596,7 +1596,31 @@ static int64_t sc_flock(guest_t *g,
     int64_t err = host_fd_ref_open_io((int) x0, &host_ref);
     if (err < 0)
         return err;
-    int64_t ret = flock(host_ref.fd, (int) x1) < 0 ? linux_errno() : 0;
+
+    /* A blocking flock parks the vCPU thread where no teardown wake reaches it,
+     * so poll LOCK_NB instead. An explicit LOCK_NB, and LOCK_UN which never
+     * blocks, go straight through.
+     */
+    int op = (int) x1;
+    int64_t ret;
+    if ((op & LOCK_NB) || (op & ~LOCK_NB) == LOCK_UN) {
+        ret = flock(host_ref.fd, op) < 0 ? linux_errno() : 0;
+    } else {
+        unsigned backoff = 0;
+        for (;;) {
+            if (flock(host_ref.fd, op | LOCK_NB) == 0) {
+                ret = 0;
+                break;
+            }
+            if (errno != EWOULDBLOCK) {
+                ret = linux_errno();
+                break;
+            }
+            ret = io_retry_backoff(&backoff);
+            if (ret < 0)
+                break;
+        }
+    }
     host_fd_ref_close(&host_ref);
     return ret;
 }
