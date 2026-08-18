@@ -117,8 +117,10 @@ bool proc_fakeroot_enabled(void);
  * path resolved the way the guest resolves paths: under --sysroot the sysroot
  * spelling and the host spelling of one file both name that file, because the
  * match is on file identity rather than on the string (see
- * proc_fakeroot_exec_path). Returns false without arming anything for NULL, an
- * empty string, a relative path, or one that does not fit.
+ * proc_fakeroot_exec_path).
+ *
+ * Returns false without arming anything for NULL, an empty string, a relative
+ * path, or one that does not fit.
  *
  * Startup only. The stored path is read without a lock by every vCPU thread
  * that reaches execve, so this must be called before any of them exists;
@@ -309,9 +311,11 @@ bool proc_sysroot_casefold_enabled(void);
  *
  * Returns buf when a sysroot-backed file exists, and also when the path names a
  * temp root or a guest system directory, both of which resolve there whether or
- * not they exist. Returns path unchanged when no sysroot applies or when any
- * other sysroot-backed path does not exist, or NULL if sysroot path
- * construction would truncate or escape containment checks.
+ * not they exist.
+ *
+ * Returns path unchanged when no sysroot applies or when any other
+ * sysroot-backed path does not exist, or NULL if sysroot path construction
+ * would truncate or escape containment checks.
  */
 const char *proc_resolve_sysroot_path(const char *path,
                                       char *buf,
@@ -345,6 +349,47 @@ const char *proc_resolve_sysroot_create_path(const char *path,
  */
 #define SYSCALL_EXEC_HAPPENED (-0x10000)
 
+/* SVC restart across an execve handed to the group leader.
+ *
+ * The leader is woken out of a blocking wait so its run loop can pick the
+ * execve up, and the wait reports EINTR that no signal explains. The dispatch
+ * epilogue arms a restart instead of reporting it: X0 keeps the argument the
+ * guest passed and ELR_EL1 steps back over the SVC, so the ERET re-executes the
+ * syscall once the handoff has been serviced.
+ *
+ * A signal delivered before the guest resumes cancels it. Two reasons, and
+ * either alone would be enough. The EINTR becomes one Linux can produce, since
+ * a signal really did arrive. And the frame the handler returns through carries
+ * the live X8, which by then is the TLBI wire value the shim epilogue wrote
+ * rather than the syscall number the shim would have restored from its own
+ * saved frame. That is harmless while the saved PC is past the SVC, but a
+ * rewound PC would make rt_sigreturn re-execute the SVC as the wrong call.
+ *
+ * Cancel is a no-op unless ELR_EL1 still holds the value the arm wrote, so a
+ * later delivery on an unrelated path cannot disturb a guest that has moved on.
+ */
+void syscall_restart_arm(hv_vcpu_t vcpu,
+                         uint64_t elr_after_svc,
+                         int64_t result);
+void syscall_restart_cancel(hv_vcpu_t vcpu);
+
+/* Refuse an SVC restart for the syscall now running. Called by a wait that has
+ * already consumed part of a deadline the guest supplied: re-running the
+ * original arguments would restart that timeout from zero, and a guest whose
+ * siblings hand off execve faster than the timeout would never see it expire.
+ * Reporting EINTR there is what Linux does when it cannot resume from a
+ * remainder, and libc retries with the remainder it was handed.
+ */
+void syscall_restart_forbid(void);
+
+/* True while the handler running is the re-execution of a restarted SVC rather
+ * than a call the guest made. A syscall that left host state behind before it
+ * was interrupted needs this to resume that state instead of reporting it: the
+ * guest never saw the first attempt, so nothing about it may reach the guest.
+ * sys_connect is the one such caller; see connect_nonblock_wait.
+ */
+bool syscall_is_restarted(void);
+
 /* Process table (for fork/clone children). */
 
 typedef struct {
@@ -369,8 +414,10 @@ typedef struct {
 } proc_entry_t;
 
 /* Reserve bookkeeping before creating a helper process. A successful
- * reservation guarantees proc_register_child() can make the child visible
- * after fork IPC completes. Returns 0 or a negative Linux errno.
+ * reservation guarantees proc_register_child() can make the child visible after
+ * fork IPC completes.
+ *
+ * Returns 0 or a negative Linux errno.
  */
 int proc_reserve_child(int64_t guest_pid, int64_t pgid);
 
@@ -386,9 +433,9 @@ void proc_cancel_child(int64_t guest_pid);
 /* Mark a child as exited by host PID (for CLONE_VFORK wait). */
 void proc_mark_child_exited(pid_t host_pid, int status);
 
-/* Accumulate a reaped guest child's rusage into the cutime/cstime counters
- * that times(2) reports. Call at every host reap of a proc_table child; never
- * for emulator helper subprocesses.
+/* Accumulate a reaped guest child's rusage into the cutime/cstime counters that
+ * times(2) reports. Call at every host reap of a proc_table child; never for
+ * emulator helper subprocesses.
  */
 void proc_children_cpu_add(const struct rusage *ru);
 
@@ -397,8 +444,9 @@ void proc_children_cpu_us(uint64_t *utime_us, uint64_t *stime_us);
 
 /* Write a macOS struct rusage to guest memory as linux_rusage_t. The field
  * layout matches on LP64; ru_maxrss is converted from macOS bytes to Linux
- * kilobytes. Returns the guest_write_small result (0 on success, negative on
- * fault).
+ * kilobytes.
+ *
+ * Returns the guest_write_small result (0 on success, negative on fault).
  */
 int write_rusage_to_guest(guest_t *g, uint64_t gva, const struct rusage *ru);
 
@@ -449,8 +497,8 @@ void proc_autoreap_exited_children(void);
 /* Pull authoritative PPID state into a newly bootstrapped fork child. */
 void proc_lifecycle_sync_self(guest_t *g);
 
-/* Notify the guest parent that this process reached a terminal state. Called
- * by fork-child teardown before the host process exits.
+/* Notify the guest parent that this process reached a terminal state. Called by
+ * fork-child teardown before the host process exits.
  */
 void proc_process_exit(int wait_status);
 
@@ -470,9 +518,10 @@ pid_t proc_guest_to_host_pid(int64_t gpid);
 
 /* Look up a host PID in the child process table, falling back to the
  * cross-process registry so the rest of the fork family (grandchildren,
- * siblings' descendants) resolves too. Returns the guest PID if @host_pid is
- * a live member of this guest's fork family, or -1 otherwise (e.g. the lock
- * holder is an unrelated host process).
+ * siblings' descendants) resolves too.
+ *
+ * Returns the guest PID if @host_pid is a live member of this guest's fork
+ * family, or -1 otherwise (e.g. the lock holder is an unrelated host process).
  */
 int64_t proc_host_to_guest_pid(pid_t host_pid);
 
@@ -553,22 +602,20 @@ void proc_request_hvc6_yield(void);
  * (before each hv_vcpu_run() entry or re-entry).
  *
  * Stop semantics:
- * Return nonzero to stop the loop. A nonzero tick return is propagated
- * and returned as the run loop's exit code.
+ * Return nonzero to stop the loop. A nonzero tick return is propagated and
+ * returned as the run loop's exit code.
  *
- * Cooperative-only timing:
- * The tick is only checked at host boundaries, not during guest execution.
- * A guest spinning entirely in EL0 without VM-exiting will never trigger
- * the tick, meaning a tick-initiated hook cannot interrupt a runaway guest.
- * To force interruption of a runaway guest, use hv_vcpus_exit().
+ * Cooperative-only timing: The tick is only checked at host boundaries, not
+ * during guest execution. A guest spinning entirely in EL0 without VM-exiting
+ * will never trigger the tick, meaning a tick-initiated hook cannot interrupt a
+ * runaway guest. To force interruption of a runaway guest, use hv_vcpus_exit().
  *
- * Concurrency and lifetime:
- * When a single vcpu_run_hooks_t and its opaque data are shared across
- * multiple vCPUs, the tick function will be invoked concurrently from
- * multiple host threads and must be thread-safe. The run loop does not keep
- * a copy of the hooks structure and dereferences it every iteration; the
- * caller must ensure the hooks structure and opaque lifetime extend until
- * all run loops return.
+ * Concurrency and lifetime: When a single vcpu_run_hooks_t and its opaque data
+ * are shared across multiple vCPUs, the tick function will be invoked
+ * concurrently from multiple host threads and must be thread-safe. The run loop
+ * does not keep a copy of the hooks structure and dereferences it every
+ * iteration; the caller must ensure the hooks structure and opaque lifetime
+ * extend until all run loops return.
  */
 typedef int (*vcpu_run_loop_tick_fn)(guest_t *g, void *opaque);
 

@@ -2461,9 +2461,77 @@ static void escape_log_string(char *dest, const char *src, size_t dest_sz)
     dest[d] = '\0';
 }
 
+/* Per-vCPU, like cpu_tlbi_req and for the same reason: only the owning thread
+ * touches its own vCPU registers, so this needs no lock and cannot be torn by
+ * another vCPU's epilogue. See syscall_restart_arm in syscall/proc.h.
+ */
+static _Thread_local struct {
+    bool armed;
+    bool restarted;       /* this invocation is the re-executed SVC */
+    bool forbidden;       /* a wait consumed part of a guest deadline */
+    uint64_t elr_rewound; /* what the arm wrote, so cancel can recognize it */
+    uint64_t elr_after_svc;
+    int64_t result;
+} cpu_restart_req;
+
+void syscall_restart_forbid(void)
+{
+    cpu_restart_req.forbidden = true;
+}
+
+bool syscall_is_restarted(void)
+{
+    return cpu_restart_req.restarted;
+}
+
+void syscall_restart_arm(hv_vcpu_t vcpu, uint64_t elr_after_svc, int64_t result)
+{
+    cpu_restart_req.armed = true;
+    cpu_restart_req.elr_after_svc = elr_after_svc;
+    cpu_restart_req.elr_rewound = elr_after_svc - 4;
+    cpu_restart_req.result = result;
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, cpu_restart_req.elr_rewound);
+}
+
+void syscall_restart_cancel(hv_vcpu_t vcpu)
+{
+    if (!cpu_restart_req.armed)
+        return;
+    cpu_restart_req.armed = false;
+
+    /* Only undo a rewind the guest has not already left. Anything else moved
+     * ELR_EL1 on (a handoff that succeeded and reloaded the image, a fault
+     * path), and putting the old value back would resume the wrong place.
+     */
+    uint64_t elr = 0;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
+    if (elr != cpu_restart_req.elr_rewound)
+        return;
+
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1,
+                        cpu_restart_req.elr_after_svc);
+    hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) cpu_restart_req.result);
+}
+
 int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
 {
     uint64_t x0, x1, x2, x3, x4, x5, x8;
+
+    /* A restart that survived to here was taken, and ELR_EL1 proves it: on SVC
+     * entry it is the address after the instruction, which matches only if this
+     * is the same SVC the arm rewound to. Anything that moved on in between --
+     * a cancel, or a handed-off execve that succeeded and reloaded the image --
+     * fails the compare and reads as a fresh call. Read only when armed, so the
+     * common path pays nothing for it.
+     */
+    cpu_restart_req.forbidden = false;
+    cpu_restart_req.restarted = false;
+    if (cpu_restart_req.armed) {
+        uint64_t entry_elr = 0;
+        cpu_restart_req.armed = false;
+        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &entry_elr);
+        cpu_restart_req.restarted = entry_elr == cpu_restart_req.elr_after_svc;
+    }
 
     hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8);
     x0 = 0;
@@ -2736,8 +2804,29 @@ fast_done:
                 }
             }
         }
+
+        /* Arm rather than report; syscall_restart_arm in syscall/proc.h holds
+         * the contract, and syscall_restart_forbid the waits that opt out.
+         *
+         * No signal test here, deliberately. A queued signal may still be
+         * discarded at delivery (SIG_IGN, default-ignore), so refusing on one
+         * would hand back the very EINTR this removes. Only a delivery that
+         * commits to a handler frame cancels.
+         */
+        bool restart_armed = false;
+        if (result == -LINUX_EINTR && !cpu_restart_req.forbidden &&
+            thread_stop_is_leader_work_only()) {
+            uint64_t elr = 0;
+            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr);
+            if (elr >= 4) {
+                syscall_restart_arm(vcpu, elr, result);
+                restart_armed = true;
+            }
+        }
+
         /* Write result back to X0 */
-        hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) result);
+        if (!restart_armed)
+            hv_vcpu_set_reg(vcpu, HV_REG_X0, (uint64_t) result);
 
         /* Signal the shim to flush TLB if this vCPU modified page tables.
          * Protocol after HVC #5 lives in tlbi_request_emit_to_vcpu (see
