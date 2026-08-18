@@ -349,6 +349,14 @@ void thread_interrupt_all(void);
  */
 void thread_wake_all_blocked(void);
 
+/* The same wakes minus the futex interrupt, for work only the leader has to
+ * notice (an execve handed to it). The interrupt flag is process-wide and
+ * one-shot, so a teardown-strength wake used for a handoff hands an unexplained
+ * EINTR to whichever thread consumes it. Callers must publish the reason the
+ * leader's thread_stop_requested turns true BEFORE calling this.
+ */
+void thread_wake_leader_for_work(void);
+
 /* Wake workers parked on internal condvars (fork barrier, ptrace stop/wait) so
  * exit_group teardown reaches them within a bounded time. hv_vcpus_exit only
  * interrupts threads inside hv_vcpu_run, and the wakeup pipe / futex interrupt
@@ -424,6 +432,14 @@ bool thread_leader_work_pending(void);
  * cap expired.
  */
 int thread_stop_requested(void);
+
+/* True when the only thing thread_stop_requested is reporting is an execve
+ * handed to this leader: nothing is tearing this thread down. The wait it broke
+ * has nothing to report to the guest, since Linux returns no EINTR without a
+ * signal, so the syscall epilogue restarts the SVC instead and the handoff runs
+ * from the run loop in between.
+ */
+int thread_stop_is_leader_work_only(void);
 
 /* True when the caller is the thread group leader (the main host thread, the
  * one whose run loop returning tears the process down). de_thread cannot
