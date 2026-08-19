@@ -761,6 +761,7 @@ run_unit_tests()
     test_rc "$runner" "test-threaded-exec" 0 "$bindir/test-threaded-exec"
     test_rc "$runner" "test-threaded-exec-worker" 0 \
         "$bindir/test-threaded-exec" worker
+    test_rc "$runner" "test-exec-handoff" 0 "$bindir/test-exec-handoff"
     test_rc "$runner" "test-mprotect-mt" 0 "$bindir/test-mprotect-mt"
 
     printf "\nNegative tests\n"
