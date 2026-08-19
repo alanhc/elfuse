@@ -226,6 +226,10 @@ jobs:
           make -j4 $rules
 
       - name: Upload prover log
+        # The proof result is the step above; this only carries the log that
+        # explains a failure. The artifact service timing out has failed a lane
+        # whose proofs all passed, so a transport error here is not a verdict.
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -284,6 +288,10 @@ jobs:
           done
 
       - name: Upload prover log
+        # The proof result is the step above; this only carries the log that
+        # explains a failure. The artifact service timing out has failed a lane
+        # whose proofs all passed, so a transport error here is not a verdict.
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@v7
         with:
