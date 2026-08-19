@@ -91,6 +91,7 @@ if [ ! -x "$STATIC_BENCH" ]; then
 fi
 
 failures=0
+unmeasured=0
 benchmarks_run=0
 
 # Set by any failure a second run would reproduce, so run_and_check skips the
@@ -245,6 +246,7 @@ run_and_check()
             "$variant" "$(sysctl -n vm.loadavg 2> /dev/null | awk '{print $2}')" \
             "$(sysctl -n hw.ncpu 2> /dev/null)"
         failures=$before
+        unmeasured=$((unmeasured + 1))
     fi
 }
 
@@ -273,6 +275,22 @@ fi
 if [ "$failures" -ne 0 ]; then
     echo
     echo "guardrail FAILED ($failures threshold violation(s))" >&2
+    exit 1
+fi
+
+# A variant whose thresholds were exceeded twice and then dropped for host load
+# was not measured, so this run is no evidence that the ceilings hold. It exits
+# non-zero for the same reason it would on a real violation: make check is the
+# CI gate, and a run that never exercised the ceilings must not report the same
+# status as one that did.
+#
+# What the load check buys is the diagnosis, not the exit code. The bare
+# threshold number this replaces said nothing about why, and cost more than one
+# investigation before anyone thought to look at the host.
+if [ "$unmeasured" -ne 0 ]; then
+    echo
+    echo "guardrail UNMEASURED ($unmeasured variant(s), host busy)" >&2
+    echo "  the ceilings were not exercised; re-run on an idle host" >&2
     exit 1
 fi
 echo
