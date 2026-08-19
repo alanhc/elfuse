@@ -98,6 +98,7 @@ TEST_LIST="$SCRIPT_DIR/manifest.txt"
 # shellcheck source=tests/test-config.sh
 source "$SCRIPT_DIR/test-config.sh"
 source "$SCRIPT_DIR/lib/hang-sample.sh"
+source "$SCRIPT_DIR/lib/bash-compat.sh" # test_host_is_busy
 
 # Capture a stack sample from a test about to hit the watchdog. A hang that only
 # reproduces under suite load is otherwise reported as a bare "timeout after Ns"
@@ -401,6 +402,29 @@ for i in "${filtered_idx[@]}"; do
         hang_sample_finish 1
     else
         hang_sample_finish 0
+    fi
+
+    # A watchdog firing on a loaded machine reports the neighbours, not the
+    # code. Re-run once, and only when the host really is busy, so an idle
+    # machine still reports the timeout at once and pays nothing for this. Every
+    # genuine hang the suite has caught reproduced on every attempt, so a second
+    # timeout still fails. The sample from the first attempt is kept: it is the
+    # one taken while the suite was in the state that produced it.
+    if [ "$rc" -eq 124 ] && test_host_is_busy; then
+        report_case skip "$name" " (timeout under host load; re-running)"
+        hang_sample_arm "$binary" "$TIMEOUT" \
+            "$TESTDIR_ABS/test-timeouts/$(basename "$binary")-hang.txt"
+        if output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" \
+            ${args[@]+"${args[@]}"} 2>&1); then
+            rc=0
+        else
+            rc=$?
+        fi
+        if [ "$rc" -eq 124 ]; then
+            hang_sample_finish 1
+        else
+            hang_sample_finish 0
+        fi
     fi
 
     if evaluate_result "$rc" "$expected" "$stdout_pat" "$output"; then

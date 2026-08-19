@@ -167,6 +167,33 @@ run()
     fi
     hang_sample_finish "$harness_timed_out"
 
+    # A watchdog firing on a loaded machine says as much about the neighbours as
+    # about the code, and this suite has spent real time chasing timeouts that
+    # reproduced 0 times out of 60 on an idle host. Retry once, and only when
+    # the host is actually busy, so an idle machine still reports a timeout
+    # immediately and pays nothing. Every genuine hang this has caught (an
+    # execve deadlock, a restarted timeout that never expired) reproduced on
+    # every attempt, so a second one still fails.
+    if [ "$harness_timed_out" -eq 1 ] && test_host_is_busy; then
+        test_report skip "$tool" " (timeout under host load; re-running)"
+        hang_sample_arm "$tool" "$TEST_TIMEOUT" \
+            "${BUILD_DIR:-build}/test-timeouts/$(basename "$tool")-hang.txt"
+        start_us=$(epoch_us)
+        if output=$(timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} \
+            "$(test_tool_path "$tool")" "$@" 2>&1); then
+            rc=0
+        else
+            rc=$?
+        fi
+        end_us=$(epoch_us)
+        elapsed_us=$((end_us - start_us))
+        harness_timed_out=0
+        if [ "$rc" -eq 124 ] && [ "$elapsed_us" -ge "$limit_us" ]; then
+            harness_timed_out=1
+        fi
+        hang_sample_finish "$harness_timed_out"
+    fi
+
     if [ "$harness_timed_out" -eq 1 ]; then
         test_report fail "$tool" " (timeout after ${TEST_TIMEOUT}s)"
         test_excerpt "$output"

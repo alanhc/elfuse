@@ -474,8 +474,22 @@ static void test_vfork_exec_unblocks_parent(void)
           "clock_gettime(end) failed");
     long elapsed_ms = (long) (end.tv_sec - start.tv_sec) * 1000L +
                       (long) (end.tv_nsec - start.tv_nsec) / 1000000L;
-    CHECK(elapsed_ms < 500,
-          "vfork parent resumed after %ld ms (expected < 500 ms)", elapsed_ms);
+
+    /* The property is that CLONE_VFORK released the parent at the child's
+     * execve rather than at its exit. Ask that directly rather than through a
+     * stopwatch: the child sleeps a second after exec, so a parent that really
+     * was released early finds it still running. The wall-clock form said the
+     * same thing less reliably and cost more than it caught, failing at 642 ms
+     * and 1137 ms against a 500 ms limit on runs where the behaviour was right
+     * and the host was merely busy. The elapsed time is still reported, since
+     * it is what a reader wants when this does fail.
+     */
+    int probe_status = 0;
+    pid_t probe = waitpid((pid_t) ret, &probe_status, WNOHANG);
+    CHECK(probe == 0,
+          "vfork parent resumed only after the child exited "
+          "(waitpid(WNOHANG) returned %d after %ld ms)",
+          (int) probe, elapsed_ms);
 
     int status = 0;
     pid_t waited = waitpid((pid_t) ret, &status, 0);
