@@ -1086,6 +1086,18 @@ bool thread_current_is_leader(void)
     return current_thread == &thread_table[0];
 }
 
+/* Milliseconds on CLOCK_MONOTONIC since @since. Only the de_thread wait needs
+ * it, which measures how long its siblings took rather than when they left.
+ */
+static int64_t thread_elapsed_ms(const struct timespec *since)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t) (now.tv_sec - since->tv_sec) * 1000 +
+           (now.tv_nsec - since->tv_nsec) / 1000000;
+}
+
 int thread_exec_de_thread(void)
 {
     if (!current_thread || thread_count_joinable_siblings() == 0)
@@ -1132,10 +1144,34 @@ int thread_exec_de_thread(void)
      * poll() after another one drained sits out its own 200 ms recheck no
      * matter how many bytes the wake wrote. Re-poke while they wind down, which
      * costs a threaded execve milliseconds instead of a poll quantum per parked
-     * sibling (measured: 38 s to 2.5 s over 200 threaded execs). The join below
-     * still bounds the wait if a sibling never arrives.
+     * sibling (measured: 38 s to 2.5 s over 200 threaded execs).
+     *
+     * How long to wait for is measured in departures, not in iterations. A
+     * fixed count has to be chosen against the slowest re-check quantum a
+     * parked sibling owes (200 ms, in the io wait) multiplied by how far behind
+     * schedule the host is running, and that multiplier is not a property this
+     * code can know: CI runs four sanitizer lanes on one machine, where a
+     * count wide enough is dead time on every threaded execve elsewhere.
+     * Waiting while siblings are still leaving separates a slow host from
+     * siblings nothing wakes, which is what the stall interval and the ceiling
+     * below are for.
+     *
+     * Both are wall-clock, because the sleep is a floor: an oversubscribed host
+     * stretches each iteration well past its 1 ms, so a bound counted in
+     * iterations would run for minutes and blow the caller's timeout instead of
+     * reaching the diagnosed exit.
      */
-    for (int i = 0; i < 200 && thread_count_joinable_siblings() > 0; i++) {
+    enum {
+        DE_THREAD_STALL_MS = 1000,   /* no departures before giving up */
+        DE_THREAD_CEILING_MS = 10000 /* total, however well it is going */
+    };
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+
+    int remaining = thread_count_joinable_siblings();
+    int64_t elapsed_ms = 0, progress_ms = 0;
+
+    while (remaining > 0) {
         /* The whole wake set, not just the pipe: a sibling in a tight compute
          * loop is reachable only by hv_vcpus_exit, and one kick that lands
          * between two hv_vcpu_run calls is lost. Re-issuing costs nothing here
@@ -1143,12 +1179,30 @@ int thread_exec_de_thread(void)
          */
         thread_wake_all_blocked();
         usleep(1000);
+
+        int now = thread_count_joinable_siblings();
+        elapsed_ms = thread_elapsed_ms(&started);
+        if (now < remaining) {
+            remaining = now;
+            progress_ms = elapsed_ms;
+        }
+        if (elapsed_ms >= DE_THREAD_CEILING_MS ||
+            elapsed_ms - progress_ms >= DE_THREAD_STALL_MS)
+            break;
     }
 
     /* Name who is still here before the bounded join runs, so a teardown that
      * ends fatally says which thread held it up rather than only how many did.
+     * The timings go with it: a report that spent its whole budget with
+     * siblings leaving throughout is a slow host, and one whose last departure
+     * is the start of the wait is a sibling no wake reaches, which are
+     * different bugs.
      */
-    if (thread_count_joinable_siblings() > 0) {
+    if (remaining > 0) {
+        log_warn(
+            "execve: %d sibling(s) still in the guest after %lld ms, last "
+            "departure at %lld ms",
+            remaining, (long long) elapsed_ms, (long long) progress_ms);
         pthread_mutex_lock(&thread_lock);
         THREAD_FOR_EACH_ACTIVE (t) {
             if (thread_is_joinable_sibling(t))
