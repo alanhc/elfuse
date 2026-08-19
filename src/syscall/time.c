@@ -115,8 +115,20 @@ static int64_t interruptible_sleep_ns(guest_t *g,
                                       uint64_t rem_gva,
                                       bool write_rem)
 {
+    int64_t requested_ns = remaining_ns;
+
     while (remaining_ns > 0) {
         if (thread_stop_requested() || signal_pending()) {
+            /* Only once part of a relative interval is spent, because the
+             * restart re-runs the original request rather than the remainder.
+             * This check also runs before the first chunk, where nothing is
+             * spent and a restart costs the guest nothing, so forbidding there
+             * would manufacture the EINTR no signal explains. An absolute
+             * deadline (write_rem false, TIMER_ABSTIME) re-derives the same
+             * instant and stays restartable throughout.
+             */
+            if (write_rem && remaining_ns != requested_ns)
+                syscall_restart_forbid();
             if (write_rem &&
                 write_remaining_sleep(g, rem_gva, remaining_ns) < 0)
                 return -LINUX_EFAULT;
@@ -133,6 +145,8 @@ static int64_t interruptible_sleep_ns(guest_t *g,
             if (slept_ns < 0)
                 slept_ns = 0;
             remaining_ns -= slept_ns;
+            if (write_rem && remaining_ns != requested_ns)
+                syscall_restart_forbid();
             if (write_rem &&
                 write_remaining_sleep(g, rem_gva, remaining_ns) < 0)
                 return -LINUX_EFAULT;

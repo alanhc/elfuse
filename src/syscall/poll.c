@@ -255,6 +255,9 @@ ppoll_retry:
         /* Check for process/thread interrupts after waking. */
         if (thread_stop_requested() || futex_interrupt_consume() ||
             signal_pending_interruption(NULL)) {
+            /* Finite wait: part of the guest's timeout is already spent. */
+            if (deadline_ms >= 0)
+                syscall_restart_forbid();
             ret = -1;
             errno = EINTR;
             break;
@@ -641,6 +644,9 @@ pselect_retry:
 
         if (thread_stop_requested() || futex_interrupt_consume() ||
             signal_pending_interruption(NULL)) {
+            /* Finite wait: part of the guest's timeout is already spent. */
+            if (has_timeout)
+                syscall_restart_forbid();
             ret = -1;
             errno = EINTR;
             break;
@@ -1474,13 +1480,22 @@ int64_t sys_epoll_pwait(guest_t *g,
          * undelivered, and it spun at 100% CPU without ever drawing a window.
          *
          * exit_group still wins outright: the process is going away and there
-         * is nothing to deliver events to.
+         * is nothing to deliver events to. An execve handed to this leader does
+         * not: the thread keeps running, and dropping what kqueue already
+         * dequeued would be worse here than for a signal, because EV_CLEAR and
+         * EV_ONESHOT registrations consume the edge and nothing re-reports it.
+         * The handoff runs at the top of the run loop whether this returns
+         * events or EINTR, so letting the events win costs it nothing.
          */
-        bool interrupted = thread_stop_requested();
+        bool interrupted = thread_stop_requested() &&
+                           !(nready > 0 && thread_stop_is_leader_work_only());
         if (!interrupted && nready <= 0)
             interrupted =
                 futex_interrupt_consume() || signal_pending_interruption(NULL);
         if (interrupted) {
+            /* Finite wait: part of the guest's timeout is already spent. */
+            if (has_timeout)
+                syscall_restart_forbid();
             nready = -1;
             errno = EINTR;
             break;

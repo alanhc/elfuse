@@ -1768,9 +1768,15 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
         if (has_timeout && remaining_ns <= 0)
             return -LINUX_EAGAIN;
 
-        /* Exit if the process, or just this thread, is tearing down. */
-        if (thread_stop_requested())
+        /* Exit if the process, or just this thread, is tearing down. The chunks
+         * already consumed above came out of the guest's timeout, so a restart
+         * of the original request would grant it the full span again.
+         */
+        if (thread_stop_requested()) {
+            if (has_timeout)
+                syscall_restart_forbid();
             return -LINUX_EINTR;
+        }
 
         /* If a non-waited, guest-visible signal is pending, return -EINTR.
          * Mirror signal_pending_interruption()'s disposition filter: SIG_IGN
@@ -1784,8 +1790,11 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
         uint64_t candidates = self_pending_locked() & ~*blocked & ~mask;
         bool interrupt = signal_set_would_wake_locked(candidates);
         pthread_mutex_unlock(&sig_lock);
-        if (interrupt)
+        if (interrupt) {
+            if (has_timeout)
+                syscall_restart_forbid();
             return -LINUX_EINTR;
+        }
 
         /* Sleep one chunk, then recheck. */
         int64_t sleep_ns =
@@ -1993,6 +2002,17 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
     }
 
     /* Deliver to user handler: build rt_sigframe on guest stack */
+
+    /* Past every disposition that discards the signal, so this is the point a
+     * handler frame is committed to. An armed SVC restart has to come off here,
+     * before the state below is snapshotted: the frame would otherwise capture
+     * the rewound PC together with the live X8, which is the shim's TLBI wire
+     * value rather than the syscall number, and rt_sigreturn would re-execute
+     * the SVC as whatever syscall that value names. Undoing the rewind also
+     * gives the guest back the EINTR it was going to get, which this signal now
+     * explains. See syscall_restart_arm in syscall/proc.h.
+     */
+    syscall_restart_cancel(vcpu);
 
     /* 1. Save current vCPU state.
      *
