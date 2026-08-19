@@ -996,6 +996,13 @@ static int fuse_request_locked(fuse_session_t *session,
                     req->interrupt_sent = true;
                 }
                 req->detached = true;
+
+                /* FUSE_INTERRUPT is on the wire and the request is detached, so
+                 * an SVC restart would re-issue the whole operation under a
+                 * fresh unique: a duplicate write or unlink rather than a
+                 * resumed wait.
+                 */
+                syscall_restart_forbid();
                 return -LINUX_EINTR;
             }
         }

@@ -1,20 +1,18 @@
-# bash-compat.sh -- Shared bash 3.2+ compatibility helpers for the elfuse
-# test harness.
+# bash-compat.sh -- Shared bash 3.2+ compatibility helpers for the elfuse test
+# harness.
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
-#
 # shellcheck shell=bash
-#
-# macOS still ships bash 3.2.57 as /bin/bash (frozen since 2007 over the
-# GPLv3 move). The Makefile invokes scripts via `bash tests/foo.sh`, so
-# stock macOS picks up /bin/bash regardless of the env-bash shebang. This
-# helper consolidates the small set of cross-version shims the suite
-# needs so each script does not have to re-derive them.
+# macOS still ships bash 3.2.57 as /bin/bash (frozen since 2007 over the GPLv3
+# move). The Makefile invokes scripts via `bash tests/foo.sh`, so stock macOS
+# picks up /bin/bash regardless of the env-bash shebang. This helper
+# consolidates the small set of cross-version shims the suite needs so each
+# script does not have to re-derive them.
 #
 # Source it as the first action after `set -uo pipefail`:
 #
-#     # shellcheck source=tests/lib/bash-compat.sh
+# # shellcheck source=tests/lib/bash-compat.sh
 #     . "$(dirname "${BASH_SOURCE[0]}")/lib/bash-compat.sh"
 #
 # Provides:
@@ -33,8 +31,8 @@
 #   - Do not use ${var^^} / ${var,,} case-conversion; pipe through tr.
 #   - Do not use 'mapfile' / 'readarray'; use a 'while read' loop.
 
-# Minimum bash version that the elfuse harness supports. Stays at 3.2 so
-# the stock macOS /bin/bash works without Homebrew.
+# Minimum bash version that the elfuse harness supports. Stays at 3.2 so the
+# stock macOS /bin/bash works without Homebrew.
 : "${BASH_COMPAT_MIN_MAJOR:=3}"
 : "${BASH_COMPAT_MIN_MINOR:=2}"
 
@@ -60,8 +58,8 @@ bash_compat_require()
 
 bash_compat_require
 
-# Pick the best available microsecond clock source. The chosen
-# implementation is bound to 'epoch_us' so callers stay version-agnostic.
+# Pick the best available microsecond clock source. The chosen implementation is
+# bound to 'epoch_us' so callers stay version-agnostic.
 #
 # Ordered for lowest per-call cost first:
 #   1. $EPOCHREALTIME (bash 5.0+) -- builtin, no fork.
@@ -113,3 +111,20 @@ else
     fi
     unset _bash_compat_ns_probe
 fi
+
+# True when this machine is too loaded for a wall-clock measurement to mean
+# anything. Shared so the throughput guardrail and the per-test watchdog agree
+# on what "busy" is rather than drifting apart.
+#
+# The threshold is deliberately generous: below it, a timing failure is the code
+# and gets reported; above it, the number is measuring the neighbours. Observed
+# on this project with an unrelated prover run in the background, correct code
+# ran 2 to 3 times slower and tripped several bounds at once.
+test_host_is_busy()
+{
+    local load ncpu
+    load=$(sysctl -n vm.loadavg 2> /dev/null | awk '{print $2}')
+    ncpu=$(sysctl -n hw.ncpu 2> /dev/null)
+    [ -n "$load" ] && [ -n "$ncpu" ] || return 1
+    awk -v l="$load" -v n="$ncpu" 'BEGIN { exit !(l > n * 0.6) }'
+}

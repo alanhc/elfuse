@@ -7,28 +7,6 @@
  *
  * Verifies socket syscalls work by creating an AF_UNIX socketpair and
  * exchanging data. This avoids needing a network stack.
- *
- * Tests:
- * 1. socketpair(AF_UNIX, SOCK_STREAM) creates two connected fds
- * 2. write/read through socketpair transfers data correctly
- * 3. getsockopt(SO_TYPE) returns SOCK_STREAM
- * 4. getsockname/getpeername return the socketpair addresses
- * 5. sendmsg/recvmsg transfers a single iovec payload
- * 6. sendmsg/recvmsg transfers a two-iovec payload
- * 7. sendmmsg/recvmmsg transfers a single message
- * 8. sendto/recvfrom over an AF_UNIX datagram pair
- * 9. recvmsg single iovec preserves MSG_TRUNC
- * 10. getsockopt(SO_ERROR) read-and-clear
- * 11. shutdown(SHUT_WR) causes read to return 0 (EOF)
- * 12. socketpair(AF_UNIX, SOCK_SEQPACKET)
- * 13. socket(AF_UNIX, SOCK_SEQPACKET)
- * 14. zero-length recvmsg follows receive-readiness semantics (EAGAIN when
- *     nonblocking and empty, blocks when empty, 0 without consuming when
- *     data is pending)
- * 15. invalid recvmsg iov returns EFAULT immediately
- * 16. SEQPACKET peer close reads as EOF (0), not ECONNRESET (Rust spawn)
- * 17. genuine AF_UNIX datagram peer close is not folded to EOF
- * 18. recvmmsg(vlen>1) on a peer-closed SEQPACKET substitute does not hang
  */
 
 #include <signal.h>
@@ -389,6 +367,45 @@ int main(void)
             close(listener);
     }
 
+    /* Test 19: a fresh connect on an established stream returns EISCONN */
+    printf("test-socket: 19. second connect returns EISCONN... ");
+    {
+        int listener = socket(AF_INET, SOCK_STREAM, 0);
+        int client = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr = {
+            .sin_family = AF_INET,
+            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        };
+        socklen_t addrlen = sizeof(addr);
+
+        const char *step = NULL;
+        if (listener < 0 || client < 0)
+            step = "socket";
+        else if (bind(listener, (struct sockaddr *) &addr, sizeof(addr)) < 0)
+            step = "bind";
+        else if (listen(listener, 1) < 0)
+            step = "listen";
+        else if (getsockname(listener, (struct sockaddr *) &addr, &addrlen) < 0)
+            step = "getsockname";
+        else if (connect(client, (struct sockaddr *) &addr, sizeof(addr)) < 0)
+            step = "first connect";
+        else if (connect(client, (struct sockaddr *) &addr, sizeof(addr)) != -1)
+            step = "second connect returned 0";
+        else if (errno != EISCONN)
+            step = "second connect errno";
+
+        if (step) {
+            printf("FAIL at %s (errno=%d)\n", step, errno);
+            failures++;
+        } else {
+            printf("PASS\n");
+        }
+        if (listener >= 0)
+            close(listener);
+        if (client >= 0)
+            close(client);
+    }
+
     /* Test 11: shutdown + EOF */
     printf("test-socket: 11. shutdown(SHUT_WR) -> EOF... ");
     shutdown(sv[0], SHUT_WR);
@@ -688,6 +705,7 @@ int main(void)
             close(dsv[0]);
             char b[8];
             ssize_t dn = recv(dsv[1], b, sizeof(b), 0);
+
             /* Any error is acceptable (ECONNRESET on macOS/elfuse, EAGAIN on
              * Linux); a clean EOF(0) is the regression this guards.
              */
@@ -728,6 +746,7 @@ int main(void)
             }
             /* Blocking (no MSG_DONTWAIT): this is the path that would hang. */
             int mr = recvmmsg(msv[1], mm, 4, 0, NULL);
+
             /* elfuse stops at the first EOF (mr==1); Linux keeps reading the
              * persistent EOF and returns 4. Accept any mr>=1 with the first
              * message empty; the point is that it returned at all.

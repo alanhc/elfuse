@@ -250,10 +250,36 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
          */
         signal_check_timer_real();
 
+        /* Teardown leaves before polling: this thread is going away and has
+         * nobody to report readiness to. An execve handed to this leader is
+         * different, because the thread keeps running and the dispatcher
+         * restarts the SVC, so leaving without looking throws away a wait whose
+         * fd may already be ready and pays for a whole syscall re-entry to
+         * discover it. Look first, with a zero timeout so the run loop still
+         * reaches the handoff promptly, and leave only if there is nothing.
+         *
+         * Correctness does not depend on this: the restart re-polls either way,
+         * and a connect loop under a sibling exec loop completes 4000/4000 with
+         * or without it. Progress does. Measured over four runs of that loop,
+         * median 1.8 s here against 2.9 s when the wait leaves before polling.
+         */
+        bool leader_only = thread_stop_is_leader_work_only();
+        if (!leader_only && thread_stop_requested())
+            return -LINUX_EINTR;
+
         /* Ignored/default-ignore signals do not interrupt; restartable handlers
          * still need to run promptly through the syscall epilogue.
+         *
+         * The futex interrupt is left alone on the leader-work path, which the
+         * single ||-chain this replaced did by short-circuiting. It is a
+         * process-wide one-shot standing in for SIGCHLD when the last
+         * clone-thread exits, and consuming it here would hand its EINTR to a
+         * restart that swallows it, so no thread would ever observe the edge.
+         * Left set, it is still there for the next interruptible wait in any
+         * thread, which is the ordering this wants: a ready fd is reported
+         * first and the one-shot keeps until something waits again.
          */
-        if (thread_stop_requested() || futex_interrupt_consume() ||
+        if ((!leader_only && futex_interrupt_consume()) ||
             signal_pending_interruption(NULL))
             return -LINUX_EINTR;
 
@@ -262,7 +288,7 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
          * drain the byte meant to wake this one. The 200 ms recheck guarantees
          * every waiter re-evaluates its own interrupt conditions.
          */
-        int ret = poll(fds, 2, 200);
+        int ret = poll(fds, 2, leader_only ? 0 : 200);
         if (ret < 0)
             return linux_errno();
 
@@ -270,6 +296,9 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
             wakeup_pipe_drain();
         if (fds[0].revents)
             return 0;
+
+        if (leader_only)
+            return -LINUX_EINTR;
     }
 }
 

@@ -321,6 +321,11 @@ $(BUILD_DIR)/test-threaded-exec: tests/test-threaded-exec.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-exec-handoff parks the leader while a worker hands it a failing execve.
+$(BUILD_DIR)/test-exec-handoff: tests/test-exec-handoff.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-cntvct-thread verifies cloned vCPUs inherit EL0 timer access.
 $(BUILD_DIR)/test-cntvct-thread: tests/test-cntvct-thread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

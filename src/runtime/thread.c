@@ -226,6 +226,7 @@ rescan:
         memset(t, 0, sizeof(*t));
         t->generation = next_generation;
         t->sp_el1_slot = -1; /* No SP_EL1 yet; thread_alloc_sp_el1 fills this */
+        t->in_syscall = -1;  /* Not in one; syscall_dispatch fills this */
         t->guest_tid = tid;
         if (stack_start < stack_end) {
             t->stack_map_start = stack_start;
@@ -480,7 +481,16 @@ void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx)
     pthread_mutex_unlock(&thread_lock);
 }
 
-void thread_join_workers(void)
+/* exec_mode is de_thread's contract rather than teardown's: the process
+ * continues afterwards, so a straggler must not be detached (the handle stays
+ * claimable for the real teardown) and a vm-clone slot must not be waited on at
+ * all. execve leaves a CLONE_VM child on the old mm and de_thread excludes it
+ * from the survivor count, but an exited-but-unreaped one keeps active == 1 for
+ * wait4, so the poll below would spend the whole cap on a thread that already
+ * left. The other legitimate budget consumer, a sibling parked in the fork
+ * barrier, is drained before the teardown is armed; see thread_exec_de_thread.
+ */
+static void thread_join_workers_mode(bool exec_mode)
 {
     /* Snapshot worker threads under the lock. The code needs the host_thread
      * handle and a way to check the active flag without re-locking. Storing the
@@ -517,6 +527,9 @@ void thread_join_workers(void)
          * after guest_destroy unmaps it.
          */
         if (t == &thread_table[0])
+            continue;
+
+        if (exec_mode && t->is_vm_clone)
             continue;
 
         /* Inactive slots are included when they still hold an unjoined handle:
@@ -591,6 +604,27 @@ void thread_join_workers(void)
         if (workers[w].recycled ||
             !__atomic_load_n(&workers[w].t->active, __ATOMIC_ACQUIRE)) {
             pthread_join(workers[w].thr, NULL);
+        } else if (exec_mode) {
+            /* Hand the claim back instead of detaching. The caller answers a
+             * straggler with a diagnosed exit, and until it does the handle
+             * belongs to a process that is still running: detaching it here
+             * would let a later teardown pass, or thread_alloc recycling the
+             * slot, reason about a pthread nobody may touch any more.
+             *
+             * A generation bump seen only now (the poll loop broke before the
+             * recycle) means the slot belongs to a different logical thread and
+             * the claim would be handed to the wrong handle. thread_alloc only
+             * recycles an inactive slot, so the previous occupant has already
+             * exited and this join returns at once.
+             */
+            pthread_mutex_lock(&thread_lock);
+            bool same_thread =
+                workers[w].t->generation == workers[w].generation;
+            if (same_thread)
+                workers[w].t->host_thread_needs_join = true;
+            pthread_mutex_unlock(&thread_lock);
+            if (!same_thread)
+                pthread_join(workers[w].thr, NULL);
         } else {
             pthread_detach(workers[w].thr);
             pthread_mutex_lock(&thread_lock);
@@ -598,6 +632,11 @@ void thread_join_workers(void)
             pthread_mutex_unlock(&thread_lock);
         }
     }
+}
+
+void thread_join_workers(void)
+{
+    thread_join_workers_mode(false);
 }
 
 bool thread_destroy_all_vcpus(hv_vcpu_t main_vcpu,
@@ -881,19 +920,31 @@ int thread_fork_barrier_check(void)
     return 1;
 }
 
-void thread_wake_all_blocked(void)
+void thread_wake_leader_for_work(void)
 {
-    /* hv_vcpus_exit only reaches threads inside hv_vcpu_run, so the futex
-     * interrupt covers futex waiters, the wakeup pipe covers poll/epoll/read
-     * parks, and thread_wake_exit_waiters covers the internal condvars (fork
-     * barrier, ptrace stop/wait). Every teardown caller needs all four; what
-     * differs between them is only why they are tearing down.
+    /* hv_vcpus_exit only reaches threads inside hv_vcpu_run, so the wakeup pipe
+     * covers poll/epoll/read parks and thread_wake_exit_waiters covers the
+     * internal condvars (fork barrier, ptrace stop/wait). Each is answered by
+     * the woken thread re-checking its own predicate, so aiming them at the
+     * whole table to reach one thread costs nothing.
+     *
+     * Leaving futex_interrupt_request out (the header says why) loses nothing:
+     * the futex waits re-check thread_stop_requested on a 100 ms quantum, and
+     * that is what sends the leader to run the execve.
      */
-    futex_interrupt_request();
     wakeup_pipe_signal();
     thread_interrupt_all();
     thread_wake_exit_waiters();
     exec_handoff_wake_waiters();
+}
+
+void thread_wake_all_blocked(void)
+{
+    /* Teardown: every thread really is leaving, so the futex interrupt on top
+     * of the wakes above is an EINTR each of them has to see.
+     */
+    futex_interrupt_request();
+    thread_wake_leader_for_work();
 }
 
 void thread_wake_exit_waiters(void)
@@ -983,11 +1034,8 @@ int thread_exec_stop_requested(void)
            !current_thread->is_vm_clone;
 }
 
-int thread_stop_requested(void)
+static int thread_stop_requested_for_leader_work(void)
 {
-    if (thread_exec_stop_requested() || proc_exit_group_requested())
-        return 1;
-
     /* A non-leader execve is handed to the leader, which can only pick it up
      * from its run loop. Break it out of whatever it is parked in so the
      * handoff does not wait on an unrelated blocking syscall. Every other
@@ -995,6 +1043,24 @@ int thread_stop_requested(void)
      * a third thread has no part in it.
      */
     return thread_leader_work_pending() && thread_current_is_leader();
+}
+
+void thread_note_syscall(int nr)
+{
+    if (current_thread)
+        __atomic_store_n(&current_thread->in_syscall, nr, __ATOMIC_RELAXED);
+}
+
+int thread_stop_requested(void)
+{
+    return thread_exec_stop_requested() || proc_exit_group_requested() ||
+           thread_stop_requested_for_leader_work();
+}
+
+int thread_stop_is_leader_work_only(void)
+{
+    return thread_stop_requested_for_leader_work() &&
+           !proc_exit_group_requested() && !thread_exec_stop_requested();
 }
 
 /* Whether an execve teardown will reap this slot: not the caller, not the main
@@ -1025,6 +1091,18 @@ static int thread_count_joinable_siblings(void)
 bool thread_current_is_leader(void)
 {
     return current_thread == &thread_table[0];
+}
+
+/* Milliseconds on CLOCK_MONOTONIC since @since. Only the de_thread wait needs
+ * it, which measures how long its siblings took rather than when they left.
+ */
+static int64_t thread_elapsed_ms(const struct timespec *since)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t) (now.tv_sec - since->tv_sec) * 1000 +
+           (now.tv_nsec - since->tv_nsec) / 1000000;
 }
 
 int thread_exec_de_thread(void)
@@ -1073,10 +1151,34 @@ int thread_exec_de_thread(void)
      * poll() after another one drained sits out its own 200 ms recheck no
      * matter how many bytes the wake wrote. Re-poke while they wind down, which
      * costs a threaded execve milliseconds instead of a poll quantum per parked
-     * sibling (measured: 38 s to 2.5 s over 200 threaded execs). The join below
-     * still bounds the wait if a sibling never arrives.
+     * sibling (measured: 38 s to 2.5 s over 200 threaded execs).
+     *
+     * How long to wait for is measured in departures, not in iterations. A
+     * fixed count has to be chosen against the slowest re-check quantum a
+     * parked sibling owes (200 ms, in the io wait) multiplied by how far behind
+     * schedule the host is running, and that multiplier is not a property this
+     * code can know: CI runs four sanitizer lanes on one machine, where a
+     * count wide enough is dead time on every threaded execve elsewhere.
+     * Waiting while siblings are still leaving separates a slow host from
+     * siblings nothing wakes, which is what the stall interval and the ceiling
+     * below are for.
+     *
+     * Both are wall-clock, because the sleep is a floor: an oversubscribed host
+     * stretches each iteration well past its 1 ms, so a bound counted in
+     * iterations would run for minutes and blow the caller's timeout instead of
+     * reaching the diagnosed exit.
      */
-    for (int i = 0; i < 200 && thread_count_joinable_siblings() > 0; i++) {
+    enum {
+        DE_THREAD_STALL_MS = 1000,   /* no departures before giving up */
+        DE_THREAD_CEILING_MS = 10000 /* total, however well it is going */
+    };
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+
+    int remaining = thread_count_joinable_siblings();
+    int64_t elapsed_ms = 0, progress_ms = 0;
+
+    while (remaining > 0) {
         /* The whole wake set, not just the pipe: a sibling in a tight compute
          * loop is reachable only by hv_vcpus_exit, and one kick that lands
          * between two hv_vcpu_run calls is lost. Re-issuing costs nothing here
@@ -1084,27 +1186,55 @@ int thread_exec_de_thread(void)
          */
         thread_wake_all_blocked();
         usleep(1000);
+
+        int now = thread_count_joinable_siblings();
+        elapsed_ms = thread_elapsed_ms(&started);
+        if (now < remaining) {
+            remaining = now;
+            progress_ms = elapsed_ms;
+        }
+        if (elapsed_ms >= DE_THREAD_CEILING_MS ||
+            elapsed_ms - progress_ms >= DE_THREAD_STALL_MS)
+            break;
     }
 
     /* Name who is still here before the bounded join runs, so a teardown that
      * ends fatally says which thread held it up rather than only how many did.
+     * The timings go with it: a report that spent its whole budget with
+     * siblings leaving throughout is a slow host, and one whose last departure
+     * is the start of the wait is a sibling no wake reaches, which are
+     * different bugs.
      */
-    if (thread_count_joinable_siblings() > 0) {
+    if (remaining > 0) {
+        log_warn(
+            "execve: %d sibling(s) still in the guest after %lld ms, last "
+            "departure at %lld ms",
+            remaining, (long long) elapsed_ms, (long long) progress_ms);
         pthread_mutex_lock(&thread_lock);
         THREAD_FOR_EACH_ACTIVE (t) {
-            if (thread_is_joinable_sibling(t))
-                log_warn("execve: tid=%lld has not left the guest yet",
-                         (long long) t->guest_tid);
+            if (!thread_is_joinable_sibling(t))
+                continue;
+            int32_t nr = __atomic_load_n(&t->in_syscall, __ATOMIC_RELAXED);
+            if (nr < 0)
+                log_warn(
+                    "execve: tid=%lld has not left the guest yet, "
+                    "running guest code",
+                    (long long) t->guest_tid);
+            else
+                log_warn(
+                    "execve: tid=%lld has not left the guest yet, "
+                    "in syscall %d",
+                    (long long) t->guest_tid, nr);
         }
         pthread_mutex_unlock(&thread_lock);
     }
 
-    thread_join_workers();
+    thread_join_workers_mode(true);
 
-    /* thread_join_workers is bounded, so a sibling parked in a host call that
-     * never re-checked can outlive the cap and be detached. One such call is
-     * still reachable from guest code: the read side of a blocking FIFO open,
-     * which macOS gives nothing to poll on (see open_nonblocking_writer in
+    /* The join is bounded, so a sibling parked in a host call that never
+     * re-checked can outlive the cap and be detached. One such call is still
+     * reachable from guest code: the read side of a blocking FIFO open, which
+     * macOS gives nothing to poll on (see open_nonblocking_writer in
      * syscall/fs.c). semop, fcntl F_SETLKW and flock used to belong on this
      * list and no longer do; each polls a non-blocking form now.
      *

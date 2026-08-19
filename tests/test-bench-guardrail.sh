@@ -60,12 +60,12 @@ THRESH_URANDOM=400
 # arm is 5x the static one because sysroot redirection resolves every path
 # component. Ceilings sit ~1.25x over observed.
 #
-# The static arm is the detector. Restoring the sigsetjmp regression moves it
-# 82 -> 125, comfortably past 105, while the dynamic arm moved only 407 -> 488
-# and slipped under its ceiling on one run: sysroot resolution is so much of
-# that 13.6 us that a per-copy cost is diluted to noise. Keep the dynamic arm
-# for gross regressions, do not tighten it toward 450 chasing the small ones,
-# and do not read a dynamic pass as evidence the copy helpers are clean.
+# The static arm is the detector. Restoring the sigsetjmp regression moves it 82
+# -> 125, comfortably past 105, while the dynamic arm moved only 407 -> 488 and
+# slipped under its ceiling on one run: sysroot resolution is so much of that
+# 13.6 us that a per-copy cost is diluted to noise. Keep the dynamic arm for
+# gross regressions, do not tighten it toward 450 chasing the small ones, and do
+# not read a dynamic pass as evidence the copy helpers are clean.
 THRESH_STAT_RATIO_STATIC=105
 THRESH_STAT_RATIO_GLIBC=500
 
@@ -91,6 +91,7 @@ if [ ! -x "$STATIC_BENCH" ]; then
 fi
 
 failures=0
+unmeasured=0
 benchmarks_run=0
 
 # Set by any failure a second run would reproduce, so run_and_check skips the
@@ -104,6 +105,21 @@ deterministic=0
 extract_ns()
 {
     awk -v label="$2" '$1 == label { print $2 }' "$1"
+}
+
+# A throughput ceiling is a claim about this machine when it is free to answer.
+# On a loaded host the number measures the load, not the code: every lane that
+# does host work inflates together while the shim-served ones barely move, so
+# the getpid-relative ratios stop cancelling and the absolute ceilings blow out.
+# Observed here at 2 to 3 times the idle figures with a prover run in the
+# background, on code that was not the cause. Consulted only after a retry has
+# also failed, so a real regression on an idle machine still fails twice and is
+# reported.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/bash-compat.sh"
+
+host_is_busy()
+{
+    test_host_is_busy
 }
 
 # check_threshold <variant> <label> <ns/op> <ceiling-ns>
@@ -223,6 +239,15 @@ run_and_check()
     failures=$before
     deterministic=0
     run_one_pass "$@"
+
+    if [ "$failures" -ne "$before" ] && [ "$deterministic" -eq 0 ] \
+        && host_is_busy; then
+        printf "  ${C_YELLOW}SKIP${C_RESET}  %-12s host load %s over %s cpus; throughput not measurable\n" \
+            "$variant" "$(sysctl -n vm.loadavg 2> /dev/null | awk '{print $2}')" \
+            "$(sysctl -n hw.ncpu 2> /dev/null)"
+        failures=$before
+        unmeasured=$((unmeasured + 1))
+    fi
 }
 
 echo "=== bench-guardrail (iters=$ITERS) ==="
@@ -250,6 +275,22 @@ fi
 if [ "$failures" -ne 0 ]; then
     echo
     echo "guardrail FAILED ($failures threshold violation(s))" >&2
+    exit 1
+fi
+
+# A variant whose thresholds were exceeded twice and then dropped for host load
+# was not measured, so this run is no evidence that the ceilings hold. It exits
+# non-zero for the same reason it would on a real violation: make check is the
+# CI gate, and a run that never exercised the ceilings must not report the same
+# status as one that did.
+#
+# What the load check buys is the diagnosis, not the exit code. The bare
+# threshold number this replaces said nothing about why, and cost more than one
+# investigation before anyone thought to look at the host.
+if [ "$unmeasured" -ne 0 ]; then
+    echo
+    echo "guardrail UNMEASURED ($unmeasured variant(s), host busy)" >&2
+    echo "  the ceilings were not exercised; re-run on an idle host" >&2
     exit 1
 fi
 echo

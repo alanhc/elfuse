@@ -648,7 +648,31 @@ test_pipe()
 # There is no "core" vs "extended" split here; everything below runs in both
 # elfuse-aarch64 and qemu-aarch64 modes, and genuine, understood divergences
 # from the qemu reference kernel are called out via QEMU_SKIP with a comment
-# rather than silently dropped from this list.
+# rather than silently dropped from this list. The unit lane runs binaries this
+# repo builds, not fixtures it downloads, so an empty build/ is a setup mistake
+# rather than a run to report on. Without this every test fails on a missing
+# file and the summary reads like a hundred-odd regressions; "make clean"
+# followed by "make elfuse" is enough to produce it, because elfuse alone does
+# not build the test binaries. Name the cause once and stop, the way driver.sh
+# does with ALLOW_MISSING_BINARIES.
+require_unit_binaries()
+{
+    local bindir="$1"
+    local missing=0 probe
+
+    for probe in test-hello hello-musl echo-test test-comprehensive \
+        test-thread test-epoll test-signal test-exec-handoff; do
+        [ -x "$bindir/$probe" ] || missing=$((missing + 1))
+    done
+    [ "$missing" -eq 0 ] && return 0
+
+    printf '\n%s\n' "test-matrix: no test binaries in $bindir"
+    printf '%s\n' "  The unit lane needs them built first. Run 'make check'," \
+        "  or build the lane's binaries directly, then re-run this." \
+        "  Set ALLOW_MISSING_BINARIES=1 to run anyway."
+    return 1
+}
+
 run_unit_tests()
 {
     local runner="$1" bindir="$2"
@@ -761,6 +785,7 @@ run_unit_tests()
     test_rc "$runner" "test-threaded-exec" 0 "$bindir/test-threaded-exec"
     test_rc "$runner" "test-threaded-exec-worker" 0 \
         "$bindir/test-threaded-exec" worker
+    test_rc "$runner" "test-exec-handoff" 0 "$bindir/test-exec-handoff"
     test_rc "$runner" "test-mprotect-mt" 0 "$bindir/test-mprotect-mt"
 
     printf "\nNegative tests\n"
@@ -1221,6 +1246,15 @@ run_suite()
         fi
         verify_expected_counts "$mode"
         return $?
+    fi
+
+    # Checked here rather than inside run_unit_tests so an empty build fails
+    # this lane through the caller's accounting. Exiting from inside the lane
+    # would take the whole script down with it under MODE=all, skipping the
+    # qemu lane and the rosetta one, which does not read GUEST_TEST_BINARIES.
+    if [ "${ALLOW_MISSING_BINARIES:-0}" != "1" ] \
+        && ! require_unit_binaries "$GUEST_TEST_BINARIES"; then
+        return 1
     fi
 
     run_unit_tests "$runner" "$GUEST_TEST_BINARIES"

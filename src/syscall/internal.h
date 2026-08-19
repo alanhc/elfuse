@@ -14,6 +14,14 @@
  *   epoll inst   (syscall/poll.c):    per-epoll-instance regs[]; taken under
  *                                     fd_lock by the close hook, taken alone
  *                                     (no fd_lock held) by epoll_ctl/pwait
+ *   exec_handoff (syscall/exec.c):    the one execve handoff slot; nested under
+ *                                     mmap_lock only by exec_handoff_reset, and
+ *                                     holds sig_lock beneath it through
+ *                                     signal_restore_blocked. A requester drops
+ *                                     mmap_lock before taking it: waiting for
+ *                                     the slot under mmap_lock deadlocks
+ *                                     against the leader, which needs that lock
+ *                                     to run the request that frees the slot
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)

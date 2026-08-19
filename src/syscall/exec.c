@@ -748,10 +748,12 @@ void exec_handoff_wake_waiters(void)
     pthread_mutex_unlock(&exec_handoff_lock);
 }
 
-/* Block until the slot reaches want. Returns false when thread_stop_requested
- * broke the wait instead, which for the requester means the exec it asked for
- * already succeeded and de_thread is reaping it. Caller holds the lock; the
- * bounded quantum is a safety net under the wake in thread_wake_all_blocked.
+/* Block until the slot reaches want.
+ *
+ * Returns false when thread_stop_requested broke the wait instead, which for
+ * the requester means the exec it asked for already succeeded and de_thread is
+ * reaping it. Caller holds the lock; the bounded quantum is a safety net under
+ * the wake in thread_wake_leader_for_work.
  */
 static bool exec_handoff_wait_for(exec_handoff_state_t want)
 {
@@ -762,13 +764,13 @@ static bool exec_handoff_wait_for(exec_handoff_state_t want)
 
         /* Re-poke while the request is still unclaimed. The leader is woken
          * once at publish, and a kick that lands between two hv_vcpu_run calls
-         * is lost; without this the requester waits forever and the leader
-         * runs on none the wiser. The wake set broadcasts this same condvar,
-         * so the lock has to come off around it.
+         * is lost; without this the requester waits forever and the leader runs
+         * on none the wiser. The wake set broadcasts this same condvar, so the
+         * lock has to come off around it.
          */
         if (exec_handoff.state == HANDOFF_PUBLISHED) {
             pthread_mutex_unlock(&exec_handoff_lock);
-            thread_wake_all_blocked();
+            thread_wake_leader_for_work();
             pthread_mutex_lock(&exec_handoff_lock);
         }
     }
@@ -787,6 +789,23 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
                                       uint64_t envp_gva,
                                       const char *host_path)
 {
+    /* Release mmap_lock, which this thread's sc_execve wrapper holds, before
+     * touching the slot at all.
+     *
+     * Waiting for the slot under it deadlocks the second of two concurrent
+     * requesters against the leader: the leader takes the first request,
+     * releases exec_handoff_lock, and blocks acquiring mmap_lock to run it,
+     * while this thread holds mmap_lock waiting for a slot only that leader can
+     * free. Neither side is torn down, so no stop check breaks the cycle.
+     *
+     * Safe to drop this early because the handoff is the first thing sys_execve
+     * does for a non-leader, so nothing has yet read what mmap_lock protects,
+     * and the guest addresses published below are dereferenced by the leader
+     * under its own mmap_lock rather than here. Re-taken on every return path
+     * so the wrapper's unlock stays balanced.
+     */
+    pthread_mutex_unlock(&mmap_lock);
+
     pthread_mutex_lock(&exec_handoff_lock);
 
     /* Wait for the slot. A concurrent handoff either fails (freeing the slot)
@@ -794,6 +813,7 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
      */
     if (!exec_handoff_wait_for(HANDOFF_EMPTY)) {
         pthread_mutex_unlock(&exec_handoff_lock);
+        pthread_mutex_lock(&mmap_lock);
         return -LINUX_EINTR;
     }
 
@@ -801,6 +821,7 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
     exec_handoff.path_gva = path_gva;
     exec_handoff.argv_gva = argv_gva;
     exec_handoff.envp_gva = envp_gva;
+
     /* An empty string is the "no host_path" marker, so the flag the buffer
      * would otherwise need stays derivable from the buffer itself.
      */
@@ -811,24 +832,17 @@ static int64_t exec_handoff_to_leader(uint64_t path_gva,
         exec_handoff_set_state(HANDOFF_EMPTY);
         pthread_cond_broadcast(&exec_handoff_cond);
         pthread_mutex_unlock(&exec_handoff_lock);
+        pthread_mutex_lock(&mmap_lock);
         return -LINUX_ENAMETOOLONG;
     }
     exec_handoff.blocked_mask = current_thread ? current_thread->blocked : 0;
     pthread_mutex_unlock(&exec_handoff_lock);
 
-    /* Release mmap_lock, which this thread's sc_execve wrapper holds, for the
-     * whole wait: the leader needs it to run the exec, and the teardown that
-     * reaps this thread needs it free. Re-taken before returning so the
-     * wrapper's unlock stays balanced, and by then the leader has released it
-     * around its own teardown.
-     */
-    pthread_mutex_unlock(&mmap_lock);
-
     /* The leader may be parked in a blocking syscall. thread_stop_requested is
      * true for it while a request is pending, so its wait returns EINTR and its
      * run loop reaches the service point.
      */
-    thread_wake_all_blocked();
+    thread_wake_leader_for_work();
 
     pthread_mutex_lock(&exec_handoff_lock);
     bool reported = exec_handoff_wait_for(HANDOFF_DONE);
@@ -917,6 +931,16 @@ int64_t exec_run_handoff(hv_vcpu_t vcpu, guest_t *g, bool verbose)
 
     pthread_mutex_lock(&exec_handoff_lock);
     if (rc == SYSCALL_EXEC_HAPPENED) {
+        /* Drop any SVC restart this leader had armed before it picked the
+         * handoff up. The image it belonged to is gone, and leaving it armed
+         * lets the new image's first syscall match the recorded ELR by
+         * coincidence (most plausibly on a self-re-exec at the same load base)
+         * and read as a restart, which is what makes sys_connect swallow a
+         * genuine EISCONN. The cancel sees the mismatch and only clears the
+         * record.
+         */
+        syscall_restart_cancel(vcpu);
+
         /* The requester is being reaped by de_thread and will never read this.
          * Free the slot so the new image can execve again.
          */
@@ -1399,15 +1423,13 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * already have destroyed. It also has to precede the CLOEXEC sweep and
      * guest_reset: a sibling parked in read() on a fd about to close, or still
      * executing the old image's code, winds down against the memory and fd
-     * table its guest still expects.
-     */
-    /* Both callers hold mmap_lock (order 1) across the whole syscall, and the
-     * teardown must not run under it: a sibling blocked in
-     * pthread_mutex_lock(&mmap_lock) inside sc_brk, sc_mmap, sc_munmap,
-     * sc_mprotect, or its own deferred stack unmap is reachable by none of the
-     * teardown wakes, so it can never reach a stop check and the join below
-     * would always time out. Measured before this release: four siblings
-     * looping on mmap/munmap took the fatal path every time.
+     * table its guest still expects. Both callers hold mmap_lock (order 1)
+     * across the whole syscall, and the teardown must not run under it: a
+     * sibling blocked in pthread_mutex_lock(&mmap_lock) inside sc_brk, sc_mmap,
+     * sc_munmap, sc_mprotect, or its own deferred stack unmap is reachable by
+     * none of the teardown wakes, so it can never reach a stop check and the
+     * join below would always time out. Measured before this release: four
+     * siblings looping on mmap/munmap took the fatal path every time.
      *
      * Dropping it here is safe because nothing in the teardown touches guest
      * memory or the region table, and re-acquiring cannot contend: by the time

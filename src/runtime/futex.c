@@ -585,8 +585,15 @@ static int64_t futex_os_sync_wait(guest_t *g,
             efault_retries = 0;
         }
 
-        if (thread_stop_requested() || futex_interrupt_consume())
+        if (thread_stop_requested() || futex_interrupt_consume()) {
+            /* This path's deadline is relative (futex_make_deadline above is
+             * called with is_absolute = 0), so part of it is already spent and
+             * a restart would re-derive it from the guest's original value.
+             */
+            if (has_timeout)
+                syscall_restart_forbid();
             return -LINUX_EINTR;
+        }
 
         /* Drain any expired guest itimer so its SIGALRM / SIGVTALRM / SIGPROF
          * queues into sig_state.pending; without this poke, a guest with all
@@ -601,8 +608,11 @@ static int64_t futex_os_sync_wait(guest_t *g,
          * hint cannot produce a stale-true edge after rt_sigprocmask masked the
          * queued signal.
          */
-        if (signal_pending())
+        if (signal_pending()) {
+            if (has_timeout)
+                syscall_restart_forbid();
             return -LINUX_EINTR;
+        }
 
         /* For has_timeout: futex_remaining_ns returns 0 next iteration once the
          * user deadline elapses, so the loop exits with -ETIMEDOUT.
@@ -842,6 +852,15 @@ static int64_t futex_wait(guest_t *g,
 
     if (__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE))
         return 0;
+
+    /* Plain FUTEX_WAIT counts its timeout from the call, so part of it is spent
+     * by the time any of the exits above reports EINTR, and an SVC restart
+     * would re-derive the deadline from the guest's original relative value.
+     * FUTEX_WAIT_BITSET is absolute and re-derives the same instant, so it
+     * stays restartable. See syscall_restart_forbid.
+     */
+    if (ret == -LINUX_EINTR && has_timeout && !is_absolute)
+        syscall_restart_forbid();
     return ret;
 }
 

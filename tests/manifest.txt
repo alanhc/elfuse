@@ -86,6 +86,7 @@ test-pthread
 test-thread-churn
 test-threaded-exec
 test-threaded-exec worker
+test-exec-handoff
 test-simd-clone                # diff=skip
 
 [section] Stress tests
