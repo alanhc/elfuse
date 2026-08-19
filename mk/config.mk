@@ -70,6 +70,46 @@ CFLAGS := -O2 -Wall -Wextra -Wpedantic \
           -Wnull-dereference -Wno-unused-parameter
 CFLAGS += $(EXTRA_CFLAGS)
 
+# Warnings are errors, because this tree has none and the gates around it (the
+# syscall coverage check, the EINTR contract, the proof targets) all fail the
+# build rather than print. A compiler diagnostic that only prints is the one
+# signal here that a reader has to notice on their own.
+#
+# WERROR=0 turns it off, which is what a newer compiler with a new warning
+# wants: the flag must not be the reason a fresh clone stops building. CI keeps
+# the default so the new warning still gets found.
+WERROR ?= 1
+ifeq ($(WERROR),1)
+CFLAGS += -Werror
+endif
+
+# Hardening. This process parses input the guest fully controls (its ELF, every
+# syscall argument, FUSE frames, netlink messages, sockaddr and cmsg blobs), so
+# the cheap compiler-side checks are worth their cost here even though the
+# bounds math itself is proved in src/proved/. PIE is already the Darwin
+# default; -fstack-protector-strong and _FORTIFY_SOURCE are not.
+#
+# _FORTIFY_SOURCE is skipped under AddressSanitizer alone, which predefines it
+# to 0 on purpose (its interceptors do the same job), so redefining it is a
+# -Wmacro-redefined error under the -Werror above. UBSAN and TSAN predefine
+# nothing and keep it, which is what makes those lanes exercise the same libc
+# entry points (__memcpy_chk and the rest) the shipped binary calls.
+#
+# Every -fsanitize= argument is split on commas so the test is an exact name
+# match. A substring test for -fsanitize=address is order-dependent while
+# reading as if it were not: it answers correctly for
+# "-fsanitize=address,undefined" and wrongly for "-fsanitize=undefined,address",
+# the same request spelled the other way round, which then fails the build on
+# the macro redefinition.
+sanitize_comma := ,
+SANITIZERS := $(subst $(sanitize_comma), ,\
+                $(patsubst -fsanitize=%,%,$(filter -fsanitize=%,$(CFLAGS))))
+
+CFLAGS += -fstack-protector-strong
+ifeq ($(filter address,$(SANITIZERS)),)
+CFLAGS += -D_FORTIFY_SOURCE=2
+endif
+
 ifneq ($(strip $(ELFUSE_NR_EMBEDDER_HVC6)),)
 CFLAGS += -DELFUSE_NR_EMBEDDER_HVC6=$(ELFUSE_NR_EMBEDDER_HVC6)
 endif

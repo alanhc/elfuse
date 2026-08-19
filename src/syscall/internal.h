@@ -7,16 +7,55 @@
  * Cross-domain declarations: shared locks, the FD table, and translation
  * helpers used by multiple syscall modules.
  *
- * Lock ordering (acquire in ascending order to prevent deadlocks):
+ * Lock ordering (acquire in ascending order to prevent deadlocks). This is
+ * every file-scope lock in the tree that is ever held across another
+ * acquisition, whether the inner one is taken directly or through a call. The
+ * leaf list below closes it: a lock named there holds nothing beneath it, so
+ * the pair of lists is exhaustive rather than "the ones that seemed worth
+ * writing down". Adding a mutex or an rwlock means placing it here or in the
+ * leaf list, and a leaf that grows a call to another locker moves up here.
+ *
+ * Per-instance locks (one per epoll instance, futex bucket, FUSE session) are
+ * named beside the file-scope lock they nest under. That pairing is the whole
+ * of their ordering except for the FUSE session lock, which also holds fd_lock
+ * and sig_lock beneath it: fuse_queue_request_locked runs with the session lock
+ * held and reaches asyncio_fire, which snapshots an fd and queues a signal.
+ * fuse_lock is always dropped before the session lock is used that way, so the
+ * two claims do not meet.
+ *
+ * The numbered "Lock order: N" comments at the definitions predate this list
+ * and are not indices into it. This list is the document; a number there says
+ * only which locks that one was known to precede when it was written.
+ *
+ *   proc_tmpdir_lock (runtime/procemu.c): lazy /proc snapshot tree; holds
+ *                                     mmap_lock beneath it, because
+ *                                     ensure_proc_tmpdir builds the
+ *                                     /proc/self/maps and smaps snapshots
+ *                                     through proc_intercept_open while the
+ *                                     lock is held. Above mmap_lock, so
+ *                                     mmap_lock's "1" means first among the
+ *                                     locks a syscall path takes, not that
+ *                                     nothing precedes it
  *   mmap_lock    (syscall/mem.c):     mmap/brk allocators + page tables
  *   pt_lock      (core/guest.c):      page table pool allocator
+ *   pty_keepalive_lock (runtime/procemu-pty.c): pty master keepalive table;
+ *                                     holds fd_lock beneath it in
+ *                                     proc_pty_master_adopt's joint publish
+ *                                     window and in duplicate_guest_fd, which
+ *                                     brackets fd_snapshot_and_dup. Both paths
+ *                                     take it in this direction, which is what
+ *                                     keeps them from deadlocking each other
+ *   oom_write_lock (runtime/procemu.c): /proc/self/oom_score_adj writer; holds
+ *                                     fd_lock beneath it through
+ *                                     proc_oom_refresh_live_fds_locked
  *   fd_lock      (syscall/fdtable.c): FD table (alloc/close/dup)
  *   epoll inst   (syscall/poll.c):    per-epoll-instance regs[]; taken under
  *                                     fd_lock by the close hook, taken alone
  *                                     (no fd_lock held) by epoll_ctl/pwait
- *   exec_handoff (syscall/exec.c):    the one execve handoff slot; nested under
- *                                     mmap_lock only by exec_handoff_reset, and
- *                                     holds sig_lock beneath it through
+ *   exec_handoff_lock (syscall/exec.c): the one execve handoff slot; nested
+ *                                     under mmap_lock only by
+ *                                     exec_handoff_reset, and holds sig_lock
+ *                                     beneath it through
  *                                     signal_restore_blocked. A requester drops
  *                                     mmap_lock before taking it: waiting for
  *                                     the slot under mmap_lock deadlocks
@@ -25,9 +64,53 @@
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)
+ *   autoreap_lock (syscall/proc.c):   serializes the whole no-zombie reap
+ *                                     sequence against rt_sigaction; holds
+ *                                     pid_lock and, through
+ *                                     proc_pidfd_notify_exit, pidfd_lock
+ *   elf_path_lock (syscall/proc-state.c): cached /proc/self/exe path; holds
+ *                                     cwd_lock beneath it through
+ *                                     proc_get_cwd, and sysroot_lock through
+ *                                     the proc_cwd_refresh that runs with
+ *                                     cwd_lock dropped
  *   pid_lock     (syscall/proc.c):    process table / wait state
+ *   pidfd_lock   (syscall/proc-pidfd.c): pidfd registry
  *   futex bucket (runtime/futex.c):   per-bucket, index-ordered if >1
+ *   cwd_lock     (syscall/proc-state.c): cached guest cwd. A leaf on every
+ *                                     path but one: proc_acquire_cwd_view
+ *                                     returns still holding it, and both
+ *                                     callers that inspect view.path in place
+ *                                     (sys_faccessat, fuse_resolve_at_path)
+ *                                     call fuse_path_matches_mount inside the
+ *                                     view, so fuse_lock nests beneath it
+ *   fuse_lock    (syscall/fuse.c):    mount/session registry; holds the
+ *                                     per-session session->lock beneath it,
+ *                                     which is what pins a session against
+ *                                     daemon exit while a request is in flight
  *   inotify_lock (syscall/inotify.c): inotify watch table
+ *
+ * Leaves. Each of these is the innermost lock on every path that takes it, so
+ * it has no position in the order above and cannot be half of an inversion:
+ *
+ *   absock_lock (net-absock.c)       rlimit_lock (sys.c)
+ *   log_mutex (debug/log.c)          rosettad_path_lock (rosetta.c)
+ *   nl_lock (netlink.c)              session_lock (proc-identity.c)
+ *   overlay_lock (chown-overlay.c)   shm_dir_lock (procemu.c)
+ *   proc_scratch_lock (procemu.c)    shm_lock (sysvipc.c)
+ *   removed_overlay_lock (fs.c)      syscpu_dir_lock (procemu.c)
+ *                                    sysinfo_lock (sys.c)
+ *                                    sysroot_lock (proc-state.c)
+ *
+ * log_mutex is the one leaf every other entry may hold: a lock anywhere in
+ * either list can log while held. It sits below the whole order rather than
+ * beside the rest of the leaves, and it acquires nothing itself, so it closes
+ * no cycle.
+ *
+ * pt_lock, thread_lock, sfd_lock, pid_lock and pidfd_lock are leaves today
+ * too. They stay in the ordered list because each is named as an inner lock
+ * above, so the order they would be acquired in is the load-bearing fact about
+ * them. sig_lock is not one of them: signal_queue_thread_common takes
+ * thread_lock under it.
  */
 
 #pragma once

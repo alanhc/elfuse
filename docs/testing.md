@@ -91,6 +91,11 @@ What they do:
 - `make check`: fast elfuse-internal gate. Runs, in order:
   - `scripts/check-syscall-coverage.py` so any new `dispatch.tbl`
     entry without a direct or aliased test reference fails the build
+  - `scripts/check-lock-order.py` so a new file-scope `pthread_mutex_t`
+    or `pthread_rwlock_t` that the lock-ordering block at the top of
+    `src/syscall/internal.h` does not name fails the build. Membership
+    only: whether the lock belongs in the ordered list or the leaf list
+    stays a judgement for review
   - the unit suite from `tests/manifest.txt` -- deliberately narrow: the
     elfuse-internal implementation tests with no real Linux counterpart (the
     EL1 shim fast-path suite, `test-mremap-infra`, `test-mremap-fork-tracking`,
