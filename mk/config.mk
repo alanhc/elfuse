@@ -70,6 +70,19 @@ CFLAGS := -O2 -Wall -Wextra -Wpedantic \
           -Wnull-dereference -Wno-unused-parameter
 CFLAGS += $(EXTRA_CFLAGS)
 
+# Warnings are errors, because this tree has none and the gates around it (the
+# syscall coverage check, the EINTR contract, the proof targets) all fail the
+# build rather than print. A compiler diagnostic that only prints is the one
+# signal here that a reader has to notice on their own.
+#
+# WERROR=0 turns it off, which is what a newer compiler with a new warning
+# wants: the flag must not be the reason a fresh clone stops building. CI keeps
+# the default so the new warning still gets found.
+WERROR ?= 1
+ifeq ($(WERROR),1)
+CFLAGS += -Werror
+endif
+
 ifneq ($(strip $(ELFUSE_NR_EMBEDDER_HVC6)),)
 CFLAGS += -DELFUSE_NR_EMBEDDER_HVC6=$(ELFUSE_NR_EMBEDDER_HVC6)
 endif

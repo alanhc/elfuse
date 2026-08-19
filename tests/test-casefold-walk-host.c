@@ -258,12 +258,12 @@ static void section_symlink(void)
      * link_guest_offset at the link itself, so a relative target can be joined
      * to the directory holding it.
      */
-    if (casefold_resolve_at(AT_FDCWD, root, "/link.to.lowdir/inner.txt", false,
-                            out, sizeof(out), &walk) == CASEFOLD_SYMLINK &&
+    static const char through_link[] = "/link.to.lowdir/inner.txt";
+    if (casefold_resolve_at(AT_FDCWD, root, through_link, false, out,
+                            sizeof(out), &walk) == CASEFOLD_SYMLINK &&
         !strcmp(out + strlen(root), "/link.to.lowdir") &&
-        !strcmp("/link.to.lowdir/inner.txt" + walk.link_rest_offset,
-                "inner.txt") &&
-        !strcmp("/link.to.lowdir/inner.txt" + walk.link_guest_offset,
+        !strcmp(through_link + walk.link_rest_offset, "inner.txt") &&
+        !strcmp(through_link + walk.link_guest_offset,
                 "link.to.lowdir/inner.txt"))
         host_ok();
     else
