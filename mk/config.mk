@@ -83,6 +83,33 @@ ifeq ($(WERROR),1)
 CFLAGS += -Werror
 endif
 
+# Hardening. This process parses input the guest fully controls (its ELF, every
+# syscall argument, FUSE frames, netlink messages, sockaddr and cmsg blobs), so
+# the cheap compiler-side checks are worth their cost here even though the
+# bounds math itself is proved in src/proved/. PIE is already the Darwin
+# default; -fstack-protector-strong and _FORTIFY_SOURCE are not.
+#
+# _FORTIFY_SOURCE is skipped under AddressSanitizer alone, which predefines it
+# to 0 on purpose (its interceptors do the same job), so redefining it is a
+# -Wmacro-redefined error under the -Werror above. UBSAN and TSAN predefine
+# nothing and keep it, which is what makes those lanes exercise the same libc
+# entry points (__memcpy_chk and the rest) the shipped binary calls.
+#
+# Every -fsanitize= argument is split on commas so the test is an exact name
+# match. A substring test for -fsanitize=address is order-dependent while
+# reading as if it were not: it answers correctly for
+# "-fsanitize=address,undefined" and wrongly for "-fsanitize=undefined,address",
+# the same request spelled the other way round, which then fails the build on
+# the macro redefinition.
+sanitize_comma := ,
+SANITIZERS := $(subst $(sanitize_comma), ,\
+                $(patsubst -fsanitize=%,%,$(filter -fsanitize=%,$(CFLAGS))))
+
+CFLAGS += -fstack-protector-strong
+ifeq ($(filter address,$(SANITIZERS)),)
+CFLAGS += -D_FORTIFY_SOURCE=2
+endif
+
 ifneq ($(strip $(ELFUSE_NR_EMBEDDER_HVC6)),)
 CFLAGS += -DELFUSE_NR_EMBEDDER_HVC6=$(ELFUSE_NR_EMBEDDER_HVC6)
 endif
