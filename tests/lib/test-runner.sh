@@ -97,6 +97,12 @@ test_report()
         fail) printf "%s [ ${RED}FAIL${RESET} ]%s\n" "$name" "$detail" ;;
         skip) printf "%s [ ${YELLOW}SKIP${RESET} ]%s\n" "$name" "$detail" ;;
         xfail) printf "%s [ ${YELLOW}XFAIL${RESET} ]%s\n" "$name" "$detail" ;;
+        # No bracketed verdict, because the test has not been decided yet and
+        # every other state here is one the summary counts. The blanks are as
+        # wide as the FAIL and SKIP tags, which is the closest a single width
+        # gets: the verdicts do not share a column either (OK is 7 wide, FAIL
+        # and SKIP 9, XFAIL 10).
+        info) printf "%s %-8s%s\n" "$name" "" "$detail" ;;
     esac
 }
 
@@ -173,11 +179,15 @@ run()
     # the host is actually busy, so an idle machine still reports a timeout
     # immediately and pays nothing. Every genuine hang this has caught (an
     # execve deadlock, a restarted timeout that never expired) reproduced on
-    # every attempt, so a second one still fails.
+    # every attempt, so a second one still fails. The retry samples to its own
+    # file so the first attempt's stack, taken in the state that produced the
+    # timeout, survives.
     if [ "$harness_timed_out" -eq 1 ] && test_host_is_busy; then
-        test_report skip "$tool" " (timeout under host load; re-running)"
+        # Informational, not a verdict: the test has not been decided yet, so
+        # this must not advance the skip counter the summary reports.
+        test_report info "$tool" " (timeout under host load; re-running)"
         hang_sample_arm "$tool" "$TEST_TIMEOUT" \
-            "${BUILD_DIR:-build}/test-timeouts/$(basename "$tool")-hang.txt"
+            "${BUILD_DIR:-build}/test-timeouts/$(basename "$tool")-hang-retry.txt"
         start_us=$(epoch_us)
         if output=$(timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} \
             "$(test_tool_path "$tool")" "$@" 2>&1); then

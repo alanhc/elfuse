@@ -276,6 +276,41 @@ evaluate_result()
     return 0
 }
 
+# Run one test binary and record the outcome in rc and output.
+#
+# One function for the first attempt and the host-load retry both. Not
+# tidiness: the two drifted the moment they were written apart, and the retry
+# went in without the descriptor limit the first attempt applies, so a
+# constrained test was re-run as a different test.
+#
+# ulimit runs in the subshell that produces output, and a failure to raise it
+# exits that subshell with 125 rather than chaining into timeout. A && chain
+# reports ulimit's own status, which the caller cannot tell from the binary's,
+# and the binary never ran at all.
+run_test_binary()
+{
+    local binary="$1" nofile="$2" sample="$3"
+    shift 3
+
+    hang_sample_arm "$binary" "$TIMEOUT" "$sample"
+    if [ -n "$nofile" ]; then
+        output=$(
+            ulimit -n "$nofile" 2> /dev/null || exit 125
+            exec timeout "$TIMEOUT" "$ELFUSE" "$binary" "$@" 2>&1
+        )
+        rc=$?
+    else
+        output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" "$@" 2>&1)
+        rc=$?
+    fi
+
+    if [ "$rc" -eq 124 ]; then
+        hang_sample_finish 1
+    else
+        hang_sample_finish 0
+    fi
+}
+
 report_case()
 {
     local state="$1"
@@ -286,6 +321,12 @@ report_case()
         ok) printf "%-45s [ ${GREEN}OK${RESET} ]%s\n" "$name" "$detail" ;;
         fail) printf "%-45s [ ${RED}FAIL${RESET} ]%s\n" "$name" "$detail" ;;
         skip) printf "%-45s [ ${YELLOW}SKIP${RESET} ]%s\n" "$name" "$detail" ;;
+        # No bracketed verdict, because the test has not been decided yet and
+        # every other state here is one the summary counts. The blanks are as
+        # wide as the FAIL and SKIP tags, which is the closest a single width
+        # gets: the verdicts do not share a column either (OK is 7 wide, FAIL
+        # and SKIP 9).
+        info) printf "%-45s %-8s%s\n" "$name" "" "$detail" ;;
     esac
 }
 
@@ -375,56 +416,33 @@ for i in "${filtered_idx[@]}"; do
     # "${array[@]}". Host-limit annotations live in the manifest. Keep this
     # execution path generic so adding another constrained test does not require
     # a name-qualified branch here.
-    hang_sample_arm "$binary" "$TIMEOUT" \
-        "$TESTDIR_ABS/test-timeouts/$(basename "$binary")-hang.txt"
-
     if host_nofile=$(elfuse_test_host_nofile "$TEST_LIST" "$name"); then
-        if [ -n "$host_nofile" ]; then
-            if output=$(ulimit -n "$host_nofile" \
-                && timeout "$TIMEOUT" "$ELFUSE" "$binary" \
-                    ${args[@]+"${args[@]}"} 2>&1); then
-                rc=0
-            else
-                rc=$?
-            fi
-        elif output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" \
-            ${args[@]+"${args[@]}"} 2>&1); then
-            rc=0
-        else
-            rc=$?
-        fi
+        run_test_binary "$binary" "$host_nofile" \
+            "$TESTDIR_ABS/test-timeouts/$(basename "$binary")-hang.txt" \
+            ${args[@]+"${args[@]}"}
     else
         output="invalid host_nofile test annotation"
         rc=125
-    fi
-
-    if [ "$rc" -eq 124 ]; then
-        hang_sample_finish 1
-    else
-        hang_sample_finish 0
     fi
 
     # A watchdog firing on a loaded machine reports the neighbours, not the
     # code. Re-run once, and only when the host really is busy, so an idle
     # machine still reports the timeout at once and pays nothing for this. Every
     # genuine hang the suite has caught reproduced on every attempt, so a second
-    # timeout still fails. The sample from the first attempt is kept: it is the
-    # one taken while the suite was in the state that produced it.
+    # timeout still fails.
+    #
+    # Its sample goes to a separate file. The first attempt's is the one taken
+    # while the suite was in the state that produced the timeout, so it is the
+    # one worth keeping.
     if [ "$rc" -eq 124 ] && test_host_is_busy; then
-        report_case skip "$name" " (timeout under host load; re-running)"
-        hang_sample_arm "$binary" "$TIMEOUT" \
-            "$TESTDIR_ABS/test-timeouts/$(basename "$binary")-hang.txt"
-        if output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" \
-            ${args[@]+"${args[@]}"} 2>&1); then
-            rc=0
+        if [ "$TAP" -eq 1 ]; then
+            echo "# $name timed out under host load; re-running"
         else
-            rc=$?
+            report_case info "$name" "timed out under host load; re-running"
         fi
-        if [ "$rc" -eq 124 ]; then
-            hang_sample_finish 1
-        else
-            hang_sample_finish 0
-        fi
+        run_test_binary "$binary" "$host_nofile" \
+            "$TESTDIR_ABS/test-timeouts/$(basename "$binary")-hang-retry.txt" \
+            ${args[@]+"${args[@]}"}
     fi
 
     if evaluate_result "$rc" "$expected" "$stdout_pat" "$output"; then
