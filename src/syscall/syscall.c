@@ -2556,6 +2556,17 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
     int nr = (int) x8;
     const syscall_entry_t *entry = NULL;
 
+    /* Where this thread is, for the execve teardown to report when a sibling
+     * will not leave. It covers the inline fast paths too, not just the table
+     * handlers: the read/write one performs the transfer itself, and a ready
+     * poll reserves nothing, so a concurrent reader of the same pipe or socket
+     * can take the data and leave the call parked in the host with no wake able
+     * to reach it. That is the shape of the failure this reports on, so
+     * excluding the path would answer "running guest code" for the case that
+     * most needs naming.
+     */
+    thread_note_syscall(nr);
+
     /* Per-syscall histogram for the dynamic-linker bring-up storm. Zero when
      * disabled so the bottom-of-dispatch record path is a single branch.
      */
@@ -2761,6 +2772,7 @@ slow_path:
                     syscall_hist_record(nr, hist_end_ns - hist_start_ns);
                 syscall_hist_freeze("frozen at first execve");
             }
+            thread_note_syscall(-1);
             return SYSCALL_EXEC_HAPPENED;
         }
     } else {
@@ -2777,6 +2789,8 @@ slow_path:
 
 
 fast_done:
+    thread_note_syscall(-1);
+
     if (!should_exit) {
         /* Verbose: log syscall return value and file paths */
         if (verbose) {

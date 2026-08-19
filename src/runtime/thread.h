@@ -103,6 +103,13 @@ typedef struct thread_entry {
     uint64_t altstack_size; /* Alternate signal stack size */
     bool on_altstack;       /* True if currently delivering on altstack */
 
+    /* The Linux syscall this thread is inside, or -1 between calls. Written
+     * around the handler call in syscall_dispatch and read only by the execve
+     * teardown, which otherwise reports a sibling that would not leave by tid
+     * alone and leaves the wait it is parked in to be guessed.
+     */
+    int32_t in_syscall;
+
     /* Robust futex list head (GVA). When non-zero, thread exit walks the list
      * and sets FUTEX_OWNER_DIED on each lock word.
      */
@@ -432,6 +439,13 @@ bool thread_leader_work_pending(void);
  * cap expired.
  */
 int thread_stop_requested(void);
+
+/* Record the syscall this thread is entering, or -1 on the way out. Relaxed:
+ * the only reader is a diagnostic on a path that is already failing, and
+ * ordering it against every syscall would cost the whole guest to sharpen one
+ * log line.
+ */
+void thread_note_syscall(int nr);
 
 /* True when the only thing thread_stop_requested is reporting is an execve
  * handed to this leader: nothing is tearing this thread down. The wait it broke

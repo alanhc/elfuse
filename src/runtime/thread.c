@@ -226,6 +226,7 @@ rescan:
         memset(t, 0, sizeof(*t));
         t->generation = next_generation;
         t->sp_el1_slot = -1; /* No SP_EL1 yet; thread_alloc_sp_el1 fills this */
+        t->in_syscall = -1;  /* Not in one; syscall_dispatch fills this */
         t->guest_tid = tid;
         if (stack_start < stack_end) {
             t->stack_map_start = stack_start;
@@ -1044,6 +1045,12 @@ static int thread_stop_requested_for_leader_work(void)
     return thread_leader_work_pending() && thread_current_is_leader();
 }
 
+void thread_note_syscall(int nr)
+{
+    if (current_thread)
+        __atomic_store_n(&current_thread->in_syscall, nr, __ATOMIC_RELAXED);
+}
+
 int thread_stop_requested(void)
 {
     return thread_exec_stop_requested() || proc_exit_group_requested() ||
@@ -1205,9 +1212,19 @@ int thread_exec_de_thread(void)
             remaining, (long long) elapsed_ms, (long long) progress_ms);
         pthread_mutex_lock(&thread_lock);
         THREAD_FOR_EACH_ACTIVE (t) {
-            if (thread_is_joinable_sibling(t))
-                log_warn("execve: tid=%lld has not left the guest yet",
-                         (long long) t->guest_tid);
+            if (!thread_is_joinable_sibling(t))
+                continue;
+            int32_t nr = __atomic_load_n(&t->in_syscall, __ATOMIC_RELAXED);
+            if (nr < 0)
+                log_warn(
+                    "execve: tid=%lld has not left the guest yet, "
+                    "running guest code",
+                    (long long) t->guest_tid);
+            else
+                log_warn(
+                    "execve: tid=%lld has not left the guest yet, "
+                    "in syscall %d",
+                    (long long) t->guest_tid, nr);
         }
         pthread_mutex_unlock(&thread_lock);
     }
