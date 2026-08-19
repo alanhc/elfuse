@@ -126,7 +126,24 @@ static int64_t connect_nonblock_wait(int host_fd,
 {
     if (connect(host_fd, sa, len) == 0)
         return 0;
-    if (errno != EINPROGRESS && errno != EINTR)
+
+    /* EALREADY is this same connect still in flight. Linux never reports it to
+     * a blocking caller: __inet_stream_connect sets it, then falls through to
+     * wait out TCP_SYN_SENT and returns 0. Waiting below does the same.
+     *
+     * EISCONN is that connect having landed, and it is only swallowed for a
+     * restarted SVC. A guest that calls connect twice on a socket whose first
+     * connect returned is asking a different question and Linux answers EISCONN
+     * (sock->state is SS_CONNECTED by then). After a restart the guest never
+     * saw the first attempt return at all, so Linux would be in SS_CONNECTING
+     * and would answer 0; reporting EISCONN there would leak elfuse's own retry
+     * into a syscall the guest issued once. Measured with a connect loop under
+     * a sibling exec loop: 4000/4000 succeed on Linux, and without this gate
+     * about 60% came back EISCONN.
+     */
+    bool resuming = syscall_is_restarted();
+    if (errno != EINPROGRESS && errno != EINTR && errno != EALREADY &&
+        !(resuming && errno == EISCONN))
         return linux_errno();
 
     int64_t waited = io_wait_fd_or_interrupted(host_fd, POLLOUT);
