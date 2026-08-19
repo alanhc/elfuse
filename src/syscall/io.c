@@ -776,11 +776,14 @@ static uint32_t mac_oflag_to_linux(tcflag_t mf)
 #define LINUX_CLOCAL 0x0800
 
 /* LINUX_CBAUD 0x0000100f and LINUX_CBAUDEX 0x00001000 encode baud in c_cflag;
- * macOS uses dedicated speed fields, so termios translation ignores CBAUD on
- * translation. TCGETS2/TCSETS2 use BOTHER to signal numeric c_ispeed/c_ospeed.
+ * macOS uses dedicated speed fields, so the c_cflag translation tables skip
+ * CBAUD and the TCGETS/TCSETS arms convert it with the helpers below.
+ * TCGETS2/TCSETS2 use BOTHER to signal numeric c_ispeed/c_ospeed.
  */
 #define LINUX_CBAUD 0x100f
 #define LINUX_BOTHER 0x1000
+/* CIBAUD is CBAUD shifted by IBSHIFT (asm-generic/termbits.h). */
+#define LINUX_IBSHIFT 16
 
 /* Decode a Linux CBAUD field value to a numeric baud rate.
  * Returns the numeric rate, or 0 for B0 / unknown. Standard rates B0-B38400 are
@@ -806,6 +809,68 @@ static speed_t linux_cbaud_to_speed(uint32_t cbaud)
     return 0;
 }
 
+/* Encode a numeric baud rate as a Linux CBAUD field value (the inverse of
+ * linux_cbaud_to_speed).
+ *
+ * Returns the B* index for the standard rates, or BOTHER for a rate Linux has
+ * no symbolic name for, so cfgetospeed() in the guest sees the same constant it
+ * passed to cfsetospeed().
+ */
+static uint32_t speed_to_linux_cbaud(speed_t speed)
+{
+    for (uint32_t i = 0; i < 16; i++) {
+        if (linux_cbaud_to_speed(i) == speed)
+            return i;
+        if (i && linux_cbaud_to_speed(LINUX_BOTHER | i) == speed)
+            return LINUX_BOTHER | i;
+    }
+    return LINUX_BOTHER;
+}
+
+/* Encode the host line rates into the CBAUD and CIBAUD fields of a Linux
+ * c_cflag, the way tty_termios_encode_baud_rate() does: CBAUD always carries
+ * the output rate; CIBAUD is set only when the input rate differs, and is left
+ * at B0 ("same as output") otherwise.
+ */
+static uint32_t linux_cflag_speed_bits(const struct termios *t)
+{
+    speed_t ospeed = cfgetospeed(t), ispeed = cfgetispeed(t);
+    uint32_t bits = speed_to_linux_cbaud(ospeed);
+    if (ispeed != ospeed)
+        bits |= speed_to_linux_cbaud(ispeed) << LINUX_IBSHIFT;
+    return bits;
+}
+
+/* Apply the CBAUD/CIBAUD fields of a plain (non-termios2) Linux c_cflag to a
+ * host termios, following drivers/tty/tty_baudrate.c: the output rate is the
+ * CBAUD table entry; the input rate is CIBAUD's, or the output rate when CIBAUD
+ * is B0. Two values carry no rate and leave the host speed untouched: B0 in
+ * CBAUD, which on Linux means "drop DTR/RTS" (not emulated), and a bare BOTHER,
+ * which the kernel resolves from the tty's current c_ospeed/c_ispeed because
+ * the plain struct has no speed fields -- so a tcgetattr/tcsetattr round trip
+ * on a port set to 74880 through termios2 must not collapse the line to B0.
+ */
+static int apply_linux_cflag_speeds(struct termios *t, uint32_t c_cflag)
+{
+    uint32_t cbaud = c_cflag & LINUX_CBAUD;
+    uint32_t cibaud = (c_cflag >> LINUX_IBSHIFT) & LINUX_CBAUD;
+    speed_t orate = linux_cbaud_to_speed(cbaud);
+
+    /* Both B0 and a bare BOTHER decode to 0, but they must part ways in the
+     * CIBAUD-empty fallback: BOTHER resolves the input rate from the tty's
+     * current output rate (tty_termios_baud_rate reads c_ospeed), while B0
+     * carries no rate at all and must leave a split input rate alone.
+     */
+    speed_t irate = cibaud == 0
+                        ? (cbaud == LINUX_BOTHER ? cfgetospeed(t) : orate)
+                        : linux_cbaud_to_speed(cibaud);
+    if (orate && cfsetospeed(t, orate) < 0)
+        return -1;
+    if (irate && cfsetispeed(t, irate) < 0)
+        return -1;
+    return 0;
+}
+
 /* CSIZE: Linux CS5=0x00, CS6=0x10, CS7=0x20, CS8=0x30
  *        macOS CS5=0x00, CS6=0x100, CS7=0x200, CS8=0x300
  */
@@ -817,7 +882,9 @@ static const termios_field_pair_t csize_map[] = {
 };
 
 /* CBAUD and CBAUDEX are absent on purpose: the baud rate travels in the
- * c_ispeed and c_ospeed fields, not in c_cflag.
+ * c_ispeed and c_ospeed fields, not in c_cflag. The TCGETS/TCSETS arms in
+ * sys_ioctl encode and decode the CBAUD field separately, since plain termios
+ * has no speed fields for a guest libc to consult.
  */
 static const termios_flag_pair_t cflag_map[] = {
     {LINUX_CSTOPB, CSTOPB}, {LINUX_CREAD, CREAD}, {LINUX_PARENB, PARENB},
@@ -2276,7 +2343,12 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         linux_termios_t lt = {0};
         lt.c_iflag = mac_iflag_to_linux(t.c_iflag);
         lt.c_oflag = mac_oflag_to_linux(t.c_oflag);
-        lt.c_cflag = mac_cflag_to_linux(t.c_cflag);
+
+        /* Plain termios has no speed fields: cfgetospeed()/cfgetispeed() in the
+         * guest decode CBAUD/CIBAUD out of c_cflag, so encode the host rates
+         * back into it.
+         */
+        lt.c_cflag = mac_cflag_to_linux(t.c_cflag) | linux_cflag_speed_bits(&t);
         lt.c_lflag = mac_lflag_to_linux(t.c_lflag);
         termios_copy_cc_to_linux(lt.c_cc, t.c_cc);
         if (guest_write_small(g, arg, &lt, sizeof(lt)) < 0) {
@@ -2305,6 +2377,16 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         t.c_cflag = linux_cflag_to_mac(lt.c_cflag);
         t.c_lflag = linux_lflag_to_mac(lt.c_lflag);
         termios_copy_cc_to_mac(t.c_cc, lt.c_cc);
+
+        /* musl and glibc <= 2.41 store the rate in CBAUD (and CIBAUD for a
+         * split input rate) and issue plain TCSETS; glibc 2.42+ always uses
+         * TCSETS2. Dropping the field here would leave a USB-serial port at
+         * whatever speed the host last had.
+         */
+        if (apply_linux_cflag_speeds(&t, lt.c_cflag) < 0) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
         int action = termios_action_for(request);
         if (tcsetattr(host_fd, action, &t) < 0) {
             host_fd_ref_close(&host_ref);
@@ -2315,9 +2397,11 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
     }
 
     case LINUX_TCGETS2: {
-        /* termios2 variant: same as TCGETS but with c_ispeed/c_ospeed. Set
-         * BOTHER in c_cflag so the guest uses the numeric speed fields rather
-         * than decoding CBAUD (which mac_cflag_to_linux drops).
+        /* termios2 variant: same as TCGETS plus numeric c_ispeed/c_ospeed. The
+         * kernel hands back the same c_cflag for both requests (the B* index
+         * when the rate has one, BOTHER otherwise), so encode it the same way
+         * rather than forcing BOTHER; the numeric fields are always filled, as
+         * the kernel does.
          */
         struct termios t;
         if (tcgetattr(host_fd, &t) < 0) {
@@ -2327,7 +2411,8 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         linux_termios2_t lt2 = {0};
         lt2.c_iflag = mac_iflag_to_linux(t.c_iflag);
         lt2.c_oflag = mac_oflag_to_linux(t.c_oflag);
-        lt2.c_cflag = mac_cflag_to_linux(t.c_cflag) | LINUX_BOTHER;
+        lt2.c_cflag =
+            mac_cflag_to_linux(t.c_cflag) | linux_cflag_speed_bits(&t);
         lt2.c_lflag = mac_lflag_to_linux(t.c_lflag);
         termios_copy_cc_to_linux(lt2.c_cc, t.c_cc);
         lt2.c_ispeed = (uint32_t) cfgetispeed(&t);
@@ -2362,22 +2447,31 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         t.c_lflag = linux_lflag_to_mac(lt2.c_lflag);
         termios_copy_cc_to_mac(t.c_cc, lt2.c_cc);
 
-        /* Resolve baud rate: BOTHER means use numeric c_ispeed/c_ospeed;
-         * otherwise decode the standard CBAUD index to a numeric rate.
+        /* Resolve the rates the way tty_termios_baud_rate() and
+         * tty_termios_input_baud_rate() do: the output rate is CBAUD's table
+         * entry, or the numeric c_ospeed for BOTHER; the input rate is CIBAUD's
+         * -- B0 meaning "same as output", BOTHER meaning the numeric c_ispeed.
+         * The TCGETS2 arm above reports a split host rate as CBAUD+CIBAUD
+         * indexes, so an unchanged tcgetattr/tcsetattr pair from a termios2
+         * libc must decode CIBAUD or it would collapse the input rate to the
+         * output rate. B0 output (drop DTR/RTS on Linux, not emulated) leaves
+         * the host speed untouched, as in the plain TCSETS arm.
          */
         uint32_t cbaud = lt2.c_cflag & LINUX_CBAUD;
-        speed_t ispeed, ospeed;
-        if (cbaud == LINUX_BOTHER) {
-            ispeed = (speed_t) lt2.c_ispeed;
-            ospeed = (speed_t) lt2.c_ospeed;
-        } else {
-            speed_t rate = linux_cbaud_to_speed(cbaud);
-            ispeed = rate;
-            ospeed = rate;
-        }
-        if (cfsetispeed(&t, ispeed) < 0 || cfsetospeed(&t, ospeed) < 0) {
-            host_fd_ref_close(&host_ref);
-            return linux_errno();
+        uint32_t cibaud = (lt2.c_cflag >> LINUX_IBSHIFT) & LINUX_CBAUD;
+        speed_t ospeed = cbaud == LINUX_BOTHER ? (speed_t) lt2.c_ospeed
+                                               : linux_cbaud_to_speed(cbaud);
+        if (ospeed != 0) {
+            speed_t ispeed = cibaud == 0 ? ospeed
+                             : cibaud == LINUX_BOTHER
+                                 ? (speed_t) lt2.c_ispeed
+                                 : linux_cbaud_to_speed(cibaud);
+            if (ispeed == 0)
+                ispeed = ospeed;
+            if (cfsetispeed(&t, ispeed) < 0 || cfsetospeed(&t, ospeed) < 0) {
+                host_fd_ref_close(&host_ref);
+                return linux_errno();
+            }
         }
         int action = termios_action_for(request);
         if (tcsetattr(host_fd, action, &t) < 0) {
