@@ -1153,25 +1153,29 @@ int thread_exec_de_thread(void)
      * costs a threaded execve milliseconds instead of a poll quantum per parked
      * sibling (measured: 38 s to 2.5 s over 200 threaded execs).
      *
-     * How long to wait for is measured in departures, not in iterations. A
-     * fixed count has to be chosen against the slowest re-check quantum a
-     * parked sibling owes (200 ms, in the io wait) multiplied by how far behind
-     * schedule the host is running, and that multiplier is not a property this
-     * code can know: CI runs four sanitizer lanes on one machine, where a
-     * count wide enough is dead time on every threaded execve elsewhere.
-     * Waiting while siblings are still leaving separates a slow host from
-     * siblings nothing wakes, which is what the stall interval and the ceiling
-     * below are for.
+     * One wall-clock ceiling bounds the wait, and nothing else does. Departures
+     * look like a liveness signal and are not one: once a single sibling is
+     * left there are none left to observe, so a stall interval only ever
+     * measures that last sibling's own latency, which is the fixed bound it was
+     * meant to replace. Sized honestly it would have to cover the slowest
+     * re-check quantum a parked sibling owes (200 ms, in the io wait)
+     * multiplied by how far behind schedule the host is running, and that
+     * multiplier is not a property this code can know: CI runs the sanitizer
+     * lanes of several workflows on one machine, where a 1000 ms stall interval
+     * gave up on a sibling sitting in mmap and sent an otherwise healthy execve
+     * to the post-PNR fatal exit.
      *
-     * Both are wall-clock, because the sleep is a floor: an oversubscribed host
+     * Spending the whole budget here rather than splitting it with the join
+     * below is what the re-poke is for: this loop kicks the wake set every
+     * iteration, and the join only polls. Time moved from here to there buys a
+     * parked sibling nothing.
+     *
+     * Wall-clock, because the sleep is a floor: an oversubscribed host
      * stretches each iteration well past its 1 ms, so a bound counted in
      * iterations would run for minutes and blow the caller's timeout instead of
      * reaching the diagnosed exit.
      */
-    enum {
-        DE_THREAD_STALL_MS = 1000,   /* no departures before giving up */
-        DE_THREAD_CEILING_MS = 10000 /* total, however well it is going */
-    };
+    enum { DE_THREAD_CEILING_MS = 10000 };
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
 
@@ -1193,8 +1197,7 @@ int thread_exec_de_thread(void)
             remaining = now;
             progress_ms = elapsed_ms;
         }
-        if (elapsed_ms >= DE_THREAD_CEILING_MS ||
-            elapsed_ms - progress_ms >= DE_THREAD_STALL_MS)
+        if (elapsed_ms >= DE_THREAD_CEILING_MS)
             break;
     }
 
