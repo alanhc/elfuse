@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,14 @@
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000
 #endif
+
+/* termios2 is only reachable through asm/termbits.h, which clashes with
+ * termios.h; spell the asm-generic values (shared by aarch64 and x86_64).
+ */
+#define TEST_TCGETS2 0x802c542a
+#define TEST_TCSETS2 0x402c542b
+#define TEST_CBAUD 0x100f
+#define TEST_BOTHER 0x1000
 #ifndef SYS_statx
 #define SYS_statx 291
 #endif
@@ -1378,6 +1387,182 @@ int main(void)
         }
         if (fm >= 0)
             close(fm);
+    }
+
+    /* Serial line control on a slave. The guest libc's tcsetattr() encodes the
+     * rate in CBAUD and issues plain TCSETS (glibc's cfsetspeed, musl always),
+     * so a translation that only reads the termios2 speed fields silently
+     * leaves the host line at its old rate and tcgetattr() reports B0 forever.
+     */
+    {
+        int sm = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+        unsigned int sn = 0;
+        int sunlock = 0;
+        if (sm >= 0 && ioctl(sm, TIOCGPTN, &sn) == 0 &&
+            ioctl(sm, TIOCSPTLCK, &sunlock) == 0) {
+            char spath[64];
+            snprintf(spath, sizeof(spath), "/dev/pts/%u", sn);
+            int sl = open(spath, O_RDWR | O_NOCTTY);
+            struct termios stio;
+            int sget = sl >= 0 ? tcgetattr(sl, &stio) : -1;
+
+            TEST("tcsetattr(B115200) round-trips through tcgetattr");
+            int sset = -1;
+            struct termios sback;
+            memset(&sback, 0, sizeof(sback));
+            if (sget == 0) {
+                cfsetispeed(&stio, B115200);
+                cfsetospeed(&stio, B115200);
+                sset = tcsetattr(sl, TCSANOW, &stio);
+                if (sset == 0)
+                    sget = tcgetattr(sl, &sback);
+            }
+            EXPECT_TRUE(sset == 0 && sget == 0 &&
+                            cfgetospeed(&sback) == B115200 &&
+                            cfgetispeed(&sback) == B115200,
+                        "CBAUD dropped on TCSETS or not reported by TCGETS");
+
+            /* A plain tcgetattr/tcsetattr pair must not touch the line: a
+             * BOTHER-only CBAUD (what TCGETS reports for a nonstandard host
+             * rate) resolves to the current speed on Linux, not to B0.
+             */
+            TEST("tcsetattr with an unchanged termios keeps the rate");
+            int skeep = sget == 0 ? tcsetattr(sl, TCSANOW, &sback) : -1;
+            struct termios sagain;
+            memset(&sagain, 0, sizeof(sagain));
+            int sget2 = skeep == 0 ? tcgetattr(sl, &sagain) : -1;
+            EXPECT_TRUE(
+                skeep == 0 && sget2 == 0 && cfgetospeed(&sagain) == B115200,
+                "unchanged tcsetattr disturbed the line rate");
+
+            /* Set a rate Linux has no B* constant for through termios2 (the
+             * path pyserial takes for custom baud rates), then do the plain
+             * pair: TCGETS can only report BOTHER for it, and TCSETS must
+             * resolve that to the current 74880, not cfsetospeed(B0).
+             */
+            TEST("a nonstandard rate survives a plain tcgetattr/tcsetattr");
+            struct {
+                uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
+                uint8_t c_line;
+                uint8_t c_cc[19];
+                uint32_t c_ispeed, c_ospeed;
+            } st2;
+            memset(&st2, 0, sizeof(st2));
+            int s2get = sl >= 0 ? ioctl(sl, TEST_TCGETS2, &st2) : -1;
+            int s2set = -1;
+            if (s2get == 0) {
+                st2.c_cflag = (st2.c_cflag & ~TEST_CBAUD) | TEST_BOTHER;
+                st2.c_ispeed = st2.c_ospeed = 74880;
+                s2set = ioctl(sl, TEST_TCSETS2, &st2);
+            }
+            struct termios splain;
+            memset(&splain, 0, sizeof(splain));
+            int s2pair = s2set == 0 && tcgetattr(sl, &splain) == 0
+                             ? tcsetattr(sl, TCSANOW, &splain)
+                             : -1;
+            memset(&st2, 0, sizeof(st2));
+            int s2after = s2pair == 0 ? ioctl(sl, TEST_TCGETS2, &st2) : -1;
+            EXPECT_TRUE(
+                s2after == 0 && st2.c_ospeed == 74880 && st2.c_ispeed == 74880,
+                "plain TCSETS with a BOTHER-only CBAUD changed the "
+                "rate");
+
+            /* A split rate travels in CIBAUD on a plain TCSETS (musl's
+             * cfsetispeed writes it; glibc <= 2.41 does not) and the kernel
+             * reports CIBAUD back only when the rates differ
+             * (tty_termios_encode_baud_rate), so a raw round trip must see both
+             * fields and a re-unified rate must clear CIBAUD again.
+             */
+            TEST("split input rate round-trips through CIBAUD");
+            struct termios ssplit;
+            int ssget = sl >= 0 ? tcgetattr(sl, &ssplit) : -1;
+            int ssset = -1, ssback = -1;
+            struct termios ssaw;
+            memset(&ssaw, 0, sizeof(ssaw));
+            if (ssget == 0) {
+                ssplit.c_cflag &= ~(TEST_CBAUD | (TEST_CBAUD << 16));
+                ssplit.c_cflag |= B115200 | (B9600 << 16);
+                ssset = ioctl(sl, TCSETS, &ssplit);
+                if (ssset == 0)
+                    ssback = ioctl(sl, TCGETS, &ssaw);
+            }
+            EXPECT_TRUE(ssset == 0 && ssback == 0 &&
+                            (ssaw.c_cflag & TEST_CBAUD) == B115200 &&
+                            ((ssaw.c_cflag >> 16) & TEST_CBAUD) == B9600,
+                        "CIBAUD not applied by TCSETS or not reported by "
+                        "TCGETS");
+
+            /* B0 in both CBAUD and CIBAUD carries no rate: a guest that
+             * hand-rolled a termios with the baud bits zeroed must not disturb
+             * the split host rate through the CIBAUD-empty fallback (B0 and
+             * bare BOTHER both decode to 0 but only BOTHER resolves from the
+             * current output rate).
+             */
+            TEST("CBAUD=B0 leaves a split rate untouched");
+            struct termios sb0;
+            int sb0get = sl >= 0 ? tcgetattr(sl, &sb0) : -1;
+            int sb0set = -1, sb0chk = -1;
+            if (sb0get == 0) {
+                struct termios sraw = sb0;
+                sraw.c_cflag &= ~(TEST_CBAUD | (TEST_CBAUD << 16));
+                sb0set = ioctl(sl, TCSETS, &sraw);
+                memset(&st2, 0, sizeof(st2));
+                sb0chk = sb0set == 0 ? ioctl(sl, TEST_TCGETS2, &st2) : -1;
+            }
+            EXPECT_TRUE(
+                sb0chk == 0 && st2.c_ispeed == 9600 && st2.c_ospeed == 115200,
+                "B0 fallback collapsed the split rate");
+
+            /* The same split rate must survive an unchanged tcgetattr/tcsetattr
+             * pair through the termios2 requests (what glibc 2.42 issues):
+             * TCGETS2 reports CBAUD+CIBAUD indexes, and TCSETS2 must decode
+             * CIBAUD instead of collapsing the input rate to the output rate.
+             */
+            TEST("split rate survives an unchanged TCGETS2/TCSETS2 pair");
+            memset(&st2, 0, sizeof(st2));
+            int sp2get = ioctl(sl, TEST_TCGETS2, &st2);
+            int sp2ok = sp2get == 0 && (st2.c_cflag & TEST_CBAUD) == B115200 &&
+                        ((st2.c_cflag >> 16) & TEST_CBAUD) == B9600 &&
+                        st2.c_ispeed == 9600 && st2.c_ospeed == 115200;
+            int sp2set = sp2ok ? ioctl(sl, TEST_TCSETS2, &st2) : -1;
+            memset(&st2, 0, sizeof(st2));
+            int sp2after = sp2set == 0 ? ioctl(sl, TEST_TCGETS2, &st2) : -1;
+            EXPECT_TRUE(
+                sp2after == 0 && st2.c_ispeed == 9600 && st2.c_ospeed == 115200,
+                "unchanged TCSETS2 collapsed a split rate");
+
+            int ssuni = -1;
+            if (ssback == 0) {
+                ssaw.c_cflag &= ~(TEST_CBAUD << 16);
+                ssuni = ioctl(sl, TCSETS, &ssaw) == 0 ? ioctl(sl, TCGETS, &ssaw)
+                                                      : -1;
+            }
+            EXPECT_TRUE(ssuni == 0 &&
+                            ((ssaw.c_cflag >> 16) & TEST_CBAUD) == 0 &&
+                            (ssaw.c_cflag & TEST_CBAUD) == B115200,
+                        "CIBAUD B0 did not re-unify the input rate");
+
+            /* TCGETS and TCGETS2 come from the same kernel c_cflag, so their
+             * CBAUD fields must be identical, and a standard rate must show as
+             * the B* index (not BOTHER) in both.
+             */
+            TEST("TCGETS2 reports the same CBAUD as TCGETS");
+            struct termios sagree;
+            memset(&sagree, 0, sizeof(sagree));
+            memset(&st2, 0, sizeof(st2));
+            EXPECT_TRUE(ioctl(sl, TCGETS, &sagree) == 0 &&
+                            ioctl(sl, TEST_TCGETS2, &st2) == 0 &&
+                            (st2.c_cflag & TEST_CBAUD) ==
+                                (sagree.c_cflag & TEST_CBAUD) &&
+                            (st2.c_cflag & TEST_CBAUD) == B115200 &&
+                            st2.c_ospeed == 115200,
+                        "TCGETS2 c_cflag disagrees with TCGETS");
+
+            if (sl >= 0)
+                close(sl);
+        }
+        if (sm >= 0)
+            close(sm);
     }
 
     SUMMARY("test-pty");
