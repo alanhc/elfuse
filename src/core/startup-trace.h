@@ -21,8 +21,7 @@
  * can ask for one without paying for the other.
  */
 
-#ifndef ELFUSE_STARTUP_TRACE_H
-#define ELFUSE_STARTUP_TRACE_H
+#pragma once
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -99,5 +98,3 @@ static inline void startup_trace_step(const char *label, uint64_t start_ns)
     fprintf(stderr, "startup %-28s %8.3f ms\n", label,
             (double) (end_ns - start_ns) / 1000000.0);
 }
-
-#endif /* ELFUSE_STARTUP_TRACE_H */

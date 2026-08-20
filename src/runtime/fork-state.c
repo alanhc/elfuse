@@ -377,7 +377,7 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
         return 0;
     }
 
-    ipc_fd_entry_t *fd_entries = calloc(num_fds, sizeof(ipc_fd_entry_t));
+    ipc_fd_entry_t *fd_entries = calloc(num_fds, sizeof(*fd_entries));
     if (!fd_entries)
         return -1;
 

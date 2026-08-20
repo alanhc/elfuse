@@ -448,7 +448,7 @@ int main(int argc, char **argv)
              * the flag count, so one allocation needs no growth path.
              */
             if (!env_overrides) {
-                env_overrides = (char **) calloc((size_t) argc, sizeof(char *));
+                env_overrides = calloc((size_t) argc, sizeof(char *));
                 if (!env_overrides) {
                     log_error("out of memory");
                     goto cleanup;
@@ -564,7 +564,7 @@ int main(int argc, char **argv)
     bool have_sysroot = (sysroot != NULL || create_sysroot != NULL);
     const char *sysroot_src = create_sysroot ? create_sysroot : sysroot;
     if (have_sysroot) {
-        sysroot_path = (char *) calloc(LINUX_PATH_MAX, 1);
+        sysroot_path = calloc(LINUX_PATH_MAX, 1);
         if (sysroot_path) {
             size_t src_len =
                 str_copy_trunc(sysroot_path, sysroot_src, LINUX_PATH_MAX);
@@ -577,7 +577,7 @@ int main(int argc, char **argv)
     }
     sysroot = sysroot_path;
     guest_argc = argc - arg_start;
-    guest_argv = (const char **) calloc((size_t) guest_argc, sizeof(char *));
+    guest_argv = calloc((size_t) guest_argc, sizeof(char *));
     if (!elf_path || (have_sysroot && !sysroot_path) || !guest_argv) {
         log_error("out of memory");
         goto cleanup;

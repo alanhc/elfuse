@@ -1058,7 +1058,7 @@ int64_t sys_epoll_create1(int flags)
     }
 
     /* Allocate per-instance registration table */
-    epoll_instance_t *inst = calloc(1, sizeof(epoll_instance_t));
+    epoll_instance_t *inst = calloc(1, sizeof(*inst));
     if (!inst) {
         close(kq);
         return -LINUX_ENOMEM;

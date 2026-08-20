@@ -764,7 +764,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         return -LINUX_ENOMEM;
     }
 
-    thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
+    thread_create_args_t *tca = calloc(1, sizeof(*tca));
     if (!tca) {
         thread_deactivate(t);
         pthread_cond_destroy(&startup.cond);
@@ -1193,7 +1193,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         return -LINUX_ENOMEM;
     }
 
-    thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
+    thread_create_args_t *tca = calloc(1, sizeof(*tca));
     if (!tca) {
         thread_deactivate(t);
         return -LINUX_ENOMEM;
