@@ -145,6 +145,8 @@ The build signs `build/elfuse` before use. Override the signing identity with
   reference -- runtime lifecycle, HVF constraints, EL1 shim and HVC
   protocol, page-table splitting, syscall translation tables, threads
   / futex, fork / clone IPC, signals, ptrace, and the GDB stub.
+- [CONTRIBUTING.md](CONTRIBUTING.md): the coding style, the formatters
+  and what each gate enforces, and the commit-message rules.
 
 ## Build And Validation
 
@@ -192,6 +194,24 @@ do.
 - `uname` and `/proc/version` report Linux 6.18 LTS, a floor for
   version-gated userspace; `src/syscall/dispatch.tbl` states what is
   implemented.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It is the tracked style
+guide: the C conventions this tree actually follows, which formatter
+owns which part of a file, what CI gates and what it does not, and the
+seven commit-message rules the log is written to.
+
+Two things settle most review comments before they are written:
+
+```sh
+make indent        # apply every formatter, comment reflow included
+make check-format  # verify without rewriting
+```
+
+File an issue before a substantial change, so the design discussion
+happens before the effort does. Typo fixes, small refactors, and
+comment or documentation edits need no issue.
 
 ## License
 

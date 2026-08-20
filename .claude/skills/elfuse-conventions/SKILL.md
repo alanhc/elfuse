@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions that are not guessable from the code: the seven-rule commit message style, ASCII-only source comments, kebab-case filenames, the type and return conventions at the ABI boundary, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
+description: elfuse conventions that CONTRIBUTING.md does not carry: the register a comment or commit message is written in, comment brevity, the type and return conventions at the ABI boundary, PR etiquette, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. CONTRIBUTING.md is the tracked style guide and settles C style, formatter mechanics, and the gates; read it first and use this for what it leaves to a reviewer. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
 ---
 
 # elfuse conventions
@@ -8,6 +8,17 @@ description: elfuse conventions that are not guessable from the code: the seven-
 Almost nothing here is enforced by a gate. `clang-format` settles formatting
 and `make check-format` settles the generated files, so those are not in this
 file; what is left is the set a reviewer would otherwise have to say out loud.
+
+`CONTRIBUTING.md` is the other half and the tracked one. It settles C style,
+which formatter and which version, what each gate actually covers, and the
+seven commit-message rules. Read it before writing C rather than working from
+a memory of typical C style, because several of its rules are not the common
+default: `#pragma once` over include guards, `/* */` with no `//` anywhere,
+the asterisk bound to the name, no VLA, and `(void)` for a function that takes
+nothing, since `-Wstrict-prototypes` rejects the empty `()` form and the build
+treats that warning as an error. This file does not restate it.
+Where both speak, `CONTRIBUTING.md` wins, and a rule that drifts apart between
+the two is a defect in this file.
 
 The one exception is these files themselves. `scripts/check-skill-refs.py`
 fails when a skill names a file, make target, docs section, or sibling skill
@@ -22,9 +33,14 @@ A contributor may keep untracked working docs at the repo root or under
 `.claude/`; which ones exist differs per clone. Never `git add`, commit,
 stage, gitignore, or delete another person's: untracked but visible in
 `git status` is deliberate. None of them survive a fresh clone, so nothing
-here defers to one; the load-bearing conventions are written out below,
-because on a clean checkout `docs/` and these skills are all a contributor
-gets.
+here defers to one.
+
+What a clean checkout does carry is `CONTRIBUTING.md`, `docs/`, and these
+skills, which is where every load-bearing convention has to be written. Note
+that `scripts/check-skill-refs.py` cannot tell those apart: a bare markdown
+name at the repo root is left unverifiable on purpose, since it may be a
+private working doc, so a pointer to `CONTRIBUTING.md` from a skill is not
+gate-protected the way a `src/` path is. Renaming it is a manual sweep.
 
 ## Style
 
@@ -91,6 +107,49 @@ Comments and commit messages are third-person: name the subject (the caller,
 this function) or use imperative phrasing.
 
 Filenames use kebab-case, never underscore. Symbol names use snake_case.
+
+## What the formatter settles, and what it cannot
+
+Do not hand-format. `clang-format` owns indentation, brace placement (the
+function brace on its own line, the control-structure brace on the same line),
+the pointer asterisk binding to the name, spacing, wrapping, and trailing
+commas in initializers. `commentflow` owns what clang-format
+half-does: it breaks an over-long comment line but never refills a
+short-wrapped one, so comment width is settled by reflowing to the same
+`ColumnLimit`. Write it reasonably,
+write the comment as a sentence, and let `make indent` place the breaks.
+
+The formatter is silent on the rest, so apply these while writing rather than
+after:
+
+- Include order. `.clang-format` sets `SortIncludes: Never`, so the formatter
+  neither sorts nor regroups what you wrote, and a wrong order stays wrong
+  through every gate. System headers first, then project headers, each group
+  separated by a blank line, the file's own header among the project group.
+- ASCII in comments, `/* */` with no `//`, kebab-case filenames, snake_case
+  symbols, `#pragma once`.
+- Fixed-width types on the guest side of the boundary, host types on the host
+  side, and `bool` versus `int` for what a function returns.
+- The banned libc calls, no VLA, no invented `_`-prefixed identifier. Those
+  fail in CI, not in the formatter.
+
+Two scripts check, and both run in CI: `.ci/check-format.sh` for clang-format
+over the C sources, `.ci/check-commentflow.sh` for comment width over the C,
+shell, and assembly sources. The second owns its file list for `make
+check-format` too, so the local target and the gate cannot drift apart on
+coverage. Both fail rather than skip when their tool is missing.
+
+`make indent` is a no-op on a clean tree, in both halves: every file clang-format
+selects already formats to itself, and every file commentflow selects already
+reflows to itself. That was not free. The tree's comments were wrapped by hand
+before the tool existed, and the one-time reflow rewrote 142 of the 353 C and
+header files, both assembly files, and 36 of the 41 shell scripts. It landed as
+its own commit because a mechanical change with no behavior in it cannot be
+reviewed alongside one that has some.
+
+The gate is what keeps it a no-op. If `make indent` ever hands you a diff in a
+file you did not touch, something reintroduced hand-wrapping, or your
+commentflow is not the version the gate runs.
 
 ## Code
 
