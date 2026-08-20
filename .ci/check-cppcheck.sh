@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 
-# Run cppcheck static analysis on elfuse host source files (src/ only).
-# Tests use raw-syscall stubs and are excluded.
+# Run cppcheck static analysis on elfuse host source files (src/ only). Tests
+# use raw-syscall stubs and are excluded.
 #
-# CI mode: --max-configs=1 + --enable=warning for speed. Generated headers
-# under build/ that the source #includes must exist before invocation:
+# CI mode: --max-configs=1 + --enable=warning for speed. Generated headers under
+# build/ that the source #includes must exist before invocation:
 #   build/dispatch.h    -- via scripts/gen-syscall-dispatch.py
 #   build/version.h     -- one-line #define
 #   build/shim_blob.h   -- empty stub (the byte array contents are opaque
 #                          to cppcheck and produce no useful findings)
 #
-# Generating real dispatch.h instead of stubbing it keeps cppcheck honest
-# about the syscall dispatch layer. Stubbing shim_blob.h is acceptable
-# because the file is just a byte array with no callable surface.
+# Generating real dispatch.h instead of stubbing it keeps cppcheck honest about
+# the syscall dispatch layer. Stubbing shim_blob.h is acceptable because the
+# file is just a byte array with no callable surface.
 
 set -e -u -o pipefail
 
@@ -28,8 +28,9 @@ trap 'rm -rf "$BUILD_DIR"' EXIT
 
 python3 scripts/gen-syscall-dispatch.py --output "$BUILD_DIR/dispatch.h"
 printf '#define ELFUSE_VERSION "ci"\n' > "$BUILD_DIR/version.h"
-# shim_blob.h declares an opaque byte array and its length; cppcheck
-# gains nothing from the real contents, so a minimal stub suffices.
+
+# shim_blob.h declares an opaque byte array and its length; cppcheck gains
+# nothing from the real contents, so a minimal stub suffices.
 cat > "$BUILD_DIR/shim_blob.h" << 'EOF'
 static const unsigned char shim_bin[1] = {0};
 static const unsigned int shim_bin_len = 1;

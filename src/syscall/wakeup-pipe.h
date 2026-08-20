@@ -18,8 +18,8 @@
  */
 void wakeup_pipe_init(void);
 
-/* Wake every thread parked on the read end. Safe from a signal-handling
- * thread; a missing pipe is a no-op.
+/* Wake every thread parked on the read end. Safe from a signal-handling thread;
+ * a missing pipe is a no-op.
  */
 void wakeup_pipe_signal(void);
 

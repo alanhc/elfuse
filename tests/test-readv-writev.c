@@ -286,10 +286,10 @@ static void test_pwritev2_append(void)
     EXPECT_TRUE(nr == 6 && !memcmp(buf, "baseXY", 6), "append data mismatch");
 }
 
-/* Test 8: zero iovcnt returns 0 without moving the append file offset.
- * Linux reference (verified under qemu-system-aarch64): import_iovec()
- * yields an empty iterator, do_iter_write returns 0 before the offset is
- * touched, so pwritev2(RWF_APPEND) with iovcnt == 0 is a complete no-op.
+/* Test 8: zero iovcnt returns 0 without moving the append file offset. Linux
+ * reference (verified under qemu-system-aarch64): import_iovec() yields an
+ * empty iterator, do_iter_write returns 0 before the offset is touched, so
+ * pwritev2(RWF_APPEND) with iovcnt == 0 is a complete no-op.
  */
 
 static void test_pwritev2_append_zero_iovcnt(void)
@@ -320,14 +320,14 @@ static void test_pwritev2_append_zero_iovcnt(void)
     EXPECT_TRUE(ret == 0 && pos == 1, "zero iovcnt not a no-op");
 }
 
-/* Test 8: zero-iovcnt validation ordering across all six vector entry
- * points. Linux reference (fs/read_write.c): a negative offset fails EINVAL
- * before the fd lookup (do_preadv/do_pwritev; -1 is a valid sentinel only
- * for preadv2/pwritev2), the positional variants fail non-seekable files
- * with ESPIPE (FMODE_PREAD/FMODE_PWRITE), wrong-direction and O_PATH fds
- * fail EBADF (FMODE_READ/FMODE_WRITE in do_iter_read/do_iter_write), and
- * RWF flags are never validated because do_iter_* return before
- * kiocb_set_rw_flags for an empty vector.
+/* Test 8: zero-iovcnt validation ordering across all six vector entry points.
+ * Linux reference (fs/read_write.c): a negative offset fails EINVAL before the
+ * fd lookup (do_preadv/do_pwritev; -1 is a valid sentinel only for
+ * preadv2/pwritev2), the positional variants fail non-seekable files with
+ * ESPIPE (FMODE_PREAD/FMODE_PWRITE), wrong-direction and O_PATH fds fail EBADF
+ * (FMODE_READ/FMODE_WRITE in do_iter_read/do_iter_write), and RWF flags are
+ * never validated because do_iter_* return before kiocb_set_rw_flags for an
+ * empty vector.
  */
 
 enum vec_op {

@@ -1,4 +1,5 @@
-/* setuid-on-exec must grant an ID the guest can actually mean.
+/*
+ * setuid-on-exec must grant an ID the guest can actually mean.
  *
  * A sysroot's files are owned by whoever unpacked them on the host, and no host
  * IDs are mapped into the guest. Honouring setuid on such a file would leave
@@ -13,10 +14,10 @@
  * it pins is the other half: a virtual owner, foreign or root, never elevates.
  *
  * Note which owner does the work. The set-id path reads the *physical* stat,
- * and mkstemp already leaves the helper owned by the host user (501 or
- * whatever unpacked the tree), which is foreign to the guest either way. The
- * virtual chowns below stage the guest-visible half; the physical host owner
- * is what the exec actually sees and refuses to honour.
+ * and mkstemp already leaves the helper owned by the host user (501 or whatever
+ * unpacked the tree), which is foreign to the guest either way. The virtual
+ * chowns below stage the guest-visible half; the physical host owner is what
+ * the exec actually sees and refuses to honour.
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -140,6 +141,7 @@ static int stage_owner(unsigned owner)
     struct stat st;
     if (stat(helper_path, &st) != 0)
         return -1;
+
     /* exec reads ownership the same way stat does, so a stat that does not show
      * the chown means the two would disagree about what was staged.
      */
@@ -168,6 +170,7 @@ int main(int argc, char **argv)
         return child_main(argv[2]);
 
     int failures = 0;
+
     /* Checks that actually exercised an exec. Without this a run where every
      * interesting case skipped -- a privileged caller, say -- would print the
      * success line and exit 0 having proved nothing.
@@ -229,13 +232,13 @@ int main(int argc, char **argv)
      * The regression guard for that escalation.
      *
      * A guest stat cannot tell a recorded chown from one the host really
-     * performed -- the overlay is invisible from in here, and both report
-     * owner 0. That distinction matters, because when elfuse itself runs as
-     * host root the chown below is physical, and a physically root-owned
-     * setuid file is *supposed* to elevate. Resolve it from the outcome
-     * instead: elevation to 0 only happens when the physical owner is 0, which
-     * only a real chown can produce. Staying put and landing on root are both
-     * correct, one per staging; anything else is the bug.
+     * performed -- the overlay is invisible from in here, and both report owner
+     * 0. That distinction matters, because when elfuse itself runs as host root
+     * the chown below is physical, and a physically root-owned setuid file is
+     * *supposed* to elevate. Resolve it from the outcome instead: elevation to
+     * 0 only happens when the physical owner is 0, which only a real chown can
+     * produce. Staying put and landing on root are both correct, one per
+     * staging; anything else is the bug.
      */
     printf("test-setuid-exec: 3. virtual root owner does not elevate... ");
     {

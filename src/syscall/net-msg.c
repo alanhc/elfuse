@@ -1073,11 +1073,11 @@ int64_t sys_recvmmsg(guest_t *g,
             /* Same conversion as ppoll and pselect6. Truncating turned a
              * sub-millisecond timeout into poll(0) and an immediate EAGAIN.
              *
-             * Deliberately the finite conversion, unlike epoll_pwait2: the
-             * wait below is one poll with nothing to re-arm it, so a -1 here
-             * would block forever with no way back out, on a call the guest
-             * asked to bound. timespec_to_poll_ms saturates instead, which is
-             * still far past any real timeout but is reached.
+             * Deliberately the finite conversion, unlike epoll_pwait2: the wait
+             * below is one poll with nothing to re-arm it, so a -1 here would
+             * block forever with no way back out, on a call the guest asked to
+             * bound. timespec_to_poll_ms saturates instead, which is still far
+             * past any real timeout but is reached.
              */
             int timeout_ms = timespec_to_poll_ms(ts.tv_sec, ts.tv_nsec);
             struct pollfd pfd = {.fd = host_ref.fd, .events = POLLIN};

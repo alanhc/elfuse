@@ -4,8 +4,8 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Keep the descriptor accounting in one header.  Shell test runners derive
- * their limits from this file instead of copying the arithmetic from main.c.
+ * Keep the descriptor accounting in one header. Shell test runners derive their
+ * limits from this file instead of copying the arithmetic from main.c.
  */
 
 #pragma once
@@ -16,9 +16,8 @@
 /* Host descriptors kept available for elfuse's internal operations. Blocking
  * I/O may hold two duplicated descriptors per guest thread (for example,
  * copy_file_range()), while another bounded slice covers runtime pipes, fork
- * IPC, debugger sockets, and sysroot/FUSE plumbing. Operations whose
- * descriptor use grows with their input set, such as ppoll(), require separate
- * accounting.
+ * IPC, debugger sockets, and sysroot/FUSE plumbing. Operations whose descriptor
+ * use grows with their input set, such as ppoll(), require separate accounting.
  */
 #define HOST_FD_RESERVE 256
 

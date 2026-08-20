@@ -425,6 +425,7 @@ static void *vcpu_thread(void *arg)
     int markers_left = ctx->max_hvc5;
     for (;;) {
         vcpu_exit_t ex;
+
         /* Tell run_vcpu to return on every HVC #5 (max_hvc5=0) so the handler
          * can inspect X8 and decide whether to resume or stop.
          */

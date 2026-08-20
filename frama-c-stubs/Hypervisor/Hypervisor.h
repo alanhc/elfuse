@@ -16,12 +16,12 @@
  * the SDK header the binary must link against. Up here nothing but
  * FRAMAC_STUB_DIR in mk/verify.mk can reach it.
  *
- * This is reached only through mk/verify.mk, never by a compile. Nothing
- * proved reads any constant defined here, so the values matter only in that
- * they must not collide: HV_REG_X0 + n is how src/hvutil.h names a register,
- * which needs the X registers consecutive and in order, and the rest are
- * distinct placeholders. A wrong value here cannot weaken a proof, but it can
- * make a walked switch look degenerate, so keep them apart.
+ * This is reached only through mk/verify.mk, never by a compile. Nothing proved
+ * reads any constant defined here, so the values matter only in that they must
+ * not collide: HV_REG_X0 + n is how src/hvutil.h names a register, which needs
+ * the X registers consecutive and in order, and the rest are distinct
+ * placeholders. A wrong value here cannot weaken a proof, but it can make a
+ * walked switch look degenerate, so keep them apart.
  *
  * The set is what the parsing sources actually reference. Widening the proof
  * surface to a source that names one more will fail with "Cannot resolve
@@ -87,9 +87,9 @@ typedef uint32_t hv_simd_fp_reg_t;
 
 #define HV_SIMD_FP_REG_Q0 0
 
-/* The real type is a 16-byte vector. Frama-C rejects the vector_size
- * attribute, and no proved function reads a lane, so a struct of the same
- * width and alignment stands in.
+/* The real type is a 16-byte vector. Frama-C rejects the vector_size attribute,
+ * and no proved function reads a lane, so a struct of the same width and
+ * alignment stands in.
  */
 typedef struct {
     unsigned char v[16];

@@ -335,6 +335,7 @@ void crash_report(hv_vcpu_t vcpu,
 
     sysctl_str("kern.osproductversion", os_version, sizeof(os_version));
     sysctl_str("kern.osrelease", os_release, sizeof(os_release));
+
     /* machdep.cpu.brand_string is absent on Apple Silicon. Fall back to
      * hw.model so the report still names the host hardware.
      */

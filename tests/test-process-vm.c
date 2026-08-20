@@ -163,10 +163,10 @@ static void test_error_paths(void)
  * behavior, not merely a strange result, which is why the copy helper uses
  * memmove per step.
  *
- * This does not try to catch that undefined behavior by its output. Measured
- * on this host, the forward copy it replaced produced correct leading bytes and
- * a result that simply differed from memmove, so nothing observable separates
- * the two reliably; the fix rests on the language rule, not on a reproducer.
+ * This does not try to catch that undefined behavior by its output. Measured on
+ * this host, the forward copy it replaced produced correct leading bytes and a
+ * result that simply differed from memmove, so nothing observable separates the
+ * two reliably; the fix rests on the language rule, not on a reproducer.
  *
  * What the case does pin is the part that is specified: the full count comes
  * back and nothing outside the destination is disturbed. The content of the
@@ -190,8 +190,9 @@ static void test_overlapping_self_copy(void)
         TEST("process_vm_readv overlapping self copy");
         EXPECT_EQ(raw_process_vm_readv(getpid(), &dst_iov, 1, &src_iov, 1, 0),
                   (long) span, "overlapping copy reported short");
-        /* head + delta, not head: the destination starts past the delta gap,
-         * so those bytes are before it too and a stray write there must fail.
+
+        /* head + delta, not head: the destination starts past the delta gap, so
+         * those bytes are before it too and a stray write there must fail.
          */
         EXPECT_TRUE(memcmp(buf, original, head + delta) == 0,
                     "overlapping copy wrote before the destination");

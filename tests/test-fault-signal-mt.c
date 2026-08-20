@@ -1,12 +1,13 @@
-/* Multi-threaded synchronous-fault delivery test
+/*
+ * Multi-threaded synchronous-fault delivery test
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
  * Regression lock-in for synchronous fault (SIGSEGV) delivery in a
  * multi-threaded guest. Faults were routed through the process-wide pending
- * bitmask (signal_queue + signal_deliver), so a fault raised by one vCPU
- * thread could be dequeued and delivered by another: the other thread had no
+ * bitmask (signal_queue + signal_deliver), so a fault raised by one vCPU thread
+ * could be dequeued and delivered by another: the other thread had no
  * thread-local fault info, so the kernel-visible siginfo became si_code=SI_USER
  * with no si_addr instead of SEGV_MAPERR. A JVM treats such a SIGSEGV as a
  * fatal external signal rather than a recoverable implicit null check, so javac
@@ -22,8 +23,8 @@
  * faults: a synchronous SIGSEGV whose disposition is SIG_IGN, or which is
  * blocked, resets to SIG_DFL + unblocked and terminates the process. Without
  * the reset, SIG_IGN resumes at the faulting PC and re-faults forever, and a
- * blocked fault either stalls the same way or runs a handler the guest asked
- * to block. Each case runs in a forked child that must die by SIGSEGV.
+ * blocked fault either stalls the same way or runs a handler the guest asked to
+ * block. Each case runs in a forked child that must die by SIGSEGV.
  *
  * Syscalls exercised: rt_sigaction, rt_sigprocmask, clone (pthreads), fork,
  * wait4, the fault delivery path.
@@ -46,14 +47,16 @@ int passes = 0, fails = 0;
 #define NFAULTS 4000
 
 /* The bad address every thread reads. Page zero is never mapped, so the read
- * faults with a translation fault -> SEGV_MAPERR and si_addr == FAULT_ADDR. */
+ * faults with a translation fault -> SEGV_MAPERR and si_addr == FAULT_ADDR.
+ */
 #define FAULT_ADDR ((volatile int *) (uintptr_t) 0x8)
 
 static _Thread_local sigjmp_buf recover;
 static _Thread_local volatile int armed;
 
 /* Set by the handler when it observes a malformed delivery. async-signal-safe
- * stores to sig_atomic_t/int flags only. */
+ * stores to sig_atomic_t/int flags only.
+ */
 static volatile sig_atomic_t bad_si_code = 0;
 static volatile sig_atomic_t bad_si_addr = 0;
 static volatile sig_atomic_t unarmed_delivery = 0;
@@ -62,16 +65,19 @@ static void segv_handler(int sig, siginfo_t *info, void *uc)
 {
     (void) sig;
     (void) uc;
+
     /* A synchronous fault must report a fault si_code (SEGV_MAPERR for an
      * unmapped address), never SI_USER (0), which is what a stolen/cross-thread
-     * delivery produced. */
+     * delivery produced.
+     */
     if (info->si_code != SEGV_MAPERR && info->si_code != SEGV_ACCERR)
         bad_si_code = 1;
     if (info->si_addr != (void *) FAULT_ADDR)
         bad_si_addr = 1;
     if (!armed) {
         /* Delivered to a thread that is not currently faulting: the fault was
-         * misrouted. Cannot recover (no jmp target), so fail and exit. */
+         * misrouted. Cannot recover (no jmp target), so fail and exit.
+         */
         unarmed_delivery = 1;
         _exit(2);
     }
@@ -94,10 +100,13 @@ static void *fault_loop(void *arg)
 }
 
 /* Fork a child that faults under the disposition installed by `setup` and
- * return its wait status. Returns -1 on fork/waitpid failure, -2 if the child
- * had to be killed: a re-fault-forever regression spins the child on the
- * faulting PC without reaching a signal poll point, so no in-child alarm can
- * interrupt it -- the parent must bound the wait and kill. */
+ * return its wait status.
+ *
+ * Returns -1 on fork/waitpid failure, -2 if the child had to be killed: a
+ * re-fault-forever regression spins the child on the faulting PC without
+ * reaching a signal poll point, so no in-child alarm can interrupt it -- the
+ * parent must bound the wait and kill.
+ */
 #define CHILD_WAIT_MS 8000
 
 static int fault_child_status(void (*setup)(void))
@@ -126,7 +135,8 @@ static int fault_child_status(void (*setup)(void))
 }
 
 /* elfuse fork children report signal deaths as exit(128+signum); accept the
- * native WIFSIGNALED form too. */
+ * native WIFSIGNALED form too.
+ */
 static int died_by(int status, int sig)
 {
     if (WIFSIGNALED(status) && WTERMSIG(status) == sig)
@@ -144,8 +154,10 @@ static void blocked_handler(int sig, siginfo_t *info, void *uc)
     (void) sig;
     (void) info;
     (void) uc;
+
     /* Must never run: SIGSEGV was blocked when the fault hit, so Linux
-     * force_sig semantics reset to SIG_DFL and terminate instead. */
+     * force_sig semantics reset to SIG_DFL and terminate instead.
+     */
     _exit(3);
 }
 
@@ -167,8 +179,9 @@ int main(void)
 {
     printf("test-fault-signal-mt: multi-threaded SIGSEGV delivery\n\n");
 
-    /* Forced-fault disposition cases run first, in forked children, before
-     * this process installs its own SIGSEGV handler or spawns threads. */
+    /* Forced-fault disposition cases run first, in forked children, before this
+     * process installs its own SIGSEGV handler or spawns threads.
+     */
     TEST("SIG_IGN'd synchronous SIGSEGV terminates");
     int status = fault_child_status(setup_ign);
     if (status == -2)

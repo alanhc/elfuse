@@ -13,8 +13,8 @@
  *   - Syscall handlers that translate Linux syscalls to macOS equivalents.
  *
  * Usage: elfuse [options] <elf-path> [args...]; `elfuse --help` lists the
- * options. The flag list lives once in ELFUSE_USAGE_BODY below; --help and
- * the argument-error paths render it differently but cannot drift apart.
+ * options. The flag list lives once in ELFUSE_USAGE_BODY below; --help and the
+ * argument-error paths render it differently but cannot drift apart.
  */
 
 #include <errno.h>
@@ -200,15 +200,15 @@ static int host_dc_zva_assert(void)
     return 0;
 }
 
-/* Usage synopsis: one flag list, two renderings. @sep joins the groups,
- * with a space for ELFUSE_USAGE and a newline plus an indent to the column
- * after "usage: elfuse " for ELFUSE_USAGE_WRAPPED.
+/* Usage synopsis: one flag list, two renderings. @sep joins the groups, with a
+ * space for ELFUSE_USAGE and a newline plus an indent to the column after
+ * "usage: elfuse " for ELFUSE_USAGE_WRAPPED.
  *
- * The error paths need the flat form because log_error stamps a timestamp
- * and a source location on the first line only, so a wrapped string prints
- * ragged under the prefix; --help has no prefix and takes the wrapped form,
- * which fits 80 columns. Sharing one body keeps the flag list from drifting
- * between them (one copy had already lost the --gdb flags).
+ * The error paths need the flat form because log_error stamps a timestamp and a
+ * source location on the first line only, so a wrapped string prints ragged
+ * under the prefix; --help has no prefix and takes the wrapped form, which fits
+ * 80 columns. Sharing one body keeps the flag list from drifting between them
+ * (one copy had already lost the --gdb flags).
  */
 #define ELFUSE_USAGE_BODY(sep)                                             \
     "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]" sep         \
@@ -250,6 +250,7 @@ int main(int argc, char **argv)
     int n_env_overrides = 0;
     bool clear_env = false;
     int arg_start = 1;
+
     /* Everything the shared cleanup label reads is declared and initialized
      * here, above the option loop, so any later error path can `goto cleanup`:
      * a goto that skipped an initializer would leave the unwind reading
@@ -425,8 +426,8 @@ int main(int argc, char **argv)
             arg_start += 2;
         } else if (!strcmp(argv[arg_start], "--workdir") &&
                    arg_start + 1 < argc) {
-            /* A relative path resolves against the host cwd, silently
-             * starting the guest outside the intended tree. strdup because
+            /* A relative path resolves against the host cwd, silently starting
+             * the guest outside the intended tree. strdup because
              * runtime_set_process_title() clobbers the argv block.
              */
             if (argv[arg_start + 1][0] != '/') {
@@ -443,8 +444,8 @@ int main(int argc, char **argv)
             arg_start += 2;
         } else if (!strcmp(argv[arg_start], "--env") && arg_start + 1 < argc) {
             /* Tokens are borrowed from argv; guest_env_build strdups what it
-             * keeps (the ordering rationale sits at its call site). argc
-             * bounds the flag count, so one allocation needs no growth path.
+             * keeps (the ordering rationale sits at its call site). argc bounds
+             * the flag count, so one allocation needs no growth path.
              */
             if (!env_overrides) {
                 env_overrides = (char **) calloc((size_t) argc, sizeof(char *));
@@ -536,10 +537,10 @@ int main(int argc, char **argv)
                                timeout_sec);
 
     /* Before runtime_set_process_title clobbers the argv block env_overrides
-     * borrows from, and before --create-sysroot would provision a
-     * sparsebundle for a launch a malformed --env is about to refuse. With
-     * neither flag given envp stays NULL, which launch_args_t defines as the
-     * host environ, unchanged.
+     * borrows from, and before --create-sysroot would provision a sparsebundle
+     * for a launch a malformed --env is about to refuse. With neither flag
+     * given envp stays NULL, which launch_args_t defines as the host environ,
+     * unchanged.
      */
     if (n_env_overrides > 0 || clear_env) {
         envp = guest_env_build(environ, env_overrides, n_env_overrides,
@@ -719,8 +720,8 @@ int main(int argc, char **argv)
 
     /* Hand the bring-up, run loop, and guest teardown to elfuse_launch. main()
      * retains ownership of the original argv (proctitle above), the sysroot
-     * mount (detached at the cleanup label after the guest exits so the
-     * mount stays live for the whole run), host cwd, and the heap elf_path /
+     * mount (detached at the cleanup label after the guest exits so the mount
+     * stays live for the whole run), host cwd, and the heap elf_path /
      * sysroot_path / guest_argv / envp / workdir copies.
      */
     launch_args_t largs = {
@@ -739,8 +740,9 @@ int main(int argc, char **argv)
         .timeout_sec = timeout_sec,
         .verbose = verbose,
     };
-    /* Ownership of the temp unlink transfers here (contract in launch.h);
-     * drop main()'s claim so the shared cleanup below cannot double-unlink.
+
+    /* Ownership of the temp unlink transfers here (contract in launch.h); drop
+     * main()'s claim so the shared cleanup below cannot double-unlink.
      */
     elf_host_temp = false;
     exit_code = elfuse_launch(&largs);
@@ -750,10 +752,9 @@ cleanup:
      * caller-owned heap copies, detaches the sysroot mount, restores the host
      * cwd, and drops a still-owned FUSE-materialized temp ELF. This must run
      * even after a bring-up whose HVF teardown guest_destroy deferred to
-     * process exit, because process exit reclaims neither the sysroot mount
-     * nor the temp ELF. The guest itself belongs to elfuse_launch, which
-     * destroys it on every exit path, so nothing here touches HVF or guest
-     * memory.
+     * process exit, because process exit reclaims neither the sysroot mount nor
+     * the temp ELF. The guest itself belongs to elfuse_launch, which destroys
+     * it on every exit path, so nothing here touches HVF or guest memory.
      */
     rosettad_clear_binary_path();
     if (have_host_cwd && host_cwd[0] != '\0' && chdir(host_cwd) < 0)

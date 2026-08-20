@@ -7,18 +7,18 @@
  * An executable under a case-protected directory exists on disk only under an
  * escaped spelling, and exec crosses that boundary twice: the path being
  * executed must be resolved like every other guest path, and the identity the
- * kernel then reports (/proc/self/exe, /proc/self/fd/N) must carry the
- * guest's bytes, never the stored spelling or the sysroot prefix.
+ * kernel then reports (/proc/self/exe, /proc/self/fd/N) must carry the guest's
+ * bytes, never the stored spelling or the sysroot prefix.
  *
  * Linux contract pinned: execveat(2) resolves pathname relative to dirfd with
- * the caller's namespace rules, and proc(5) says /proc/self/exe is a symlink
- * to the executed binary as pathnames name it, a path the process can hand
+ * the caller's namespace rules, and proc(5) says /proc/self/exe is a symlink to
+ * the executed binary as pathnames name it, a path the process can hand
  * straight back to execve.
  *
  * Code under test: sc_execveat in src/syscall/syscall.c, sys_execve in
  * src/syscall/exec.c, and proc_readlink_self_exe / proc_intercept_readlink in
- * src/runtime/procemu.c. A regression shows up as execveat reporting ENOENT
- * for a binary execve runs fine, or as /proc/self/exe naming an .ef= spelling,
+ * src/runtime/procemu.c. A regression shows up as execveat reporting ENOENT for
+ * a binary execve runs fine, or as /proc/self/exe naming an .ef= spelling,
  * which is how a self-re-exec (busybox applets, watchdogs) stops working.
  *
  * Run under --sysroot on a case-folding volume.
@@ -71,8 +71,8 @@ static int child_exe_is(const char *want, bool reexec)
         return EXIT_MISMATCH;
     }
     if (reexec) {
-        /* The reported identity must be live: hand it straight back to
-         * execve, as a self-re-exec does.
+        /* The reported identity must be live: hand it straight back to execve,
+         * as a self-re-exec does.
          */
         char *argv2[] = {buf, "--exe-is", (char *) want, NULL};
         execve("/proc/self/exe", argv2, NULL);

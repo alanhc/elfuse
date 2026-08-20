@@ -194,9 +194,11 @@ static void test_dir_create(void)
 }
 
 /* Drain events by reading (which drives elfuse's diff), retrying until a named
- * IN_CREATE for `want` shows up. Returns false if `unwant` (an event that must
- * never appear, e.g. from an unrelated directory) is seen first, or if `want`
- * never arrives within the retry budget. `unwant` may be NULL.
+ * IN_CREATE for `want` shows up.
+ *
+ * Returns false if `unwant` (an event that must never appear, e.g. from an
+ * unrelated directory) is seen first, or if `want` never arrives within the
+ * retry budget. `unwant` may be NULL.
  */
 static bool watched_child_seen(int fd, const char *want, const char *unwant)
 {
@@ -287,6 +289,7 @@ static void test_dir_rename_follows_inode(void)
         FAIL("mkdtemp");
         return;
     }
+
     /* Sized so the compiler can prove each snprintf fits (dir is a fixed-length
      * template; -Wformat-truncation reasons about declared buffer sizes).
      */

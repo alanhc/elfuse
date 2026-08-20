@@ -94,8 +94,8 @@ void proc_identity_init(void)
         gid = 0;
     }
 
-    /* A staged --user wins over the defaults and over fakeroot; consumed
-     * here so it applies to one bring-up only (contract in proc.h).
+    /* A staged --user wins over the defaults and over fakeroot; consumed here
+     * so it applies to one bring-up only (contract in proc.h).
      */
     if (atomic_exchange(&initial_ids_staged, false)) {
         uid = atomic_load(&initial_uid);

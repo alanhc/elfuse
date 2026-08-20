@@ -96,10 +96,10 @@ int main(void)
                             gfl.l_type == F_WRLCK),
                 "F_GETLK returned an invalid l_type");
 
-    /* F_GETLK must report the *guest* PID of a conflicting lock, not
-     * elfuse's raw host PID -- guest code that treats l_pid as a real PID
-     * (e.g. a kill(pid, 0) liveness check) would otherwise resolve a foreign
-     * host process instead of the actual lock holder.
+    /* F_GETLK must report the *guest* PID of a conflicting lock, not elfuse's
+     * raw host PID -- guest code that treats l_pid as a real PID (e.g. a
+     * kill(pid, 0) liveness check) would otherwise resolve a foreign host
+     * process instead of the actual lock holder.
      */
     TEST("F_GETLK reports the guest PID of a conflicting child lock");
     int pfd[2];

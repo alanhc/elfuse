@@ -3187,9 +3187,9 @@ static void vcpu_handle_mrs_trap(hv_vcpu_t vcpu,
     uint64_t value = 0;
 
     /* ID register emulation: return VZ-sanitized values BEFORE trying HVF.
-     * HVF's hv_vcpu_get_sys_reg succeeds for ID
-     * registers but returns raw hardware values, which include features the
-     * hypervisor does not actually virtualize.
+     * HVF's hv_vcpu_get_sys_reg succeeds for ID registers but returns raw
+     * hardware values, which include features the hypervisor does not actually
+     * virtualize.
      *
      * Values captured from a Lima VZ VM on Apple Silicon via inline MRS from
      * EL0 (kernel trap-and-emulate). These are checked first, before the HVF

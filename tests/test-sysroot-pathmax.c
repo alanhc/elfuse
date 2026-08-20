@@ -7,25 +7,24 @@
  * Linux allows a path of 4096 bytes; macOS stops at 1024 (PATH_MAX,
  * sys/syslimits.h), and an escaped component roughly doubles on disk, so a
  * guest path the kernel it emulates would accept can exceed what the host
- * kernel will take. The documented policy (docs/filenames.md, "Whole paths")
- * is that such a path reports ENAMETOOLONG and is never truncated, because a
+ * kernel will take. The documented policy (docs/filenames.md, "Whole paths") is
+ * that such a path reports ENAMETOOLONG and is never truncated, because a
  * truncated path names a different file. This pins the guest-visible
  * consequences of that policy at the boundary.
  *
- * Two lanes: literal components (host length ~ guest length + sysroot
- * prefix, so the ceiling is crossed on any volume) and escaped components
- * (guest path well under 1024; only the escape expansion crosses, so this
- * lane exercises the case-exact walk specifically). Both assert the same
- * contract: every level either works fully (create, stat, list back)
- * or fails with exactly ENAMETOOLONG, monotonically once the ceiling is
- * crossed, with no level truncating into a sibling that a listing would
- * expose.
+ * Two lanes: literal components (host length ~ guest length + sysroot prefix,
+ * so the ceiling is crossed on any volume) and escaped components (guest path
+ * well under 1024; only the escape expansion crosses, so this lane exercises
+ * the case-exact walk specifically). Both assert the same contract: every level
+ * either works fully (create, stat, list back) or fails with exactly
+ * ENAMETOOLONG, monotonically once the ceiling is crossed, with no level
+ * truncating into a sibling that a listing would expose.
  *
- * Code under test: the accumulated-path checks in
- * src/syscall/casefold-walk.c and the translation exits in
- * src/syscall/path.c. A regression shows up as a create succeeding past the
- * ceiling under a spelling other than its own (truncation), as a wrong
- * errno, or as a success-after-failure flip while descending.
+ * Code under test: the accumulated-path checks in src/syscall/casefold-walk.c
+ * and the translation exits in src/syscall/path.c. A regression shows up as a
+ * create succeeding past the ceiling under a spelling other than its own
+ * (truncation), as a wrong errno, or as a success-after-failure flip while
+ * descending.
  *
  * On a byte-exact volume the escaped lane stores names literally and stays
  * short of the ceiling; its probes then assert plain success, so the test
@@ -70,17 +69,19 @@ static void step_name(char *out, size_t outsz, int depth, bool escaped)
     out[escaped ? ESC_STEP_LEN : STEP_LEN] = '\0';
 }
 
-/* The recipe probes the volume host-side and passes "fold" or "exact": a
- * guest cannot tell the volume kinds apart (hiding that difference is what
- * the escape is for), but whether the escaped lane must cross the ceiling
- * depends on it, and an expectation that accepts both outcomes on a folding
- * volume would let the interesting lane pass vacuously.
+/* The recipe probes the volume host-side and passes "fold" or "exact": a guest
+ * cannot tell the volume kinds apart (hiding that difference is what the escape
+ * is for), but whether the escaped lane must cross the ceiling depends on it,
+ * and an expectation that accepts both outcomes on a folding volume would let
+ * the interesting lane pass vacuously.
  */
 static bool volume_folds;
 
 /* Descend one level at a time under @root, requiring each mkdir to either
- * succeed completely or fail with ENAMETOOLONG, and never to succeed again
- * once a level has failed. Returns the deepest path that succeeded in @path.
+ * succeed completely or fail with ENAMETOOLONG, and never to succeed again once
+ * a level has failed.
+ *
+ * Returns the deepest path that succeeded in @path.
  */
 static void descend(const char *root, bool escaped)
 {
@@ -116,6 +117,7 @@ static void descend(const char *root, bool escaped)
             return;
         }
         hit_ceiling = true;
+
         /* The failed level must not exist under any spelling: a truncated
          * create would leave an entry the parent listing exposes.
          */
@@ -128,8 +130,8 @@ static void descend(const char *root, bool escaped)
     if (escaped && !hit_ceiling) {
         /* A byte-exact volume stores the escaped lane literally, and
          * ESC_MAX_DEPTH * (ESC_STEP_LEN + 1) stays under 1024 there; not
-         * crossing is the correct outcome on such a volume, and the only
-         * legal one on a folding volume is crossing.
+         * crossing is the correct outcome on such a volume, and the only legal
+         * one on a folding volume is crossing.
          */
         struct stat st;
         if (volume_folds)
@@ -148,8 +150,8 @@ static void descend(const char *root, bool escaped)
                  : "literal deepest level lists exactly one child");
     {
         /* The deepest surviving directory holds at most the single child the
-         * next (failed) level would have created, which is none. Any entry
-         * here is a truncated spelling of a deeper create.
+         * next (failed) level would have created, which is none. Any entry here
+         * is a truncated spelling of a deeper create.
          */
         DIR *d = opendir(deepest);
         struct dirent *de;
@@ -180,6 +182,7 @@ static void descend(const char *root, bool escaped)
         snprintf(file, sizeof(file), "%s", deepest);
         step_name(name, sizeof(name), depth_limit, escaped);
         snprintf(file + len, sizeof(file) - len, "/%s", name);
+
         /* Fill the remaining guest budget so the host spelling is over the
          * ceiling whichever lane this is.
          */
@@ -193,9 +196,9 @@ static void descend(const char *root, bool escaped)
             close(fd);
             FAIL("open(O_CREAT) succeeded on a path past the ceiling");
         } else if (errno == ENAMETOOLONG || errno == ENOENT) {
-            /* ENOENT is legal when an intermediate level is the one past
-             * the ceiling on a byte-exact volume: the parent chain stops
-             * existing before the name gets too long.
+            /* ENOENT is legal when an intermediate level is the one past the
+             * ceiling on a byte-exact volume: the parent chain stops existing
+             * before the name gets too long.
              */
             PASS();
         } else {

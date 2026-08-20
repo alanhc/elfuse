@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Shared helpers for coreutils shell suites
 #
 # Copyright 2026 elfuse contributors

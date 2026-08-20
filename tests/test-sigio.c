@@ -230,6 +230,7 @@ int main(void)
 
             sigio_count = 0;
             int dfd = dup(sv[0]);
+
             /* The original arming already covers readiness; closing sv[0]
              * leaves only the dup armed, proving the alias inherited O_ASYNC.
              */
@@ -281,6 +282,7 @@ int main(void)
             fcntl(sv[0], F_SETFL, fl & ~O_ASYNC);
 
             sigurg_count = 0;
+
             /* Urgent byte from the client; the server's OOB mark drives
              * EVFILT_EXCEPT/NOTE_OOB, which the watcher maps to SIGURG.
              */

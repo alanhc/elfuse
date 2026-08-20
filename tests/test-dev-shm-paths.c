@@ -6,8 +6,8 @@
  *
  * Every path syscall must resolve /dev/shm/<name> to the same per-UID host
  * backing object that open() creates. The regression: LTP's setup_ipc
- * (lib/tst_test.c) does open(O_CREAT|O_EXCL) then chmod() on a /dev/shm path;
- * a split resolution turns the chmod into ENOENT and aborts every test.
+ * (lib/tst_test.c) does open(O_CREAT|O_EXCL) then chmod() on a /dev/shm path; a
+ * split resolution turns the chmod into ENOENT and aborts every test.
  *
  * The containment half checks that no shm op follows a symlink planted at a
  * leaf: the backing store is a host directory, so a followed link escapes onto
@@ -55,7 +55,8 @@ static char fixture_suffix[16];
 
 /* Guest PIDs restart from the same value in each independent elfuse process.
  * Reserve a host-unique suffix so concurrent runtime jobs cannot unlink or
- * replace one another's /dev/shm fixtures. */
+ * replace one another's /dev/shm fixtures.
+ */
 static int name_fixtures(void)
 {
     char seed[] = "/tmp/elfuse-shm-seed-XXXXXX";
@@ -211,6 +212,7 @@ static void test_statfs_root_reports_tmpfs(void)
         FAIL("/dev/shm statfs is not TMPFS_MAGIC");
         return;
     }
+
     /* A trailing slash names the same mount root (stat accepts it), so statfs
      * must answer identically rather than falling through to the host.
      */
@@ -363,8 +365,9 @@ static void test_fifo_truncate_fast(void)
         FAIL("unlink FIFO");
         return;
     }
-    /* Accept EINVAL (Linux truncate-on-FIFO). The critical property is that
-     * the call returned at all rather than hanging.
+
+    /* Accept EINVAL (Linux truncate-on-FIFO). The critical property is that the
+     * call returned at all rather than hanging.
      */
     EXPECT_TRUE(rc == -1 && saved == EINVAL,
                 "truncate on FIFO did not fail with EINVAL");
@@ -535,6 +538,7 @@ static void test_symlink_dir_chdir_contained(void)
         FAIL("unlink symlink");
         return;
     }
+
     /* Either the chdir failed (ELOOP/ENOTDIR), or if it somehow succeeded the
      * cwd must not have escaped; the strong assertion is that it failed.
      */
@@ -618,9 +622,9 @@ static void test_imported_symlink_contained(void)
     EXPECT_TRUE(ok, "chmod followed an imported shm symlink");
 }
 
-/* execve of a symlink leaf pointing at a host binary must not run the target;
- * a real binary copied into /dev/shm must still run. Both are checked in a
- * child so a successful exec does not replace the test process.
+/* execve of a symlink leaf pointing at a host binary must not run the target; a
+ * real binary copied into /dev/shm must still run. Both are checked in a child
+ * so a successful exec does not replace the test process.
  */
 static void test_execve_symlink_contained(void)
 {
@@ -686,6 +690,7 @@ static void test_execve_real_binary_runs(const char *self)
         FAIL("copy self into /dev/shm");
         return;
     }
+
     /* Grant world-execute so elfuse's exec-permission model (which compares the
      * emulated euid against the host file's owner) admits the copy regardless
      * of the runner's host uid. Without this the check is owner-only (0700) and

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-rosetta-msync.sh - msync(MS_SYNC/MS_ASYNC) on high-VA regions via Rosetta
 #
 # Copyright 2026 elfuse contributors

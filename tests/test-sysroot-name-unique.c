@@ -7,16 +7,15 @@
  * On a case-folding sysroot a name whose spelling the volume cannot hold is
  * stored escaped, so a directory can end up holding a mixture of literal and
  * escaped entries. What must hold throughout is that each guest name is
- * reachable through exactly one of them: every spelling opens its own file,
- * a spelling that was never created reports ENOENT, and a listing reports each
+ * reachable through exactly one of them: every spelling opens its own file, a
+ * spelling that was never created reports ENOENT, and a listing reports each
  * name once and never leaks an on-disk spelling.
  *
  * The sequence below is adversarial on purpose. It creates the members of a
  * case-colliding set in an order that makes each one take a different kind of
- * slot, then deletes and recreates them so the literal slot changes hands
- * while the others stay put. No assertion here may depend on *which* spelling
- * won the literal slot: that follows arrival order and is not part of the
- * contract.
+ * slot, then deletes and recreates them so the literal slot changes hands while
+ * the others stay put. No assertion here may depend on *which* spelling won the
+ * literal slot: that follows arrival order and is not part of the contract.
  *
  * Code under test: the resolver in src/syscall/casefold-walk.c reached through
  * src/syscall/path.c, and the mutating handlers in src/syscall/fs.c that use
@@ -24,8 +23,8 @@
  * name surviving its own unlink, or a listing that disagrees with what can be
  * opened.
  *
- * Run under --sysroot. The host-side shape check in the make recipe asserts
- * the on-disk half.
+ * Run under --sysroot. The host-side shape check in the make recipe asserts the
+ * on-disk half.
  */
 
 #include <dirent.h>
@@ -124,8 +123,8 @@ int main(void)
     expect_absent("FOO absent before it is made", DIR_R "/FOO");
     expect_listing("listing holds Foo alone", "Foo");
 
-    /* The second member cannot take the same slot, so it is stored escaped,
-     * and the guest must not be able to tell.
+    /* The second member cannot take the same slot, so it is stored escaped, and
+     * the guest must not be able to tell.
      */
     TEST("create foo beside Foo");
     EXPECT_TRUE(file_write(DIR_R "/foo", "B") == 0, "create foo");
@@ -193,8 +192,8 @@ int main(void)
     }
     expect_listing("listing after link", "FOO,fOO,foo");
 
-    /* Taking the set apart one at a time: each removal leaves the rest
-     * readable under their own names.
+    /* Taking the set apart one at a time: each removal leaves the rest readable
+     * under their own names.
      */
     TEST("unlink fOO");
     EXPECT_TRUE(unlink(DIR_R "/fOO") == 0, "unlink fOO");

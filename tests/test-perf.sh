@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
+
 # test-perf.sh -- Performance comparison: native vs elfuse for grep/wc/cat
 #
 # Copyright 2026 elfuse contributors
 # Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Measures wall-clock time for common coreutils operations, comparing
-# macOS native tools against the same tools running under elfuse. Overhead
-# comes from VM startup (~1-3ms) and per-syscall vmexits (~1-5us each).
-# Pure computation (regex matching etc.) runs at native speed.
+# Measures wall-clock time for common coreutils operations, comparing macOS
+# native tools against the same tools running under elfuse. Overhead comes from
+# VM startup (~1-3ms) and per-syscall vmexits (~1-5us each). Pure computation
+# (regex matching etc.) runs at native speed.
 #
-# Timing uses the epoch_us helper from tests/lib/bash-compat.sh, which
-# prefers $EPOCHREALTIME (bash 5.0+) and falls back to 'date +%s %N'
-# (macOS 14+/GNU coreutils) or python3 / perl so the script works on
-# stock macOS bash 3.2 too.
+# Timing uses the epoch_us helper from tests/lib/bash-compat.sh, which prefers
+# $EPOCHREALTIME (bash 5.0+) and falls back to 'date +%s %N' (macOS 14+/GNU
+# coreutils) or python3 / perl so the script works on stock macOS bash 3.2 too.
 #
 # Usage: tests/test-perf.sh <elfuse-binary> <tool-bin-dir>
 # Example: tests/test-perf.sh build/elfuse /path/to/tool/bin
 
 set -euo pipefail
-# pipefail in particular matters here: several benchmarks pipe an
-# elfuse-hosted producer (e.g. cat) into a native consumer (e.g. wc).
-# Without pipefail, a producer crash returns rc=0 from the pipeline,
-# so the elfuse-side failure was silently smoothed into a "fast" sample.
+
+# pipefail in particular matters here: several benchmarks pipe an elfuse-hosted
+# producer (e.g. cat) into a native consumer (e.g. wc). Without pipefail, a
+# producer crash returns rc=0 from the pipeline, so the elfuse-side failure was
+# silently smoothed into a "fast" sample.
 
 # shellcheck source=tests/lib/bash-compat.sh
 . "$(dirname "$0")/lib/bash-compat.sh"
@@ -44,13 +45,13 @@ PATTERN="syscall"
 
 PERF_FAILED=0
 
-# Collect $RUNS timing samples for a command, print median and stats.
-# Args: label command...
+# Collect $RUNS timing samples for a command, print median and stats. Args:
+# label command...
 # Earlier revisions swallowed every sample's exit status with '|| true',
-# which made a missing native binary, an elfuse crash, or a host SIP
-# block silently degrade into "median 0 ms PASS". Now any non-zero
-# sample aborts the timing for that label and flips PERF_FAILED so the
-# script exits non-zero after running every other benchmark.
+# which made a missing native binary, an elfuse crash, or a host SIP block
+# silently degrade into "median 0 ms PASS". Now any non-zero sample aborts the
+# timing for that label and flips PERF_FAILED so the script exits non-zero after
+# running every other benchmark.
 benchmark()
 {
     local label="$1"
@@ -122,9 +123,10 @@ trap 'rm -f "$TMPFILE"' EXIT
 for _ in $(seq 1 100); do cat "$SYSCALL_C" >> "$TMPFILE"; done
 TMPSIZE=$(wc -c < "$TMPFILE" | tr -d ' ')
 printf "  ${CYAN}(test file: %s bytes)${RESET}\n" "$TMPSIZE"
-# sh -c spawns a child shell that does not inherit the outer pipefail
-# from the script's 'set -o pipefail'. Run the pipeline under bash so
-# pipefail is available on systems whose /bin/sh is not bash-compatible.
+
+# sh -c spawns a child shell that does not inherit the outer pipefail from the
+# script's 'set -o pipefail'. Run the pipeline under bash so pipefail is
+# available on systems whose /bin/sh is not bash-compatible.
 benchmark "native cat|wc" bash -c "set -o pipefail; cat '$TMPFILE' | wc -l"
 benchmark "elfuse cat|wc" bash -c "set -o pipefail; '$ELFUSE' '$TOOL_BIN/cat' '$TMPFILE' | wc -l"
 echo

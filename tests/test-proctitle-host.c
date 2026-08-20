@@ -38,6 +38,7 @@
 static void on_sigsegv(int sig)
 {
     (void) sig;
+
     /* Cannot rely on stdio inside an async signal handler, but a single _exit
      * with a recognizable code is sufficient: the run target prints a
      * meaningful failure when the child exits with 139.
@@ -61,6 +62,7 @@ int main(void)
     }
 
     size_t page = (size_t) pgsz;
+
     /* Layout: [page 0: writable argv] [page 1: PROT_NONE guard]
      *         [page 2: writable envp sentinel]
      * A reverted argv+envp walk that consults environ computes an avail

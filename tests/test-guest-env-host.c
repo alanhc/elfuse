@@ -33,7 +33,7 @@ void log_impl(int level, const char *file, int line, const char *fmt, ...)
     (void) fmt;
 }
 
-/* ---- the oracle -------------------------------------------------------- */
+/* the oracle */
 
 enum { MODEL_MAX = 32, MODEL_ENTRY_MAX = 256 };
 
@@ -44,8 +44,9 @@ typedef struct {
     bool refused; /* an override named nothing */
 } model_t;
 
-/* Split "KEY=VALUE" at the first '='. Returns false when @s is not one:
- * no '=' at all, or an empty name.
+/* Split "KEY=VALUE" at the first '='.
+ *
+ * Returns false when @s is not one: no '=' at all, or an empty name.
  */
 static bool model_split(const char *s, char *name, char *value)
 {
@@ -102,9 +103,9 @@ static const char *model_host_value(char *const *host_env, const char *name)
     return NULL;
 }
 
-/* Reference merge. Builds the environment as an insertion-ordered name list,
- * so position comes from when a name was first seen rather than from which
- * slot the implementation happened to reuse.
+/* Reference merge. Builds the environment as an insertion-ordered name list, so
+ * position comes from when a name was first seen rather than from which slot
+ * the implementation happened to reuse.
  */
 static void model_build(model_t *m,
                         char *const *host_env,
@@ -144,7 +145,7 @@ static void model_build(model_t *m,
     }
 }
 
-/* ---- structural invariants --------------------------------------------- */
+/* structural invariants */
 
 /* Hold @envp to what every returned vector owes regardless of the cell:
  * NULL-terminated at @n, every entry a well-formed "KEY=VALUE", no name twice.
@@ -184,13 +185,14 @@ static bool check_structure(char **envp, int n, const char *cell)
     return true;
 }
 
-/* ---- the product ------------------------------------------------------- */
+/* the product */
 
 /* One base per way a host vector can be awkward. */
 static char *base_plain[] = {(char *) "A=1", (char *) "B=2", (char *) "C=3",
                              NULL};
-/* The one base separating a name the launcher set to "" from one it never
- * set: the alphabet's bare "A" imports "A=" here instead of being skipped.
+
+/* The one base separating a name the launcher set to "" from one it never set:
+ * the alphabet's bare "A" imports "A=" here instead of being skipped.
  */
 static char *base_emptyval[] = {(char *) "A=", (char *) "B=2", NULL};
 static char *base_dup[] = {(char *) "A=first", (char *) "B=2",
@@ -215,9 +217,9 @@ static const struct {
     {"prefix", base_prefix},
 };
 
-/* One token per branch of the merge. The refused "=VAL" is in the product so
- * a rejection lands at every base and at either override position, not only
- * at the single base named_cells reaches.
+/* One token per branch of the merge. The refused "=VAL" is in the product so a
+ * rejection lands at every base and at either override position, not only at
+ * the single base named_cells reaches.
  */
 static const char *const alphabet[] = {
     "NEW=x",   "A=over",  "A=",          "A=a=b", "A",
@@ -299,7 +301,7 @@ static void run_cell(char *const *host_env,
     strv_free((const char **) envp, n);
 }
 
-/* ---- cells the product cannot spell ------------------------------------ */
+/* cells the product cannot spell */
 
 static void named_cells(void)
 {

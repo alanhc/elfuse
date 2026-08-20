@@ -21,11 +21,13 @@ typedef struct string_builder {
     string_builder_storage_t storage;
 } string_builder_t;
 
-/* Initialize a builder, reserving initial_capacity bytes including the NUL.
- * A zero capacity leaves storage unallocated for lazy growth. This fresh
- * initializer is safe on an uninitialized automatic object; destroy an
- * existing builder before reinitializing it. Returns 0 on success or -1 with
- * errno set on invalid input or allocation failure.
+/* Initialize a builder, reserving initial_capacity bytes including the NUL. A
+ * zero capacity leaves storage unallocated for lazy growth. This fresh
+ * initializer is safe on an uninitialized automatic object; destroy an existing
+ * builder before reinitializing it.
+ *
+ * Returns 0 on success or -1 with errno set on invalid input or allocation
+ * failure.
  */
 int string_builder_init(string_builder_t *builder, size_t initial_capacity);
 

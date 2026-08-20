@@ -63,6 +63,7 @@ static inline void startup_trace_resolve(void)
     const char *v = getenv("ELFUSE_STARTUP_TRACE");
     if (!v || !v[0] || !strcmp(v, "0"))
         return;
+
     /* The legacy "1" knob enables steps. Recognize it both as the whole value
      * and as a token so compound forms like "1,syscalls" still keep the step
      * trace on alongside the histogram, instead of silently dropping it.

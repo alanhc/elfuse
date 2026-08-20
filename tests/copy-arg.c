@@ -32,6 +32,7 @@ int main(int argc, char **argv)
     int out = open(argv[2], O_CREAT | O_WRONLY | O_TRUNC, 0755);
     if (out < 0)
         return perror(argv[2]), 1;
+
     /* write_fd_all, not a bare write: the destination goes through the FUSE
      * write path, where a short count is a success that must be resumed, and
      * write(2) leaves errno untouched on one. The read retries EINTR for the

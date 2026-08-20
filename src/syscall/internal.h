@@ -106,11 +106,11 @@
  * beside the rest of the leaves, and it acquires nothing itself, so it closes
  * no cycle.
  *
- * pt_lock, thread_lock, sfd_lock, pid_lock and pidfd_lock are leaves today
- * too. They stay in the ordered list because each is named as an inner lock
- * above, so the order they would be acquired in is the load-bearing fact about
- * them. sig_lock is not one of them: signal_queue_thread_common takes
- * thread_lock under it.
+ * pt_lock, thread_lock, sfd_lock, pid_lock and pidfd_lock are leaves today too.
+ * They stay in the ordered list because each is named as an inner lock above,
+ * so the order they would be acquired in is the load-bearing fact about them.
+ * sig_lock is not one of them: signal_queue_thread_common takes thread_lock
+ * under it.
  */
 
 #pragma once

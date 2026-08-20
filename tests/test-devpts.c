@@ -1,4 +1,5 @@
-/* devpts identification and Unix98 pty allocation.
+/*
+ * devpts identification and Unix98 pty allocation.
  *
  * glibc's posix_openpt() opens /dev/ptmx and then confirms devpts is mounted
  * before handing the master back (sysdeps/unix/sysv/linux/getpt.c). If statfs
@@ -65,8 +66,8 @@ int main(void)
 
     /* No assertion on fstatfs(master): Linux answers from whatever filesystem
      * provides /dev/ptmx, which is devpts only when it is the bind-mounted
-     * /dev/pts/ptmx and tmpfs or devtmpfs otherwise. There is no portable
-     * value to expect.
+     * /dev/pts/ptmx and tmpfs or devtmpfs otherwise. There is no portable value
+     * to expect.
      *
      * The slave fd is not ambiguous that way -- on Linux it really does live on
      * devpts -- and elfuse still does not answer devpts for it. That is left
@@ -109,10 +110,10 @@ int main(void)
         } else {
             /* Raw mode: in canonical mode the slave read would block until a
              * newline arrives, and ECHO would race the payload back at the
-             * master. Both would hang the run rather than fail it, so a
-             * termios failure has to stop here -- carrying on would spend the
-             * whole alarm window below only to report a round-trip failure
-             * that is really a setup failure.
+             * master. Both would hang the run rather than fail it, so a termios
+             * failure has to stop here -- carrying on would spend the whole
+             * alarm window below only to report a round-trip failure that is
+             * really a setup failure.
              */
             struct termios tio;
             if (tcgetattr(slave, &tio) != 0) {
@@ -128,6 +129,7 @@ int main(void)
                 close(slave);
                 goto round_trip_done;
             }
+
             /* Belt and braces: a stuck read must fail the test, not wedge CI.
              */
             signal(SIGALRM, on_alarm);
@@ -138,10 +140,10 @@ int main(void)
             char buf[sizeof(msg)];
             memset(buf, 0, sizeof(buf));
 
-            /* A pty may transfer fewer bytes per call than asked for, in
-             * either direction, so drive both to completion instead of
-             * assuming one call moves the whole payload -- a legal short read
-             * would otherwise fail a working pair. The alarm above bounds the
+            /* A pty may transfer fewer bytes per call than asked for, in either
+             * direction, so drive both to completion instead of assuming one
+             * call moves the whole payload -- a legal short read would
+             * otherwise fail a working pair. The alarm above bounds the
              * exchange, so a stall still fails rather than looping forever.
              */
             size_t sent = 0;
@@ -180,9 +182,9 @@ int main(void)
     {
         /* The last four are aliases of a live slave that strtoul would take:
          * leading zeros, a sign, leading whitespace. Linux answers ENOENT for
-         * every one of them, and accepting any would let one slave answer
-         * under several names -- for stat, for devpts identity, and for
-         * whether chmod and chown are intercepted at all.
+         * every one of them, and accepting any would let one slave answer under
+         * several names -- for stat, for devpts identity, and for whether chmod
+         * and chown are intercepted at all.
          */
         char alias_zero[64], alias_plus[64], alias_space[64];
         snprintf(alias_zero, sizeof(alias_zero), "/dev/pts/0%s",
@@ -204,8 +206,8 @@ int main(void)
                 bad++;
             } else if (errno != ENOENT) {
                 /* Failing is not enough: EACCES or ENOTDIR would mean the
-                 * lookup went wrong somewhere else rather than the slave
-                 * simply not existing.
+                 * lookup went wrong somewhere else rather than the slave simply
+                 * not existing.
                  */
                 printf("FAIL (%s errno=%d (%s), want ENOENT) ", bogus[i], errno,
                        strerror(errno));

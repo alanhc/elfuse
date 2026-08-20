@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
+
 # test-rosetta-execfd.sh - guest fd is preserved across a rosetta execve
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Regression for the hardcoded guest fd 3 in rosetta_finalize. The runner
-# used to install the x86_64 binary at guest fd 3, clobbering whatever the
-# guest had already opened there. apt hands gpgv a status pipe on fd 3
-# (gpgv --status-fd 3); the eviction broke signature verification with
-# "Good signature, but could not determine key fingerprint". rosetta_finalize
-# now takes the lowest free non-stdio slot and publishes it via AT_EXECFD, so a
-# guest fd opened before an x86_64 execve survives into the new image and
-# intentionally closed stdio fds stay closed.
+# Regression for the hardcoded guest fd 3 in rosetta_finalize. The runner used
+# to install the x86_64 binary at guest fd 3, clobbering whatever the guest had
+# already opened there. apt hands gpgv a status pipe on fd 3 (gpgv --status-fd
+# 3); the eviction broke signature verification with "Good signature, but could
+# not determine key fingerprint". rosetta_finalize now takes the lowest free
+# non-stdio slot and publishes it via AT_EXECFD, so a guest fd opened before an
+# x86_64 execve survives into the new image and intentionally closed stdio fds
+# stay closed.
 #
-# The probe: a shell opens fd 3 onto a marker file, then execs busybox to
-# cat /proc/self/fd/3. If the runner evicts fd 3, cat reads the busybox ELF
-# instead of the marker. Both processes are x86_64 statics, so the inner
-# exec goes through the rosetta exec re-bootstrap path.
+# The probe: a shell opens fd 3 onto a marker file, then execs busybox to cat
+# /proc/self/fd/3. If the runner evicts fd 3, cat reads the busybox ELF instead
+# of the marker. Both processes are x86_64 statics, so the inner exec goes
+# through the rosetta exec re-bootstrap path.
 #
 # Skips cleanly when Rosetta Linux is absent or the x86_64 fixture tree is
 # missing (run tests/fetch-fixtures.sh INCLUDE_X86_64=1 first).

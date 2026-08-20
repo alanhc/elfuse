@@ -588,6 +588,7 @@ int main(void)
     TEST("DISPLAY parse '/path/sock:0'");
     {
         display_info_t d;
+
         /* Path does not exist on disk, so parse_display falls back to the full
          * string as socket_path
          */

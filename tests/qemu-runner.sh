@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
+
 # qemu-runner.sh -- Boot qemu-system-aarch64 with the elfuse test fixtures
 # initramfs and provide qemu_exec() for command execution over ssh.
 #
-# Sourced by tests/test-matrix.sh (for the qemu-aarch64 mode) but also
-# usable interactively:
+# Sourced by tests/test-matrix.sh (for the qemu-aarch64 mode) but also usable
+# interactively:
 #   . tests/qemu-runner.sh
 #   qemu_start
 #   qemu_exec uname -a
 #   qemu_stop
 #
-# The booted VM mounts the host repo root at /mnt/host via virtio-9p,
-# so any path under the repo is reachable from the VM as
-# /mnt/host/<relative-path>.
+# The booted VM mounts the host repo root at /mnt/host via virtio-9p, so any
+# path under the repo is reachable from the VM as /mnt/host/<relative-path>.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -23,10 +23,11 @@ QEMU_BIN="${QEMU_BIN:-qemu-system-aarch64}"
 QEMU_PORT="${QEMU_PORT:-2222}"
 QEMU_MEM="${QEMU_MEM:-2048}"
 QEMU_SMP="${QEMU_SMP:-4}"
+
 # Accelerator + CPU model are auto-selected at qemu_start time: HVF + cpu=host
 # on Apple Silicon when the qemu build supports it, otherwise TCG + cortex-a72
-# (slower but portable to non-aarch64 hosts and qemu builds without HVF).
-# Either can be forced via QEMU_ACCEL=tcg / QEMU_CPU=cortex-a72.
+# (slower but portable to non-aarch64 hosts and qemu builds without HVF). Either
+# can be forced via QEMU_ACCEL=tcg / QEMU_CPU=cortex-a72.
 QEMU_ACCEL="${QEMU_ACCEL:-}"
 QEMU_CPU="${QEMU_CPU:-}"
 QEMU_BOOT_TIMEOUT="${QEMU_BOOT_TIMEOUT:-90}"
@@ -65,8 +66,8 @@ qemu_ensure_fixtures()
     done
 }
 
-# Pick a free localhost TCP port for ssh forwarding (avoids collisions
-# when several test-matrix runs overlap or QEMU_PORT is in use).
+# Pick a free localhost TCP port for ssh forwarding (avoids collisions when
+# several test-matrix runs overlap or QEMU_PORT is in use).
 qemu_pick_port()
 {
     if command -v python3 > /dev/null 2>&1; then
@@ -160,17 +161,17 @@ qemu_start()
     done
 
     # The Alpine initramfs keeps /tmp on "rootfs", which busybox df cannot
-    # resolve to a /proc/mounts entry ("df: ...: can't find mount point").
-    # Mount a dedicated tmpfs, as any regular system has, so paths under
-    # /tmp map to a resolvable st_dev. Guarded so a repeated qemu_start
-    # against a running VM does not stack mounts.
+    # resolve to a /proc/mounts entry ("df: ...: can't find mount point"). Mount
+    # a dedicated tmpfs, as any regular system has, so paths under /tmp map to a
+    # resolvable st_dev. Guarded so a repeated qemu_start against a running VM
+    # does not stack mounts.
     _qemu_ssh_raw 'grep -q " /tmp tmpfs " /proc/mounts || mount -t tmpfs tmpfs /tmp'
 }
 
-# Each call opens a fresh ssh connection.  Avoids ControlMaster pitfalls
-# (master dying mid-suite cascades rc=255 to every later command) at the
-# cost of ~100ms handshake overhead per call -- a flat ~15s across the
-# full matrix, well within the suite's tolerance.
+# Each call opens a fresh ssh connection. Avoids ControlMaster pitfalls (master
+# dying mid-suite cascades rc=255 to every later command) at the cost of ~100ms
+# handshake overhead per call -- a flat ~15s across the full matrix, well within
+# the suite's tolerance.
 _qemu_ssh_raw()
 {
     ssh -o StrictHostKeyChecking=no \
@@ -185,11 +186,11 @@ _qemu_ssh_raw()
         root@127.0.0.1 "$@"
 }
 
-# Run a command in the VM.  Any argument that is an absolute path under the
-# host repo root is rewritten to its /mnt/host/... in-VM equivalent so the
-# guest can dereference it through the virtio-9p share.  Cwd is forced to
-# /mnt/host so test arguments using paths like "tests/foo" work the same
-# as they do when run on the macOS host.
+# Run a command in the VM. Any argument that is an absolute path under the host
+# repo root is rewritten to its /mnt/host/... in-VM equivalent so the guest can
+# dereference it through the virtio-9p share. Cwd is forced to /mnt/host so test
+# arguments using paths like "tests/foo" work the same as they do when run on
+# the macOS host.
 qemu_exec()
 {
     local args=() a
@@ -229,8 +230,8 @@ qemu_stop()
 }
 
 # When sourced, register a cleanup trap that does not clobber the caller's
-# existing trap chain.  When executed directly, the EXIT trap fires on
-# script exit.
+# existing trap chain. When executed directly, the EXIT trap fires on script
+# exit.
 trap 'qemu_stop' EXIT
 
 # CLI driver: when run directly, support 'qemu-runner.sh start|exec|stop'.

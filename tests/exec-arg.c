@@ -7,9 +7,9 @@
  * Replace this process with argv[1], handing it argv[2..] as its own argv.
  * argv[2] is the target's argv[0], separate from the path because a multicall
  * binary dispatches on it. Sysroot recipes run this as a guest so the target
- * goes through the guest execve path: the initial process is loaded by the
- * core bootstrap, which resolves PT_INTERP by literal concatenation plus the
- * /lib fallback only, so a lane about interpreter resolution through escaped
+ * goes through the guest execve path: the initial process is loaded by the core
+ * bootstrap, which resolves PT_INTERP by literal concatenation plus the /lib
+ * fallback only, so a lane about interpreter resolution through escaped
  * spellings has to exec from inside the guest.
  */
 

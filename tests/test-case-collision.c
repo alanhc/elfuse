@@ -7,8 +7,8 @@
  * Names that a case-folding volume would merge must stay separate files to the
  * guest, and every syscall that names a file has to agree about which one it
  * means. This walks the whole surface (open, rename, renameat2 with EXCHANGE
- * and NOREPLACE, linkat, symlinkat, getdents64, statx, xattr) against a set
- * of names differing only in case.
+ * and NOREPLACE, linkat, symlinkat, getdents64, statx, xattr) against a set of
+ * names differing only in case.
  *
  * Code under test: the resolver in src/syscall/casefold-walk.c reached through
  * src/syscall/path.c. A regression shows up as two guest names resolving to one
@@ -147,10 +147,10 @@ static int getdents_contains_after_partial(const char *dir_path,
 }
 
 /* One linkat case over a symlink: create @target_name, point @link_name at it
- * (spelled relative or absolute by @absolute_target), and hard-link the
- * symlink with @flags. @expect_link says which node the new name must be: the
- * link itself without AT_SYMLINK_FOLLOW, the target with it. The hard-link
- * names are case-protected, so on a folding sysroot every case exercises the
+ * (spelled relative or absolute by @absolute_target), and hard-link the symlink
+ * with @flags. @expect_link says which node the new name must be: the link
+ * itself without AT_SYMLINK_FOLLOW, the target with it. The hard-link names are
+ * case-protected, so on a folding sysroot every case exercises the
  * escaped-create path through linkat rather than through open.
  */
 static void check_linkat(const char *base,
@@ -424,17 +424,16 @@ int main(void)
         }
     }
 
-    /* AT_SYMLINK_FOLLOW hard-links what the symlink points at, so the result
-     * is a regular file; without it linkat(2) links the symlink itself, and
-     * that holds for an absolute target too: nothing has to resolve the
-     * target to copy the link.
+    /* AT_SYMLINK_FOLLOW hard-links what the symlink points at, so the result is
+     * a regular file; without it linkat(2) links the symlink itself, and that
+     * holds for an absolute target too: nothing has to resolve the target to
+     * copy the link.
      *
      * The followed target is spelled relative in one case and absolute in the
      * other: a symlink stores the bytes the guest wrote, so the two spellings
      * reach the target through different resolution paths (the relative one
      * against the translated parent, the absolute one through the
-     * guest-namespace splice), and only running both shows linkat follows
-     * each.
+     * guest-namespace splice), and only running both shows linkat follows each.
      */
     TEST("linkat AT_SYMLINK_FOLLOW links the target, not the symlink");
     check_linkat(base, "real-target", "real-link", "REAL-HARD", false,

@@ -171,6 +171,7 @@ static void test_large_read_from_split_block(void)
         ssize_t ret = read(fd, buf, IO_SIZE);
         ok = (ret == (ssize_t) IO_SIZE);
     }
+
     /* Verify the entire read buffer, including the 2MiB boundary crossing where
      * L3-to-L2 page table transitions happen.
      */

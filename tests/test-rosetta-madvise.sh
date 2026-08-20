@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-rosetta-madvise.sh - madvise(MADV_DONTNEED) on high-VA regions via
 # Rosetta
 #

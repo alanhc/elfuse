@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-rosetta-mremap.sh - mremap() on high-VA source regions via Rosetta
 #
 # Copyright 2026 elfuse contributors

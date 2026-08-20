@@ -11,11 +11,11 @@
  * root reports ELOOP, a diagnosis about symlinks for a path containing none.
  *
  * Code under test: proc_resolve_sysroot_create_path and
- * proc_resolve_sysroot_path_flags in src/syscall/proc-state.c: the parent
- * split off the walk's recorded offsets, and the all-slash guard the
- * containment check needs. A regression shows up as ELOOP where the host's
- * own answer should come through, which sends a caller looking for a link
- * loop that does not exist.
+ * proc_resolve_sysroot_path_flags in src/syscall/proc-state.c: the parent split
+ * off the walk's recorded offsets, and the all-slash guard the containment
+ * check needs. A regression shows up as ELOOP where the host's own answer
+ * should come through, which sends a caller looking for a link loop that does
+ * not exist.
  *
  * Nothing here writes: the macOS root is read-only, and what is asserted is
  * that the guest is told so rather than being told something untrue. Run under
@@ -65,8 +65,8 @@ int main(void)
      * containment check splits a parent off the resolved path, and with the
      * one-character prefix that parent is the root itself; treating the shape
      * as impossible reported ELOOP for lstat("/"), which no Linux kernel can
-     * produce: "/" is a directory, and nofollow only changes the answer for
-     * a symlink.
+     * produce: "/" is a directory, and nofollow only changes the answer for a
+     * symlink.
      */
     TEST("the root itself resolves without following");
     EXPECT_TRUE(lstat("/", &st) == 0 && S_ISDIR(st.st_mode), "lstat /");

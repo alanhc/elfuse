@@ -201,8 +201,8 @@ int main(void)
 
     /* 7. readv(): a first entry far too small for the response. A receive that
      * stops at entry 0 cannot exceed READV_HEAD bytes. The entries are adjacent
-     * halves of one buffer, so the scattered bytes stay contiguous and parse
-     * as an ordinary message stream.
+     * halves of one buffer, so the scattered bytes stay contiguous and parse as
+     * an ordinary message stream.
      */
     req.nlh.nlmsg_seq = 4;
     sent = sendto(fd, &req, req.nlh.nlmsg_len, 0, (struct sockaddr *) &kernel,

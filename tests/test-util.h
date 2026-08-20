@@ -55,7 +55,8 @@ static inline ssize_t read_file_nul(const char *path, char *buf, size_t bufsz)
 }
 
 /* Read a file whose size is not available from st_size (for example a proc
- * file) until EOF, growing the buffer and appending a NUL terminator. */
+ * file) until EOF, growing the buffer and appending a NUL terminator.
+ */
 static inline ssize_t read_file_dynamic_nul(const char *path,
                                             char **buf_out,
                                             size_t *len_out)
@@ -252,8 +253,8 @@ static inline int dir_entry_count(const char *dir)
 }
 
 /* Membership only; an unopenable @dir reads as absent, so a negative-only
- * assertion must pair with a positive one or use dir_count_name, whose -1
- * keeps "cannot read" distinct from "not present".
+ * assertion must pair with a positive one or use dir_count_name, whose -1 keeps
+ * "cannot read" distinct from "not present".
  */
 static inline bool dir_contains(const char *dir, const char *name)
 {
@@ -293,11 +294,12 @@ static inline int dir_count_name(const char *dir, const char *name)
 }
 
 /* Bind a pathname AF_UNIX socket of @type at @path, listening with @backlog
- * when it is positive. Returns the descriptor, or -1 with the socket closed
- * and no socket file created by this call left behind.
- * An over-long @path is truncated into sun_path exactly as the lanes did by
- * hand; the bind then addresses the truncated name, which the caller's own
- * assertions catch.
+ * when it is positive.
+ *
+ * Returns the descriptor, or -1 with the socket closed and no socket file
+ * created by this call left behind. An over-long @path is truncated into
+ * sun_path exactly as the lanes did by hand; the bind then addresses the
+ * truncated name, which the caller's own assertions catch.
  */
 static inline int unix_bind(const char *path, int type, int backlog)
 {
@@ -314,10 +316,10 @@ static inline int unix_bind(const char *path, int type, int backlog)
         return -1;
     }
     if (backlog > 0 && listen(fd, backlog) != 0) {
-        /* bind created the file, so a rerun would get EADDRINUSE from it.
-         * Only this branch unlinks: on a bind failure the file is not this
-         * call's, and removing it would break whoever owns it. sun_path,
-         * not @path, because the file carries the truncated name.
+        /* bind created the file, so a rerun would get EADDRINUSE from it. Only
+         * this branch unlinks: on a bind failure the file is not this call's,
+         * and removing it would break whoever owns it. sun_path, not @path,
+         * because the file carries the truncated name.
          */
         unlink(sa.sun_path);
         close(fd);

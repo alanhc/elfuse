@@ -1250,8 +1250,8 @@ run_suite()
 
     # Checked here rather than inside run_unit_tests so an empty build fails
     # this lane through the caller's accounting. Exiting from inside the lane
-    # would take the whole script down with it under MODE=all, skipping the
-    # qemu lane and the rosetta one, which does not read GUEST_TEST_BINARIES.
+    # would take the whole script down with it under MODE=all, skipping the qemu
+    # lane and the rosetta one, which does not read GUEST_TEST_BINARIES.
     if [ "${ALLOW_MISSING_BINARIES:-0}" != "1" ] \
         && ! require_unit_binaries "$GUEST_TEST_BINARIES"; then
         return 1

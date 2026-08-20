@@ -35,8 +35,8 @@
  * Several bitmaps in the tree run 64 bits to a word over the same fd table:
  * pselect6's three guest bitmasks in poll.c, the free-fd allocator's
  * fd_free_bitmap in fdtable.c, and the urandom bitmap in shim-globals.c. They
- * share the constants here, but not every one of them should route its
- * indexing through the helpers below.
+ * share the constants here, but not every one of them should route its indexing
+ * through the helpers below.
  *
  * The bound belongs here when it is a fact about the input: pselect6's nfds
  * arrives from the guest, so the reject branch is a branch the code has to take

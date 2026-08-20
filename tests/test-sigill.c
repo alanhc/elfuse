@@ -34,6 +34,7 @@ static void sigill_handler(int sig, siginfo_t *info, void *ucontext)
      * ucontext_t.uc_mcontext.__ss.__pc on aarch64 Linux is the faulting PC.
      */
     ucontext_t *uc = (ucontext_t *) ucontext;
+
     /* Linux aarch64: mcontext_t has regs[31], sp, pc, pstate. pc is at offset
      * regs[32] equivalent, but the layout varies. Use the struct field
      * directly.

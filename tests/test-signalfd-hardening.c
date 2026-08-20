@@ -65,6 +65,7 @@ static void build_kernel_siginfo(int sig,
     memcpy(out + 4, &s32, 4); /* si_errno */
     s32 = code;
     memcpy(out + 8, &s32, 4);
+
     /* offset 12 is _pad0 (or part of _sifields alignment). Linux's _sifields
      * starts at offset 16 on aarch64; for SI_QUEUE the layout there is:
      *   si_pid (4) si_uid (4) si_value (8)
@@ -75,6 +76,7 @@ static void build_kernel_siginfo(int sig,
     memcpy(out + 20, &s32, 4);
     s32 = payload_int;
     memcpy(out + 24, &s32, 4);
+
     /* Kernel ignores the upper 4 bytes of si_value's int form, but writes the
      * pointer form into the full 8-byte slot at offset 24 for sigval_t. The
      * pointer goes into the low 8 bytes so signal_queue_rt() reads either
@@ -82,6 +84,7 @@ static void build_kernel_siginfo(int sig,
      */
     u64 = (uint64_t) (uintptr_t) payload_ptr;
     memcpy(out + 24, &u64, 8);
+
     /* If both int and ptr are set, ptr wins because it overlaps. Tests pick one
      * or the other.
      */

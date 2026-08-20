@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-proctitle-low-stack.sh -- Regress Apple Silicon argv/env stack overwrite
 #
 # Copyright 2026 elfuse contributors
@@ -6,18 +7,17 @@
 #
 # Usage: tests/test-proctitle-low-stack.sh <elfuse-binary> <busybox-binary>
 #
-# The original failure (see git log for runtime/proctitle.c) was an argv
-# tail overshoot by Apple libc memset stp/DC ZVA ladders writing past the
-# explicit byte count when the destination touched the stack ceiling. The
-# fix walks only the contiguous argv block and stores byte-by-byte through
-# a volatile pointer.
+# The original failure (see git log for runtime/proctitle.c) was an argv tail
+# overshoot by Apple libc memset stp/DC ZVA ladders writing past the explicit
+# byte count when the destination touched the stack ceiling. The fix walks only
+# the contiguous argv block and stores byte-by-byte through a volatile pointer.
 #
 # This regression launches the standard busybox echo path under a host
-# RLIMIT_STACK far below every macOS default (8176 KiB on Apple Silicon,
-# 8192 KiB on Intel), and verifies the rewrite still terminates cleanly.
-# Earlier revisions of this script gated the cap behind a -gt comparison
-# that became a no-op on hosts whose default soft cap already met or
-# beat the gate value; the cap is now applied unconditionally.
+# RLIMIT_STACK far below every macOS default (8176 KiB on Apple Silicon, 8192
+# KiB on Intel), and verifies the rewrite still terminates cleanly. Earlier
+# revisions of this script gated the cap behind a -gt comparison that became a
+# no-op on hosts whose default soft cap already met or beat the gate value; the
+# cap is now applied unconditionally.
 
 set -euo pipefail
 
@@ -29,14 +29,14 @@ TEST_TIMEOUT="${TEST_TIMEOUT:-10}"
 # shellcheck source=tests/lib/test-runner.sh
 source "$SCRIPT_DIR/lib/test-runner.sh"
 
-# Override via env for local experiments. The default sits an order of
-# magnitude below every observed macOS shell default and well above the
-# floor where elfuse's own host runtime needs more stack than is provided
-# (empirically ~560 KiB on macOS 26 / Apple M-series).
+# Override via env for local experiments. The default sits an order of magnitude
+# below every observed macOS shell default and well above the floor where
+# elfuse's own host runtime needs more stack than is provided (empirically ~560
+# KiB on macOS 26 / Apple M-series).
 PROCTITLE_LOW_STACK_KIB="${PROCTITLE_LOW_STACK_KIB:-1024}"
 
-# Distinct exit codes from the wrapped child shell let the parent
-# distinguish "rlimit setup failed" from "elfuse crashed".
+# Distinct exit codes from the wrapped child shell let the parent distinguish
+# "rlimit setup failed" from "elfuse crashed".
 ULIMIT_SETUP_FAIL=98
 ULIMIT_VERIFY_FAIL=99
 

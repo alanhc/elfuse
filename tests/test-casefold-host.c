@@ -19,9 +19,9 @@
  *
  * Code under test: src/syscall/casefold.c. A regression shows up as a guest
  * name that comes back as a different name, two distinct names sharing one
- * encoding, or a name elfuse emits that the volume then refuses to create.
- * Each of those would surface inside a guest much later as a missing or a
- * wrong file.
+ * encoding, or a name elfuse emits that the volume then refuses to create. Each
+ * of those would surface inside a guest much later as a missing or a wrong
+ * file.
  *
  * Native macOS binary; no HVF entitlement needed.
  */
@@ -44,9 +44,9 @@
 #include "host-test-util.h"
 #include "syscall/casefold.h"
 
-/* True when @s is well-formed UTF-8: no overlong forms, no surrogates,
- * nothing above U+10FFFF. APFS refuses to create a name that is not, so an
- * ill-formed name has to be escaped rather than stored.
+/* True when @s is well-formed UTF-8: no overlong forms, no surrogates, nothing
+ * above U+10FFFF. APFS refuses to create a name that is not, so an ill-formed
+ * name has to be escaped rather than stored.
  */
 static bool casefold_utf8_valid(const char *s)
 {
@@ -84,10 +84,10 @@ static bool casefold_utf8_valid(const char *s)
             cp = (cp << 6) | (cc & 0x3Fu);
         }
 
-        /* Reject the forms that encode a code point in more bytes than
-         * needed, the UTF-16 surrogate range, and anything past the Unicode
-         * maximum. Each has more than one byte sequence otherwise, which
-         * would break the one-spelling-per-name property.
+        /* Reject the forms that encode a code point in more bytes than needed,
+         * the UTF-16 surrogate range, and anything past the Unicode maximum.
+         * Each has more than one byte sequence otherwise, which would break the
+         * one-spelling-per-name property.
          */
         if (extra == 2 && cp < 0x800u)
             return false;
@@ -197,6 +197,7 @@ static void check_not_escaped(const char *label, const char *host)
         dump("host", host);
         return;
     }
+
     /* An unrecognized shape must pass through as itself, or a listing would
      * report a name the guest cannot open.
      */
@@ -254,10 +255,10 @@ static void fill(char *buf, size_t n, char c)
 
 /* The frozen table is the one check that fails when the format moves: every
  * other section reads its expectations back through the codec, so a
- * self-consistent format change keeps them green while orphaning every
- * sysroot already on disk. Each escaped row is asserted byte-exact in both
- * directions; a red row here means the on-disk format broke, and the remedy
- * is a format migration, not a new literal.
+ * self-consistent format change keeps them green while orphaning every sysroot
+ * already on disk. Each escaped row is asserted byte-exact in both directions;
+ * a red row here means the on-disk format broke, and the remedy is a format
+ * migration, not a new literal.
  */
 static void section_golden(void)
 {
@@ -433,6 +434,7 @@ static void section_shapes(void)
     check_not_escaped("decodes to dotdot", ".ef=2e2e");
     check_not_escaped("decodes to an embedded NUL", ".ef=610062");
     check_not_escaped("empty decode", ".ef=");
+
     /* U+4E00 is a payload symbol, but a lone one is not a valid frame: the
      * first symbol carries a length, and 0 is not a legal name length.
      */
@@ -595,6 +597,7 @@ static void section_i18n(void)
         char a[CASEFOLD_HOST_NAME_MAX + 1];
         if (!casefold_needs_escape(i18n_corpus[i]))
             continue;
+
         /* An encoder that refused these names would skip every comparison and
          * reach the host_ok() below having proved nothing, so a refusal is the
          * failure rather than a reason to move on.
@@ -744,11 +747,12 @@ static void section_accept(const char *root)
             } else {
                 snprintf(host, sizeof(host), "%s", names[k]);
             }
-            /* EEXIST is a failure, not a tolerated outcome. Every name in
-             * this sweep is distinct, so a second create landing on an entry
-             * that is already there means two guest names reached one slot,
-             * precisely the collision the encoding exists to prevent, and
-             * exactly what tolerating EEXIST would hide.
+
+            /* EEXIST is a failure, not a tolerated outcome. Every name in this
+             * sweep is distinct, so a second create landing on an entry that is
+             * already there means two guest names reached one slot, precisely
+             * the collision the encoding exists to prevent, and exactly what
+             * tolerating EEXIST would hide.
              */
             rc = create_in(dir, host);
             if (rc < 0) {
@@ -828,8 +832,8 @@ static void section_accept(const char *root)
 }
 
 /* The three volume behaviors the resolver is built on. If a macOS release
- * changes any of them the design needs revisiting, so each gets its own
- * message rather than a generic assertion failure.
+ * changes any of them the design needs revisiting, so each gets its own message
+ * rather than a generic assertion failure.
  */
 static void section_volume(const char *root)
 {

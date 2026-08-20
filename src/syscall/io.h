@@ -46,10 +46,10 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events);
  * returned the instant the resource freed, so the ceiling is the added latency
  * a guest pays after the holder releases: 2 ms costs at most 500 wakeups/s on a
  * thread that is otherwise asleep, and keeps the worst case an order of
- * magnitude below what the execve teardown budget (200 ms of pokes plus a
- * 500 ms join) would tolerate. The floor is short because the common case is a
- * lock held for microseconds; io_retry_backoff yields once before sleeping at
- * all, which catches a holder that releases inside the same quantum.
+ * magnitude below what the execve teardown budget (200 ms of pokes plus a 500
+ * ms join) would tolerate. The floor is short because the common case is a lock
+ * held for microseconds; io_retry_backoff yields once before sleeping at all,
+ * which catches a holder that releases inside the same quantum.
  */
 #define IO_RETRY_BACKOFF_START_US 50
 #define IO_RETRY_BACKOFF_MAX_US 2000

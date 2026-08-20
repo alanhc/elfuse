@@ -76,7 +76,8 @@ static void child_probe(int file_fd, unsigned char *base)
 
     /* Consume the host descriptor reserve with one-page file mappings separated
      * by holes. The attribution probe below rejects a region/address-capacity
-     * failure, so this loop cannot silently become a different regression. */
+     * failure, so this loop cannot silently become a different regression.
+     */
     const size_t filler_length = (size_t) FILL_LIMIT * 2 * PAGE_SIZE;
     void *reserved = mmap(NULL, filler_length, PROT_NONE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -109,8 +110,8 @@ static void child_probe(int file_fd, unsigned char *base)
     /* Prove that the filler stopped on host descriptor pressure rather than
      * address-space or region-table capacity. Retry the same gap before
      * releasing anything: it must still fail with ENOMEM while the host table
-     * is exhausted. Then release two guest duplicate slots (a file-backed
-     * mmap may need one temporary and one tracked host fd) and map the gap
+     * is exhausted. Then release two guest duplicate slots (a file-backed mmap
+     * may need one temporary and one tracked host fd) and map the gap
      * successfully while leaving every existing region in place. If either
      * attribution step fails, the later ENOMEM assertions would be ambiguous.
      */
@@ -144,7 +145,8 @@ static void child_probe(int file_fd, unsigned char *base)
 
     /* Consume every descriptor released by the attribution probe and the
      * removed filler region. The following mremap/munmap calls must have no
-     * host descriptor available for their internal dup(). */
+     * host descriptor available for their internal dup().
+     */
     int probe_fds[3] = {-1, -1, -1};
     for (int i = 0; i < 3; i++) {
         probe_fds[i] = dup(file_fd);
@@ -153,7 +155,8 @@ static void child_probe(int file_fd, unsigned char *base)
     }
 
     /* Splitting either boundary of the child-private tail must fail before
-     * changing memory or PTEs when no descriptor is available. */
+     * changing memory or PTEs when no descriptor is available.
+     */
     errno = 0;
     result = mremap(base, SPAN + 2 * PAGE_SIZE, SPAN + PAGE_SIZE, 0);
     int remap_errno = errno;
@@ -283,7 +286,8 @@ static void test_full_table_munmap_without_overlay(void)
 
     /* The 32 KiB region and 16 KiB interior edge keep at least one aligned
      * host-page boundary inside the first/last VMA on both 4 KiB and 16 KiB
-     * hosts. The guest only exposes 4 KiB pages to this test. */
+     * hosts. The guest only exposes 4 KiB pages to this test.
+     */
     size_t region_length = 8 * PAGE_SIZE;
     size_t stride = region_length + PAGE_SIZE;
     size_t reservation_length = (size_t) FILL_LIMIT * stride + region_length;

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-rosetta-glibc.sh - glibc loader smoke through Rosetta
 #
 # Copyright 2026 elfuse contributors
@@ -59,9 +60,9 @@ if [ ! -x "$LD_SO" ] || [ ! -x "$HELLO" ] \
     stage_glibc_fixture
 fi
 
-# Run a probe binary under elfuse + sysroot, expect rc=0 and the
-# probe's "<label>-ok" success marker on stdout. Variant probes
-# (--list output check, ld.so chained loader, etc.) stay inline below.
+# Run a probe binary under elfuse + sysroot, expect rc=0 and the probe's
+# "<label>-ok" success marker on stdout. Variant probes (--list output check,
+# ld.so chained loader, etc.) stay inline below.
 probe_marker_ok()
 {
     local label="$1"
@@ -98,30 +99,27 @@ else
     printf '%s\n' "$list_out" >&2
 fi
 
-# Runtime dlopen of libm.so.6 -> dlsym sqrt -> sqrt(16.0) -> dlclose.
-# Exercises the runtime mmap-fresh-.so codepath, which is distinct from
-# the load-time PT_INTERP path the three probes above touch.
+# Runtime dlopen of libm.so.6 -> dlsym sqrt -> sqrt(16.0) -> dlclose. Exercises
+# the runtime mmap-fresh-.so codepath, which is distinct from the load-time
+# PT_INTERP path the three probes above touch.
 probe_marker_ok "glibc-dlopen" "glibc-dlopen-ok" "$DLOPEN_BIN"
 
-# Initial-exec TLS read/write through FS-register translation. The
-# binary touches a __thread int and a __thread pointer; a broken
-# FS-to-TPIDR_EL0 plumbing under Rosetta surfaces as a value mismatch
-# rather than a crash.
+# Initial-exec TLS read/write through FS-register translation. The binary
+# touches a __thread int and a __thread pointer; a broken FS-to-TPIDR_EL0
+# plumbing under Rosetta surfaces as a value mismatch rather than a crash.
 probe_marker_ok "glibc-tls" "glibc-tls-ok" "$TLS_BIN"
 
-# General-dynamic TLS via dlopen + __tls_get_addr. The companion
-# libgdtls.so is loaded at runtime, which forces the compiler-emitted
-# access sequence to call __tls_get_addr instead of using initial-exec
-# offsets. A broken Rosetta lowering of that path surfaces as a value
-# mismatch from the get/set accessors.
+# General-dynamic TLS via dlopen + __tls_get_addr. The companion libgdtls.so is
+# loaded at runtime, which forces the compiler-emitted access sequence to call
+# __tls_get_addr instead of using initial-exec offsets. A broken Rosetta
+# lowering of that path surfaces as a value mismatch from the get/set accessors.
 probe_marker_ok "glibc-gdtls" "glibc-gdtls-ok" "$GDTLS_BIN"
 
-# pthread per-thread TLS isolation. A worker thread reads + writes its
-# own __thread slot; the probe asserts the worker saw its initial
-# default (not the main thread's value) and that the main thread's
-# slot survives the worker's write. Exercises per-thread FS-register /
-# TPIDR_EL0 setup that the single-thread glibc-tls probe does not
-# touch.
+# pthread per-thread TLS isolation. A worker thread reads + writes its own
+# __thread slot; the probe asserts the worker saw its initial default (not the
+# main thread's value) and that the main thread's slot survives the worker's
+# write. Exercises per-thread FS-register / TPIDR_EL0 setup that the
+# single-thread glibc-tls probe does not touch.
 probe_marker_ok "glibc-pthread-tls" "glibc-pthread-tls-ok" "$PTHREAD_TLS_BIN"
 
 report_summary "$total"

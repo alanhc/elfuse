@@ -46,6 +46,7 @@ static void test_binary_low_linked(void)
 {
     TEST("binary linked below ELF_DEFAULT_BASE");
     uintptr_t pc = (uintptr_t) &test_binary_low_linked;
+
     /* The legacy guard window is [0x100000, 0x400000); the test binary's .text
      * must land inside it for the regression to be meaningful.
      */
@@ -57,6 +58,7 @@ static void test_mprotect_own_data_page(void)
 {
     TEST("mprotect own .data page to PROT_READ");
     void *page = (void *) data_page;
+
     /* Drop the page to read-only, RELRO-style. Pre-fix this returned -EINVAL
      * because [SHIM_BASE, ELF_DEFAULT_BASE) was rejected outright.
      */
@@ -65,6 +67,7 @@ static void test_mprotect_own_data_page(void)
         FAIL("mprotect(PROT_READ) on low-linked .data page failed");
         return;
     }
+
     /* Restore RW immediately so any later code that touches the page (e.g.
      * printf's stdout buffer if the linker placed it nearby, or libc exit
      * cleanup) cannot fault. mprotect-restoring is itself the same code path;
@@ -78,6 +81,7 @@ static void test_mprotect_own_data_page(void)
 static void test_munmap_low_scratch_range(void)
 {
     TEST("munmap on scratch range below ELF_DEFAULT_BASE");
+
     /* 0x180000 sits in the legacy guard window [0x100000, 0x400000) but outside
      * the binary's loaded segments (which start at the link address >=
      * 0x200000). With the new high-IPA infra reserve, this range has no PT

@@ -4,23 +4,22 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * A relative symlink target stores the bytes the guest gave it, and
- * readlink(2) hands them back. On a folding sysroot that puts the target and
- * the disk out of step, because a name the volume cannot hold as itself is
- * stored escaped; handing the stored bytes to the host kernel then looks for
- * a name that is not there. An absolute target cannot even be stored
- * verbatim: anything following the link natively resolves it from the host
- * root rather than the sysroot, so creation rewrites it to a target relative
- * to the link's own directory (sys_symlinkat in src/syscall/fs.c). readlink
- * reports that rewritten spelling, the one visible divergence, because
- * nothing on disk tells a rewritten target from a relative one the guest
- * wrote.
+ * A relative symlink target stores the bytes the guest gave it, and readlink(2)
+ * hands them back. On a folding sysroot that puts the target and the disk out
+ * of step, because a name the volume cannot hold as itself is stored escaped;
+ * handing the stored bytes to the host kernel then looks for a name that is not
+ * there. An absolute target cannot even be stored verbatim: anything following
+ * the link natively resolves it from the host root rather than the sysroot, so
+ * creation rewrites it to a target relative to the link's own directory
+ * (sys_symlinkat in src/syscall/fs.c). readlink reports that rewritten
+ * spelling, the one visible divergence, because nothing on disk tells a
+ * rewritten target from a relative one the guest wrote.
  *
  * Following therefore happens in the guest's namespace: the target is resolved
  * as a guest path, through the same sysroot-or-host dispatch every other guest
  * path takes. An absolute target consequently behaves exactly like the same
- * absolute path typed by the guest: inside the sysroot when it is there, on
- * the host when it is not and the path is not a guest system directory.
+ * absolute path typed by the guest: inside the sysroot when it is there, on the
+ * host when it is not and the path is not a guest system directory.
  *
  * Code under test: the symlink handling in src/syscall/casefold-walk.c and the
  * splice in src/syscall/proc-state.c. A regression shows up as ENOENT for a
@@ -152,11 +151,11 @@ int main(void)
         EXPECT_TRUE(chdir("/") == 0, "restore cwd");
     }
 
-    /* readlink reports the disk. A relative target is stored verbatim, so
-     * the guest's own bytes come back; an absolute one was rewritten at
-     * symlink() time to the sysroot-relative spelling (see the header), and
-     * that spelling is what comes back. The link here sits one directory
-     * below the guest root, so the rewrite is ".." plus the absolute target.
+    /* readlink reports the disk. A relative target is stored verbatim, so the
+     * guest's own bytes come back; an absolute one was rewritten at symlink()
+     * time to the sysroot-relative spelling (see the header), and that spelling
+     * is what comes back. The link here sits one directory below the guest
+     * root, so the rewrite is ".." plus the absolute target.
      */
     TEST("readlink returns a relative target verbatim");
     at(path, sizeof(path), "rel-escaped");
@@ -222,9 +221,9 @@ int main(void)
         "content through an over-climbing target");
 
     /* Regression guards for the link budget, green at introduction: exactly
-     * MAXSYMLINKS (40) links resolve and the 41st reports ELOOP, matching
-     * Linux (path_resolution(7)). An off-by-one in either direction flips
-     * exactly one of the pair.
+     * MAXSYMLINKS (40) links resolve and the 41st reports ELOOP, matching Linux
+     * (path_resolution(7)). An off-by-one in either direction flips exactly one
+     * of the pair.
      */
     TEST("a 40-link chain resolves");
     {
@@ -272,8 +271,8 @@ int main(void)
                     readlink(path, buf, sizeof(buf) - 1) > 0,
                 "the link itself exists");
 
-    /* Operations that do not follow must keep working on the link, since a
-     * fix that resolved targets everywhere would break removing a dangling one.
+    /* Operations that do not follow must keep working on the link, since a fix
+     * that resolved targets everywhere would break removing a dangling one.
      */
     TEST("unlink removes the link, not its target");
     at(path, sizeof(path), "rel-escaped");
@@ -282,8 +281,8 @@ int main(void)
     EXPECT_TRUE(reads("Target.One", "escaped") == 0, "target still there");
 
     /* Creating below an intermediate link has to follow it too, and the create
-     * resolver is separate code from the lookup one, the same split that let
-     * a wrong-case create escape once already. The new file must appear in the
+     * resolver is separate code from the lookup one, the same split that let a
+     * wrong-case create escape once already. The new file must appear in the
      * directory the link names, not beside the link.
      */
     TEST("a create below an intermediate link follows it");
@@ -387,14 +386,14 @@ int main(void)
         if (f >= 0)
             close(f);
 
-        /* Creates through the descriptor must cross the link too. Create is
-         * a separate resolver from lookup, and the descriptor-relative walk
-         * is a separate entry point from the absolute one; the absolute
+        /* Creates through the descriptor must cross the link too. Create is a
+         * separate resolver from lookup, and the descriptor-relative walk is a
+         * separate entry point from the absolute one; the absolute
          * create-below-a-link cases above pass while this one regresses
-         * whenever the two entry points map the create flag differently:
-         * the create then aims at the host-literal path instead of landing
-         * inside the sysroot, per openat(2)'s dirfd rule and
-         * path_resolution(7)'s follow rule for intermediate components.
+         * whenever the two entry points map the create flag differently: the
+         * create then aims at the host-literal path instead of landing inside
+         * the sysroot, per openat(2)'s dirfd rule and path_resolution(7)'s
+         * follow rule for intermediate components.
          */
         TEST("a dirfd-relative create below an intermediate link");
         f = -1;

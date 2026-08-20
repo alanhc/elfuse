@@ -168,10 +168,10 @@ int main(void)
     int failed = 0;
     install();
 
-    /* 0: setpgid argument validation. The kernel defaults pgid==0 to pid
-     * before checking pgid < 0, so a negative pid with pgid==0 becomes a
-     * negative pgid and fails EINVAL, not ESRCH; ESRCH needs a valid pgid
-     * alongside the nonexistent pid.
+    /* 0: setpgid argument validation. The kernel defaults pgid==0 to pid before
+     * checking pgid < 0, so a negative pid with pgid==0 becomes a negative pgid
+     * and fails EINVAL, not ESRCH; ESRCH needs a valid pgid alongside the
+     * nonexistent pid.
      */
     if (setpgid(0, -5) != -1 || errno != EINVAL) {
         fprintf(stderr, "FAIL: setpgid(0,-5) should be EINVAL\n");

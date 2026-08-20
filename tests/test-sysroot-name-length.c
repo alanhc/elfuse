@@ -4,12 +4,12 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Linux allows a path component of 255 bytes, and a guest is entitled to all
- * of them, including for a name that has to be stored escaped, which is
- * longer on disk than the name it stands for. The volume underneath measures
- * its own limit in UTF-16 code units rather than bytes, which is what leaves
- * room for the escape; this asserts the guest-visible consequence, that no
- * length below the Linux maximum is refused and 256 bytes is.
+ * Linux allows a path component of 255 bytes, and a guest is entitled to all of
+ * them, including for a name that has to be stored escaped, which is longer on
+ * disk than the name it stands for. The volume underneath measures its own
+ * limit in UTF-16 code units rather than bytes, which is what leaves room for
+ * the escape; this asserts the guest-visible consequence, that no length below
+ * the Linux maximum is refused and 256 bytes is.
  *
  * The interesting lengths are the two tier boundaries the encoding has and the
  * Linux maximum. A guest must not be able to tell where a tier changes, so the
@@ -17,9 +17,9 @@
  *
  * Code under test: the two payload tiers in src/syscall/casefold.c and the
  * length accounting in src/syscall/casefold-walk.c. A regression shows up as
- * ENAMETOOLONG for a name Linux allows (most likely at whichever tier
- * boundary the encoding grew), or as a colliding pair at full length
- * collapsing into one file.
+ * ENAMETOOLONG for a name Linux allows (most likely at whichever tier boundary
+ * the encoding grew), or as a colliding pair at full length collapsing into one
+ * file.
  *
  * Run under --sysroot.
  */
@@ -89,8 +89,8 @@ static int create(const char *name, const char *text)
     return file_write(path, text);
 }
 
-/* One name of a given length: create it, read it back, and require a listing
- * to report the same bytes. @mixed picks whether it needs escaping.
+/* One name of a given length: create it, read it back, and require a listing to
+ * report the same bytes. @mixed picks whether it needs escaping.
  */
 static void check_length(size_t bytes, bool mixed)
 {
@@ -118,8 +118,8 @@ static void check_length(size_t bytes, bool mixed)
 }
 
 /* A colliding pair at a given length. Both members must exist as separate
- * files, which is the case a side-table-free mapping has to earn: the escape
- * is longer than the name, so this is where a length limit would bite.
+ * files, which is the case a side-table-free mapping has to earn: the escape is
+ * longer than the name, so this is where a length limit would bite.
  */
 static void check_pair(size_t bytes)
 {
@@ -204,8 +204,8 @@ int main(void)
     check_length(254, true);
     check_length(GUEST_NAME_MAX, true);
 
-    /* The same lengths through the second walker, which must not have a
-     * ceiling of its own.
+    /* The same lengths through the second walker, which must not have a ceiling
+     * of its own.
      */
     check_openat2(126);
     check_openat2(GUEST_NAME_MAX);

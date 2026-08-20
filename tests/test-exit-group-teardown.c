@@ -4,8 +4,8 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * exit_group must terminate the process even when a thread is parked on one
- * of the runtime's internal condvars, which neither the wakeup pipe nor the
+ * exit_group must terminate the process even when a thread is parked on one of
+ * the runtime's internal condvars, which neither the wakeup pipe nor the
  * hv_vcpus_exit kick can reach:
  *
  *   wait: the main thread blocks in wait4 on a SEIZEd tracee that never
@@ -27,11 +27,11 @@
  *         progress; the teardown broadcast frees them directly.
  *
  * All scenarios must exit with code 42, carried by exit_group from whichever
- * thread raced the park. PTRACE_SEIZE on a same-thread-group thread fails
- * with EPERM on real Linux (it works on elfuse, where ptrace is scoped to
- * the emulated process); the ptrace scenarios treat SEIZE failure as "park
- * cannot be constructed" and fall through to a plain exit_group(42) so the
- * expected exit code holds under differential testing.
+ * thread raced the park. PTRACE_SEIZE on a same-thread-group thread fails with
+ * EPERM on real Linux (it works on elfuse, where ptrace is scoped to the
+ * emulated process); the ptrace scenarios treat SEIZE failure as "park cannot
+ * be constructed" and fall through to a plain exit_group(42) so the expected
+ * exit code holds under differential testing.
  *
  * Syscalls: clone(220), ptrace(117), wait4(260), nanosleep(101),
  * sched_yield(124), exit(93), exit_group(94)
@@ -63,8 +63,8 @@ static void msleep(long ms)
     raw_syscall4(101, (long) &ts, 0, 0, 0); /* nanosleep */
 }
 
-/* Terminates the process group from a worker thread after a delay, so the
- * park under test is in place when the exit-group flag is set.
+/* Terminates the process group from a worker thread after a delay, so the park
+ * under test is in place when the exit-group flag is set.
  */
 static int killer_fn(void)
 {
@@ -74,8 +74,8 @@ static int killer_fn(void)
     return 0;
 }
 
-/* Spins on sched_yield so the thread is always either inside hv_vcpu_run or
- * at a run-loop preemption point (where it can enter ptrace-stop or the fork
+/* Spins on sched_yield so the thread is always either inside hv_vcpu_run or at
+ * a run-loop preemption point (where it can enter ptrace-stop or the fork
  * barrier). Never stops, never exits on its own.
  */
 static int spin_fn(void)
@@ -125,8 +125,8 @@ static int scenario_wait(void)
     return 0;
 }
 
-/* stop: hold a tracee in ptrace-stop (parked on resume_cond), then
- * exit_group from the tracer without ever calling PTRACE_CONT.
+/* stop: hold a tracee in ptrace-stop (parked on resume_cond), then exit_group
+ * from the tracer without ever calling PTRACE_CONT.
  */
 static int scenario_stop(void)
 {
@@ -136,6 +136,7 @@ static int scenario_stop(void)
 
     if (raw_syscall4(117, PTRACE_SEIZE, tracee, 0, 0) == 0) {
         raw_syscall4(117, PTRACE_INTERRUPT, tracee, 0, 0);
+
         /* Blocks until the tracee reaches ptrace-stop, i.e. is parked on
          * resume_cond with nobody left to CONT it after this thread exits.
          */
@@ -157,9 +158,9 @@ static int scenario_fork(void)
     while (!killer_armed)
         raw_syscall0(124);
 
-    /* Fork continuously so a barrier is likely in flight when the killer
-     * fires; each child exits immediately and is reaped to keep the process
-     * table bounded. The loop only ends when exit_group tears it down.
+    /* Fork continuously so a barrier is likely in flight when the killer fires;
+     * each child exits immediately and is reaped to keep the process table
+     * bounded. The loop only ends when exit_group tears it down.
      */
     for (;;) {
         /* clone with flags=SIGCHLD: plain fork */

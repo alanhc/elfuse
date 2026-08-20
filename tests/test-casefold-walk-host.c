@@ -249,14 +249,14 @@ static void section_symlink(void)
           "link.to.lowdir");
 
     /* A link the walk does have to pass through stops it, and the walk says so
-     * rather than letting the host follow the stored bytes: those name a
-     * guest path, whose components may be escaped and whose absolute form
-     * starts at the sysroot, so the host would look somewhere else. The caller
-     * resolves the target in the guest namespace and comes back.
+     * rather than letting the host follow the stored bytes: those name a guest
+     * path, whose components may be escaped and whose absolute form starts at
+     * the sysroot, so the host would look somewhere else. The caller resolves
+     * the target in the guest namespace and comes back.
      *
-     * link_rest_offset points at what is left to resolve, and
-     * link_guest_offset at the link itself, so a relative target can be joined
-     * to the directory holding it.
+     * link_rest_offset points at what is left to resolve, and link_guest_offset
+     * at the link itself, so a relative target can be joined to the directory
+     * holding it.
      */
     static const char through_link[] = "/link.to.lowdir/inner.txt";
     if (casefold_resolve_at(AT_FDCWD, root, through_link, false, out,
@@ -287,12 +287,11 @@ static void section_symlink(void)
         host_fail("following a dangling link stops at the link",
                   "expected CASEFOLD_SYMLINK with nothing left to resolve");
 
-    /* A second hard link to a symlink is that same link under another name,
-     * and it resolves by the name the caller used. The volume reports the
-     * primary link's name for such an entry, so a probe that trusts the
-     * reported spelling alone rules it a fold and the walk reports absent,
-     * which is how linkat(2) of a symlink produced an entry lstat could not
-     * see.
+    /* A second hard link to a symlink is that same link under another name, and
+     * it resolves by the name the caller used. The volume reports the primary
+     * link's name for such an entry, so a probe that trusts the reported
+     * spelling alone rules it a fold and the walk reports absent, which is how
+     * linkat(2) of a symlink produced an entry lstat could not see.
      */
     check("fold-stable second link to a symlink", "/second-link",
           CASEFOLD_FOUND, "second-link");
@@ -301,8 +300,8 @@ static void section_symlink(void)
 
     /* Same entry, asked about the report rather than the spelling. A directory
      * listing carries no object type, so a walk the fallback answered cannot
-     * claim to know the leaf's, and the NO_XDEV walker skips its own fstatat
-     * on the strength of that flag.
+     * claim to know the leaf's, and the NO_XDEV walker skips its own fstatat on
+     * the strength of that flag.
      */
     if (casefold_resolve_at(AT_FDCWD, root, "/second-link", false, out,
                             sizeof(out), &walk) == CASEFOLD_FOUND &&
@@ -400,9 +399,9 @@ static void section_limits(void)
 }
 
 /* Forged getattrlist replies. No real volume produces these here, and
- * getattrlist(2) documents that a truncated reply can reference data beyond
- * the buffer, so the bounds check is exercised directly rather than through
- * the filesystem. Code under test: casefold_attr_stored_name(). A regression
+ * getattrlist(2) documents that a truncated reply can reference data beyond the
+ * buffer, so the bounds check is exercised directly rather than through the
+ * filesystem. Code under test: casefold_attr_stored_name(). A regression
  * dereferences the kernel-claimed offset unchecked and, on a volume that
  * misbehaves (an SMB or NFS --sysroot), reads past the probe's stack buffer.
  */
@@ -471,8 +470,8 @@ static void section_reply_bounds(void)
         host_fail("reply bounds",
                   "reference beyond the claimed length accepted");
 
-    /* A claimed length larger than the buffer must be capped at the buffer:
-     * the kernel never writes more than attrBufSize, whatever length says.
+    /* A claimed length larger than the buffer must be capped at the buffer: the
+     * kernel never writes more than attrBufSize, whatever length says.
      */
     f.length = (u_int32_t) sizeof(f) + 64;
     f.name_ref.attr_length = (u_int32_t) sizeof(f);

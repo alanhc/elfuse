@@ -504,6 +504,7 @@ static void test_rvae_2mib_straddle(void)
         FAIL("mmap");
         return;
     }
+
     /* Pick the first 2 MiB boundary AT LEAST 16 pages above the start so the
      * 32-page protect window straddles it (16 pages below + 16 above). If the
      * natural rounded-up boundary is too close to base, jump to the next one --
@@ -649,6 +650,7 @@ int main(void)
     test_rvae_boundary_sweep();
     test_rvae_2mib_straddle();
     test_rvae_icache_stress();
+
     /* Drive the RVAE1IS NUM encoding across its boundaries under contention: 17
      * pages -> NUM=8, 32 -> NUM=15 (mid), 64 -> NUM=31 (max).
      */

@@ -9,10 +9,10 @@
  * names spelled this way, so a row may change only together with a deliberate
  * format migration, never to make a test pass. The codec's own tests all read
  * through the codec and therefore stay green across any self-consistent format
- * change; only a comparison against these frozen literals fails when the
- * format moves. test-casefold-host.c asserts every row in both directions,
- * and the mk/tests.mk corpus recipe stages a subset host-side for the guest
- * corpus test to read back.
+ * change; only a comparison against these frozen literals fails when the format
+ * moves. test-casefold-host.c asserts every row in both directions, and the
+ * mk/tests.mk corpus recipe stages a subset host-side for the guest corpus test
+ * to read back.
  */
 
 #pragma once
@@ -49,8 +49,8 @@
 #define CFV_H64 CFV_H32 CFV_H32
 #define CFV_H125 CFV_H64 CFV_H32 CFV_H16 CFV_H8 CFV_H4 "58"
 
-/* Long-tier symbols, one UTF-8 literal per code point. The tier packs the
- * name MSB-first into 12-bit groups and adds U+4E00 to each; a leading symbol
+/* Long-tier symbols, one UTF-8 literal per code point. The tier packs the name
+ * MSB-first into 12-bit groups and adds U+4E00 to each; a leading symbol
  * carries the byte length. 'X' = 0x58 repeated gives the periodic groups
  * 0x585/0x858 -> U+5385/U+5658, so one two-symbol pair covers three payload
  * bytes: 126 bytes = 1008 bits = exactly 42 pairs, 255 bytes = 2040 bits =

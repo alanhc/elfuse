@@ -217,9 +217,9 @@ int main(void)
                     "cpu root W_OK returned unexpected error");
     }
 
-    /* '..' in the suffix must not let the open/stat reach a real target.
-     * elfuse rejects traversal inside the synthetic tree with EACCES; Linux
-     * resolves the normalized sysfs path and reports ENOENT for this probe.
+    /* '..' in the suffix must not let the open/stat reach a real target. elfuse
+     * rejects traversal inside the synthetic tree with EACCES; Linux resolves
+     * the normalized sysfs path and reports ENOENT for this probe.
      */
     TEST("dotdot traversal in open does not resolve");
     {

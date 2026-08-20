@@ -16,10 +16,10 @@
 #include "core/guest.h"
 
 /* Guest-visible kernel identity for uname(2) and /proc/version;
- * tests/test-proc.c pins the two surfaces to each other. The release names
- * the 6.18 LTS baseline and tracks no test image; syscall/dispatch.tbl
- * states what elfuse implements. glibc rejects only a release below its
- * build-time floor, so a high floor is the safe side.
+ * tests/test-proc.c pins the two surfaces to each other. The release names the
+ * 6.18 LTS baseline and tracks no test image; syscall/dispatch.tbl states what
+ * elfuse implements. glibc rejects only a release below its build-time floor,
+ * so a high floor is the safe side.
  */
 #define GUEST_KERNEL_RELEASE "6.18.0"
 #define GUEST_KERNEL_VERSION "#1 SMP PREEMPT_DYNAMIC"
@@ -65,9 +65,9 @@ int64_t sys_prlimit64(guest_t *g,
  * A guest that reads two surfaces subtracts one against the other, and there
  * the underflow happens beyond any saturating arithmetic elfuse does on its own
  * side. busybox free is exactly this reader: it takes total and free from
- * sysinfo(2) and buff/cache from /proc/meminfo, then computes
- * used = total - free - cached. So the total and the free both have to come
- * from here rather than being sampled once per surface.
+ * sysinfo(2) and buff/cache from /proc/meminfo, then computes used = total -
+ * free - cached. So the total and the free both have to come from here rather
+ * than being sampled once per surface.
  *
  * sys_guest_ram_bytes() is the total to report as MemTotal/totalram: the host's
  * real memory, or a plausible stand-in if the sysctl fails, never zero.
@@ -77,9 +77,9 @@ int64_t sys_prlimit64(guest_t *g,
 uint64_t sys_guest_ram_bytes(void);
 uint64_t sys_guest_ram_free(void);
 
-/* Snapshot/restore the guest-visible RLIMIT_NOFILE across the posix_spawn
- * fork boundary. The host limit is internal capacity and is deliberately not
- * exposed through these helpers.
+/* Snapshot/restore the guest-visible RLIMIT_NOFILE across the posix_spawn fork
+ * boundary. The host limit is internal capacity and is deliberately not exposed
+ * through these helpers.
  */
 void sys_nofile_snapshot(uint64_t *cur, uint64_t *max);
 int sys_nofile_restore(uint64_t cur, uint64_t max);

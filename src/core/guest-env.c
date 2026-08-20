@@ -27,8 +27,8 @@ static size_t override_key_len(const char *ov)
 }
 
 /* Name length of a "KEY=VALUE" entry, or 0 when @entry is not one: it carries
- * no '=', or its name is empty. Both make the entry unmatchable by an
- * override, which is why guest_env_build drops rather than forwards them.
+ * no '=', or its name is empty. Both make the entry unmatchable by an override,
+ * which is why guest_env_build drops rather than forwards them.
  */
 static size_t entry_key_len(const char *entry)
 {
@@ -88,9 +88,10 @@ char **guest_env_build(char *const *host_env,
     if (!clear_env) {
         for (int i = 0; i < n_host; i++) {
             size_t klen = entry_key_len(host_env[i]);
-            /* env_find() rescans envp[0 .. n) per entry, so this is
-             * quadratic over an environment of tens of entries. A hash would
-             * cost more to build than the scan costs to run at that size.
+
+            /* env_find() rescans envp[0 .. n) per entry, so this is quadratic
+             * over an environment of tens of entries. A hash would cost more to
+             * build than the scan costs to run at that size.
              */
             if (klen == 0 || env_find(envp, n, host_env[i], klen) >= 0)
                 continue;

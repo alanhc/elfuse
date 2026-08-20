@@ -4,11 +4,11 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * OFD locks (Linux F_OFD_GETLK=36/F_OFD_SETLK=37/F_OFD_SETLKW=38) are owned
- * by the open file description rather than by a process, so Linux always
- * reports l_pid=-1 for a conflicting F_OFD_GETLK lock. Passing the host's
- * raw l_pid straight through leaks a host PID to the guest and breaks
- * software (e.g. SQLite) that checks for the OFD-lock -1 sentinel.
+ * OFD locks (Linux F_OFD_GETLK=36/F_OFD_SETLK=37/F_OFD_SETLKW=38) are owned by
+ * the open file description rather than by a process, so Linux always reports
+ * l_pid=-1 for a conflicting F_OFD_GETLK lock. Passing the host's raw l_pid
+ * straight through leaks a host PID to the guest and breaks software (e.g.
+ * SQLite) that checks for the OFD-lock -1 sentinel.
  */
 
 #include <errno.h>
@@ -54,9 +54,10 @@ int main(void)
         perror("open fd1");
         return 1;
     }
+
     /* A second open() yields a distinct open file description, so OFD locks
-     * taken on fd1 can conflict with a query made through fd2 even though
-     * both fds live in the same process.
+     * taken on fd1 can conflict with a query made through fd2 even though both
+     * fds live in the same process.
      */
     int fd2 = open(path, O_RDWR, 0644);
     if (fd2 < 0) {
@@ -79,8 +80,8 @@ int main(void)
     EXPECT_TRUE(gr == 0 && gfl.l_type == F_WRLCK,
                 "F_OFD_GETLK did not report the conflicting write lock");
 
-    /* This is the behavior issue #129 reports as broken: l_pid must be -1
-     * for an OFD lock conflict, never a real (host or guest) PID.
+    /* This is the behavior issue #129 reports as broken: l_pid must be -1 for
+     * an OFD lock conflict, never a real (host or guest) PID.
      */
     TEST("F_OFD_GETLK l_pid is -1 on conflict");
     EXPECT_EQ(gfl.l_pid, -1, "F_OFD_GETLK leaked a non -1 l_pid");

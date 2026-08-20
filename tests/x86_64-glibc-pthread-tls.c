@@ -34,7 +34,8 @@ static void emit(int fd, const char *s)
 struct worker_result {
     uint64_t initial;     /* per_thread_value as the worker first sees it */
     uint64_t after_write; /* per_thread_value after the worker writes its
-                           * own marker */
+                           * own marker
+                           */
 };
 
 static void *worker(void *arg)
@@ -79,6 +80,7 @@ int main(void)
         emit(STDERR_FILENO, "worker-write-readback-wrong");
         return 5;
     }
+
     /* Main's slot must still hold the value we wrote before pthread _create,
      * untouched by the worker's write.
      */

@@ -117,10 +117,11 @@ int chown_overlay_set(uint64_t dev,
         }
         e->dev = dev;
         e->ino = ino;
+
         /* Initialise with the sentinel (uint32_t)-1, meaning "no override
-         * recorded for this field yet".  The apply path skips sentinel
-         * fields, so a partial chown that only touches one of uid/gid does
-         * not corrupt the other field with a stale physical host value.
+         * recorded for this field yet". The apply path skips sentinel fields,
+         * so a partial chown that only touches one of uid/gid does not corrupt
+         * the other field with a stale physical host value.
          */
         e->uid = (uint32_t) -1;
         e->gid = (uint32_t) -1;
@@ -136,9 +137,9 @@ int chown_overlay_set(uint64_t dev,
     if (new_group != (uint32_t) -1)
         e->gid = new_group;
 
-    /* A sentinel field means "keep whatever cur reports".  Resolve before
-     * comparing so the no-op check is evaluated in the guest-virtual ID
-     * space on both sides.
+    /* A sentinel field means "keep whatever cur reports". Resolve before
+     * comparing so the no-op check is evaluated in the guest-virtual ID space
+     * on both sides.
      */
     uint32_t effective_uid = e->uid == (uint32_t) -1 ? cur_uid : e->uid;
     uint32_t effective_gid = e->gid == (uint32_t) -1 ? cur_gid : e->gid;
@@ -175,8 +176,8 @@ void chown_overlay_apply(struct stat *st)
     overlay_entry_t *e =
         find_locked((uint64_t) st->st_dev, (uint64_t) st->st_ino);
     if (e) {
-        /* Skip sentinel fields: (uint32_t)-1 means "no override recorded"
-         * for that field, so leave the host value untouched.
+        /* Skip sentinel fields: (uint32_t)-1 means "no override recorded" for
+         * that field, so leave the host value untouched.
          */
         if (e->uid != (uint32_t) -1)
             st->st_uid = e->uid;
@@ -203,6 +204,7 @@ int chown_overlay_send(int ipc_sock)
     pthread_rwlock_rdlock(&overlay_lock);
 
     size_t n = atomic_load_explicit(&entry_count, memory_order_acquire);
+
     /* The cap is well above any realistic chown-heavy workload (dpkg, OCI layer
      * commit). Hitting it indicates a runaway table or a bug, not a legitimate
      * parent; refuse to truncate-on-success and fail the fork so the caller

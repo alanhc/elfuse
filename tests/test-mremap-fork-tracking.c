@@ -5,10 +5,10 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * These cases exercise elfuse's inherited-at-fork region bookkeeping, not a
- * portable Linux ABI contract. Do not add this binary to test-matrix.sh:
- * Linux can merge the adjacent file mappings below, and extends MAP_SHARED
- * mappings directly from the backing file rather than creating elfuse's
- * child-private tracking tail.
+ * portable Linux ABI contract. Do not add this binary to test-matrix.sh: Linux
+ * can merge the adjacent file mappings below, and extends MAP_SHARED mappings
+ * directly from the backing file rather than creating elfuse's child-private
+ * tracking tail.
  */
 
 #include <errno.h>
@@ -289,8 +289,9 @@ static void test_postfork_repeated_allocations_keep_lineage(void)
                 _exit(90);
 
             /* If child allocation reused the inherited source's vma_id,
-             * find_mremap_source would incorrectly accept the adjacent pair.
-             * A reseeded allocator keeps the logical lineages distinct. */
+             * find_mremap_source would incorrectly accept the adjacent pair. A
+             * reseeded allocator keeps the logical lineages distinct.
+             */
             errno = 0;
             void *same = mremap(first, 2 * span, 2 * span, 0);
             if (same != MAP_FAILED || errno != EFAULT)
@@ -386,8 +387,9 @@ static void test_misaligned_shared_mremap_writeback(void)
     }
 
     /* Deliberately place the source one host page into its reservation. This
-     * keeps the guest mapping page-aligned while making it non-2MiB-aligned,
-     * so the MAP_SHARED overlay/mremap path exercises a split HVF segment. */
+     * keeps the guest mapping page-aligned while making it non-2MiB-aligned, so
+     * the MAP_SHARED overlay/mremap path exercises a split HVF segment.
+     */
     size_t reservation_length = 2 * span + page;
     void *reservation = mmap(NULL, reservation_length, PROT_NONE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -411,7 +413,8 @@ static void test_misaligned_shared_mremap_writeback(void)
     source[page + 7] = 'B';
 
     /* Block in-place growth so mremap must move the mapping and leave the
-     * destination on the snapshot-style shared-writeback path. */
+     * destination on the snapshot-style shared-writeback path.
+     */
     void *blocker = mmap(source + span, span, PROT_NONE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (blocker != source + span) {
@@ -462,10 +465,11 @@ static void test_misaligned_shared_mremap_writeback(void)
     close(fd);
 }
 
-/* Force the snapshot-style MAP_SHARED path by placing a guest-page mapping
- * one page into an otherwise unused reservation. Apple hosts use larger host
- * pages than the guest's 4 KiB pages, so this address cannot receive a live
- * file overlay. */
+/* Force the snapshot-style MAP_SHARED path by placing a guest-page mapping one
+ * page into an otherwise unused reservation. Apple hosts use larger host pages
+ * than the guest's 4 KiB pages, so this address cannot receive a live file
+ * overlay.
+ */
 static void *map_misaligned_shared_fixed(size_t length,
                                          int prot,
                                          int fd,
@@ -482,9 +486,10 @@ static void *map_misaligned_shared_fixed(size_t length,
 
     void *address = (char *) reservation + page;
     if (munmap(reservation, length + page) != 0) {
-        /* Keep ownership visible to the caller when the reservation cannot
-         * be released. Returning MAP_FAILED alone would make the live
-         * mapping indistinguishable from an allocation that never happened. */
+        /* Keep ownership visible to the caller when the reservation cannot be
+         * released. Returning MAP_FAILED alone would make the live mapping
+         * indistinguishable from an allocation that never happened.
+         */
         *reservation_out = reservation;
         return MAP_FAILED;
     }
@@ -829,9 +834,11 @@ static void test_file_backed_mremap_emfile_atomic(void)
         }
         if (errno != EMFILE || last_dup < 0)
             _exit(62);
+
         /* Keep one guest slot available for the /proc/self/maps proof below.
          * The close also releases one host descriptor; the file-backed filler
-         * loop consumes it again before finding the actual host/table limit. */
+         * loop consumes it again before finding the actual host/table limit.
+         */
         if (close(last_dup) != 0)
             _exit(69);
 
@@ -865,7 +872,8 @@ static void test_file_backed_mremap_emfile_atomic(void)
          * readable. Near the fixed tracker capacity, VMA count alone cannot
          * prove whether tracker pressure or host descriptors ended the filler
          * loop, so skip instead of attributing an ambiguous ENOMEM to the
-         * second mremap dup. */
+         * second mremap dup.
+         */
         int maps_count = 0;
         if (!count_maps_entries(&maps_count) || maps_count >= 4000)
             _exit(77);
@@ -890,7 +898,8 @@ static void test_file_backed_mremap_emfile_atomic(void)
 
         /* Exactly one host descriptor is free again. A fixed subrange move
          * consumes it for target tracking, then must fail atomically when the
-         * source-boundary snapshot cannot duplicate its backing fd. */
+         * source-boundary snapshot cannot duplicate its backing fd.
+         */
         errno = 0;
         char *fixed = mremap(fixed_probe + 2 * span, span, span,
                              MREMAP_MAYMOVE | MREMAP_FIXED, fixed_probe);
@@ -898,9 +907,10 @@ static void test_file_backed_mremap_emfile_atomic(void)
             fixed_probe[2 * span] != 'S')
             _exit(73);
 
-        /* Release guest dup slots and filler tracker descriptors, then retry.
-         * A failed split that published backing_fd=-1 would make this retry
-         * fail even though descriptor capacity is now available. */
+        /* Release guest dup slots and filler tracker descriptors, then retry. A
+         * failed split that published backing_fd=-1 would make this retry fail
+         * even though descriptor capacity is now available.
+         */
         for (int guest_fd = 0; guest_fd < 4096; guest_fd++) {
             if (guest_fd != fd)
                 (void) close(guest_fd);

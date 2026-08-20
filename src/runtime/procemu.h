@@ -111,8 +111,8 @@ int proc_dev_shm_resolve(const char *guest_suffix,
  */
 void proc_pty_close_keepalive(int master_host_fd);
 
-/* Record a slave fd the guest now holds, so the master knows it is not yet
- * hung up. Both guest-facing slave opens report through this: the /dev/pts/N
+/* Record a slave fd the guest now holds, so the master knows it is not yet hung
+ * up. Both guest-facing slave opens report through this: the /dev/pts/N
  * intercept and the TIOCGPTPEER ioctl.
  */
 void proc_pty_note_guest_slave(int slave_host_fd, uint32_t linux_pts_num);

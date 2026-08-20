@@ -107,6 +107,7 @@ static void test_fchmodat2_symlink_nofollow(void)
         return;
     }
     close(fd);
+
     /* Derive the symlink name from the unique target so we never call mktemp,
      * which is racy and triggers a linker warning on glibc.
      */
@@ -491,6 +492,7 @@ static void test_openat2_resolve_no_symlinks_deep_path(void)
     TEST("openat2 RESOLVE_NO_SYMLINKS resolves a link-free deep path");
 
     char dir_template[] = "/tmp/elfuse-openat2-deep-XXXXXX";
+
     /* Where each component starts, so the teardown shortens the very path the
      * setup built instead of re-deriving its shape.
      */
@@ -676,6 +678,7 @@ static void test_openat2_resolve_no_xdev_allows_same_mount(void)
         PASS();
         return;
     }
+
     /* Acceptable if /etc/passwd doesn't exist on the host running the test, as
      * long as the error is not EXDEV.
      */
@@ -1342,9 +1345,9 @@ static void test_mmap_low_hint_exact(void)
     munmap(p, len);
 }
 
-/* A dirfd that is open but not a directory (and has no host-nameable path,
- * e.g. a pipe) must resolve a relative path with ENOTDIR, not EBADF: the fd
- * itself is valid, it just cannot anchor a lookup. Issue #133.
+/* A dirfd that is open but not a directory (and has no host-nameable path, e.g.
+ * a pipe) must resolve a relative path with ENOTDIR, not EBADF: the fd itself
+ * is valid, it just cannot anchor a lookup. Issue #133.
  */
 static void test_openat2_resolve_no_xdev_non_directory_dirfd_rejects_enotdir(
     void)

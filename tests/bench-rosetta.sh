@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
+
 # bench-rosetta.sh - Wall-clock benchmark harness for x86_64-via-Rosetta
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Measures wall-clock time for a curated set of static x86_64 workloads
-# running under elfuse + Rosetta. The intent is a stable reproducible
-# regression baseline; absolute numbers are noisy on macOS so the script
-# prints best-of-N runs and a coefficient of variation.
+# Measures wall-clock time for a curated set of static x86_64 workloads running
+# under elfuse + Rosetta. The intent is a stable reproducible regression
+# baseline; absolute numbers are noisy on macOS so the script prints best-of-N
+# runs and a coefficient of variation.
 #
 # The bench deliberately stays self-contained:
 #   - workloads come from the Alpine x86_64 staticbin tree
 #   - no external comparison runs (those need separate hardware access)
 #
-# To compare against native x86_64 hardware or aarch64 hosts, capture the
-# same workloads' wall-clock there and paste them into the output yourself.
+# To compare against native x86_64 hardware or aarch64 hosts, capture the same
+# workloads' wall-clock there and paste them into the output yourself.
 #
 # Usage: tests/bench-rosetta.sh [path/to/elfuse] [iterations]
 
@@ -62,9 +63,10 @@ trap 'rm -rf "$SHORTDIR"' EXIT
 data="${SHORTDIR}/data/in.bin"
 dd if=/dev/urandom of="$data" bs=1024 count=64 status=none
 
-# Capture wall-clock in nanoseconds across N iterations of CMD. Returns
-# the best (minimum) sample and a basic spread (max - min).
-# Args: <label> <cmd...>
+# Capture wall-clock in nanoseconds across N iterations of CMD.
+#
+# Returns the best (minimum) sample and a basic spread (max - min). Args:
+# <label> <cmd...>
 run_bench()
 {
     local label="$1"
@@ -104,8 +106,8 @@ printf 'elfuse:     %s\n' "$ELFUSE"
 printf 'rosetta:    %s\n' "$ROSETTA_PATH"
 printf 'iterations: %d per workload\n\n' "$ITERS"
 
-# Warm the rosetta AOT cache. The first launch of any binary pays a
-# translation cost; subsequent launches hit ~/.cache/elfuse-rosettad/.
+# Warm the rosetta AOT cache. The first launch of any binary pays a translation
+# cost; subsequent launches hit ~/.cache/elfuse-rosettad/.
 printf 'Warming AOT cache:\n'
 for app in echo seq factor sha256sum md5sum sha512sum sort wc; do
     "$ELFUSE" "${SHORTDIR}/bin/${app}" --help > /dev/null 2>&1 || true
@@ -127,9 +129,9 @@ run_bench "md5-64k" "$ELFUSE" "${SHORTDIR}/bin/md5sum" "$data"
 run_bench "sha512-64k" "$ELFUSE" "${SHORTDIR}/bin/sha512sum" "$data"
 run_bench "wc-64k" "$ELFUSE" "${SHORTDIR}/bin/wc" "-c" "$data"
 
-# Compare against the aarch64 equivalent so the cost of rosetta vs native
-# guest translation is visible. The aarch64 staticbin tree is the source
-# of truth (same Alpine version, different arch).
+# Compare against the aarch64 equivalent so the cost of rosetta vs native guest
+# translation is visible. The aarch64 staticbin tree is the source of truth
+# (same Alpine version, different arch).
 aarch64_bin="${FIXTURES}/aarch64-musl/staticbin/bin/busybox"
 if [ -x "$aarch64_bin" ]; then
     printf '\nAarch64 reference (same workload, native elfuse path):\n'

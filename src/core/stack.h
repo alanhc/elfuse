@@ -58,8 +58,8 @@ typedef struct {
  * that string from the execve filename rather than from argv[0], and the two
  * differ whenever the caller passed an alternate argv[0] or the kernel
  * prepended a binfmt_misc interpreter, so callers pass it explicitly instead of
- * leaving it to be inferred from argv's shape. NULL falls back to argv[0].
- * If auxv_out is non-NULL, it receives the exact auxv words written to guest
+ * leaving it to be inferred from argv's shape. NULL falls back to argv[0]. If
+ * auxv_out is non-NULL, it receives the exact auxv words written to guest
  * memory, in the same order exposed by /proc/self/auxv.
  * Returns the initial SP (stack pointer) to pass to the guest.
  */

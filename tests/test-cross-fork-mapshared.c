@@ -145,6 +145,7 @@ static void test_file_backed_cross_fork(void)
         FAIL("mkstemp");
         return;
     }
+
     /* Keep the file present so child can re-open via /proc semantics is
      * unnecessary -- the child inherits fd from CLOEXEC=off and we map via the
      * inherited fd. Unlink keeps the file on the FS but invisible via path;

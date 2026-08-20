@@ -1643,6 +1643,7 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 {
     if (iovcnt == 0)
         return vec_zero_iovcnt(fd, true, false);
+
     /* Ahead of the single-entry shortcut: a one-entry writev of nothing reports
      * 0, while the write(2) the shortcut would reach reports ENODATA.
      */

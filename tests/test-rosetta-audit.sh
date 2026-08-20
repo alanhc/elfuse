@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-rosetta-audit.sh - Rosetta thread/signal audit smoke
 #
 # Copyright 2026 elfuse contributors

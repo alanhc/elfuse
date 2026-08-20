@@ -7,13 +7,13 @@
  * A pathname socket's address is a filesystem path, and it must resolve like
  * one: through the sysroot, with the same escape rules as open(2), so bind,
  * stat, connect, and unlink all agree on which file a name means. The address
- * read back through getsockname/getpeername must carry the guest's bytes,
- * never the sysroot prefix or a stored spelling.
+ * read back through getsockname/getpeername must carry the guest's bytes, never
+ * the sysroot prefix or a stored spelling.
  *
- * Linux contract pinned: unix(7). Binding to a pathname creates a socket
- * file at that path in the caller's namespace, colliding names are distinct
- * files, rebinding an in-use path is EADDRINUSE, and the full 108-byte
- * sun_path budget is the guest's.
+ * Linux contract pinned: unix(7). Binding to a pathname creates a socket file
+ * at that path in the caller's namespace, colliding names are distinct files,
+ * rebinding an in-use path is EADDRINUSE, and the full 108-byte sun_path budget
+ * is the guest's.
  *
  * Code under test: net_sockaddr_to_mac / net_sockaddr_from_mac in
  * src/syscall/net-absock.c and their call sites in src/syscall/net.c and
@@ -48,8 +48,8 @@ int passes = 0, fails = 0;
 
 #define DIR_S "/sockdir"
 
-/* Connect to @path, send @token, report what the peer heard through
- * @accepted on the listener side.
+/* Connect to @path, send @token, report what the peer heard through @accepted
+ * on the listener side.
  */
 static int connect_send(const char *path, char token)
 {
@@ -143,8 +143,8 @@ int main(void)
             close(fd2);
     }
 
-    /* Names differing only by case are distinct sockets, each reachable by
-     * its own spelling: one stored literally, one escaped.
+    /* Names differing only by case are distinct sockets, each reachable by its
+     * own spelling: one stored literally, one escaped.
      */
     TEST("case-colliding socket names coexist");
     {
@@ -176,14 +176,14 @@ int main(void)
     }
 
     /* recvmsg reports a datagram's source address, and the length it reports
-     * has to describe the bytes it wrote: the guest spelling, which is what
-     * the translation hands back. A host spelling is longer, so a guest
-     * sizing the path as msg_namelen - offsetof(sun_path) reads past the
-     * address into whatever its own buffer held. recvmsg used to report the
-     * macOS length while writing the translated address, which the other
-     * three readback paths (accept, getsockname and recvfrom) never did.
-     * Both sockets are bound, because an unbound sender has no address for
-     * the receiver to be told about.
+     * has to describe the bytes it wrote: the guest spelling, which is what the
+     * translation hands back. A host spelling is longer, so a guest sizing the
+     * path as msg_namelen - offsetof(sun_path) reads past the address into
+     * whatever its own buffer held. recvmsg used to report the macOS length
+     * while writing the translated address, which the other three readback
+     * paths (accept, getsockname and recvfrom) never did. Both sockets are
+     * bound, because an unbound sender has no address for the receiver to be
+     * told about.
      */
     TEST("recvmsg reports the guest address length");
     {
@@ -238,8 +238,8 @@ int main(void)
 
     /* A Linux-legal guest name whose translated host spelling overflows the
      * 104-byte macOS sun_path: the escape more than doubles a mixed-case
-     * component and the sysroot prefix comes on top, so this is the common
-     * case for deep socket paths, not a corner.
+     * component and the sysroot prefix comes on top, so this is the common case
+     * for deep socket paths, not a corner.
      */
     TEST("a name whose host spelling overflows macOS sun_path still binds");
     {
@@ -273,9 +273,9 @@ int main(void)
      * at_flags, so that rule cannot ride on an open flag here and is checked
      * outright. Following a guest-planted link reported ENOTSOCK for a host
      * file that exists and ENOENT for one that does not, which tells the guest
-     * whether any host path exists, including every path
-     * is_guest_system_path() keeps it from naming: connecting to /etc/passwd
-     * directly is ENOENT, and through the link it was not.
+     * whether any host path exists, including every path is_guest_system_path()
+     * keeps it from naming: connecting to /etc/passwd directly is ENOENT, and
+     * through the link it was not.
      */
     TEST("connect does not follow a shm symlink out of the backing dir");
     {
@@ -300,8 +300,8 @@ int main(void)
 
     /* The same rule for bind, which is the half that writes: a dangling link
      * binds the socket at its target, so following one plants a socket file
-     * anywhere the guest can name as a target. The recipe checks host-side
-     * that nothing landed there.
+     * anywhere the guest can name as a target. The recipe checks host-side that
+     * nothing landed there.
      */
     TEST("bind does not follow a shm symlink out of the backing dir");
     {
@@ -330,8 +330,8 @@ int main(void)
      * state handshake, so the child is a fresh elfuse process: it inherits the
      * namespace id but has not created that directory itself. Undoing the link
      * used to be conditional on having created it, so a guest that only
-     * inherited the socket read back the /tmp link path in place of the name
-     * it asked for, and could neither stat nor rebind what it was told.
+     * inherited the socket read back the /tmp link path in place of the name it
+     * asked for, and could neither stat nor rebind what it was told.
      */
     TEST("a forked child reads back the guest spelling, not the link");
     {

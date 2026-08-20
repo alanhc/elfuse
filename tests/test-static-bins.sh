@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
+
 # test-static-bins.sh -- Static binary smoke tests for elfuse
 #
 # Copyright 2026 elfuse contributors
 # Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Tests a variety of standalone static aarch64-linux-musl binaries through elfuse.
-# Exercises different runtime profiles: shell interpreters (bash, dash),
+# Tests a variety of standalone static aarch64-linux-musl binaries through
+# elfuse. Exercises different runtime profiles: shell interpreters (bash, dash),
 # scripting languages (lua, gawk), text tools (grep, sed, find), and
 # compute-heavy workloads (fibonacci, mandelbrot).
 #
@@ -20,8 +21,8 @@ ELFUSE="${1:?Usage: $0 <elfuse-binary> <static-bins-dir>}"
 BINDIR="${2:?Usage: $0 <elfuse-binary> <static-bins-dir>}"
 SYSROOT="${3:-}"
 
-# Source the shared runner so this script reuses the standard reporting
-# helpers and pass/fail accounting.
+# Source the shared runner so this script reuses the standard reporting helpers
+# and pass/fail accounting.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC2034  # Consumed by tests/lib/test-runner.sh.
 BIN=""
@@ -35,9 +36,9 @@ TEST_TIMEOUT="${TEST_TIMEOUT:-10}"
 # shellcheck source=tests/lib/test-runner.sh
 source "$SCRIPT_DIR/lib/test-runner.sh"
 
-# GNU 'timeout' is required to bound each guest invocation. On macOS it
-# ships via Homebrew coreutils. Fail loudly upfront instead of letting
-# every test report a cryptic "command not found, rc=127".
+# GNU 'timeout' is required to bound each guest invocation. On macOS it ships
+# via Homebrew coreutils. Fail loudly upfront instead of letting every test
+# report a cryptic "command not found, rc=127".
 if ! command -v timeout > /dev/null 2>&1; then
     printf "error: 'timeout' not on PATH (install Homebrew coreutils)\n" >&2
     exit 2
@@ -52,8 +53,8 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # Resolve the binary under either the flat fixture directory or its bin/
-# subdirectory. Use -f rather than -x because guest ELFs are data files on
-# macOS and are launched through elfuse instead of directly by the host.
+# subdirectory. Use -f rather than -x because guest ELFs are data files on macOS
+# and are launched through elfuse instead of directly by the host.
 find_bin()
 {
     local name="$1"
@@ -203,8 +204,8 @@ srun_check "dash: functions" "$DASH_BIN" "result=15" -c 'sum() { total=0; for n 
 # Bash shell
 printf "\n${BLUE}── Bash shell ──${RESET}\n"
 
-# Keep the Bash coverage in a real script so array syntax, regexes, and
-# here-doc quoting are not obscured by nested shell escaping.
+# Keep the Bash coverage in a real script so array syntax, regexes, and here-doc
+# quoting are not obscured by nested shell escaping.
 cat > "$TMPDIR/bash-test.sh" << 'BASH_SCRIPT'
 echo "bash ${BASH_VERSION}"
 echo "sum=$((17 * 31))"
