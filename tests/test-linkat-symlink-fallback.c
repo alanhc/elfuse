@@ -5,13 +5,13 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Per linkat(2) on Darwin: without AT_SYMLINK_FOLLOW, hard-linking a symlink
- * itself (rather than its target) "may result in some file systems returning
- * an error" -- reproduced on Case-sensitive HFS+ as ENOTSUP, where the same
- * call against a regular file succeeds. Linux allows hard-linking a symlink
- * unconditionally. sys_linkat() falls back to symlinkat() with the same
- * target when the host linkat() fails with EPERM/ENOTSUP and the source is a
- * symlink, so the guest sees the Linux-compatible outcome regardless of the
- * host filesystem.
+ * itself (rather than its target) "may result in some file systems returning an
+ * error" -- reproduced on Case-sensitive HFS+ as ENOTSUP, where the same call
+ * against a regular file succeeds. Linux allows hard-linking a symlink
+ * unconditionally. sys_linkat() falls back to symlinkat() with the same target
+ * when the host linkat() fails with EPERM/ENOTSUP and the source is a symlink,
+ * so the guest sees the Linux-compatible outcome regardless of the host
+ * filesystem.
  *
  * The Makefile target only runs this under a --sysroot backed by a
  * Case-sensitive HFS+ disk image (created via hdiutil); it skips with exit 77

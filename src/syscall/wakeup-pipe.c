@@ -5,9 +5,9 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * The self-pipe every indefinite host poll/select/kevent waits on alongside
- * its real fds. Free of syscall-layer dependencies, so the concurrency
- * contract in wakeup-pipe.h can be tested on its own.
+ * The self-pipe every indefinite host poll/select/kevent waits on alongside its
+ * real fds. Free of syscall-layer dependencies, so the concurrency contract in
+ * wakeup-pipe.h can be tested on its own.
  */
 
 #include <fcntl.h>

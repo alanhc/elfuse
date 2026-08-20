@@ -4,19 +4,19 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Over-long pathname AF_UNIX socket paths and long abstract names both derive
- * a short filename from a digest, and absock_shorten_path treats a same-named
- * link whose target differs as stale and repoints it. A digest narrow enough
- * to collide in practice therefore aims one socket's live link at another's
+ * Over-long pathname AF_UNIX socket paths and long abstract names both derive a
+ * short filename from a digest, and absock_shorten_path treats a same-named
+ * link whose target differs as stale and repoints it. A digest narrow enough to
+ * collide in practice therefore aims one socket's live link at another's
  * target, which is cross-socket misdirection, not a cosmetic clash. The old
  * 32-bit tail collides at the birthday bound of ~2^16 names, cheap enough to
  * brute-force below; the 64-bit tail must tell such a pair apart.
  *
  * Code under test: absock_encode_name and absock_link_name in
- * src/syscall/net-absock.c, through the header's unit-test seam; no real
- * volume can be made to produce the collision on demand, so the naming
- * functions are fed directly. A regression narrows the digest or truncates it
- * out of the name.
+ * src/syscall/net-absock.c, through the header's unit-test seam; no real volume
+ * can be made to produce the collision on demand, so the naming functions are
+ * fed directly. A regression narrows the digest or truncates it out of the
+ * name.
  *
  * What a pass does not prove: 64-bit collisions still exist at their own
  * birthday bound (~2^32 names); the guarantee bought here is the width, not
@@ -98,8 +98,8 @@ static uint32_t fnv1a32(const char *s)
 }
 
 /* All candidates share this 20-byte prefix, mimicking two sockets under one
- * sysroot: the literal prefix bytes of the derived name are then identical,
- * so the digest tail carries all of the distinction.
+ * sysroot: the literal prefix bytes of the derived name are then identical, so
+ * the digest tail carries all of the distinction.
  */
 #define SHARED_PREFIX "/Shared.Sysroot.Pre/"
 
@@ -123,8 +123,8 @@ static void spell_candidate(uint32_t idx, char *out, size_t outsz)
      * fixed-position window stay collision-free far past the birthday bound,
      * because FNV-1a mixes so little that the window maps near-injectively.
      * Varying the length moves every later byte's position instead. The
-     * shortest candidate is still well past the hex tier, so the digest
-     * branch is the one exercised.
+     * shortest candidate is still well past the hex tier, so the digest branch
+     * is the one exercised.
      */
     char pad[24];
     size_t pad_len = idx % 23;
@@ -138,8 +138,8 @@ static void spell_candidate(uint32_t idx, char *out, size_t outsz)
 
 /* Find two distinct strings, sharing the 20-byte prefix, whose 32-bit FNV-1a
  * over the whole string collides. ~2^16 uniformly hashed candidates reach the
- * birthday bound; 400k found one at ~207k when this was written, so failing
- * to find one signals the generator regressed, not bad luck.
+ * birthday bound; 400k found one at ~207k when this was written, so failing to
+ * find one signals the generator regressed, not bad luck.
  */
 static bool find_fnv32_collision(char *a, char *b, size_t bufsz)
 {
@@ -202,8 +202,8 @@ int main(void)
     host_check(strlen(name_a) < 104, "link budget",
                "link name must fit sun_path");
 
-    /* Pid scoping: the marker that makes every exit-time unlink provably of
-     * the process's own property.
+    /* Pid scoping: the marker that makes every exit-time unlink provably of the
+     * process's own property.
      */
     {
         char marker[32];
@@ -213,8 +213,8 @@ int main(void)
                    "link name must embed the minting pid");
     }
 
-    /* The digest never truncates: with a tight buffer the literal prefix
-     * gives way, and the 16-hex-digit tail survives in full.
+    /* The digest never truncates: with a tight buffer the literal prefix gives
+     * way, and the 16-hex-digit tail survives in full.
      */
     {
         char tight[64];

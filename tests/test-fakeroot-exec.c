@@ -187,6 +187,7 @@ static int copy_program(const char *src, char *dst, size_t dst_sz)
         close(in);
         return -1;
     }
+
     /* mkstemp creates 0600. The copy needs the other-execute bit: its host
      * owner is the real macOS uid, which never matches the emulated guest uid,
      * so check_exec_permission only ever consults the other bits.
@@ -221,6 +222,7 @@ static int copy_program(const char *src, char *dst, size_t dst_sz)
         perror("copy: close dst");
         rc = -1;
     }
+
     /* One drop site for the staged file: mkstemp already created it, so every
      * failure from here on has to leave nothing behind in the shared /tmp.
      */

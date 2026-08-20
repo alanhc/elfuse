@@ -97,6 +97,7 @@ int main(void)
             failures++;
             continue;
         }
+
         /* Per-thread distribution sanity: each bucket should be roughly
          * NSAMPLES / 256 = 64 with stddev about 8. Flag any thread whose
          * distribution is wildly off.

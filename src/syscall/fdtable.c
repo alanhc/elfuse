@@ -196,9 +196,9 @@ static int fd_bitmap_find_free(int minfd)
     if (!fdset_slot(minfd, &word, &bit))
         return -1;
 
-    /* Bits below minfd drop out of the first word; every later word is whole.
-     * A word index under FD_BITMAP_WORDS and a bit index under 64 put the
-     * result below FD_TABLE_SIZE, so no ceiling is needed on the way out.
+    /* Bits below minfd drop out of the first word; every later word is whole. A
+     * word index under FD_BITMAP_WORDS and a bit index under 64 put the result
+     * below FD_TABLE_SIZE, so no ceiling is needed on the way out.
      */
     for (uint64_t mask = ~0ULL << bit; word < FD_BITMAP_WORDS;
          word++, mask = ~0ULL) {
@@ -502,9 +502,9 @@ int fd_alloc_at_relaxed(int fd,
     return fd;
 }
 
-/* Internal: mark fd closed with fd_lock already held. Requires
- * 0 <= fd < FD_TABLE_SIZE; it indexes fd_table and the free bitmap without
- * rechecking, so a caller that has not established that corrupts both.
+/* Internal: mark fd closed with fd_lock already held. Requires 0 <= fd <
+ * FD_TABLE_SIZE; it indexes fd_table and the free bitmap without rechecking, so
+ * a caller that has not established that corrupts both.
  *
  * Clear host_fd and dir BEFORE marking the slot free in the bitmap. Otherwise
  * another thread could fd_alloc() this slot, populate it with a new

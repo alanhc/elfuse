@@ -41,8 +41,8 @@ static int setup_fixtures(void)
     }
     close(fd);
 
-    /* The AT_FDCWD case below needs a writable cwd; the process's inherited
-     * cwd may not be (e.g. a read-only rootfs in a VM test image).
+    /* The AT_FDCWD case below needs a writable cwd; the process's inherited cwd
+     * may not be (e.g. a read-only rootfs in a VM test image).
      */
     snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/elfuse-fchownat-empty-dir-%d",
              (int) getpid());

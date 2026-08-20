@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-launch-flags.sh -- Pin the behavior of the guest launch flags
 #
 # Copyright 2026 elfuse contributors
@@ -7,20 +8,21 @@
 # Usage: tests/test-launch-flags.sh <elfuse-binary> <guest-elf>
 #            [<env-dump-guest> <cat-guest>]
 #
-# --user, --workdir, --env, and --clear-env are rejected before the first
-# guest instruction (--user before the VM exists, --workdir during bring-up),
-# so a launcher gets a diagnostic rather than a guest running as something
-# other than what was asked for. Given <env-dump-guest> the environment lanes
-# add only what tests/test-guest-env-host.c cannot reach: main() collecting
-# the --env tokens, build_linux_stack, and the /proc/self/environ sink.
+# --user, --workdir, --env, and --clear-env are rejected before the first guest
+# instruction (--user before the VM exists, --workdir during bring-up), so a
+# launcher gets a diagnostic rather than a guest running as something other than
+# what was asked for. Given <env-dump-guest> the environment lanes add only what
+# tests/test-guest-env-host.c cannot reach: main() collecting the --env tokens,
+# build_linux_stack, and the /proc/self/environ sink.
 
 set -euo pipefail
 
 ELFUSE="${1:?Usage: $0 <elfuse-binary> <guest-elf>}"
 GUEST="${2:?Usage: $0 <elfuse-binary> <guest-elf>}"
+
 # The environment observers are optional: a prebuilt guest-binary tree
-# (GUEST_TEST_BINARIES) predates test-env-dump, so those lanes skip rather
-# than fail when it is absent.
+# (GUEST_TEST_BINARIES) predates test-env-dump, so those lanes skip rather than
+# fail when it is absent.
 ENV_DUMP="${3:-}"
 ENV_CAT="${4:-}"
 
@@ -83,10 +85,11 @@ check reject "--env with an empty argument" "empty variable name" --env ""
 check accept "--fakeroot with an explicit root --user" '' --fakeroot --user 0:0
 check accept "--user UINT32_MAX" '' --user 4294967295
 
-# The containment refusal and its rationale live in elfuse_launch. mktemp
-# lands in /var/folders, outside is_sysroot_backed_temp_path()'s /tmp prefix,
-# so proc_resolve_sysroot_path's host fallback is reachable here.
+# The containment refusal and its rationale live in elfuse_launch. mktemp lands
+# in /var/folders, outside is_sysroot_backed_temp_path()'s /tmp prefix, so
+# proc_resolve_sysroot_path's host fallback is reachable here.
 scratch=$(mktemp -d)
+
 # create_private_dir() rejects a group or other bit on the /dev/shm backing
 # root, and that failure surfaces as a resolve error, not the refusal the last
 # check measures. The leaf itself never has to exist: path_translate_at() sets
@@ -103,8 +106,8 @@ check reject "--workdir absent in the sysroot, present on the host" \
 check accept "--workdir present in the sysroot" '' \
     --sysroot "$scratch/sysroot" --workdir /inroot
 
-# Pins elfuse_launch's "--sysroot /" carve-out: a bare separator must not
-# reject every workdir under it.
+# Pins elfuse_launch's "--sysroot /" carve-out: a bare separator must not reject
+# every workdir under it.
 check accept "--workdir under a root sysroot" '' --sysroot / --workdir /var/tmp
 
 # Refusal rationale in elfuse_launch; see dev_shm_resolve_path().
@@ -112,14 +115,14 @@ check reject "--workdir under /dev/shm" "not supported" \
     --workdir /dev/shm/launch-flags-wd
 
 # The environment the lanes below measure against. MARKER is set so an import
-# and a replacement have something to find; ABSENT is cleared in this process
-# so the "unset on the host" lane cannot be answered by an inherited value.
+# and a replacement have something to find; ABSENT is cleared in this process so
+# the "unset on the host" lane cannot be answered by an inherited value.
 export ELFUSE_TEST_MARKER=marker-value
 unset ELFUSE_TEST_ABSENT
 
 # guest_env <flags...> -- the guest's environ, one entry per line, in order.
-# stderr lands in a file rather than /dev/null so a lane that dies on launch
-# can report why, not just the exit code.
+# stderr lands in a file rather than /dev/null so a lane that dies on launch can
+# report why, not just the exit code.
 guest_env()
 {
     "$ELFUSE" "$@" "$ENV_DUMP" 2> "$scratch/guest-env-stderr"
@@ -150,9 +153,11 @@ env_exact()
 if [ -z "$ENV_DUMP" ] || [ ! -f "$ENV_DUMP" ]; then
     report_skip "environment lanes (no env-dump guest binary)"
 else
+
     # The `elfuse-oci run` spelling, and the only one that makes the guest's
     # environment a function of the flags alone.
     env_exact "--clear-env alone yields an empty environment" "" --clear-env
+
     # One vector through every branch of the merge at once.
     # tests/test-guest-env-host.c settles which answer each branch owes; this
     # lane adds that the answer survives build_linux_stack into the guest.
@@ -160,13 +165,14 @@ else
         "$(printf 'A=2\nB=\nC=b=c\nELFUSE_TEST_MARKER=marker-value')" \
         --clear-env --env A=1 --env B= --env C=b=c \
         --env ELFUSE_TEST_MARKER --env ELFUSE_TEST_ABSENT --env A=2
+
     # --clear-env selects the base wherever it appears, so a launcher that
     # appends it after the --env list gets the same environment.
     env_exact "--clear-env after --env selects the same base" "A=1" \
         --env A=1 --clear-env
 
-    # The only lane with a long override list, so it is the one that would
-    # catch main() sizing the override array short of the flags given.
+    # The only lane with a long override list, so it is the one that would catch
+    # main() sizing the override array short of the flags given.
     many_flags=()
     many_want=""
     for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
@@ -176,8 +182,8 @@ else
     env_exact "twelve --env entries all reach the guest" "$many_want" \
         --clear-env "${many_flags[@]}"
 
-    # Here-strings below, never pipes: under pipefail a `grep -q` exiting at
-    # its first match SIGPIPEs the writer. Every capture carries
+    # Here-strings below, never pipes: under pipefail a `grep -q` exiting at its
+    # first match SIGPIPEs the writer. Every capture carries
     # `|| status=$?` because set -e would abort on the very miss these lanes
     # exist to detect.
     status=0
@@ -239,13 +245,13 @@ want index $base_index)"
     fi
 
     # The procfs sink is held to the same flags and expected entries as the
-    # stack lanes above; it is not a direct comparison of one run's two
-    # sinks.
+    # stack lanes above; it is not a direct comparison of one run's two sinks.
     if [ -n "$ENV_CAT" ] && [ -f "$ENV_CAT" ]; then
-        # /proc/self/environ is NUL-separated and command substitution drops
-        # NUL bytes, so this one must translate inside the pipeline rather
-        # than through a variable. Safe against the SIGPIPE race above
-        # because tr reads to EOF and never exits early.
+
+        # /proc/self/environ is NUL-separated and command substitution drops NUL
+        # bytes, so this one must translate inside the pipeline rather than
+        # through a variable. Safe against the SIGPIPE race above because tr
+        # reads to EOF and never exits early.
         status=0
         procfs="$("$ELFUSE" --clear-env --env A=1 --env B=2 "$ENV_CAT" \
             /proc/self/environ 2> "$scratch/guest-env-stderr" \

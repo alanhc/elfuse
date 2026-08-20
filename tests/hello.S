@@ -1,11 +1,12 @@
-/* Minimal aarch64-linux assembly hello world
+/*
+ * Minimal aarch64-linux assembly hello world
  *
  * Copyright 2026 elfuse contributors
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Exercises Tier 1 syscalls: write(2) and exit(2).
- * Assemble and link as a static aarch64-linux ELF:
+ * Exercises Tier 1 syscalls: write(2) and exit(2). Assemble and link as a
+ * static aarch64-linux ELF:
  *   aarch64-unknown-linux-musl-as -o hello.o hello.S
  *   aarch64-unknown-linux-musl-ld -T simple.ld -o hello hello.o
  */

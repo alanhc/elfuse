@@ -13,8 +13,19 @@ SHELL_SCRIPTS := $(shell git ls-files --cached --others --exclude-standard \
 PYTHON_FORMAT_FILES := $(shell git ls-files --cached --others \
                                --exclude-standard -- '*.py')
 
-## Check formatting: C (clang-format --dry-run) + shell (shellcheck)
+# Comment reflow. clang-format breaks an over-long comment line but never
+# refills a short-wrapped one, so commentflow settles comment width and runs
+# first; clang-format then normalizes the indentation it produced. Required
+# rather than best-effort, unlike shfmt and black below: a run that skips it
+# formats to a different standard than the last one did.
+#
+# .ci/check-commentflow.sh holds the file list for both this target and the
+# gate, so the set rewritten is the set checked.
+COMMENTFLOW ?= commentflow
+
+## Check formatting: comments (commentflow) + C (clang-format --dry-run) + shell (shellcheck)
 check-format: check-syscall-dispatch
+	$(Q)COMMENTFLOW=$(COMMENTFLOW) bash .ci/check-commentflow.sh
 	@echo "  FMT     src/ tests/ (check)"
 	$(Q)$(CLANG_FORMAT) --dry-run --Werror $(C_FORMAT_FILES)
 	@echo "  MATRIX  skip lists"
@@ -39,6 +50,7 @@ check-format: check-syscall-dispatch
 
 ## Indent all C, shell, and Python files in-place
 indent: gen-syscall-dispatch
+	$(Q)COMMENTFLOW=$(COMMENTFLOW) bash .ci/check-commentflow.sh --write
 	@echo "  FMT     src/ tests/"
 	$(Q)$(CLANG_FORMAT) -i $(C_FORMAT_FILES)
 	@if command -v shfmt >/dev/null 2>&1; then \

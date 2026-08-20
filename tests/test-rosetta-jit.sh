@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-rosetta-jit.sh - LuaJIT guest-JIT smoke through Rosetta
 #
 # Copyright 2026 elfuse contributors

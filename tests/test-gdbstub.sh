@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
+
 # test-gdbstub.sh - Validate LLDB <-> elfuse gdbstub interaction
 #
 # Copyright 2026 elfuse contributors
 # Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Starts elfuse with --gdb --gdb-stop-on-entry, drives LLDB in batch mode,
-# and validates register reads, memory reads, breakpoints, stepping, and
+# Starts elfuse with --gdb --gdb-stop-on-entry, drives LLDB in batch mode, and
+# validates register reads, memory reads, breakpoints, stepping, and
 # watchpoints.
 #
 # Usage: tests/test-gdbstub.sh [-e ELFUSE] [-v]
@@ -134,8 +135,8 @@ stop_elfuse()
     sleep 0.2
 }
 
-# Run LLDB in batch mode with the given commands.
-# Captures stdout+stderr into $LLDB_OUT.
+# Run LLDB in batch mode with the given commands. Captures stdout+stderr into
+# $LLDB_OUT.
 # Returns LLDB's exit code.
 run_lldb()
 {
@@ -325,8 +326,9 @@ run_lldb \
     -o "register read pc x0 x1 x2" \
     -o "process kill" \
     -o "quit"
-# After 3 steps from 0x400000: at 0x40000c
-# x0 should be 1 (stdout), x2 should be 6 (count)
+
+# After 3 steps from 0x400000: at 0x40000c x0 should be 1 (stdout), x2 should be
+# 6 (count)
 ok=0
 if echo "$LLDB_OUT" | grep -qi "0x.*40000c"; then
     ok=1
@@ -359,8 +361,9 @@ run_lldb \
     -o "register read x0 x1 x2" \
     -o "process kill" \
     -o "quit"
-# After 3 steps (past mov x0,#1 / adr x1,msg / mov x2,#6):
-# x0=1 (stdout), x2=6 (count), x1 = 0x400020 (msg addr)
+
+# After 3 steps (past mov x0,#1 / adr x1,msg / mov x2,#6): x0=1 (stdout), x2=6
+# (count), x1 = 0x400020 (msg addr)
 ok=0
 x0_ok=0
 x2_ok=0

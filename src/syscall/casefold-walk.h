@@ -47,14 +47,16 @@ typedef enum {
 
 typedef struct {
     /* Every component but the last resolved. Answers the create resolver's
-     * question "can this be created here", which a plain access(2) on a
-     * naively concatenated parent gets wrong, because that folds case.
+     * question "can this be created here", which a plain access(2) on a naively
+     * concatenated parent gets wrong, because that folds case.
      */
     bool parent_found;
+
     /* Offset in out of the final component, so a caller can split parent from
      * leaf without a strrchr that could walk back into the host prefix.
      */
     size_t leaf_offset;
+
     /* Length of out before the final component was appended: truncating there
      * yields the parent's spelling exactly. Recorded by the walk because only
      * it knows whether a separator was inserted before the leaf. A prefix that
@@ -63,12 +65,14 @@ typedef struct {
      * where the parent is the root.
      */
     size_t parent_offset;
+
     /* Some component's slot is held by an entry spelled differently, or by one
      * the volume refuses to store. The path is absent to a byte-exact reader
      * but the sysroot does hold something there, so a caller must report ENOENT
      * rather than treat the path as unclaimed and look for it on the host.
      */
     bool folded;
+
     /* Some component of the path is not a directory, so resolution stopped
      * there (path_resolution(7)) and everything below it owes ENOTDIR. Absent
      * for the same reason folded is: the path is not there, but the sysroot
@@ -76,27 +80,31 @@ typedef struct {
      * path as unclaimed and look for it on the host.
      */
     bool notdir;
-    /* Set with CASEFOLD_SYMLINK: the byte offset in the guest path at which
-     * the components after the link begin, or the path length when the link
-     * was the final component.
+
+    /* Set with CASEFOLD_SYMLINK: the byte offset in the guest path at which the
+     * components after the link begin, or the path length when the link was the
+     * final component.
      */
     size_t link_rest_offset;
+
     /* Offset in the guest path of the link component itself, so the caller can
      * rebuild the directory a relative target is measured from.
      */
     size_t link_guest_offset;
+
     /* Object type the leaf's probe answered. False when the readdir fallback
      * answered, whose listing carries no type, and for dot components, which
      * are never probed.
      */
     bool leaf_type_known;
     bool leaf_is_link;
+
     /* True when every component that resolved was typed by its probe, so no
-     * symlink can hide in the resolved path; only the readdir fallback,
-     * whose listing carries no type, can pass one unseen. Dot components
-     * navigate rather than name an entry, and components below an absent one
-     * name nothing, so neither withholds a type. A FOUND path with this set
-     * cannot resolve outside the prefix it was built under.
+     * symlink can hide in the resolved path; only the readdir fallback, whose
+     * listing carries no type, can pass one unseen. Dot components navigate
+     * rather than name an entry, and components below an absent one name
+     * nothing, so neither withholds a type. A FOUND path with this set cannot
+     * resolve outside the prefix it was built under.
      */
     bool all_types_known;
 } casefold_walk_t;
@@ -104,8 +112,8 @@ typedef struct {
 /* Resolve @guest_path, interpreted relative to @base_fd, into its host spelling
  * in @out. @out is seeded with @base_host_prefix (the sysroot for an absolute
  * guest path, the empty string for a dirfd-relative one) and grown a component
- * at a time. Nothing is opened: each probe is a getattrlistat against
- * the prefix accumulated so far, so the walk holds no descriptors and has no
+ * at a time. Nothing is opened: each probe is a getattrlistat against the
+ * prefix accumulated so far, so the walk holds no descriptors and has no
  * cleanup path.
  *
  * Per component, once the parent is spelled in @out:
@@ -130,9 +138,9 @@ typedef struct {
  *
  * @walk may be NULL when the caller needs only the verdict and @out.
  *
- * @out doubles as the walk's probe scratch, so it must not overlap
- * @guest_path or @base_host_prefix, and it holds nothing meaningful once
- * CASEFOLD_ERROR is returned.
+ * @out doubles as the walk's probe scratch, so it must not overlap @guest_path
+ * or @base_host_prefix, and it holds nothing meaningful once CASEFOLD_ERROR is
+ * returned.
  */
 casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
                                        const char *base_host_prefix,
@@ -144,16 +152,17 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
 
 /* Validate and locate the variable-length ATTR_CMN_NAME payload in a
  * getattrlist reply. getattrlist(2) documents that a truncated reply can carry
- * an attrreference whose data starts or ends past the buffer, so nothing in
- * the reply may be dereferenced on the kernel's word alone; APFS stays inside
- * the documented bound, but --sysroot accepts network mounts that need not.
+ * an attrreference whose data starts or ends past the buffer, so nothing in the
+ * reply may be dereferenced on the kernel's word alone; APFS stays inside the
+ * documented bound, but --sysroot accepts network mounts that need not.
  *
  * @reply is the buffer handed to getattrlistat, whose first u_int32_t is the
  * length the kernel claims; @reply_cap is that buffer's size; @ref_off is the
- * byte offset of the name's attrreference_t within it. Returns the
- * NUL-terminated stored name, or NULL when any bound fails or no NUL exists
- * inside the referenced bytes. Non-static only for the host unit test, which
- * cannot forge a malformed reply through a real volume.
+ * byte offset of the name's attrreference_t within it.
+ *
+ * Returns the NUL-terminated stored name, or NULL when any bound fails or no
+ * NUL exists inside the referenced bytes. Non-static only for the host unit
+ * test, which cannot forge a malformed reply through a real volume.
  */
 const char *casefold_attr_stored_name(const void *reply,
                                       size_t reply_cap,

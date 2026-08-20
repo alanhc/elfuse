@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-rosetta-cli.sh - Exercise x86_64/Rosetta CLI gating paths
 #
 # Copyright 2026 elfuse contributors
@@ -8,10 +9,10 @@ set -euo pipefail
 
 ELFUSE="${1:-build/elfuse}"
 
-# Shared report_pass / report_fail / report_skip + test-runner.sh
-# colors. The matrix runner reads only the Results: line emitted by
-# report_summary at the bottom; per-binary lines now match the aarch64
-# modes' [ OK ] / [ FAIL ] format.
+# Shared report_pass / report_fail / report_skip + test-runner.sh colors. The
+# matrix runner reads only the Results: line emitted by report_summary at the
+# bottom; per-binary lines now match the aarch64 modes' [ OK ] / [ FAIL ]
+# format.
 # shellcheck source=tests/lib/report.sh
 . "$(dirname "$0")/lib/report.sh"
 
@@ -85,8 +86,8 @@ run_expect_fail()
 }
 
 # Rosetta is on by default and architecture is auto-detected from the ELF
-# header; --no-rosetta opts out, and the rejection message points at the
-# right flag.
+# header; --no-rosetta opts out, and the rejection message points at the right
+# flag.
 run_expect_fail "rosetta-disabled-flag" \
     "x86_64 ELF rejected by --no-rosetta" \
     "$ELFUSE" --no-rosetta "$x64_elf"
@@ -100,12 +101,11 @@ run_expect_fail "rosetta-gdb" \
     "$ELFUSE" --gdb 4010 "$x64_elf"
 
 # With Rosetta installed, elfuse bootstrap now reaches the translator and
-# rosettad bridge. Depending on host/runtime state, the remaining gaps can
-# fail in rosettad's translation cache path, in Rosetta's high-VA allocator,
-# or with the translator's own VZ-environment complaint. On hosts without
-# Rosetta installed the failure surfaces earlier with an install hint.
-# Accept any of those Rosetta-specific signatures to avoid masking unrelated
-# elfuse failures.
+# rosettad bridge. Depending on host/runtime state, the remaining gaps can fail
+# in rosettad's translation cache path, in Rosetta's high-VA allocator, or with
+# the translator's own VZ-environment complaint. On hosts without Rosetta
+# installed the failure surfaces earlier with an install hint. Accept any of
+# those Rosetta-specific signatures to avoid masking unrelated elfuse failures.
 run_expect_fail "rosetta-default" \
     "requires the Rosetta Linux translator\\|translate produced empty/missing output\\|Translation failed, invalid path or invalid executable\\|VMAllocationTracker\\|Rosetta is only intended to run on Apple Silicon" \
     "$ELFUSE" "$x64_elf"

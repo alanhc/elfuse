@@ -68,6 +68,7 @@ static int expect_ready_edge(int epfd, int fd, void (*make_ready)(int), int arg)
     make_ready(arg);
 
     struct epoll_event out[4];
+
     /* 2s budget: the bug manifests as an indefinite miss, so any generous
      * finite timeout distinguishes pass from fail without flaking.
      */

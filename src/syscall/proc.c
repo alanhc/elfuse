@@ -1421,8 +1421,8 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
 {
     /* Refuse to signal a host pid that is not (or is no longer) an elfuse
      * process: if it was recycled onto an unrelated program, a raw SIGUSR2
-     * would terminate it. This narrows -- but a sub-microsecond exit+reuse race
-     * before kill() remains -- see the signal-transport TODO.
+     * would terminate it. A sub-microsecond exit and pid reuse between this
+     * check and kill() still lands the signal on the wrong process.
      */
     int our_len;
     const char *our_path = elfuse_self_path(&our_len);
@@ -1581,7 +1581,7 @@ void proc_process_exit(int wait_status)
     free(registry);
     lifecycle_unlock_close(fd);
 
-    for (uint32_t i = 0; i < nreparented; i++) {
+    for (uint32_t i = 0; reparented && i < nreparented; i++) {
         if (reparented[i].exited) {
             /* The exiting process is not necessarily a child of the adopter, so
              * its own SIGCHLD goes elsewhere. Notify the adopter explicitly for
@@ -3187,9 +3187,9 @@ static void vcpu_handle_mrs_trap(hv_vcpu_t vcpu,
     uint64_t value = 0;
 
     /* ID register emulation: return VZ-sanitized values BEFORE trying HVF.
-     * HVF's hv_vcpu_get_sys_reg succeeds for ID
-     * registers but returns raw hardware values, which include features the
-     * hypervisor does not actually virtualize.
+     * HVF's hv_vcpu_get_sys_reg succeeds for ID registers but returns raw
+     * hardware values, which include features the hypervisor does not actually
+     * virtualize.
      *
      * Values captured from a Lima VZ VM on Apple Silicon via inline MRS from
      * EL0 (kernel trap-and-emulate). These are checked first, before the HVF

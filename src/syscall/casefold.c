@@ -18,8 +18,8 @@
 #include "syscall/casefold.h"
 
 /* Payload alphabet for the long tier: one symbol per CASEFOLD_SYM_BITS value,
- * drawn from the CJK Unified Ideographs starting at U+4E00. The block is
- * chosen because these code points have no case mappings and no canonical or
+ * drawn from the CJK Unified Ideographs starting at U+4E00. The block is chosen
+ * because these code points have no case mappings and no canonical or
  * compatibility decompositions, so no two payloads can fold onto each other
  * however aggressive the volume's matching is. Neighboring blocks are not
  * interchangeable: CJK Compatibility Ideographs (U+F900) do normalize, Hangul
@@ -61,8 +61,10 @@ bool casefold_needs_escape(const char *name)
     return casefold_is_escaped(name);
 }
 
-/* Read one payload symbol at @p. Returns its value, or -1 when @p does not
- * begin a three-byte sequence inside the payload block.
+/* Read one payload symbol at @p.
+ *
+ * Returns its value, or -1 when @p does not begin a three-byte sequence inside
+ * the payload block.
  */
 static int symbol_read(const unsigned char *p)
 {
@@ -95,10 +97,12 @@ static unsigned bit_at(const unsigned char *bytes, size_t len, size_t pos)
     return (bytes[pos / 8] >> (7 - pos % 8)) & 1u;
 }
 
-/* Decode an escaped host name. Returns the decoded length in bytes, or -1 when
- * @host is not a well-formed escape. @out must hold CASEFOLD_GUEST_NAME_MAX
- * bytes; the result is not NUL-terminated here because a decoded name may not
- * be a legal component, which the caller checks.
+/* Decode an escaped host name.
+ *
+ * Returns the decoded length in bytes, or -1 when @host is not a well-formed
+ * escape. @out must hold CASEFOLD_GUEST_NAME_MAX bytes; the result is not
+ * NUL-terminated here because a decoded name may not be a legal component,
+ * which the caller checks.
  */
 static int decode_payload(const char *host, unsigned char *out)
 {
@@ -177,6 +181,7 @@ static int decode_payload(const char *host, unsigned char *out)
     }
     if (produced != n)
         return -1;
+
     /* Padding past the last byte must be zero, or one name would have several
      * spellings and a listing could show the same file twice.
      */
@@ -229,6 +234,7 @@ int casefold_escape(const char *guest, char *out, size_t outsz)
         errno = EINVAL;
         return -1;
     }
+
     /* "." and ".." navigate rather than name an entry, so no directory can hold
      * one and an escape standing for one could never be created. Refusing here
      * keeps the codec total: everything it accepts has a real slot to live in.

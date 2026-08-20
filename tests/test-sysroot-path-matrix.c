@@ -7,25 +7,25 @@
  * Every escaped bug in the path layer sat in one cell of a cross product the
  * hand-written tests visited selectively: a final symlink through a dirfd, a
  * long-tier name through the openat2 walker, a create below an intermediate
- * link. This test enumerates the product programmatically (addressing mode
- * x operation x path shape x name class), so a cell exists because the loop
+ * link. This test enumerates the product programmatically (addressing mode x
+ * operation x path shape x name class), so a cell exists because the loop
  * reached it, not because someone thought of it.
  *
  * Linux contract pinned: path_resolution(7) makes no distinction between an
  * absolute path, a cwd-relative one, and an openat(2) dirfd-relative one that
  * name the same file: same result, same errno, same object. The oracle is
- * exactly that agreement: each cell runs one operation through all three
- * modes and requires identical (rc, errno), the same (st_dev, st_ino) for
- * lookups, and for creates that the canonical absolute spelling sees what
- * was made. Agreement is the invariant every escaped dirfd bug violated, so
- * a divergence names its cell in the failure message.
+ * exactly that agreement: each cell runs one operation through all three modes
+ * and requires identical (rc, errno), the same (st_dev, st_ino) for lookups,
+ * and for creates that the canonical absolute spelling sees what was made.
+ * Agreement is the invariant every escaped dirfd bug violated, so a divergence
+ * names its cell in the failure message.
  *
  * Code under test: path_translate_at and its relative/dirfd legs in
  * src/syscall/path.c, over the resolvers in src/syscall/proc-state.c and the
  * walk in src/syscall/casefold-walk.c. A regression shows up as one mode
- * diverging: a create landing beside a link instead of through it, a
- * lookup succeeding where a sibling mode reports ENOENT, or an errno class
- * changing with the spelling of the same file.
+ * diverging: a create landing beside a link instead of through it, a lookup
+ * succeeding where a sibling mode reports ENOENT, or an errno class changing
+ * with the spelling of the same file.
  *
  * Deliberately not here: the sysroot mounted at "/" (read-only root;
  * test-sysroot-root), concurrency (test-sysroot-name-race), and name-length
@@ -65,8 +65,8 @@ enum { MODE_ABS, MODE_CWD, MODE_DIRFD, MODE_COUNT };
 static const char *const mode_name[MODE_COUNT] = {"absolute", "cwd-relative",
                                                   "dirfd"};
 
-/* The dirfd every MODE_DIRFD operation is measured from; opened on ROOT once
- * in main. MODE_CWD relies on main having chdir'd to ROOT.
+/* The dirfd every MODE_DIRFD operation is measured from; opened on ROOT once in
+ * main. MODE_CWD relies on main having chdir'd to ROOT.
  */
 static int root_fd = -1;
 
@@ -82,8 +82,8 @@ static const char *spell(int mode, const char *rel, char *out, size_t outsz)
 
 typedef int (*cell_op_t)(int mode, const char *rel, cell_result_t *res);
 
-/* Fill @res from a stat-like probe of @rel in @mode; @nofollow picks the
- * lstat flavor. Identity is recorded so lookups can assert one object.
+/* Fill @res from a stat-like probe of @rel in @mode; @nofollow picks the lstat
+ * flavor. Identity is recorded so lookups can assert one object.
  */
 static int probe_stat(int mode,
                       const char *rel,
@@ -173,8 +173,8 @@ static int op_openat2_nosym(int mode, const char *rel, cell_result_t *res)
 }
 
 /* Create @rel, record the outcome, verify through the canonical absolute
- * spelling that exactly this mode's create is visible, then remove it the
- * same canonical way so the next mode starts from the same directory.
+ * spelling that exactly this mode's create is visible, then remove it the same
+ * canonical way so the next mode starts from the same directory.
  */
 static int op_create(int mode, const char *rel, cell_result_t *res)
 {
@@ -195,6 +195,7 @@ static int op_create(int mode, const char *rel, cell_result_t *res)
     res->has_id = false;
     if (fd >= 0) {
         close(fd);
+
         /* The canonical spelling must see what this mode made: a create that
          * "succeeded" somewhere else is the failure this matrix exists for.
          */
@@ -329,9 +330,9 @@ static const op_t ops[] = {
 };
 
 /* Path shapes: a prefix the leaf is planted under. sublink is a symlink to
- * Sub.Dir, so the third shape crosses an intermediate link; the fourth
- * carries a '..' component, which the resolvers collapse lexically, so every
- * addressing mode must keep agreeing about where the leaf lives.
+ * Sub.Dir, so the third shape crosses an intermediate link; the fourth carries
+ * a '..' component, which the resolvers collapse lexically, so every addressing
+ * mode must keep agreeing about where the leaf lives.
  */
 static const char *const shapes[] = {"", "Sub.Dir/", "sublink/",
                                      "Sub.Dir/../Sub.Dir/"};
@@ -376,10 +377,11 @@ static void run_cell(const op_t *op, const char *shape, const char *leaf)
     for (int m = 1; m < MODE_COUNT; m++) {
         if (r[m].rc != r[0].rc || r[m].err != r[0].err)
             agree = false;
+
         /* Identity must match for lookups only: a mutating cell makes (and
-         * removes) a fresh object per mode, so its inodes legitimately
-         * differ; placement is already folded into rc via the canonical
-         * probe inside the op.
+         * removes) a fresh object per mode, so its inodes legitimately differ;
+         * placement is already folded into rc via the canonical probe inside
+         * the op.
          */
         if (!op->creates && r[m].has_id && r[0].has_id &&
             (r[m].dev != r[0].dev || r[m].ino != r[0].ino))
@@ -446,8 +448,8 @@ int main(void)
                 char rel[PATH_MAX];
 
                 if (ops[o].creates) {
-                    /* Mutating cells use a fresh leaf beside the fixture so
-                     * the lookup fixtures stay untouched.
+                    /* Mutating cells use a fresh leaf beside the fixture so the
+                     * lookup fixtures stay untouched.
                      */
                     char fresh[PATH_MAX];
                     snprintf(fresh, sizeof(fresh), "New.%s", leaves[l]);
@@ -473,8 +475,8 @@ int main(void)
     run_cell(&ops[1], "", "final-link");
     run_cell(&ops[2], "", "final-link");
 
-    /* Trailing separator asserts directoriness; a regular file owes ENOTDIR
-     * in every mode alike (path_resolution(7)).
+    /* Trailing separator asserts directoriness; a regular file owes ENOTDIR in
+     * every mode alike (path_resolution(7)).
      */
     run_cell(&ops[0], "", "plain-name/");
     run_cell(&ops[0], "", "Mixed.Name/");

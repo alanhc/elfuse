@@ -255,6 +255,7 @@ static void check_intercepts_unchanged(void)
     TEST("open through magic link reopens");
     int reopened = open(magic("/proc/self/fd/", fd), O_RDONLY);
     char buf[16] = {0};
+
     /* Seek explicitly: elfuse serves this open by duplicating the descriptor,
      * so the result shares the original file offset rather than starting at 0
      * the way a fresh open on Linux would.

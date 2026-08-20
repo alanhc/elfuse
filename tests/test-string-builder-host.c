@@ -187,8 +187,9 @@ static void test_formatted_errno_expansion(void)
     string_builder_t builder = {0};
     char expected[128];
 
-    /* `%m` is a GNU printf extension; use the host libc as the oracle so
-     * Darwin (which leaves it literal) remains a valid host-test platform. */
+    /* `%m` is a GNU printf extension; use the host libc as the oracle so Darwin
+     * (which leaves it literal) remains a valid host-test platform.
+     */
     errno = ENOENT;
     assert(snprintf(expected, sizeof(expected), "errno=%m") >= 0);
     errno = ENOENT;

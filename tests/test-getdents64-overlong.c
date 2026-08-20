@@ -150,6 +150,7 @@ int main(int argc, char **argv)
     }
 
     TEST("listing has only the normal entry");
+
     /* The overlong file is present on disk but must be silently skipped, so the
      * visible-entry count is exactly 1.
      */

@@ -103,6 +103,7 @@ static int run_alarm_spin(const char *name, int use_realtime_vdso)
     }
 
     long delivered_ns = ns_diff((struct timespec *) &alarm_ts, &t_arm);
+
     /* The 100 ms timer should deliver within ~150 ms in practice; grant 300 ms
      * to absorb host scheduling jitter under load.
      */

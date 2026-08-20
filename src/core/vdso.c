@@ -147,6 +147,7 @@ static uint8_t *vdso_host_page(guest_t *g)
  * is loaded with the rest.
  */
 #define VDSO_OFF_EHDR 0x000
+
 /* NT_GNU_ABI_TAG note data lives at the old PHDR slot; 32 bytes fits
  * comfortably inside the 112-byte gap up to VVAR.
  */
@@ -217,6 +218,7 @@ static uint8_t *vdso_host_page(guest_t *g)
 #define TEXT_OFF_GETCPU (TEXT_OFF_GETTOD + TEXT_GETTOD_SIZE)
 #define TEXT_GETCPU_SIZE 0x34
 #define TEXT_END (TEXT_OFF_GETCPU + TEXT_GETCPU_SIZE)
+
 /* Offset of the SVC instruction inside __kernel_clock_gettime's svc_fallback
  * (svc_fallback opens at instruction 39 of 42, i.e. byte 0x9C; the SVC is the
  * second instruction of the fallback, at byte 0xA0). The host's
@@ -225,6 +227,7 @@ static uint8_t *vdso_host_page(guest_t *g)
  * trustworthy CNTVCT in X9.
  */
 #define VDSO_CLOCK_GETTIME_SVC_PC (TEXT_OFF_GETTIME + 0xA0)
+
 /* gettimeofday svc_fallback opens at instruction 37 of 40 (byte 0x94); SVC at
  * byte 0x98.
  */
@@ -688,6 +691,7 @@ static void emit_clock_gettime_trampoline(uint32_t *code,
     code[20] = enc_lsr_x_imm(7, 6, VDSO_ANCHOR_AGE_SHIFT);
     /* lsr x7, x6, #ANCHOR_AGE_SHIFT */
     code[21] = enc_cbnz_x(7, svc_fallback_off - 0x54);
+
     /* cbnz x7, svc_fallback (age cap) delta_ns = (delta * 699050666) >> 24.
      * 699050666 is floor((1e9 << 24) / 24e6), the mult+shift form Linux's arm64
      * vDSO uses for CNTFRQ = 24 MHz; an LSR (~1 cycle) in place of any 64-bit
@@ -808,6 +812,7 @@ static void emit_gettimeofday_trampoline(uint32_t *code,
     code[12] = enc_bcond_imm19(COND_LO, svc_fallback_off - 0x30);
     code[13] = enc_lsr_x_imm(7, 6, VDSO_ANCHOR_AGE_SHIFT);
     code[14] = enc_cbnz_x(7, svc_fallback_off - 0x38);
+
     /* Same mult+shift CNTVCT-to-ns conversion as clock_gettime; see
      * emit_clock_gettime_trampoline for the multiplier rationale.
      */
@@ -1333,6 +1338,7 @@ bool vdso_anchor_is_seeded(guest_t *g)
     uint8_t *page = vdso_host_page(g);
     if (!page)
         return false;
+
     /* A seeded-and-stable anchor has seq != 0 && (seq & 1) == 0 (see the vvar
      * layout block for the state machine). Acquire pairs with the release store
      * at the tail of vdso_seed_anchor.
@@ -1348,6 +1354,7 @@ void vdso_attention_or(guest_t *g, uint32_t bits)
         return;
     uint32_t *attention =
         (uint32_t *) (page + VDSO_OFF_VVAR + VVAR_OFF_ATTENTION);
+
     /* SEQ_CST mirrors shim_globals_attn_or: the EL0 fast paths read this word
      * without going through HVC, so a reader that LDARs attn=0 must not observe
      * later publish_creds stores. Release-acquire alone only orders the forward

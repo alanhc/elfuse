@@ -42,8 +42,8 @@ typedef enum {
      * Kept apart from PROBE_ABSENT because the two answer differently for a
      * caller deciding whether the sysroot has a claim on the path: resolution
      * stopped inside the tree (path_resolution(7)), so the path is the
-     * sysroot's to answer for and owes ENOTDIR rather than falling through to
-     * a host file that merely shares the literal spelling.
+     * sysroot's to answer for and owes ENOTDIR rather than falling through to a
+     * host file that merely shares the literal spelling.
      */
     PROBE_NOTDIR = 4
 } probe_result_t;
@@ -119,8 +119,9 @@ const char *casefold_attr_stored_name(const void *reply,
 
     if (reply_cap < sizeof(total))
         return NULL;
-    /* memcpy, not a cast: the reply struct is packed and nothing guarantees
-     * the caller's buffer aligns its fields.
+
+    /* memcpy, not a cast: the reply struct is packed and nothing guarantees the
+     * caller's buffer aligns its fields.
      */
     memcpy(&total, reply, sizeof(total));
 
@@ -168,6 +169,7 @@ static probe_result_t probe_exact(host_fd_t base_fd,
         .commonattr =
             ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_OBJTYPE | ATTR_CMN_NAME,
     };
+
     /* Fixed-size attributes come back in ascending bit order, so ATTR_CMN_NAME
      * (0x1) precedes ATTR_CMN_OBJTYPE (0x8) and the variable-length name data
      * follows both. Ordering these fields any other way silently misreads every
@@ -196,12 +198,12 @@ static probe_result_t probe_exact(host_fd_t base_fd,
                 (size_t) ((const char *) &attr_buf.name_ref -
                           (const char *) &attr_buf));
         if (stored) {
-            /* Read here, not before the test: obj_type only sits at this
-             * offset because name_ref precedes it, and it does so only when
-             * the name was returned inside the reply's own bounds. With the
-             * name withheld or the reply malformed the field would be read
-             * past where the volume wrote it, and a garbage VLNK sends the
-             * walk chasing a link that is not there.
+            /* Read here, not before the test: obj_type only sits at this offset
+             * because name_ref precedes it, and it does so only when the name
+             * was returned inside the reply's own bounds. With the name
+             * withheld or the reply malformed the field would be read past
+             * where the volume wrote it, and a garbage VLNK sends the walk
+             * chasing a link that is not there.
              */
             size_t usable = attr_buf.length < sizeof(attr_buf)
                                 ? attr_buf.length
@@ -216,13 +218,14 @@ static probe_result_t probe_exact(host_fd_t base_fd,
             }
             if (!strcmp(stored, leaf))
                 return PROBE_EXACT;
-            /* A mismatch is not yet a fold. For a second hard link to a
-             * symlink the volume reports the primary link's name here rather
-             * than the one just looked up (observed on APFS; a second link to
-             * a regular file reports itself), so an entry spelled exactly as
-             * asked can still come back under another name. Only the listing
-             * tells an aliased name from a genuinely folded one, and only a
-             * mismatch pays for the scan.
+
+            /* A mismatch is not yet a fold. For a second hard link to a symlink
+             * the volume reports the primary link's name here rather than the
+             * one just looked up (observed on APFS; a second link to a regular
+             * file reports itself), so an entry spelled exactly as asked can
+             * still come back under another name. Only the listing tells an
+             * aliased name from a genuinely folded one, and only a mismatch
+             * pays for the scan.
              *
              * The listing carries no type, and this call typed the entry the
              * volume named, not the one the listing finds, so withdraw it:
@@ -232,10 +235,11 @@ static probe_result_t probe_exact(host_fd_t base_fd,
             *type_known = false;
             return probe_by_readdir(base_fd, path, leaf);
         }
-        /* The call succeeded but the volume withheld the name or handed back
-         * a reply whose bounds do not hold it, so there is no spelling to
-         * compare. Say so rather than dispatching on an errno no one set,
-         * which would pick a verdict out of whatever ran last.
+
+        /* The call succeeded but the volume withheld the name or handed back a
+         * reply whose bounds do not hold it, so there is no spelling to
+         * compare. Say so rather than dispatching on an errno no one set, which
+         * would pick a verdict out of whatever ran last.
          */
         errno = ENOTSUP;
     }
@@ -252,10 +256,10 @@ static probe_result_t probe_exact(host_fd_t base_fd,
          * same: the name has to be escaped.
          *
          * EINVAL can also mean a malformed request rather than a malformed
-         * name, and the two are indistinguishable here. It does not matter:
-         * the attrlist is a compile-time constant, so a malformed one would
-         * fail every probe in every directory rather than this one, which no
-         * lookup in the suite would survive.
+         * name, and the two are indistinguishable here. It does not matter: the
+         * attrlist is a compile-time constant, so a malformed one would fail
+         * every probe in every directory rather than this one, which no lookup
+         * in the suite would survive.
          */
         return PROBE_UNUSABLE;
     case ENOTSUP:
@@ -333,8 +337,8 @@ static int name_by_rule(const char *guest, char *out, size_t outsz)
 }
 
 /* Probe @cand appended to the parent in @out[0..len), restoring @out to that
- * prefix on every exit. append_component writes the separator before the
- * length check, so an unrestored buffer would keep a trailing '/'.
+ * prefix on every exit. append_component writes the separator before the length
+ * check, so an unrestored buffer would keep a trailing '/'.
  */
 static probe_result_t probe_candidate(host_fd_t base_fd,
                                       char *out,
@@ -358,9 +362,9 @@ static probe_result_t probe_candidate(host_fd_t base_fd,
 
 /* Spell one component, given the parent already spelled in @out. The entry is
  * there exactly when the verdict is PROBE_EXACT; the host spelling goes to
- * @host either way. @out doubles as the probe buffer. A candidate that does
- * not fit reports ENAMETOOLONG exactly as the final spelling would, an escape
- * never being shorter than the literal it stands for.
+ * @host either way. @out doubles as the probe buffer. A candidate that does not
+ * fit reports ENAMETOOLONG exactly as the final spelling would, an escape never
+ * being shorter than the literal it stands for.
  */
 static probe_result_t resolve_component(host_fd_t base_fd,
                                         char *out,
@@ -405,9 +409,9 @@ static probe_result_t resolve_component(host_fd_t base_fd,
      * simply nothing there), the escape is the only other place the name can
      * live, so ask whether it does.
      *
-     * The escape cannot fail: casefold.h sizes @host by
-     * CASEFOLD_HOST_NAME_MAX for any name path_component_copy delivers, so a
-     * failure is a broken precondition and fails closed.
+     * The escape cannot fail: casefold.h sizes @host by CASEFOLD_HOST_NAME_MAX
+     * for any name path_component_copy delivers, so a failure is a broken
+     * precondition and fails closed.
      */
     if (casefold_escape(guest, host, hostsz) < 0)
         return PROBE_ERROR;
@@ -429,13 +433,14 @@ static probe_result_t resolve_component(host_fd_t base_fd,
      */
     if (verdict == PROBE_ABSENT || verdict == PROBE_NOTDIR)
         return name_by_rule(guest, host, hostsz) < 0 ? PROBE_ERROR : verdict;
+
     /* The slot is taken by a different spelling, or refused outright, so the
      * name belongs at its escape even though nothing is there yet. Reported as
      * folded rather than absent: the two differ to a caller deciding whether
      * the sysroot has a claim on this path.
      *
-     * A refused name converges on the same answer as an occupied slot, which
-     * is why PROBE_UNUSABLE needs no separate verdict of its own. Both mean the
+     * A refused name converges on the same answer as an occupied slot, which is
+     * why PROBE_UNUSABLE needs no separate verdict of its own. Both mean the
      * sysroot owns this path and the caller must not look for it on the host.
      * The difference is why the literal spelling is unavailable, and no caller
      * asks that. Deliberately fail-closed: the alternative sends a guest asking
@@ -546,6 +551,7 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
                     return CASEFOLD_SYMLINK;
                 }
             }
+
             /* A fold means the sysroot holds an entry where the guest asked,
              * under a spelling the guest did not use. Recorded for the caller
              * because it is the one absent verdict that must not fall through
@@ -553,11 +559,12 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
              */
             if (verdict == PROBE_FOLDED)
                 walk->folded = true;
-            /* Resolution stopped at a component that is not a directory, so
-             * the sysroot has answered and the caller must not look for the
-             * path on the host. Recorded rather than returned immediately so
-             * out still receives the remaining components: a caller reporting
-             * the error issues its own syscall against the whole spelling.
+
+            /* Resolution stopped at a component that is not a directory, so the
+             * sysroot has answered and the caller must not look for the path on
+             * the host. Recorded rather than returned immediately so out still
+             * receives the remaining components: a caller reporting the error
+             * issues its own syscall against the whole spelling.
              */
             if (verdict == PROBE_NOTDIR)
                 walk->notdir = true;
@@ -572,10 +579,10 @@ casefold_verdict_t casefold_resolve_at(host_fd_t base_fd,
         return CASEFOLD_ABSENT;
 
     /* The probe deliberately stops at a symlink rather than following it, so a
-     * caller that asked about the target has to say so. A link pointing
-     * nowhere is absent for that caller, which is what an access(2) probe
-     * would report. A typed leaf is a known non-link (a known link returned
-     * CASEFOLD_SYMLINK above), so the probe adds nothing and is skipped.
+     * caller that asked about the target has to say so. A link pointing nowhere
+     * is absent for that caller, which is what an access(2) probe would report.
+     * A typed leaf is a known non-link (a known link returned CASEFOLD_SYMLINK
+     * above), so the probe adds nothing and is skipped.
      */
     if (follow_final && !walk->leaf_type_known &&
         faccessat(base_fd, out, F_OK, 0) < 0)

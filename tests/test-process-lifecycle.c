@@ -587,6 +587,7 @@ static void test_signal_wait_status(void)
     int ready_ok = killed > 0 && read_all(ready[0], &byte, 1, true) >= 0;
     if (setup_ok)
         close(ready[0]);
+
     /* Let the child return from write(2) and enter EL0 compute code. This
      * specifically checks that the cross-process signal doorbell interrupts a
      * running vCPU whose valid Hypervisor.framework handle may be zero.
@@ -692,6 +693,7 @@ static void test_concurrent_wait_during_fork_admission(void)
                 break;
             usleep(1000);
         }
+
         /* Keep the waiter active briefly after the first report: a phantom
          * admission record would otherwise leave a second entry for this same
          * guest PID, producing a duplicate consuming wait.
@@ -1171,9 +1173,10 @@ static void test_pid1_retains_adopted_exit(void)
             report.adopted_ppid = wait_for_ppid(1, 3000);
             (void) write_all(result[1], &report, sizeof(report));
             close(result[1]);
+
             /* Keep exit_barrier[1] open until process teardown. EOF tells the
-             * observer that the leaf has finished, not merely that it sent
-             * the report above.
+             * observer that the leaf has finished, not merely that it sent the
+             * report above.
              */
             _exit(report.adopted_ppid == 1 ? 83 : 84);
         }

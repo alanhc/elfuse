@@ -5,28 +5,26 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * A guest name the volume cannot hold as itself is stored escaped, and the
- * inotify emulation reads directory snapshots straight off the volume, so
- * both halves of a watch cross the name boundary: the watched path must be
- * resolved like every other guest path, and the names carried inside
- * IN_CREATE/IN_DELETE events must be the guest's bytes, never the stored
- * spelling.
+ * inotify emulation reads directory snapshots straight off the volume, so both
+ * halves of a watch cross the name boundary: the watched path must be resolved
+ * like every other guest path, and the names carried inside IN_CREATE/IN_DELETE
+ * events must be the guest's bytes, never the stored spelling.
  *
- * Linux contract pinned: inotify(7). The name field of an event is the
- * filename within the watched directory, as the process would use it. A name
- * the process never wrote and cannot stat is not that.
+ * Linux contract pinned: inotify(7). The name field of an event is the filename
+ * within the watched directory, as the process would use it. A name the process
+ * never wrote and cannot stat is not that.
  *
  * Code under test: sys_inotify_add_watch and dir_snapshot_fd in
- * src/syscall/inotify.c, routing through src/syscall/path.c. A regression
- * shows up as inotify_add_watch reporting ENOENT for a directory the guest
- * can open, or as an event naming an .ef= spelling the guest cannot resolve,
- * which is how a file watcher (editors, build daemons) sees phantom files
- * appear.
+ * src/syscall/inotify.c, routing through src/syscall/path.c. A regression shows
+ * up as inotify_add_watch reporting ENOENT for a directory the guest can open,
+ * or as an event naming an .ef= spelling the guest cannot resolve, which is how
+ * a file watcher (editors, build daemons) sees phantom files appear.
  *
  * The emulation pumps its event queue when the descriptor is read, so events
- * are collected by polling a nonblocking fd with read(2), valid against a
- * real kernel too. A pass therefore does not prove poll(2) reports readiness
- * without an intervening read; that gap predates the name handling and is not
- * what this lane pins.
+ * are collected by polling a nonblocking fd with read(2), valid against a real
+ * kernel too. A pass therefore does not prove poll(2) reports readiness without
+ * an intervening read; that gap predates the name handling and is not what this
+ * lane pins.
  *
  * Run under --sysroot on a case-folding volume.
  */
@@ -50,8 +48,8 @@ int passes = 0, fails = 0;
 
 #define DIR_W "/watch"
 
-/* Collected event names, flattened; the emulation may batch or split reads,
- * so assertions are about membership rather than arrival order.
+/* Collected event names, flattened; the emulation may batch or split reads, so
+ * assertions are about membership rather than arrival order.
  */
 typedef struct {
     char names[16][NAME_MAX + 1];
@@ -59,11 +57,10 @@ typedef struct {
     int count;
 } events_t;
 
-/* Set as soon as any drained event carries a stored spelling, across the
- * whole run: leaking is a property of the stream, not of one lane. The one
- * exception is the watch on a directory outside the sysroot, where the
- * stored spelling is the correct name; the flag below suspends the check
- * for exactly that section.
+/* Set as soon as any drained event carries a stored spelling, across the whole
+ * run: leaking is a property of the stream, not of one lane. The one exception
+ * is the watch on a directory outside the sysroot, where the stored spelling is
+ * the correct name; the flag below suspends the check for exactly that section.
  */
 static bool escape_leaked;
 static bool stored_names_expected;
@@ -126,16 +123,16 @@ int main(int argc, char **argv)
     EXPECT_TRUE(fd >= 0, "inotify_init1");
 
     /* The watched path is a guest path: it exists in the sysroot and nowhere
-     * else, so a watch that bypasses translation opens the host's namespace
-     * and reports ENOENT for a directory the guest can chdir into.
+     * else, so a watch that bypasses translation opens the host's namespace and
+     * reports ENOENT for a directory the guest can chdir into.
      */
     TEST("a watch on an absolute sysroot directory can be added");
     wd = inotify_add_watch(fd, DIR_W, IN_CREATE | IN_DELETE);
     EXPECT_TRUE(wd >= 0, "inotify_add_watch");
 
-    /* The event name is the guest's spelling. On this volume the file below
-     * is stored escaped, so an undecoded snapshot diff would name .ef=...,
-     * bytes the guest never wrote and cannot stat.
+    /* The event name is the guest's spelling. On this volume the file below is
+     * stored escaped, so an undecoded snapshot diff would name .ef=..., bytes
+     * the guest never wrote and cannot stat.
      */
     TEST("IN_CREATE carries the guest name for an escaped file");
     snprintf(path, sizeof(path), "%s/MixedCase.txt", DIR_W);
@@ -162,9 +159,9 @@ int main(int argc, char **argv)
                     "expected IN_DELETE MixedCase.txt");
     }
 
-    /* Names differing only by case are distinct files, and their events must
-     * be distinct too: one stored literally, one escaped, both reported
-     * under the bytes the guest used.
+    /* Names differing only by case are distinct files, and their events must be
+     * distinct too: one stored literally, one escaped, both reported under the
+     * bytes the guest used.
      */
     TEST("a colliding pair produces two distinctly named events");
     memset(&ev, 0, sizeof(ev));
@@ -234,11 +231,11 @@ int main(int argc, char **argv)
 
     /* A watch is refused only for an object kqueue cannot observe: a FUSE node
      * or a synthetic /proc file, both of which elfuse answers itself with no
-     * host vnode behind them. /dev/shm is neither (the leaf is redirected to
-     * a real host file that kqueue watches like any other), so refusing it
-     * would deny a watch Linux grants on tmpfs. The same over-refusal reaches
-     * every path the open-intercept prefilter merely *might* claim: /etc/passwd
-     * with no sysroot copy, /sys/devices/system/cpu, and, because that filter
+     * host vnode behind them. /dev/shm is neither (the leaf is redirected to a
+     * real host file that kqueue watches like any other), so refusing it would
+     * deny a watch Linux grants on tmpfs. The same over-refusal reaches every
+     * path the open-intercept prefilter merely *might* claim: /etc/passwd with
+     * no sysroot copy, /sys/devices/system/cpu, and, because that filter
      * compares four bytes, any name beginning "/dev".
      */
     TEST("a watch on a /dev/shm leaf is granted, not refused");
@@ -258,13 +255,12 @@ int main(int argc, char **argv)
 
     /* The other half of that rule. A real shm leaf is watchable, but the guest
      * can also write a symlink into the backing directory, and following one
-     * leads wherever its target names. is_guest_system_path() keeps /etc out
-     * of reach precisely so a guest cannot address the host's copy, and a
-     * watch on it hands back that file's existence and every change to it.
-     * Every other consumer of a shm leaf already refuses to follow: stat
-     * reports the link itself and open reports ELOOP. Watching was the one
-     * that followed, so a guest could observe any host path it could name as
-     * a link target.
+     * leads wherever its target names. is_guest_system_path() keeps /etc out of
+     * reach precisely so a guest cannot address the host's copy, and a watch on
+     * it hands back that file's existence and every change to it. Every other
+     * consumer of a shm leaf already refuses to follow: stat reports the link
+     * itself and open reports ELOOP. Watching was the one that followed, so a
+     * guest could observe any host path it could name as a link target.
      */
     TEST("a watch does not follow a shm symlink out of the backing dir");
     {
@@ -286,10 +282,10 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Decoding is scoped the way listings are: a watch on a host directory
-     * the sysroot does not own carries entry names as stored, because those
-     * names are the host's and an escape-shaped literal there means itself.
-     * A decoding snapshot would name a file the guest cannot stat in that
+    /* Decoding is scoped the way listings are: a watch on a host directory the
+     * sysroot does not own carries entry names as stored, because those names
+     * are the host's and an escape-shaped literal there means itself. A
+     * decoding snapshot would name a file the guest cannot stat in that
      * directory, and would misreport a genuine literal ".ef=" file the guest
      * itself created there.
      */
@@ -332,8 +328,7 @@ int main(int argc, char **argv)
     }
 
     /* The catch-all: whatever arrived above, nothing may look like a stored
-     * spelling. This is what fails first when the snapshot diff stops
-     * decoding.
+     * spelling. This is what fails first when the snapshot diff stops decoding.
      */
     TEST("no event name was escape-shaped");
     EXPECT_TRUE(!escape_leaked, "an event leaked an .ef= spelling");

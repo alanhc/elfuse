@@ -21,6 +21,7 @@
 /* Guest address where the vDSO is placed (one 4KiB page, below PT pool) */
 #define VDSO_BASE 0x0000F000ULL
 #define VDSO_SIZE 0x00001000ULL /* 4KiB */
+
 /* Offset of __kernel_rt_sigreturn (the signal trampoline glibc/musl jumps to
  * via X30/LR after the handler returns). Must match TEXT_OFF_SIGRET in
  * src/core/vdso.c; kept here so signal.c can target it without including the

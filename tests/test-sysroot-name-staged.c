@@ -8,12 +8,12 @@
  * the guest view has to be well defined for names elfuse itself would never
  * produce. Two questions matter.
  *
- * A name that is a well-formed escape means the name it decodes to, wherever
- * it came from, which is what makes the mapping a property of the name and
- * not of who wrote it. A name that merely resembles one means itself:
- * uppercase hex, an odd number of digits, a payload decoding to "/" or ".."
- * are all ordinary files, and the guest must be able to open them under the
- * bytes they are spelled with.
+ * A name that is a well-formed escape means the name it decodes to, wherever it
+ * came from, which is what makes the mapping a property of the name and not of
+ * who wrote it. A name that merely resembles one means itself: uppercase hex,
+ * an odd number of digits, a payload decoding to "/" or ".." are all ordinary
+ * files, and the guest must be able to open them under the bytes they are
+ * spelled with.
  *
  * Code under test: casefold_is_escaped and casefold_to_guest in
  * src/syscall/casefold.c, reached through the directory-entry and lookup paths
@@ -21,9 +21,9 @@
  * cannot open under any name, or as a name that resembles an escape being
  * decoded into something else.
  *
- * The recipe stages all of this host-side, because a guest cannot create a
- * name that elfuse would store under a different spelling. Run under
- * --sysroot; the fixtures are staged by the make recipe.
+ * The recipe stages all of this host-side, because a guest cannot create a name
+ * that elfuse would store under a different spelling. Run under --sysroot; the
+ * fixtures are staged by the make recipe.
  */
 
 #include <dirent.h>
@@ -198,8 +198,8 @@ int main(int argc, char **argv)
     expect_reachable("a different separator is not an escape", ".ef_464f4f",
                      "literal-legacy");
 
-    /* Both spellings of one name staged together. Only something outside
-     * elfuse can produce this, and the rule is that a lookup takes the literal
+    /* Both spellings of one name staged together. Only something outside elfuse
+     * can produce this, and the rule is that a lookup takes the literal
      * spelling: the escaped one is then unreachable under any guest name. The
      * listing reports the name twice, which is the visible cost of letting a
      * host tool write a tree elfuse also manages.

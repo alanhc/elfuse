@@ -24,8 +24,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* Pass/fail bookkeeping for the host lanes. Counters in a header are safe
- * here because each host binary is a single translation unit.
+/* Pass/fail bookkeeping for the host lanes. Counters in a header are safe here
+ * because each host binary is a single translation unit.
  */
 static int host_passes;
 static int host_fails;
@@ -57,10 +57,12 @@ static inline int host_summary(const char *name)
     return host_fails ? 1 : 0;
 }
 
-/* Make a scratch root named after @tag under @argv1, $TMPDIR, or /tmp, in
- * that order. Returns 0 with the path in @out, or -1 after reporting why
- * under @lane, the caller's argv[0]: in a CI log the failure line is the
- * only thing naming which test died, and the tag does not.
+/* Make a scratch root named after @tag under @argv1, $TMPDIR, or /tmp, in that
+ * order.
+ *
+ * Returns 0 with the path in @out, or -1 after reporting why under @lane, the
+ * caller's argv[0]: in a CI log the failure line is the only thing naming which
+ * test died, and the tag does not.
  */
 static inline int host_scratch_root(const char *lane,
                                     const char *tag,
@@ -116,14 +118,15 @@ static inline int utf8_put(char *o, unsigned cp)
  * a spelling that is not what is stored, so only asking for the name back can
  * tell "exists as spelled" from "exists under a spelling that folded onto it".
  * FSOPT_NOFOLLOW because a symlink's own name is the question, not its
- * target's. Returns a pointer to static storage, valid until the next call.
+ * target's.
+ *
+ * Returns a pointer to static storage, valid until the next call.
  *
  * The reply is bounds-checked before the reference and the name are read:
  * attr_dataoffset and attr_length come from the filesystem, and --sysroot may
  * name an SMB or NFS mount that need not fill them the way APFS does. This
- * mirrors casefold_attr_stored_name rather than calling it: of the three
- * lanes including this header, only test-casefold-walk-host links
- * casefold-walk.o.
+ * mirrors casefold_attr_stored_name rather than calling it: of the three lanes
+ * including this header, only test-casefold-walk-host links casefold-walk.o.
  */
 static inline const char *disk_name(const char *dir, const char *name)
 {
@@ -168,6 +171,7 @@ static inline const char *disk_name(const char *dir, const char *name)
         return NULL;
 
     const char *stored = (const char *) &buf + name_off;
+
     /* No NUL inside the declared length means the name is not a C string, and
      * "%s" would read past what the volume wrote.
      */

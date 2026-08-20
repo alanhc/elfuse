@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Shared GNU coreutils suite definitions
 #
 # Copyright 2026 elfuse contributors
@@ -47,12 +48,13 @@ coreutils_suite_extended_text()
 coreutils_suite_basic_encoding()
 {
     coreutils_print_section "Encoding / hashing"
-    # Optional binaries (base32/basenc/sha224sum/sha384sum/b2sum/sum) are
-    # gated by test_skip_missing_tool inside run_check: when the wrapper
-    # sets TEST_SKIP_MISSING_TOOLS=1 they report SKIP with accounting,
-    # otherwise the missing binary surfaces as a hard FAIL. The previous
-    # raw "if [ -e ... ]; then" blocks bypassed both paths, silently
-    # erasing assertions whenever the binary was absent.
+
+    # Optional binaries (base32/basenc/sha224sum/sha384sum/b2sum/sum) are gated
+    # by test_skip_missing_tool inside run_check: when the wrapper sets
+    # TEST_SKIP_MISSING_TOOLS=1 they report SKIP with accounting, otherwise the
+    # missing binary surfaces as a hard FAIL. The previous raw "if [ -e ... ];
+    # then" blocks bypassed both paths, silently erasing assertions whenever the
+    # binary was absent.
     run_check base32 "NBSWY" "$TMPDIR/hello.txt"
     run_check base64 "aGVsbG8" "$TMPDIR/hello.txt"
     run_check basenc "aGVsbG8" "--base64" "$TMPDIR/hello.txt"
@@ -158,8 +160,9 @@ coreutils_suite_basic_math()
     run_check seq "5" "1" "5"
     run_check expr "3" "1" "+" "2"
     run_check factor "2 2 3" "12"
-    # numfmt is optional in some packages; rely on test_skip_missing_tool
-    # so absence becomes a SKIP under TEST_SKIP_MISSING_TOOLS=1 and a FAIL
+
+    # numfmt is optional in some packages; rely on test_skip_missing_tool so
+    # absence becomes a SKIP under TEST_SKIP_MISSING_TOOLS=1 and a FAIL
     # otherwise, rather than a silent omission.
     run_check numfmt "1\\.0[kK]" "--to=si" "1000"
 }

@@ -5,19 +5,19 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * elfuse backs /proc/self/oom_adj, oom_score_adj, and oom_score with a
- * per-open host temp file materialized at open() time, plus a separate
- * read-intercept path (proc_intercept_read) that serves live atomic state
- * to guest read/pread/readv so a write through a sibling fd is visible
- * without reopening. sendfile(2) and copy_file_range(2) do not go through
- * that read path -- they go through copy_fd_range's own, independently
- * wired proc_try_chunk_read_intercept call. These tests pin that second
- * wiring: open the source fd, mutate the value through a sibling fd, then
+ * elfuse backs /proc/self/oom_adj, oom_score_adj, and oom_score with a per-open
+ * host temp file materialized at open() time, plus a separate read-intercept
+ * path (proc_intercept_read) that serves live atomic state to guest
+ * read/pread/readv so a write through a sibling fd is visible without
+ * reopening. sendfile(2) and copy_file_range(2) do not go through that read
+ * path -- they go through copy_fd_range's own, independently wired
+ * proc_try_chunk_read_intercept call. These tests pin that second wiring: open
+ * the source fd, mutate the value through a sibling fd, then
  * sendfile/copy_file_range from the already-open fd and require the fresh
  * value, not the stale open-time snapshot.
  *
- * This is elfuse-internal plumbing with no Linux-kernel counterpart -- no
- * real program sendfile()s or copy_file_range()s out of procfs -- so unlike
+ * This is elfuse-internal plumbing with no Linux-kernel counterpart -- no real
+ * program sendfile()s or copy_file_range()s out of procfs -- so unlike
  * test-io-opt this suite is not run against the QEMU reference kernel; see
  * tests/test-matrix.sh.
  */
@@ -43,8 +43,8 @@ static void reset_oom_score_adj(void)
 
 /* Copy up to 32 bytes from in_fd to out_fd, returning the byte count and
  * reporting via *offsets_ok whether the syscall's offset bookkeeping advanced
- * to the expected 3 bytes. sendfile tracks one (source) offset;
- * copy_file_range tracks both a source and a destination offset.
+ * to the expected 3 bytes. sendfile tracks one (source) offset; copy_file_range
+ * tracks both a source and a destination offset.
  */
 typedef ssize_t (*oom_copy_fn)(int out_fd, int in_fd, int *offsets_ok);
 
@@ -66,9 +66,9 @@ static ssize_t copy_via_copy_file_range(int out_fd, int in_fd, int *offsets_ok)
 
 /* Open the synthetic oom_adj source, bump the value through a sibling
  * oom_score_adj fd, then `copy` 32 bytes from the already-open source into a
- * fresh temp file and require the updated "15\n" (3 bytes) instead of the
- * stale open-time snapshot. The copy method and its offset bookkeeping differ,
- * so the caller supplies them; everything else is shared.
+ * fresh temp file and require the updated "15\n" (3 bytes) instead of the stale
+ * open-time snapshot. The copy method and its offset bookkeeping differ, so the
+ * caller supplies them; everything else is shared.
  */
 static void run_oom_copy_test(const char *label,
                               const char *dst,

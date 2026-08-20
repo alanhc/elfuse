@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# test-dynamic-coreutils.sh -- Dynamically-linked GNU coreutils test suite for elfuse
+
+# test-dynamic-coreutils.sh -- Dynamically-linked GNU coreutils test suite for
+# elfuse
 #
 # Copyright 2026 elfuse contributors
 # Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
-#
 # shellcheck disable=SC1091,SC2034,SC2059,SC2154
-#
 # Shared entry point for dynamic coreutils coverage through elfuse --sysroot.
 #
-# Usage: tests/test-dynamic-coreutils.sh <elfuse-binary> <sysroot-dir> <coreutils-bin-dir>
-# Example: tests/test-dynamic-coreutils.sh build/elfuse $GUEST_SYSROOT $GUEST_DYNAMIC_COREUTILS/bin
+# Usage:
+#   tests/test-dynamic-coreutils.sh <elfuse-binary> <sysroot-dir> \
+#       <coreutils-bin-dir>
+#
+# Example:
+#   tests/test-dynamic-coreutils.sh build/elfuse $GUEST_SYSROOT \
+#       $GUEST_DYNAMIC_COREUTILS/bin
 
 set -euo pipefail
 

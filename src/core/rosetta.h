@@ -51,8 +51,8 @@
  * VZ environment. Without affirmative responses, rosetta prints "Rosetta is
  * only intended to run on Apple Silicon ..." and exits.
  *
- * Reverse-engineered from the rosetta binary; values captured via strace in
- * a VZ Linux VM.
+ * Reverse-engineered from the rosetta binary; values captured via strace in a
+ * VZ Linux VM.
  */
 #define ROSETTA_VZ_CHECK 0x80456125 /* Returns 69-byte signature */
 #define ROSETTA_VZ_CAPS 0x80806123  /* Returns 128-byte capability blob */

@@ -111,8 +111,8 @@ int main(void)
             FAIL("read failed");
     }
 
-    /* /proc/version and uname(2) describe one kernel, so the release the
-     * banner carries has to be the release uname reports.
+    /* /proc/version and uname(2) describe one kernel, so the release the banner
+     * carries has to be the release uname reports.
      */
     TEST("/proc/version matches uname");
     {
@@ -284,7 +284,8 @@ int main(void)
             FAIL("statfs /proc/self/exe failed");
         } else {
             /* /proc/self/exe points to the host binary file, which resides on a
-             * real filesystem, not procfs. */
+             * real filesystem, not procfs.
+             */
             EXPECT_TRUE(exe_st.f_type != 0x9fa0,
                         "statfs /proc/self/exe returned PROC_SUPER_MAGIC");
 

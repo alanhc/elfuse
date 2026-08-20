@@ -10,13 +10,13 @@
  * (caller falls through to real syscall).
  */
 
-/* Initial capacity for the transient /proc/self/maps and /proc/self/smaps VMA
+/*
+ * Initial capacity for the transient /proc/self/maps and /proc/self/smaps VMA
  * snapshot. The region tracker documents that coalescing leaves typical
  * workloads at roughly 50 tracked regions (see core/guest.h), so 64 avoids an
  * immediate growth in that case. The array grows as needed while mmap_lock is
- * held; keep a hard ceiling tied to the guest's region tables so maps/smaps
- * can enumerate every tracked VMA while keeping transient snapshot memory
- * bounded.
+ * held; keep a hard ceiling tied to the guest's region tables so maps/smaps can
+ * enumerate every tracked VMA while keeping transient snapshot memory bounded.
  */
 #define MAPS_ENTRY_INITIAL_CAP 64
 #define MAPS_ENTRY_MAX \
@@ -106,15 +106,18 @@ typedef struct {
     uint64_t offset;
     bool inherited_at_fork;
     char name[64];
-    /* Preserve the producer order for equal-start entries when qsort() is
-     * used below. Existing snapshots placed equal-start entries after one
-     * another in append order, and keeping that order avoids changing the
-     * handling of malformed/overlapping shadow metadata. */
+
+    /* Preserve the producer order for equal-start entries when qsort() is used
+     * below. Existing snapshots placed equal-start entries after one another in
+     * append order, and keeping that order avoids changing the handling of
+     * malformed/overlapping shadow metadata.
+     */
     size_t order;
 } maps_entry_t;
 
 /* A growable VMA snapshot. The generated facade keeps element-size and
- * allocation bookkeeping in the generic array implementation. */
+ * allocation bookkeeping in the generic array implementation.
+ */
 DYNAMIC_ARRAY_DEFINE(maps_entries, maps_entry_t)
 
 /* Round a VMA endpoint up to the 4 KiB granularity exposed by procfs without
@@ -184,11 +187,12 @@ static int maps_entries_append_entry(maps_entries_t *entries,
     return maps_entries_append_value(entries, value);
 }
 
-/* The live-region and shadow-gap producers are each ordered, but their
- * outputs interleave. Append both streams while holding mmap_lock and sort
- * once after all gaps have been generated. This avoids shifting an already
- * populated array for every split shadow gap (the old insertion path was
- * quadratic for fragmented snapshots). */
+/* The live-region and shadow-gap producers are each ordered, but their outputs
+ * interleave. Append both streams while holding mmap_lock and sort once after
+ * all gaps have been generated. This avoids shifting an already populated array
+ * for every split shadow gap (the old insertion path was quadratic for
+ * fragmented snapshots).
+ */
 static int maps_entries_compare_start(const void *lhs, const void *rhs)
 {
     const maps_entry_t *a = lhs;
@@ -230,10 +234,11 @@ static void maps_entries_merge_adjacent(maps_entries_t *entries)
     (void) maps_entries_resize(entries, out + 1);
 }
 
-/* Add only the portions of a preannounced interval not covered by live VMAs.
- * A shadow VMA must never overlap a realized VMA: strict smaps consumers treat
+/* Add only the portions of a preannounced interval not covered by live VMAs. A
+ * shadow VMA must never overlap a realized VMA: strict smaps consumers treat
  * overlapping headers as a malformed snapshot. Both inputs are page-rounded
- * because that is the granularity exposed by /proc/self/maps. */
+ * because that is the granularity exposed by /proc/self/maps.
+ */
 static int maps_entries_append_shadow_gaps(maps_entries_t *entries,
                                            const guest_region_t *shadow,
                                            const guest_region_t *live_regions,
@@ -1696,8 +1701,8 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
 /* Build the VMA list shared by /proc/self/maps and /proc/self/smaps. Merges
  * contiguous regions[] runs that came from one mmap, then folds in the
  * uncovered pieces of preannounced[] shadow entries around live coverage.
- * Producers append entries while the lock is held; one sort/merge pass puts
- * the interleaved live and shadow streams back into VMA order.
+ * Producers append entries while the lock is held; one sort/merge pass puts the
+ * interleaved live and shadow streams back into VMA order.
  *
  * The region and preannounced arrays are mutable from guest mmap/mprotect/
  * munmap operations. Snapshot and merge while mmap_lock is held, then release
@@ -1719,8 +1724,8 @@ static int proc_build_maps_entries(const guest_t *g,
     pthread_mutex_lock(&mmap_lock);
 
     /* Convert regions[] to maps entries. regions[] is already sorted by start
-     * address. The MAP_SHARED/MAP_ANONYMOUS/MAP_NORESERVE bits are preserved
-     * in r->flags, which is the single source of truth for the proc snapshot.
+     * address. The MAP_SHARED/MAP_ANONYMOUS/MAP_NORESERVE bits are preserved in
+     * r->flags, which is the single source of truth for the proc snapshot.
      */
     int nregions = g->nregions;
     if (nregions < 0)
@@ -1750,7 +1755,8 @@ static int proc_build_maps_entries(const guest_t *g,
     /* Add only uncovered portions of each preannounced interval. Keeping the
      * shadow VMA whole when a live mapping realizes its middle produces
      * overlapping maps/smaps headers; subtract every covered live interval
-     * instead, preserving any reserved-but-not-realized gaps. */
+     * instead, preserving any reserved-but-not-realized gaps.
+     */
     int npreannounced = g->npreannounced;
     if (npreannounced < 0)
         npreannounced = 0;
@@ -1876,14 +1882,14 @@ out:
     return proc_finish_maps_output(result, &entries, &builder);
 }
 
-/* Emit a Linux-shaped /proc/self/smaps approximation. The runtime tracks
- * guest VMAs and logical fork snapshots, but it cannot observe kernel page
- * residency or dirty bits on the host. Writable private anonymous VMAs that
- * were present in the most recent fork snapshot report their full VMA size as
- * Shared_Dirty, Rss, Pss, and Pss_Dirty; keeping those counters aligned avoids
- * a self-contradictory snapshot while retaining a coarse fork-compatibility
- * signal. Newly-created VMAs are excluded. All other fields that require
- * kernel page accounting are stable zeroes.
+/* Emit a Linux-shaped /proc/self/smaps approximation. The runtime tracks guest
+ * VMAs and logical fork snapshots, but it cannot observe kernel page residency
+ * or dirty bits on the host. Writable private anonymous VMAs that were present
+ * in the most recent fork snapshot report their full VMA size as Shared_Dirty,
+ * Rss, Pss, and Pss_Dirty; keeping those counters aligned avoids a
+ * self-contradictory snapshot while retaining a coarse fork-compatibility
+ * signal. Newly-created VMAs are excluded. All other fields that require kernel
+ * page accounting are stable zeroes.
  */
 static int proc_open_self_smaps(const guest_t *g)
 {
@@ -1935,6 +1941,7 @@ static int proc_open_self_smaps(const guest_t *g)
             vmflags_len += token_len;                        \
         }                                                    \
     } while (0)
+
         /* Only flags directly evidenced by the tracked VMA are reported. In
          * particular, do not invent Linux max-permission/accounting flags
          * (mr/mw/me/ac/sd/etc.) that the emulator cannot observe.
@@ -2005,8 +2012,8 @@ out:
  * two different machines outright, never mind two instants -- meminfo reported
  * the host's real memory while sysinfo capped it at a hardcoded 4GiB -- and
  * that guest underflowed. busybox free takes total and free from sysinfo and
- * buff/cache from here, so a Cached larger than the sysinfo total made
- * used = total - free - cached wrap into a 24-digit figure.
+ * buff/cache from here, so a Cached larger than the sysinfo total made used =
+ * total - free - cached wrap into a 24-digit figure.
  *
  * Returns a host fd, or -1. Split out of proc_intercept_open to keep that
  * dispatcher readable.
@@ -2045,12 +2052,12 @@ static int proc_open_meminfo(void)
     /* Cached has to fit in what MemFree leaves, not merely be smaller than the
      * total. The Mach counters do not partition: a purgeable page is also
      * counted in inactive, so free + inactive + purgeable can exceed physical
-     * memory however the total is derived. A guest computing
-     * used = total - free - cached wraps on that excess, which is the failure
-     * reporting one total is meant to end. Cached gives up the precision rather
-     * than MemFree, since MemFree is what sysinfo reports as freeram and the
-     * two have to keep matching. free_kb needs no clamp of its own: it comes
-     * from sys_guest_ram_free(), which is already held below the total.
+     * memory however the total is derived. A guest computing used = total -
+     * free - cached wraps on that excess, which is the failure reporting one
+     * total is meant to end. Cached gives up the precision rather than MemFree,
+     * since MemFree is what sysinfo reports as freeram and the two have to keep
+     * matching. free_kb needs no clamp of its own: it comes from
+     * sys_guest_ram_free(), which is already held below the total.
      */
     if (cached_kb > total_kb - free_kb)
         cached_kb = total_kb - free_kb;
@@ -2627,8 +2634,8 @@ int proc_intercept_open(const guest_t *g,
     if (!strcmp(path, "/proc/self/maps"))
         return proc_open_self_maps(g);
 
-    /* /proc/self/smaps -> Linux-shaped VMA blocks with tracked VMA metadata
-     * and the coarse fork Shared_Dirty/Rss/Pss/Pss_Dirty compatibility signal.
+    /* /proc/self/smaps -> Linux-shaped VMA blocks with tracked VMA metadata and
+     * the coarse fork Shared_Dirty/Rss/Pss/Pss_Dirty compatibility signal.
      */
     if (!strcmp(path, "/proc/self/smaps"))
         return proc_open_self_smaps(g);

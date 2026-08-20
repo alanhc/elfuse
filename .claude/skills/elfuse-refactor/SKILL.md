@@ -186,13 +186,21 @@ four-figure functions because nobody took it. But "in proportion" is the
 load-bearing half, and in this tree it has a mechanical edge that a good
 intention does not survive.
 
-Do not run `clang-format -i` on a whole file to tidy a small change. Files
-here are format-clean but their comment wrapping predates the current
-formatter, so a whole-file pass rewraps comments nowhere near your edit and
-buries the change in churn. Format the file only when you added code to it,
-and check `git diff --numstat` before calling the work done: a file you meant
-to touch in one line reporting twenty is churn, not cleanup. The same goes for
-a scripted edit that rewrites whole files.
+Do not run `clang-format -i` on a whole file to tidy a small change. On the
+current tree that pass is a no-op, since every file `make indent` selects
+formats to itself with no diff, so it buys nothing. What it can cost is
+everything: a clang-format that is not version 22 reformats the whole tree at
+once and buries the change, which is why `CONTRIBUTING.md` pins the version
+rather than asking for 22 or newer.
+
+`make indent` also runs `commentflow`, and since the one-time reflow landed it
+is a no-op too. Treat a tree-wide diff from either half as a signal rather than
+as cleanup: it means the formatter you have is not the one the gate runs.
+
+Format the file only when you added code to it, and check `git diff --numstat`
+before calling the work done: a file you meant to touch in one line reporting
+twenty is churn, not cleanup. The same goes for a scripted edit that rewrites
+whole files.
 
 The proportionality test is the diff, not the intent. A cleanup that lands in
 a file the task never needed to open is a separate change, and it costs the

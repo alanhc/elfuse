@@ -7,8 +7,8 @@
  * Nothing serializes name creation in a sysroot, and the reason is that the
  * on-disk spelling of a guest name is a function of that name alone: two
  * processes creating names that the volume would fold together are writing
- * different entries, so they never contend. This asserts the consequence
- * rather than the mechanism.
+ * different entries, so they never contend. This asserts the consequence rather
+ * than the mechanism.
  *
  * fork(2) under elfuse spawns a separate host process, so the children below
  * really are separate processes sharing one sysroot with no shared state
@@ -75,8 +75,8 @@ static int content_is(const char *name, const char *want)
     return file_content_is(path, want);
 }
 
-/* Fork KIDS children and run @body in each, recording each child's exit code
- * in @code (-1 for a child that could not be forked or reaped, or that died
+/* Fork KIDS children and run @body in each, recording each child's exit code in
+ * @code (-1 for a child that could not be forked or reaped, or that died
  * abnormally). One fork/wait implementation for both rounds, so the reaping
  * bookkeeping cannot drift between them.
  */

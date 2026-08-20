@@ -1,14 +1,14 @@
 /*
- * Host-side unit test for ELFUSE_FAKEROOT environment overrides and the
- * --user staging protocol.
+ * Host-side unit test for ELFUSE_FAKEROOT environment overrides and the --user
+ * staging protocol.
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * The staging cases are regression guards for the proc_set_initial_ids
- * contract in proc.h. No launcher performs two bring-ups in one host
- * process, so a regression shows up as the wrong uid/gid below rather than
- * as a launch failure.
+ * The staging cases are regression guards for the proc_set_initial_ids contract
+ * in proc.h. No launcher performs two bring-ups in one host process, so a
+ * regression shows up as the wrong uid/gid below rather than as a launch
+ * failure.
  */
 
 #include <stdio.h>
@@ -92,8 +92,8 @@ int main(void)
     assert(proc_get_gid() == GUEST_GID);
     assert(proc_fakeroot_enabled() == false);
 
-    /* Test 5: consume-once. A leftover would leak one launch's --user into
-     * the next launch of the same host process.
+    /* Test 5: consume-once. A leftover would leak one launch's --user into the
+     * next launch of the same host process.
      */
     proc_set_fakeroot_enabled(false);
     proc_set_initial_ids(1234, 5678);

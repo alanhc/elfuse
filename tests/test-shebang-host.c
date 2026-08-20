@@ -147,6 +147,7 @@ int main(void)
     }
     case9[510] = '\n';
     case9[511] = '\0';
+
     /* Since the interpreter is 508 characters, and our interp buffer is only
      * 256, it should return -ENOEXEC (buffer too small)
      */

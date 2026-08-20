@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-#
+
 # CLI gating for x86_64-via-Rosetta
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Verifies that the three command-line gates around x86_64 guests
-# reject as designed. Treats the failure itself as the test: every
-# probe is expected to exit non-zero AND emit a recognisable error
-# fragment.
+# Verifies that the three command-line gates around x86_64 guests reject as
+# designed. Treats the failure itself as the test: every probe is expected to
+# exit non-zero AND emit a recognisable error fragment.
 #
 # Categories covered:
 #   1. --gdb on x86_64 ELF: rejected by main.c
@@ -16,12 +15,11 @@
 #   3. ELFUSE_NO_ROSETTA=1 with x86_64: same rejection via env
 #
 # The end-to-end dynamic-linker bring-up under Rosetta is covered by
-# tests/test-rosetta-glibc.sh (glibc-hello / glibc-hello-via-ldso),
-# and mid-process execve re-bootstrap is covered by
-# tests/test-rosetta-statics.sh (env-execve). Those tests carry the
-# same code-path scrutiny as the dynamic / execve probes that used to
-# live here, against the vendored fixture trees that are always
-# present, so this script no longer needs the x86_64-musl Alpine
+# tests/test-rosetta-glibc.sh (glibc-hello / glibc-hello-via-ldso), and
+# mid-process execve re-bootstrap is covered by tests/test-rosetta-statics.sh
+# (env-execve). Those tests carry the same code-path scrutiny as the dynamic /
+# execve probes that used to live here, against the vendored fixture trees that
+# are always present, so this script no longer needs the x86_64-musl Alpine
 # corpus and no longer self-stages it.
 #
 # Usage: tests/test-rosetta-failure-modes.sh [path/to/elfuse]
@@ -36,9 +34,9 @@ esac
 
 SHORTDIR=/tmp/elfuse-rfm
 
-# Shared report_pass / report_fail / report_skip + Results: summary
-# emitter. Matches the matrix runner's aarch64 per-binary format so
-# tests/test-matrix.sh elfuse-x86_64 output reads uniformly.
+# Shared report_pass / report_fail / report_skip + Results: summary emitter.
+# Matches the matrix runner's aarch64 per-binary format so tests/test-matrix.sh
+# elfuse-x86_64 output reads uniformly.
 # shellcheck source=tests/lib/report.sh
 . "$(dirname "$0")/lib/report.sh"
 
@@ -47,8 +45,8 @@ fail=0
 skip=0
 total=0
 
-# Expect a non-zero exit AND a stderr fragment match.
-# Args: <label> <stderr-grep-pattern> <command...>
+# Expect a non-zero exit AND a stderr fragment match. Args: <label>
+# <stderr-grep-pattern> <command...>
 probe_fail()
 {
     local label="$1" pattern="$2"
@@ -86,8 +84,8 @@ require_timeout
 mkdir -p "$SHORTDIR"
 trap 'rm -rf "$SHORTDIR"' EXIT
 
-# Synthesize a minimal x86_64 ELF (header-only, no segments worth loading).
-# This is enough to drive the CLI gates that key on e_machine = EM_X86_64.
+# Synthesize a minimal x86_64 ELF (header-only, no segments worth loading). This
+# is enough to drive the CLI gates that key on e_machine = EM_X86_64.
 # Self-contained: no external fixture tree needed.
 min_elf="${SHORTDIR}/min-x86_64.elf"
 python3 - "$min_elf" << 'PY'
@@ -112,9 +110,7 @@ probe_fail "gdb-x86_64" \
     "--gdb is not supported for x86_64 guests" \
     "$ELFUSE" --gdb 4242 "$min_elf"
 
-# ---------------------------------------------------------------------------
 # Summary
-# ---------------------------------------------------------------------------
 
 report_summary "$total"
 

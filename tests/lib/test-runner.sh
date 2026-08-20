@@ -97,6 +97,7 @@ test_report()
         fail) printf "%s [ ${RED}FAIL${RESET} ]%s\n" "$name" "$detail" ;;
         skip) printf "%s [ ${YELLOW}SKIP${RESET} ]%s\n" "$name" "$detail" ;;
         xfail) printf "%s [ ${YELLOW}XFAIL${RESET} ]%s\n" "$name" "$detail" ;;
+
         # No bracketed verdict, because the test has not been decided yet and
         # every other state here is one the summary counts. The blanks are as
         # wide as the FAIL and SKIP tags, which is the closest a single width
@@ -183,6 +184,7 @@ run()
     # file so the first attempt's stack, taken in the state that produced the
     # timeout, survives.
     if [ "$harness_timed_out" -eq 1 ] && test_host_is_busy; then
+
         # Informational, not a verdict: the test has not been decided yet, so
         # this must not advance the skip counter the summary reports.
         test_report info "$tool" " (timeout under host load; re-running)"

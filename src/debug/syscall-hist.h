@@ -16,8 +16,7 @@
  * atomic adds.
  */
 
-#ifndef ELFUSE_SYSCALL_HIST_H
-#define ELFUSE_SYSCALL_HIST_H
+#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -69,5 +68,3 @@ void syscall_hist_disable(void);
  * may run more than once.
  */
 void syscall_hist_dump(void);
-
-#endif /* ELFUSE_SYSCALL_HIST_H */

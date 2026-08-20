@@ -89,8 +89,8 @@ int main(int argc, char **argv)
     EXPECT_ERRNO(rename("/data/MAKEfile", "/data/moved"), ENOENT,
                  "folded rename leaked");
 
-    /* O_CREAT with a wrong-case spelling must create a second, distinct
-     * entry (Linux semantics), not fold onto the existing one.
+    /* O_CREAT with a wrong-case spelling must create a second, distinct entry
+     * (Linux semantics), not fold onto the existing one.
      */
     TEST("wrong-case O_CREAT|O_EXCL succeeds");
     {

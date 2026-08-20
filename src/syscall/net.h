@@ -168,9 +168,9 @@ int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags);
 
 /* Readiness gate for a zero-payload recv/recvfrom/recvmsg: Linux clamps the
  * receive low-water target to one byte, so an empty socket blocks (EINTR on
- * guest signal) or fails EAGAIN when nonblocking, rather than returning 0
- * like the macOS host call. Call before the host receive when the resolved
- * payload length is zero.
+ * guest signal) or fails EAGAIN when nonblocking, rather than returning 0 like
+ * the macOS host call. Call before the host receive when the resolved payload
+ * length is zero.
  *
  * Returns 0 to proceed or a negative Linux errno (EINTR/EAGAIN).
  */
@@ -228,11 +228,11 @@ int64_t netlink_read(int guest_fd,
 
 int64_t netlink_send(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t len);
 
-/* Vectored forms of the two above, taking the guest iovec array they stage.
- * One netlink request, and one response, spans the whole iovec: the send
- * gathers every entry into one request and the receive fills every entry from
- * one response, so neither stops at the first entry the way the scalar special
- * fds do.
+/* Vectored forms of the two above, taking the guest iovec array they stage. One
+ * netlink request, and one response, spans the whole iovec: the send gathers
+ * every entry into one request and the receive fills every entry from one
+ * response, so neither stops at the first entry the way the scalar special fds
+ * do.
  */
 int64_t netlink_writev(int guest_fd, guest_t *g, uint64_t iov_gva, int iovcnt);
 

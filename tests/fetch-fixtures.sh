@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # fetch-fixtures.sh -- Download Alpine packages and assemble a qemu/elfuse test
 # fixture tree under externals/test-fixtures/.
 #
@@ -41,11 +42,12 @@ set -euo pipefail
 
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
 
-# The oracle kernel resolves from its own Alpine release: 3.23 ships
-# linux-virt 6.18, the LTS line elfuse reports to the guest, while the
-# userland pins stay on ALPINE_VERSION. The linux-virt apk carries the
-# kernel and its lib/modules tree, so both move together.
+# The oracle kernel resolves from its own Alpine release: 3.23 ships linux-virt
+# 6.18, the LTS line elfuse reports to the guest, while the userland pins stay
+# on ALPINE_VERSION. The linux-virt apk carries the kernel and its lib/modules
+# tree, so both move together.
 KERNEL_ALPINE_VERSION="${KERNEL_ALPINE_VERSION:-3.23}"
+
 # Empty by default -- the exact point release is resolved from the live releases
 # listing at fetch time (see resolve_minirootfs), then written back here so the
 # x86_64 path reuses the same patch. Set explicitly to pin one.
@@ -252,6 +254,7 @@ resolve_versions()
         idxtgz="${CACHE}/APKINDEX-${repo}.tar.gz"
         idxfile="${CACHE}/APKINDEX-${repo}.versions"
         log "resolve versions ($repo)"
+
         # Always try to refresh the index -- tracking the live mirror is the
         # point -- but fall back to a cached copy so warm re-runs work offline.
         # APKINDEX records are blank-line separated; P: is the package name, V:
@@ -512,6 +515,7 @@ EOF
         log "stage dyn-bin aggregate"
         rm -rf "$dynbin"
         mkdir -p "$dynbin"
+
         # ${dynbin} is at <fixtures>/aarch64-musl/dyn-bin; rootfs is at
         # <fixtures>/rootfs. The relative path back is "../../rootfs/...".
         for sub in bin usr/bin; do

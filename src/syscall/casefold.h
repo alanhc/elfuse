@@ -46,16 +46,16 @@
 #define CASEFOLD_HEX_MAX ((CASEFOLD_UNIT_MAX - CASEFOLD_PREFIX_LEN) / 2)
 
 /* Bits each long-tier payload symbol carries: twelve packs three input bytes
- * into two symbols, so a 255-byte name spends 170 payload symbols and stays
- * far inside the 255-unit budget. The alphabet size and the symbol-count
- * formula both derive from this one constant, so changing the packing moves
- * every consumer together or trips the asserts below.
+ * into two symbols, so a 255-byte name spends 170 payload symbols and stays far
+ * inside the 255-unit budget. The alphabet size and the symbol-count formula
+ * both derive from this one constant, so changing the packing moves every
+ * consumer together or trips the asserts below.
  */
 #define CASEFOLD_SYM_BITS 12u
 
 /* Symbols the long tier spends on a guest name of n bytes: one carrying the
- * length, then one per CASEFOLD_SYM_BITS of payload. Computed in size_t
- * because the result sizes buffers.
+ * length, then one per CASEFOLD_SYM_BITS of payload. Computed in size_t because
+ * the result sizes buffers.
  */
 #define CASEFOLD_SYMBOLS(n) \
     ((size_t) 1 +           \
@@ -72,10 +72,10 @@
 /* Every escape has to fit the volume's per-name limit, and both tiers spend
  * exactly one unit per output character: the hex tier emits ASCII digits, the
  * long tier BMP code points. The margin is wide today, so the arithmetic is
- * easy to disturb without noticing: raising CASEFOLD_GUEST_NAME_MAX,
- * widening CASEFOLD_PREFIX or shrinking CASEFOLD_SYM_BITS would each push the
- * long tier over, and the volume would then refuse names the guest is entitled
- * to create. Fail the build instead.
+ * easy to disturb without noticing: raising CASEFOLD_GUEST_NAME_MAX, widening
+ * CASEFOLD_PREFIX or shrinking CASEFOLD_SYM_BITS would each push the long tier
+ * over, and the volume would then refuse names the guest is entitled to create.
+ * Fail the build instead.
  */
 _Static_assert(CASEFOLD_PREFIX_LEN + 2 * CASEFOLD_HEX_MAX <= CASEFOLD_UNIT_MAX,
                "hex-tier escape exceeds the per-name UTF-16 unit limit");

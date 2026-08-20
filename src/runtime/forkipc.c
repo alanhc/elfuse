@@ -306,10 +306,11 @@ int fork_child_main(int ipc_fd,
     signal_state_t sig;
     if (fork_ipc_recv_process_state(ipc_fd, &g, &sig) < 0) {
         log_error("fork-child: failed to receive process state");
-        /* Give back the credit the parent added for this child before
-         * bailing: nothing here reaches the teardown that normally
-         * returns it, and a child that never runs must not leave the
-         * pty looking busy to the master the parent still holds.
+
+        /* Give back the credit the parent added for this child before bailing:
+         * nothing here reaches the teardown that normally returns it, and a
+         * child that never runs must not leave the pty looking busy to the
+         * master the parent still holds.
          */
         proc_pty_release_process_slaves();
         guest_destroy(&g);
@@ -318,10 +319,11 @@ int fork_child_main(int ipc_fd,
 
     if (chown_overlay_recv(ipc_fd) < 0) {
         log_error("fork-child: failed to receive chown overlay");
-        /* Give back the credit the parent added for this child before
-         * bailing: nothing here reaches the teardown that normally
-         * returns it, and a child that never runs must not leave the
-         * pty looking busy to the master the parent still holds.
+
+        /* Give back the credit the parent added for this child before bailing:
+         * nothing here reaches the teardown that normally returns it, and a
+         * child that never runs must not leave the pty looking busy to the
+         * master the parent still holds.
          */
         proc_pty_release_process_slaves();
         guest_destroy(&g);
@@ -338,10 +340,11 @@ int fork_child_main(int ipc_fd,
             0 ||
         admission_ready != 1) {
         log_error("fork-child: parent did not commit child admission");
-        /* Give back the credit the parent added for this child before
-         * bailing: nothing here reaches the teardown that normally
-         * returns it, and a child that never runs must not leave the
-         * pty looking busy to the master the parent still holds.
+
+        /* Give back the credit the parent added for this child before bailing:
+         * nothing here reaches the teardown that normally returns it, and a
+         * child that never runs must not leave the pty looking busy to the
+         * master the parent still holds.
          */
         proc_pty_release_process_slaves();
         guest_destroy(&g);
@@ -398,10 +401,10 @@ int fork_child_main(int ipc_fd,
      * the single-threaded child at this point).
      */
     if (shim_globals_install_per_vcpu(vcpu, &g, hdr.child_pid) < 0) {
-        /* Give back the credit the parent added for this child before
-         * bailing: nothing here reaches the teardown that normally
-         * returns it, and a child that never runs must not leave the
-         * pty looking busy to the master the parent still holds.
+        /* Give back the credit the parent added for this child before bailing:
+         * nothing here reaches the teardown that normally returns it, and a
+         * child that never runs must not leave the pty looking busy to the
+         * master the parent still holds.
          */
         proc_pty_release_process_slaves();
         guest_destroy(&g);
@@ -761,7 +764,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         return -LINUX_ENOMEM;
     }
 
-    thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
+    thread_create_args_t *tca = calloc(1, sizeof(*tca));
     if (!tca) {
         thread_deactivate(t);
         pthread_cond_destroy(&startup.cond);
@@ -1190,7 +1193,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         return -LINUX_ENOMEM;
     }
 
-    thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
+    thread_create_args_t *tca = calloc(1, sizeof(*tca));
     if (!tca) {
         thread_deactivate(t);
         return -LINUX_ENOMEM;

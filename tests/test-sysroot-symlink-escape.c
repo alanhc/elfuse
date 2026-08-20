@@ -6,13 +6,13 @@
  *
  * proc_resolve_sysroot_path_flags() only runs its sysroot-prefix + realpath()
  * containment check on absolute guest paths, since it has no dirfd context to
- * rebuild a host location from a relative one. That left openat(dirfd, name)
- * to the host kernel's own resolution, unconfined to dirfd's subtree: a
- * symlink reachable through a sysroot-contained dirfd with a relative target
- * holding enough ".." components could walk straight out of the sysroot with
- * no check at all. path_translate_at() now reconstructs the absolute guest
- * path from the dirfd's guest base path and re-validates it through the same
- * resolver the absolute-path surface uses.
+ * rebuild a host location from a relative one. That left openat(dirfd, name) to
+ * the host kernel's own resolution, unconfined to dirfd's subtree: a symlink
+ * reachable through a sysroot-contained dirfd with a relative target holding
+ * enough ".." components could walk straight out of the sysroot with no check
+ * at all. path_translate_at() now reconstructs the absolute guest path from the
+ * dirfd's guest base path and re-validates it through the same resolver the
+ * absolute-path surface uses.
  *
  * The Makefile target stages an absolute-target symlink and a relative-target
  * (deep "..") symlink under $sysroot/d1, both pointing at a host file outside

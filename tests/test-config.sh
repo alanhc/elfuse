@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+
 # Shared test limits derived from the runtime's capacity header.
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
 #
 # Source this file from a test runner, or invoke it with --host-nofile to print
-# the computed minimum for a Make recipe.  Keeping the arithmetic here derived
+# the computed minimum for a Make recipe. Keeping the arithmetic here derived
 # from src/elfuse-limits.h prevents shell and Make callers from drifting away
 # from the values compiled into elfuse.
 
@@ -58,9 +59,9 @@ elfuse_resolve_host_nofile()
     esac
 }
 
-# Read the host-limit annotation for a test from the manifest.  The matrix
-# runner and the data-driven driver therefore use the same metadata instead of
-# growing independent name-qualified branches.
+# Read the host-limit annotation for a test from the manifest. The matrix runner
+# and the data-driven driver therefore use the same metadata instead of growing
+# independent name-qualified branches.
 elfuse_test_host_nofile()
 {
     local manifest="$1"
@@ -82,8 +83,8 @@ elfuse_test_host_nofile()
 
 # A sourced configuration inherits the caller's positional parameters. Only
 # inspect --host-nofile when this file itself is the executed script; otherwise
-# a test runner whose first argument happens to match the CLI flag would emit
-# an unexpected value while being initialized.
+# a test runner whose first argument happens to match the CLI flag would emit an
+# unexpected value while being initialized.
 if [ "$_test_config_script" = "$0" ] \
     && [ "${1:-}" = "--host-nofile" ]; then
     printf '%s\n' "$ELFUSE_HOST_NOFILE_MIN"

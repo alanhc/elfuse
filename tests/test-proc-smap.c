@@ -121,8 +121,9 @@ static bool parse_device_token(const char *token)
            parse_unsigned_token(minor, 16, &value);
 }
 
-/* Parse the address/perms/offset/dev/inode part of a smaps header. The rest
- * of the line is an optional pathname and is intentionally left opaque. */
+/* Parse the address/perms/offset/dev/inode part of a smaps header. The rest of
+ * the line is an optional pathname and is intentionally left opaque.
+ */
 static bool parse_header(const char *line, smaps_vma_t *vma)
 {
     const char *p = line;
@@ -184,10 +185,11 @@ static bool parse_header(const char *line, smaps_vma_t *vma)
     return true;
 }
 
-/* Parse a decimal field and optionally require a suffix after its number.
- * Both smaps field families share the same label/whitespace/overflow rules;
- * only the trailing unit differs ("kB" for the first group, none for the
- * remaining numeric fields). */
+/* Parse a decimal field and optionally require a suffix after its number. Both
+ * smaps field families share the same label/whitespace/overflow rules; only the
+ * trailing unit differs ("kB" for the first group, none for the remaining
+ * numeric fields).
+ */
 static bool parse_numeric_field(const char *line,
                                 const char *label,
                                 const char *suffix,
@@ -224,8 +226,10 @@ static bool parse_vmflags(const char *line, bool *writable)
     const char *p = line + label_len;
     if (*p && !isspace((unsigned char) *p))
         return false;
+
     /* Keep the provider's stable spelling for an empty flag set: the Linux
-     * field always has a separating space, even when no token follows. */
+     * field always has a separating space, even when no token follows.
+     */
     if (!*p)
         return false;
     bool has_wr = false;
@@ -241,8 +245,10 @@ static bool parse_vmflags(const char *line, bool *writable)
         if ((size_t) (p - start) == 2 && start[0] == 'w' && start[1] == 'r')
             has_wr = true;
     }
-    /* A synthetic PROT_NONE VMA has no provable access flags and therefore
-     * may legitimately emit an empty VmFlags field. */
+
+    /* A synthetic PROT_NONE VMA has no provable access flags and therefore may
+     * legitimately emit an empty VmFlags field.
+     */
     *writable = has_wr;
     return true;
 }
@@ -283,7 +289,8 @@ static bool parse_smaps(char *buf, size_t len, smaps_info_t *info)
         *next = '\0';
 
         /* smaps records are contiguous: a blank line is not a field and is
-         * rejected so malformed snapshots cannot hide an out-of-order VMA. */
+         * rejected so malformed snapshots cannot hide an out-of-order VMA.
+         */
         if (!*line) {
             goto fail;
         }
@@ -373,8 +380,9 @@ static void free_smaps(smaps_info_t *info)
 }
 
 /* Read, parse, and release one smaps snapshot. The parser owns only its VMA
- * array, so the transient file buffer can be cleaned up in this single place
- * on both success and failure. */
+ * array, so the transient file buffer can be cleaned up in this single place on
+ * both success and failure.
+ */
 static bool load_smaps(const char *path, smaps_info_t *info)
 {
     FILE *file = fopen(path, "r");
@@ -517,8 +525,9 @@ static int child_probe(uintptr_t target,
     uintptr_t stress_end = stress + stress_size;
 
 #ifdef MAP_FIXED_NOREPLACE
-    /* Keep the probe in a known gap so the synthetic smaps builder cannot
-     * merge it with the target's final rw page or the stress fixture. */
+    /* Keep the probe in a known gap so the synthetic smaps builder cannot merge
+     * it with the target's final rw page or the stress fixture.
+     */
     uintptr_t fixed_hint = 0x700000000000ULL;
     for (int attempt = 0; attempt < 32; attempt++) {
         void *candidate =
@@ -629,17 +638,20 @@ int main(void)
     }
     if (fixture_ok) {
         /* Start with a read-only page so an allocator placing this mapping
-         * immediately after target cannot merge target's final rw page into
-         * the stress range. Alternating permissions keeps every stress page
-         * as a distinct VMA while preserving the >256 completeness probe. */
+         * immediately after target cannot merge target's final rw page into the
+         * stress range. Alternating permissions keeps every stress page as a
+         * distinct VMA while preserving the >256 completeness probe.
+         */
         for (size_t i = 0; i < stress_pages; i += 2) {
             if (mprotect(stress + i * page_size, page_size, PROT_READ) < 0) {
                 fixture_ok = false;
                 break;
             }
         }
+
         /* Keep one page inaccessible so the parser and formatter exercise
-         * PROT_NONE coverage and the required empty VmFlags spelling. */
+         * PROT_NONE coverage and the required empty VmFlags spelling.
+         */
         if (fixture_ok &&
             mprotect(stress + 2 * page_size, page_size, PROT_NONE) < 0)
             fixture_ok = false;

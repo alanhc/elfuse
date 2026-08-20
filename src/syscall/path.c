@@ -205,6 +205,7 @@ int path_parse_proc_name(const char *name)
 {
     if (!name || !*name)
         return -1;
+
     /* Linux rejects a leading zero on any name longer than one character, so
      * "0" names descriptor 0 but "00" and "03" name nothing.
      */
@@ -223,9 +224,8 @@ int path_parse_proc_name(const char *name)
 }
 
 /* Parse an absolute fd magic link to the guest descriptor it names. This
- * accepts
- * "/proc/self/fd/<n>", the equivalent spelling with this process's own pid, and
- * the /dev aliases Linux exposes as symlinks to procfs.
+ * accepts "/proc/self/fd/<n>", the equivalent spelling with this process's own
+ * pid, and the /dev aliases Linux exposes as symlinks to procfs.
  *
  * Linux makes that a magic symlink, so a path-based syscall against it acts on
  * the file the descriptor holds. It is the standard way to reach a file through
@@ -303,8 +303,8 @@ int path_fd_magiclink_dup(const char *path)
         snap.type != FD_PATH && snap.type != FD_STDIO)
         return -1;
 
-    /* dup under fd_lock: a sibling vCPU closing this slot would otherwise
-     * leave the number free for the next open to claim.
+    /* dup under fd_lock: a sibling vCPU closing this slot would otherwise leave
+     * the number free for the next open to claim.
      */
     return fd_to_host_dup(fd);
 }
@@ -315,8 +315,8 @@ int path_fd_magiclink_dup(const char *path)
  * descriptor has no host path (a pipe, socket, or anonymous fd, where F_GETPATH
  * fails and the caller's own /proc intercepts remain the right answer).
  *
- * Callers that can act on a descriptor should prefer path_fd_magiclink_dup():
- * a pathname taken here and used later is a TOCTOU, since a rename or an
+ * Callers that can act on a descriptor should prefer path_fd_magiclink_dup(): a
+ * pathname taken here and used later is a TOCTOU, since a rename or an
  * unlink-and-recreate in between leaves it naming a different inode, where
  * Linux resolves the link inside the syscall and cannot be redirected.
  */
@@ -410,11 +410,11 @@ int path_translate_at(guest_fd_t dirfd,
      * spelling. open, stat and readlink never reach host_path for these paths:
      * proc_intercept_open dups the descriptor, proc_intercept_stat fstats it,
      * and proc_intercept_readlink reports its path, and none of the three fall
-     * through to the host on a fd magic link that names an open slot (a
-     * closed one fails as EBADF rather than falling through). What this changes
-     * is every other follow-style operation -- chmod, chown, utimensat,
-     * truncate, access -- which now acts on the file the descriptor holds, the
-     * way Linux does when it resolves the magic link.
+     * through to the host on a fd magic link that names an open slot (a closed
+     * one fails as EBADF rather than falling through). What this changes is
+     * every other follow-style operation -- chmod, chown, utimensat, truncate,
+     * access -- which now acts on the file the descriptor holds, the way Linux
+     * does when it resolves the magic link.
      *
      * Returning before sysroot resolution is not a containment claim about the
      * path: F_GETPATH reports where the descriptor's file actually lives, which
@@ -1609,10 +1609,10 @@ out:
     return rc;
 }
 
-/* Returns 1 when the reconstruction climbed the guest root, so the caller
- * opens @host_out instead of walking from dirfd; 0 when it stays beneath; -1
- * with errno set. @in_sysroot reports whether the sysroot claims the path;
- * @host_out is filled for a climbed or in-sysroot path, NULL to opt out.
+/* Returns 1 when the reconstruction climbed the guest root, so the caller opens
+ * @host_out instead of walking from dirfd; 0 when it stays beneath; -1 with
+ * errno set. @in_sysroot reports whether the sysroot claims the path; @host_out
+ * is filled for a climbed or in-sysroot path, NULL to opt out.
  */
 static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
                                                    const char *path,
@@ -1681,6 +1681,7 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
      * prefix of its own to make that call from.
      */
     *in_sysroot = checked != abs_path;
+
     /* Handing the resolution back rather than letting a caller re-derive it
      * keeps the two flag mappings from drifting. A path that clamped at the
      * guest root needs it either way: both spellings are absolute, so the
@@ -1832,9 +1833,9 @@ static int reset_walk_fd(host_fd_t *current_fd, host_fd_t root_fd)
  * Outside a sysroot, and for any name needing no escape, this is the name
  * itself.
  *
- * @is_link: -1 unknown (the caller must stat), 0 not a symlink or not there,
- * 1 a symlink. Only the readdir fallback, whose listing carries no type,
- * leaves it unknown.
+ * @is_link: -1 unknown (the caller must stat), 0 not a symlink or not there, 1
+ * a symlink. Only the readdir fallback, whose listing carries no type, leaves
+ * it unknown.
  */
 static int host_component_spelling(host_fd_t dirfd,
                                    const char *guest,
@@ -1856,9 +1857,10 @@ static int host_component_spelling(host_fd_t dirfd,
         casefold_resolve_at(dirfd, "", guest, false, out, outsz, &walk);
     if (verdict == CASEFOLD_ERROR)
         return -1;
-    /* Any non-FOUND verdict here means not there: @guest is one component
-     * with follow_final false, so CASEFOLD_SYMLINK, which the walk returns
-     * only for a link it must pass through, cannot come back.
+
+    /* Any non-FOUND verdict here means not there: @guest is one component with
+     * follow_final false, so CASEFOLD_SYMLINK, which the walk returns only for
+     * a link it must pass through, cannot come back.
      */
     if (verdict != CASEFOLD_FOUND)
         *is_link = 0;
@@ -1983,8 +1985,8 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
                                         sizeof(host_name), &leaf_link) < 0)
                 goto out;
 
-            /* ENOENT still yields a verdict: nothing there can be a link.
-             * Any other errno leaves link-ness undecided, and an undecided
+            /* ENOENT still yields a verdict: nothing there can be a link. Any
+             * other errno leaves link-ness undecided, and an undecided
              * component must not be walked through as a directory.
              */
             if (host_walk && leaf_link < 0) {
@@ -2024,9 +2026,9 @@ int path_openat2_crosses_mount(guest_fd_t dirfd,
                 }
                 target[target_len] = '\0';
 
-                /* No prefix: an absolute target re-anchors the walk fd
-                 * below, and a relative one continues from current_fd,
-                 * which already names the link's directory.
+                /* No prefix: an absolute target re-anchors the walk fd below,
+                 * and a relative one continues from current_fd, which already
+                 * names the link's directory.
                  */
                 if (path_splice_link_target(NULL, 0, target, walk, pending,
                                             sizeof(pending)) < 0)

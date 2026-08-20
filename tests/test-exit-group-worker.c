@@ -4,24 +4,24 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Regression test for the exit_group teardown race: when a worker thread
- * calls exit_group while its siblings are mid-iteration, the main thread
- * must join the workers before unmapping guest memory. A regression shows
- * up as the process dying of a host-level SIGSEGV (status 139) instead of
- * reporting the exit_group code.
+ * Regression test for the exit_group teardown race: when a worker thread calls
+ * exit_group while its siblings are mid-iteration, the main thread must join
+ * the workers before unmapping guest memory. A regression shows up as the
+ * process dying of a host-level SIGSEGV (status 139) instead of reporting the
+ * exit_group code.
  *
- * Phase 1 forks N children; in each child a worker thread calls
- * exit_group(42) while sibling workers occupy every blocking state a thread
- * can be torn down from -- spinners hammering guest memory (in hv_vcpu_run),
- * a worker parked in a timed FUTEX_WAIT_BITSET with a distant absolute
- * deadline (the condvar wait path glibc's sem_timedwait and
- * pthread_cond_timedwait sit in), and a worker parked in a blocking pipe
- * read (the interruptible io wait). The parent verifies the child exited 42
- * (fork children tear down through guest_destroy). Phase 2 repeats the
- * pattern in the top-level process itself, so this test's own exit code 0 is
- * produced by a worker-initiated exit_group through main()'s teardown path.
- * The parked variants regress the bounded-quantum futex waits: an uncapped
- * sleep would outlive the join cap, get detached, and race the unmap.
+ * Phase 1 forks N children; in each child a worker thread calls exit_group(42)
+ * while sibling workers occupy every blocking state a thread can be torn down
+ * from -- spinners hammering guest memory (in hv_vcpu_run), a worker parked in
+ * a timed FUTEX_WAIT_BITSET with a distant absolute deadline (the condvar wait
+ * path glibc's sem_timedwait and pthread_cond_timedwait sit in), and a worker
+ * parked in a blocking pipe read (the interruptible io wait). The parent
+ * verifies the child exited 42 (fork children tear down through guest_destroy).
+ * Phase 2 repeats the pattern in the top-level process itself, so this test's
+ * own exit code 0 is produced by a worker-initiated exit_group through main()'s
+ * teardown path. The parked variants regress the bounded-quantum futex waits:
+ * an uncapped sleep would outlive the join cap, get detached, and race the
+ * unmap.
  *
  * Syscalls: clone(220), exit_group(94), wait4(260), sched_yield(124),
  * futex(98), read(63), pipe2(59)
@@ -62,8 +62,8 @@ static void *spinner_fn(void *arg)
 /* Park in a timed futex wait far in the future. FUTEX_WAIT_BITSET takes an
  * absolute deadline and is what glibc timed waits issue; on elfuse it maps to
  * the condvar wait path rather than the os_sync one, so this exercises the
- * bounded-quantum teardown re-check. Re-arm on any spurious wake; exit_group
- * is the only way out.
+ * bounded-quantum teardown re-check. Re-arm on any spurious wake; exit_group is
+ * the only way out.
  */
 static void *futex_parker_fn(void *arg)
 {
@@ -81,8 +81,8 @@ static void *futex_parker_fn(void *arg)
 }
 
 /* Park in a blocking read on a pipe that never gets written (the write end
- * stays open so the read cannot see EOF). Exercises the interruptible io
- * wait's teardown re-check.
+ * stays open so the read cannot see EOF). Exercises the interruptible io wait's
+ * teardown re-check.
  */
 static void *read_parker_fn(void *arg)
 {
@@ -99,19 +99,20 @@ static void *killer_fn(void *arg)
     int code = (int) (long) arg;
     while (__sync_fetch_and_add(&workers_ready, 0) < N_WORKERS)
         sched_yield();
+
     /* Give the parkers a moment to actually enter their blocking waits (the
      * ready increment happens just before the call). Not required for
-     * correctness -- a parker that enters its wait after the exit-group flag
-     * is set still notices it within one bounded quantum -- but it makes the
-     * test exercise the parked states rather than the entry races.
+     * correctness -- a parker that enters its wait after the exit-group flag is
+     * set still notices it within one bounded quantum -- but it makes the test
+     * exercise the parked states rather than the entry races.
      */
     usleep(20000);
     syscall(SYS_exit_group, code);
     return NULL;
 }
 
-/* Spawn the worker set plus a thread that calls exit_group(code), then spin
- * on the main thread. Never returns: exit_group ends the process.
+/* Spawn the worker set plus a thread that calls exit_group(code), then spin on
+ * the main thread. Never returns: exit_group ends the process.
  */
 static void run_victim(int code)
 {
@@ -169,9 +170,9 @@ summary:
     if (fails)
         return 1;
 
-    /* Phase 2: our own exit code 0 must come from a worker-initiated
-     * exit_group in the top-level process. Flush first: exit_group does not
-     * flush stdio buffers.
+    /* Phase 2: our own exit code 0 must come from a worker-initiated exit_group
+     * in the top-level process. Flush first: exit_group does not flush stdio
+     * buffers.
      */
     fflush(NULL);
     run_victim(0);

@@ -60,8 +60,10 @@ static int sibling_fn(void *arg)
         int e = shared_epfd;
         if (e >= 0) {
             struct epoll_event evs[4];
+
             /* epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask,
-             * sigsetsize); 5ms timeout keeps the spin tight against close(). */
+             * sigsetsize); 5ms timeout keeps the spin tight against close().
+             */
             raw_syscall6(__NR_epoll_pwait, (long) e, (long) evs, 4, 5, 0, 0);
         } else {
             struct {
@@ -80,7 +82,8 @@ int main(void)
 
     long flags = 0x00000100 | 0x00000200 | 0x00000400 | 0x00000800 |
                  0x00010000 | 0x00200000; /* CLONE_VM|FS|FILES|SIGHAND|THREAD|
-                                             CHILD_CLEARTID */
+                                             CHILD_CLEARTID
+                                             */
     volatile uint32_t child_tid = 1;
     long ret = raw_syscall5(__NR_clone, flags,
                             (long) (sibling_stack + sizeof(sibling_stack)), 0,
@@ -123,7 +126,8 @@ int main(void)
 
         /* Retract, then close under the sibling's in-flight pwait. Closing efd
          * first fires the close hook (epoll_note_fd_closed) on the instance the
-         * sibling is still waiting on. */
+         * sibling is still waiting on.
+         */
         shared_epfd = -1;
         if (efd >= 0)
             close(efd);

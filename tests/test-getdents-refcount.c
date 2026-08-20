@@ -8,8 +8,8 @@
  * Companion to test-getdents64-overlong.c. That test drives sys_getdents64's
  * dirent-translation edge cases. This one pins a different invariant: a
  * directory fd's DIR* stream must survive a concurrent close()/dup2() while
- * sys_getdents64() is still mid-loop reading it (src/syscall/fs.c
- * dir_stream_t / dir_stream_acquire / dir_stream_release).
+ * sys_getdents64() is still mid-loop reading it (src/syscall/fs.c dir_stream_t
+ * / dir_stream_acquire / dir_stream_release).
  *
  * fd_table[fd].dir is a bare pointer for FD_DIR entries. Before this fix,
  * sys_getdents64() read it with no lock and no pin, then looped
@@ -18,17 +18,17 @@
  * from under the in-flight loop -- the exact same use-after-free class the
  * companion epoll fix (src/syscall/poll.c epoll_instance_acquire/_release)
  * addresses for FD_EPOLL. dir_stream_acquire()/_release() close the gap by
- * refcounting the wrapper instead of freeing it the instant the fd-table's
- * own reference goes away.
+ * refcounting the wrapper instead of freeing it the instant the fd-table's own
+ * reference goes away.
  *
- * This test hammers that window: a long-lived sibling spins raw getdents64()
- * on a directory fd the main thread keeps recreating, publishing, and
- * retiring -- once via close(), once via dup2() overwriting the slot (the
- * fd_alloc_at path, which also funnels through fd_cleanup_entry). Racing
- * close()/dup2() with getdents64() on the same fd is guest-undefined, so the
- * sibling's return value is not asserted; the contract under test is that
- * elfuse never faults or double-frees. Survival across all iterations with a
- * clean exit is the pass condition.
+ * This test hammers that window: a long-lived sibling spins raw getdents64() on
+ * a directory fd the main thread keeps recreating, publishing, and retiring --
+ * once via close(), once via dup2() overwriting the slot (the fd_alloc_at path,
+ * which also funnels through fd_cleanup_entry). Racing close()/dup2() with
+ * getdents64() on the same fd is guest-undefined, so the sibling's return value
+ * is not asserted; the contract under test is that elfuse never faults or
+ * double-frees. Survival across all iterations with a clean exit is the pass
+ * condition.
  *
  * Raw syscalls in the sibling (a CLONE_THREAD child has no libc TLS).
  *
@@ -78,10 +78,9 @@ static int make_stress_dir(void)
     return 0;
 }
 
-/* Spin raw getdents64() on whatever directory fd the main thread has
- * published. The fd may be closed (or reused) concurrently; a raw syscall
- * just returns an error, which is exactly the window the refcount must make
- * memory-safe.
+/* Spin raw getdents64() on whatever directory fd the main thread has published.
+ * The fd may be closed (or reused) concurrently; a raw syscall just returns an
+ * error, which is exactly the window the refcount must make memory-safe.
  */
 static int sibling_fn(void *arg)
 {
@@ -111,7 +110,8 @@ int main(void)
 
     long flags = 0x00000100 | 0x00000200 | 0x00000400 | 0x00000800 |
                  0x00010000 | 0x00200000; /* CLONE_VM|FS|FILES|SIGHAND|THREAD|
-                                             CHILD_CLEARTID */
+                                             CHILD_CLEARTID
+                                             */
     volatile uint32_t child_tid = 1;
     long ret = raw_syscall5(__NR_clone, flags,
                             (long) (sibling_stack + sizeof(sibling_stack)), 0,
@@ -141,8 +141,8 @@ int main(void)
 
         if (i % 2 == 0) {
             /* Retract, then close under the sibling's in-flight getdents64.
-             * Fires the close hook (fd_cleanup_entry -> dir_stream_release)
-             * on the stream the sibling is still reading.
+             * Fires the close hook (fd_cleanup_entry -> dir_stream_release) on
+             * the stream the sibling is still reading.
              */
             shared_fd = -1;
             close(fd);

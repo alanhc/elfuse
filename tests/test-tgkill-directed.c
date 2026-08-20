@@ -55,6 +55,7 @@ static void *blocking_worker(void *arg)
     (void) arg;
     worker_tid = (int) raw_gettid();
     worker_ready = 1;
+
     /* Block in read() on an empty pipe. A thread-directed signal must land here
      * and interrupt this read with EINTR; a byte written by the parent is the
      * fallback that unblocks the worker if the signal was misdelivered.
@@ -150,6 +151,7 @@ static void *counting_worker(void *arg)
     sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, SIGUSR2);
+
     /* Per-thread block so the pending signal stays queued on this thread until
      * it unblocks -- no thread can consume another's instance.
      */

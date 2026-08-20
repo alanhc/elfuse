@@ -35,9 +35,7 @@ static int failures;
         }                                             \
     } while (0)
 
-/* ------------------------------------------------------------------ */
-/* Test 1: sigwait() consumes a pending SIGUSR1                        */
-/* ------------------------------------------------------------------ */
+/* Test 1: sigwait() consumes a pending SIGUSR1 */
 static void test_sigwait_basic(void)
 {
     printf("test-sigtimedwait: 1. sigwait basic... ");
@@ -59,9 +57,7 @@ static void test_sigwait_basic(void)
     printf("PASS\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* Test 2: sigwaitinfo() populates siginfo_t                           */
-/* ------------------------------------------------------------------ */
+/* Test 2: sigwaitinfo() populates siginfo_t */
 static void test_sigwaitinfo_info(void)
 {
     printf("test-sigtimedwait: 2. sigwaitinfo populates siginfo... ");
@@ -84,9 +80,7 @@ static void test_sigwaitinfo_info(void)
     printf("PASS\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* Test 3: sigtimedwait() poll-once (zero timeout) -> EAGAIN           */
-/* ------------------------------------------------------------------ */
+/* Test 3: sigtimedwait() poll-once (zero timeout) -> EAGAIN */
 static void test_sigtimedwait_poll_eagain(void)
 {
     printf("test-sigtimedwait: 3. zero timeout EAGAIN... ");
@@ -107,9 +101,7 @@ static void test_sigtimedwait_poll_eagain(void)
     printf("PASS\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* Test 4: sigtimedwait() with short timeout -> EAGAIN after expiry    */
-/* ------------------------------------------------------------------ */
+/* Test 4: sigtimedwait() with short timeout -> EAGAIN after expiry */
 static void test_sigtimedwait_timeout(void)
 {
     printf("test-sigtimedwait: 4. short timeout EAGAIN... ");
@@ -130,9 +122,7 @@ static void test_sigtimedwait_timeout(void)
     printf("PASS\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* Test 5: signal sent from another thread is consumed by sigwaitinfo  */
-/* ------------------------------------------------------------------ */
+/* Test 5: signal sent from another thread is consumed by sigwaitinfo */
 static pthread_t waiter_tid;
 
 static void *sender_fn(void *arg)
@@ -176,7 +166,7 @@ static void test_sigwaitinfo_thread(void)
     printf("PASS\n");
 }
 
-/* ------------------------------------------------------------------ */
+/* */
 
 int main(void)
 {

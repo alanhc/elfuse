@@ -4,29 +4,28 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * The recipe stages a small tree of on-disk spellings copied byte-for-byte
- * from tests/casefold-vectors.h (the frozen format), and this guest opens
- * every entry strictly by its guest name. That direction is what an existing
- * sysroot exercises after an elfuse upgrade: the disk holds spellings an
- * older build wrote, and the current build must keep reading them. The codec
- * unit test asserts the same table in-process; this asserts it end to end,
- * through staging the recipe cannot derive from the codec under test.
+ * The recipe stages a small tree of on-disk spellings copied byte-for-byte from
+ * tests/casefold-vectors.h (the frozen format), and this guest opens every
+ * entry strictly by its guest name. That direction is what an existing sysroot
+ * exercises after an elfuse upgrade: the disk holds spellings an older build
+ * wrote, and the current build must keep reading them. The codec unit test
+ * asserts the same table in-process; this asserts it end to end, through
+ * staging the recipe cannot derive from the codec under test.
  *
  * test-sysroot-name-staged is the neighbor with a different question: it pins
- * what escape-shaped and escape-resembling names mean when a host stages
- * them. Here every staged spelling is a well-formed escape from the frozen
- * table, and the assertion is that its guest name, and nothing else, reaches
- * it.
+ * what escape-shaped and escape-resembling names mean when a host stages them.
+ * Here every staged spelling is a well-formed escape from the frozen table, and
+ * the assertion is that its guest name, and nothing else, reaches it.
  *
  * Each staged file's content is its own guest name, so a resolve that lands
  * anywhere unexpected is caught by the first read. A regression shows up as
- * ENOENT on a guest name whose spelling is on disk (the decoder moved off
- * the frozen format), as an escape spelling leaking into a listing, or as
- * content that names a different file.
+ * ENOENT on a guest name whose spelling is on disk (the decoder moved off the
+ * frozen format), as an escape spelling leaking into a listing, or as content
+ * that names a different file.
  *
  * Run under --sysroot on a folding volume; the recipe probes and skips
- * elsewhere, since staged escapes only mean their guest names where the
- * escape is active.
+ * elsewhere, since staged escapes only mean their guest names where the escape
+ * is active.
  */
 
 #include <dirent.h>
@@ -46,8 +45,8 @@ int passes = 0, fails = 0;
 
 #define DIR_C "/corpus"
 
-/* The staged entry must answer to its guest name and carry it as content;
- * the trailing newline the recipe appends is not part of the assertion.
+/* The staged entry must answer to its guest name and carry it as content; the
+ * trailing newline the recipe appends is not part of the assertion.
  */
 static void check_reads_itself(const char *label, const char *guest)
 {

@@ -41,8 +41,9 @@ static void usr1_handler(int sig)
     got_usr1 = 1;
 }
 
-/* Spin up to ~2 s waiting for a flag so slow HVC-forwarded delivery has time
- * to land without hanging the suite. */
+/* Spin up to ~2 s waiting for a flag so slow HVC-forwarded delivery has time to
+ * land without hanging the suite.
+ */
 static bool wait_flag(volatile sig_atomic_t *flag)
 {
     for (int i = 0; i < 2000 && !*flag; i++) {

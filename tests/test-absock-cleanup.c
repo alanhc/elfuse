@@ -29,8 +29,8 @@
  *
  * Needs a plain-dir sysroot on a case-insensitive volume: the four escaped
  * levels below push the host path past the 104-byte macOS sun_path so the
- * shortening link is actually created, while the guest spelling stays under
- * the 108-byte Linux limit.
+ * shortening link is actually created, while the guest spelling stays under the
+ * 108-byte Linux limit.
  */
 
 #include <errno.h>
@@ -95,8 +95,8 @@ static int bind_abstract(const char *name, size_t len)
  * bound and listening. The root cannot report the outcome because it must exit
  * first, and the child cannot report it through the exit status either, since
  * the runtime reports the root's. It prints a marker line the recipe greps for;
- * a verdict file would be stored escaped and unreadable by name from the
- * host side.
+ * a verdict file would be stored escaped and unreadable by name from the host
+ * side.
  */
 static int owner_sweep_mode(void)
 {
@@ -148,13 +148,13 @@ static int owner_sweep_mode(void)
 /* Namespace-outlives-owner: the root creates the namespace dir and exits; a
  * child that already touched the namespace (so its "directory exists" flag is
  * cached) then binds an over-long socket. The root's last-one-out rmdir has
- * removed the directory by then, so the mint must notice and recreate it
- * rather than fail with ENOENT, and the child's own exit must unlink the link
- * it minted, or the link (and with it the directory) leaks forever: no later
+ * removed the directory by then, so the mint must notice and recreate it rather
+ * than fail with ENOENT, and the child's own exit must unlink the link it
+ * minted, or the link (and with it the directory) leaks forever: no later
  * process is the namespace owner. The recipe's before/after directory count
- * catches the leak; the marker line reports the mint. Same reporting scheme
- * as owner_sweep_mode(): the root must exit first, so the child prints and
- * the recipe greps.
+ * catches the leak; the marker line reports the mint. Same reporting scheme as
+ * owner_sweep_mode(): the root must exit first, so the child prints and the
+ * recipe greps.
  */
 static int child_after_owner_mode(void)
 {
@@ -173,8 +173,8 @@ static int child_after_owner_mode(void)
         close(gone[1]);
 
         /* Touch the namespace while the root is alive, so this process caches
-         * the directory as created; close right away so the root's rmdir
-         * finds the directory empty and the cached flag really goes stale.
+         * the directory as created; close right away so the root's rmdir finds
+         * the directory empty and the cached flag really goes stale.
          */
         int warm = bind_abstract(CHILD_ABS, sizeof(CHILD_ABS) - 1);
         bool ok = warm >= 0;
@@ -209,8 +209,9 @@ static int child_after_owner_mode(void)
     char b;
     if (read(ready[0], &b, 1) != 1)
         return 1;
-    /* exit(), not _exit(): the rmdir that strands the child is an atexit
-     * hook, and the scenario needs it to have really run.
+
+    /* exit(), not _exit(): the rmdir that strands the child is an atexit hook,
+     * and the scenario needs it to have really run.
      */
     exit(0);
 }

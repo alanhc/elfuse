@@ -285,10 +285,10 @@ static int elf_record_load(const elf64_phdr_t *ph,
 {
     /* Linux ignores a PT_LOAD that maps no bytes, and so does the mapper.
      * Recording it anyway would still feed load_min/load_max, the boot region
-     * tables and /proc/self/maps: a zero-memsz segment at p_vaddr ==
-     * guest_size satisfies the extent bound (gpa > guest_size - memsz is false
-     * when memsz is 0), so load_max reaches the end of the slab and brk_base
-     * follows it there.
+     * tables and /proc/self/maps: a zero-memsz segment at p_vaddr == guest_size
+     * satisfies the extent bound (gpa > guest_size - memsz is false when memsz
+     * is 0), so load_max reaches the end of the slab and brk_base follows it
+     * there.
      */
     if (ph->p_memsz == 0)
         return 0;
@@ -409,9 +409,9 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
     /* Collect only the program headers that affect process startup. */
     int seg_count = 0;
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
-        /* Zero-initialized so the phdr scratch is never read uninitialized
-         * on a path Pulse cannot follow; three of the suppressed Infer
-         * findings were here. One 56-byte clear per program header.
+        /* Zero-initialized so the phdr scratch is never read uninitialized on a
+         * path Pulse cannot follow; three of the suppressed Infer findings were
+         * here. One 56-byte clear per program header.
          */
         elf64_phdr_t ph = {0};
         if (!elf_phdr_fetch(ph_buf, ph_total, i, ehdr.e_phentsize, &ph)) {
@@ -452,15 +452,13 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info)
      *
      * Requiring the whole table inside one segment's file data is what lets
      * elf_map_segments_fd deliver it with no separate copy and no second
-     * destination to bound-check.
-     */
-    /* A segment that covers e_phoff but whose p_vaddr + rel is
-     * unrepresentable is skipped rather than distinguished, so in principle
-     * the table could be attributed to a later segment. Unreachable: such a
-     * p_vaddr sits within a few bytes of UINT64_MAX, and elf_segment_extent
-     * rejects it at map time because every accepted segment satisfies
-     * gpa <= guest_size - memsz with guest_size at most 1 TiB, so phdr_gpa
-     * never reaches build_linux_stack.
+     * destination to bound-check. A segment that covers e_phoff but whose
+     * p_vaddr + rel is unrepresentable is skipped rather than distinguished, so
+     * in principle the table could be attributed to a later segment.
+     * Unreachable: such a p_vaddr sits within a few bytes of UINT64_MAX, and
+     * elf_segment_extent rejects it at map time because every accepted segment
+     * satisfies gpa <= guest_size - memsz with guest_size at most 1 TiB, so
+     * phdr_gpa never reaches build_linux_stack.
      */
     for (int i = 0; i < seg_count; i++) {
         if (elf_phdr_gpa_in_segment(ehdr.e_phoff, ph_total,

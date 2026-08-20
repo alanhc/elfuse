@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # test-rosetta-alpine.sh - Alpine-flavored x86_64 tests through Rosetta
 #
 # Copyright 2026 elfuse contributors
@@ -190,6 +191,7 @@ run_pipe()
     fi
     local out rc
     set +e
+
     # set -o pipefail inside the subshell so the captured $? reflects the first
     # non-zero stage exit, not just the last. Without this a producer that fails
     # after emitting matching text would silently pass.

@@ -5,8 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * A reader thread runs wakeup_pipe_signal() and wakeup_pipe_read_fd() across
- * the main thread's wakeup_pipe_init(), the pairing ThreadSanitizer reported
- * on wakeup_pipe_wr under test-fork-exec. Only a -fsanitize=thread build has a
+ * the main thread's wakeup_pipe_init(), the pairing ThreadSanitizer reported on
+ * wakeup_pipe_wr under test-fork-exec. Only a -fsanitize=thread build has a
  * race detector; elsewhere this checks init, idempotency, and drain.
  */
 

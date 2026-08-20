@@ -278,10 +278,10 @@ evaluate_result()
 
 # Run one test binary and record the outcome in rc and output.
 #
-# One function for the first attempt and the host-load retry both. Not
-# tidiness: the two drifted the moment they were written apart, and the retry
-# went in without the descriptor limit the first attempt applies, so a
-# constrained test was re-run as a different test.
+# One function for the first attempt and the host-load retry both. Not tidiness:
+# the two drifted the moment they were written apart, and the retry went in
+# without the descriptor limit the first attempt applies, so a constrained test
+# was re-run as a different test.
 #
 # ulimit runs in the subshell that produces output, and a failure to raise it
 # exits that subshell with 125 rather than chaining into timeout. A && chain
@@ -321,6 +321,7 @@ report_case()
         ok) printf "%-45s [ ${GREEN}OK${RESET} ]%s\n" "$name" "$detail" ;;
         fail) printf "%-45s [ ${RED}FAIL${RESET} ]%s\n" "$name" "$detail" ;;
         skip) printf "%-45s [ ${YELLOW}SKIP${RESET} ]%s\n" "$name" "$detail" ;;
+
         # No bracketed verdict, because the test has not been decided yet and
         # every other state here is one the summary counts. The blanks are as
         # wide as the FAIL and SKIP tags, which is the closest a single width

@@ -5,16 +5,16 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * elfuse keeps one thread-table slot per guest thread (MAX_THREADS = 64).
- * Creating well over 64 threads across the test's lifetime forces later
- * clones to reuse slots whose previous occupant already exited on its own,
- * which is the only path that reaps the terminated worker's host pthread
- * (issue #157: stale joinable handles leaked on slot reuse).
+ * Creating well over 64 threads across the test's lifetime forces later clones
+ * to reuse slots whose previous occupant already exited on its own, which is
+ * the only path that reaps the terminated worker's host pthread (issue #157:
+ * stale joinable handles leaked on slot reuse).
  *
- * The sequential phase is the sharpest probe: each worker is the last one
- * alive when it exits, so its wind-down runs the last-worker wakeup that
- * takes the thread-table lock AFTER the slot is released. The next clone
- * joins that same pthread at slot-reuse time; joining under the table lock
- * would deadlock here deterministically.
+ * The sequential phase is the sharpest probe: each worker is the last one alive
+ * when it exits, so its wind-down runs the last-worker wakeup that takes the
+ * thread-table lock AFTER the slot is released. The next clone joins that same
+ * pthread at slot-reuse time; joining under the table lock would deadlock here
+ * deterministically.
  */
 
 #include <pthread.h>
@@ -35,8 +35,8 @@ static void *churn_fn(void *arg)
     return NULL;
 }
 
-/* Phase 1: sequential create+join, one live worker at a time. Every round
- * past the table size reuses the slot freed by the previous round.
+/* Phase 1: sequential create+join, one live worker at a time. Every round past
+ * the table size reuses the slot freed by the previous round.
  */
 static void test_sequential_churn(void)
 {

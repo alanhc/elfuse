@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # Verify test-config.sh distinguishes execution from sourcing.
 #
 # Copyright 2026 elfuse contributors
@@ -27,9 +28,9 @@ if [ "$direct" != "$expected" ]; then
     exit 1
 fi
 
-# A sourced helper must not interpret the caller's positional parameters as
-# its own. This reproduces the collision that previously printed an extra
-# line when the caller's first argument was --host-nofile.
+# A sourced helper must not interpret the caller's positional parameters as its
+# own. This reproduces the collision that previously printed an extra line when
+# the caller's first argument was --host-nofile.
 sourced="$(CONFIG_PATH="$CONFIG" env -u ELFUSE_HOST_NOFILE_MIN bash -c '
     set -e
     set -- --host-nofile

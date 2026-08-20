@@ -110,7 +110,8 @@ static void test_invalid_and_overflow(void)
     dynamic_array_destroy(&raw);
 
     /* A malformed metadata state must not let failed byte-size calculations
-     * feed uninitialized offsets into memory operations. */
+     * feed uninitialized offsets into memory operations.
+     */
     dynamic_array_t resize_overflow = {
         .data = NULL,
         .count = 0,

@@ -21,8 +21,7 @@
  * can ask for one without paying for the other.
  */
 
-#ifndef ELFUSE_STARTUP_TRACE_H
-#define ELFUSE_STARTUP_TRACE_H
+#pragma once
 
 #include <pthread.h>
 #include <stdbool.h>
@@ -63,6 +62,7 @@ static inline void startup_trace_resolve(void)
     const char *v = getenv("ELFUSE_STARTUP_TRACE");
     if (!v || !v[0] || !strcmp(v, "0"))
         return;
+
     /* The legacy "1" knob enables steps. Recognize it both as the whole value
      * and as a token so compound forms like "1,syscalls" still keep the step
      * trace on alongside the histogram, instead of silently dropping it.
@@ -98,5 +98,3 @@ static inline void startup_trace_step(const char *label, uint64_t start_ns)
     fprintf(stderr, "startup %-28s %8.3f ms\n", label,
             (double) (end_ns - start_ns) / 1000000.0);
 }
-
-#endif /* ELFUSE_STARTUP_TRACE_H */

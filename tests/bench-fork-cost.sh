@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+
 # Per-fork wall-clock cost for aarch64 vs x86_64-via-Rosetta
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Measures the per-fork wall-clock cost of clone(SIGCHLD) (subshell fork
-# without exec) at a few resident-memory levels, on the same host, comparing:
+# Measures the per-fork wall-clock cost of clone(SIGCHLD) (subshell fork without
+# exec) at a few resident-memory levels, on the same host, comparing:
 #
 #   - aarch64-musl static busybox  (CoW shm fast path in forkipc.c)
 #   - x86_64-musl  static busybox  (Rosetta helper path; APFS clonefile-backed
@@ -93,10 +94,12 @@ trap 'rm -rf "$SHORTDIR"' EXIT
 
 # Capture best-of-N wall-clock for one configuration. Runs are retried up to
 # MAX_TRIES per slot; only runs that exit 0 AND print the "OK" sentinel are
-# accepted. Returns "FAIL" on stdout when no run succeeds, so the caller can
-# mark the cell as unreliable rather than reporting a phantom-best time
-# captured from a crash or out-of-memory bail.
-# Args: <iter_count> <rss_bytes> <stagedir> [extra elfuse flags...]
+# accepted.
+#
+# Returns "FAIL" on stdout when no run succeeds, so the caller can mark the cell
+# as unreliable rather than reporting a phantom-best time captured from a crash
+# or out-of-memory bail. Args: <iter_count> <rss_bytes> <stagedir> [extra elfuse
+# flags...]
 run_one()
 {
     local iters="$1" rss="$2" stagedir="$3"

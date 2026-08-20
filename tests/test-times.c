@@ -4,9 +4,9 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Tests: return-value tick clock, self utime/stime accounting, waited-for
- * child cutime/cstime accounting (counted once, not on stop/WNOWAIT
- * snapshots), NULL buffer, EFAULT on a bad pointer.
+ * Tests: return-value tick clock, self utime/stime accounting, waited-for child
+ * cutime/cstime accounting (counted once, not on stop/WNOWAIT snapshots), NULL
+ * buffer, EFAULT on a bad pointer.
  */
 
 #include <fcntl.h>
@@ -39,8 +39,8 @@ static void burn_cpu_ms(long ms)
 }
 
 /* Like burn_cpu_ms, but spends the time in real open/write/close syscalls
- * rather than pure computation, so the host accounts some of it as system
- * time (ru_stime) rather than all user time.
+ * rather than pure computation, so the host accounts some of it as system time
+ * (ru_stime) rather than all user time.
  */
 static void burn_syscalls_ms(long ms)
 {
@@ -157,9 +157,9 @@ int main(void)
                 } else if (after.tms_cutime <= before.tms_cutime) {
                     FAIL("cutime did not grow individually");
                 } else {
-                    /* A regression that always reports cstime==0 must not
-                     * pass here: this child's loop is real host syscalls, not
-                     * pure computation, so cstime alone must also grow.
+                    /* A regression that always reports cstime==0 must not pass
+                     * here: this child's loop is real host syscalls, not pure
+                     * computation, so cstime alone must also grow.
                      */
                     EXPECT_TRUE(after.tms_cstime > before.tms_cstime,
                                 "cstime did not grow individually");

@@ -38,6 +38,7 @@ static struct timespec t_wake;
 static void *waiter_fn(void *arg)
 {
     (void) arg;
+
     /* musl: do __wait(l,0,2,1); while (a_cas(l,0,2)); -- FUTEX_WAIT on barrier
      * expecting 2, retry while the word is still 2.
      */

@@ -21,9 +21,9 @@ static int string_builder_invalid(void)
     return -1;
 }
 
-/* Initialize storage and establish an empty, NUL-terminated builder. This
- * fresh initializer is safe on an uninitialized automatic object; destroy an
- * existing builder before reinitializing it.
+/* Initialize storage and establish an empty, NUL-terminated builder. This fresh
+ * initializer is safe on an uninitialized automatic object; destroy an existing
+ * builder before reinitializing it.
  */
 int string_builder_init(string_builder_t *builder, size_t initial_capacity)
 {
@@ -58,7 +58,8 @@ int string_builder_reserve(string_builder_t *builder, size_t extra)
         return 0;
 
     /* The dynamic array counts payload elements. Reserve one additional char
-     * for the string builder's trailing NUL. */
+     * for the string builder's trailing NUL.
+     */
     if (extra == SIZE_MAX) {
         errno = EOVERFLOW;
         return -1;
@@ -71,7 +72,8 @@ int string_builder_reserve(string_builder_t *builder, size_t extra)
 }
 
 /* Locate a source span that aliases the builder allocation. The offset must be
- * captured before reserve because reserve may move the allocation. */
+ * captured before reserve because reserve may move the allocation.
+ */
 static int string_builder_source_offset(const string_builder_t *builder,
                                         const void *source,
                                         size_t length,
@@ -161,9 +163,11 @@ int string_builder_appendf(string_builder_t *builder, const char *format, ...)
     errno = saved_errno;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wformat-nonliteral"
+
     /* A non-NULL destination keeps static analyzers from treating the
      * standards-sanctioned n == 0 sizing call as a null dereference. The
-     * destination is never written when its size is zero. */
+     * destination is never written when its size is zero.
+     */
     formatted_len = vsnprintf(&sizing_sink, 0, format, sizing);
 #pragma clang diagnostic pop
     va_end(sizing);

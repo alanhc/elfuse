@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
+
 # test-coreutils.sh -- GNU coreutils integration suite for elfuse
 #
 # Copyright 2026 elfuse contributors
 # Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
 # SPDX-License-Identifier: Apache-2.0
-#
 # shellcheck disable=SC1091,SC2034,SC2059,SC2154
-#
 # Shared entry point for both smoke and full coreutils coverage.
 #
 # Usage: tests/test-coreutils.sh <elfuse-binary> <coreutils-bin-dir> [sysroot]
-# Example: tests/test-coreutils.sh build/elfuse /path/to/coreutils/bin /path/to/sysroot
+# Example: tests/test-coreutils.sh build/elfuse /path/to/coreutils/bin
+# /path/to/sysroot
 
 set -euo pipefail
 

@@ -200,6 +200,7 @@ static void test_open_removed_dir_keeps_overlay_until_last_close(void)
 static void test_lchown_on_symlink(void)
 {
     TEST("lchown(link) leaves target unchanged");
+
     /* Reset target ownership through the existing path so test ordering does
      * not leak overrides from earlier asserts.
      */

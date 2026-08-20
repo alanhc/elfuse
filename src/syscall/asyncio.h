@@ -70,8 +70,8 @@ void asyncio_disarm(int host_fd);
  * drain the notify pipe first, which drops the edge -- and with it the only
  * SIGIO a one-shot request like FUSE_INIT will ever produce. Linux fires
  * kill_fasync synchronously at enqueue time for the same reason. Revalidates
- * O_ASYNC and the owner against the live slot; a duplicate delivery against
- * the watcher's coalesces in the pending mask like any standard signal.
+ * O_ASYNC and the owner against the live slot; a duplicate delivery against the
+ * watcher's coalesces in the pending mask like any standard signal.
  */
 void asyncio_fire(int guest_fd);
 

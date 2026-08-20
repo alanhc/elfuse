@@ -114,8 +114,9 @@ int dynamic_array_init_with_capacity(dynamic_array_t *array,
         return dynamic_array_invalid();
 
     /* Establish a safe zero state before any fallible allocation. This is a
-     * fresh initializer, so an existing allocation must have been destroyed
-     * by the caller rather than silently leaked here. */
+     * fresh initializer, so an existing allocation must have been destroyed by
+     * the caller rather than silently leaked here.
+     */
     *array = (dynamic_array_t) {0};
 
     size_t bytes;

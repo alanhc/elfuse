@@ -541,9 +541,9 @@ static void nl_parse_link_filter(const uint8_t *req,
 
     size_t off = NLMSG_HDRLEN + netlink_align_up(sizeof(ifinfomsg_t));
 
-    /* The invariant bounds off itself, not just off relative to total.
-     * Without it the C loop test "off + RTA_HDRLEN <= total" is not known to be
-     * free of unsigned wrap, and every goal under the loop inherits that doubt.
+    /* The invariant bounds off itself, not just off relative to total. Without
+     * it the C loop test "off + RTA_HDRLEN <= total" is not known to be free of
+     * unsigned wrap, and every goal under the loop inherits that doubt.
      */
     /*@
       loop invariant off <= reqlen + NETLINK_ALIGNTO;
@@ -691,11 +691,11 @@ static int64_t nl_msg_iovcnt(const linux_msghdr_t *mhdr, int *iovcnt)
 /* The send half of sendmsg(2), sendto(2), write(2) and writev(2) on a netlink
  * socket.
  *
- * One request spans the whole iovec, so it is gathered before it is parsed.
- * A gathered length between one byte and one nlmsghdr transfers and does
- * nothing: the loop in netlink_rcv_skb() is entered only from
- * nlmsg_total_size(0) bytes up, and the send reports the byte count rather
- * than an error. Measured against Linux 6.18 under qemu-aarch64.
+ * One request spans the whole iovec, so it is gathered before it is parsed. A
+ * gathered length between one byte and one nlmsghdr transfers and does nothing:
+ * the loop in netlink_rcv_skb() is entered only from nlmsg_total_size(0) bytes
+ * up, and the send reports the byte count rather than an error. Measured
+ * against Linux 6.18 under qemu-aarch64.
  */
 static int64_t netlink_send_iov(int guest_fd,
                                 guest_t *g,
@@ -994,6 +994,7 @@ static int64_t netlink_recv_iov(int guest_fd,
         done += moved;
         if (moved < chunk) {
             pthread_mutex_unlock(&nl_lock);
+
             /* Bytes already placed are transferred; reporting EFAULT over them
              * would lose them, since buf_pos has moved past.
              */

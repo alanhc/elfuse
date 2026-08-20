@@ -104,8 +104,8 @@ static inline size_t str_copy_trunc(char *dst, const char *src, size_t dst_size)
 
 /* Free @n owned strings and the array holding them. Every slot must be a heap
  * copy, never a borrowed environ or argv pointer; a NULL @v is a no-op. The
- * count is a parameter rather than a NULL terminator because the guest argv
- * is counted rather than terminated.
+ * count is a parameter rather than a NULL terminator because the guest argv is
+ * counted rather than terminated.
  */
 static inline void strv_free(const char **v, int n)
 {

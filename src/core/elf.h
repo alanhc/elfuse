@@ -113,8 +113,8 @@ typedef struct {
     } segments[ELF_MAX_SEGMENTS];
 } elf_info_t;
 
-/* Where a loaded image lands: a segment at p_vaddr goes to
- * target_base + (p_vaddr - va_base).
+/* Where a loaded image lands: a segment at p_vaddr goes to target_base +
+ * (p_vaddr - va_base).
  *
  * A struct rather than two uint64_t parameters on purpose. They were adjacent
  * same-typed arguments once, and a signature change left three call sites
@@ -143,13 +143,14 @@ int elf_load_fd(int fd, const char *display_path, elf_info_t *info);
  *
  * Guest images pass a window of {0, load_base} (load_base 0 for ET_EXEC at its
  * link address, non-zero for ET_DYN). Rosetta passes its own va_base so its
- * 0x800000000000 link address maps low without relying on unsigned
- * wraparound. infra_lo and infra_hi
- * delimit the runtime infra reserve (page-table pool, shim text, shim_data,
- * vDSO). Any PT_LOAD copy whose destination intersects [infra_lo, infra_hi) is
- * rejected: those writes go through host_base directly and would otherwise
- * bypass the EL1-only page-table protection on shim_data. Pass 0,0 only when
- * the guest_t is not yet built. Returns 0 on success, -1 on failure.
+ * 0x800000000000 link address maps low without relying on unsigned wraparound.
+ * infra_lo and infra_hi delimit the runtime infra reserve (page-table pool,
+ * shim text, shim_data, vDSO). Any PT_LOAD copy whose destination intersects
+ * [infra_lo, infra_hi) is rejected: those writes go through host_base directly
+ * and would otherwise bypass the EL1-only page-table protection on shim_data.
+ * Pass 0,0 only when the guest_t is not yet built.
+ *
+ * Returns 0 on success, -1 on failure.
  */
 int elf_map_segments(const elf_info_t *info,
                      const char *path,

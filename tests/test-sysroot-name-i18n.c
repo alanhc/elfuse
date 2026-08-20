@@ -13,14 +13,14 @@
  * volume considers equal, and each must stay two files to the guest.
  *
  * Scripts with no case and no normalization forms (Chinese, Thai, emoji) are
- * here too, because the rule escapes them as well and they have to survive
- * the round trip unchanged.
+ * here too, because the rule escapes them as well and they have to survive the
+ * round trip unchanged.
  *
  * Every name is created by the guest. On a folding sysroot the escape delivers
  * the Linux result for all of them. A case-sensitive APFS sysroot is different:
- * the volume still folds canonical normalization and refuses names that are
- * not well-formed UTF-8, and with case folding absent the escape is inactive,
- * so canonically-equal spellings alias (a write to one clobbers the other) and
+ * the volume still folds canonical normalization and refuses names that are not
+ * well-formed UTF-8, and with case folding absent the escape is inactive, so
+ * canonically-equal spellings alias (a write to one clobbers the other) and
  * ill-formed names fail with EILSEQ. That divergence is documented in
  * docs/filenames.md; run with argv[1] "csapfs" the test pins it exactly, so a
  * future change that closes the gap turns these expectations red and updates
@@ -142,9 +142,9 @@ static void check_pair(const char *label, const char *a, const char *b)
 
 /* A canonically-equal pair. On a folding sysroot this is check_pair; on
  * case-sensitive APFS the volume folds the two spellings together with the
- * escape off, so the documented divergence is pinned instead: the second
- * write lands in the first file, both spellings read it, and the listing
- * holds one entry under the first writer's spelling.
+ * escape off, so the documented divergence is pinned instead: the second write
+ * lands in the first file, both spellings read it, and the listing holds one
+ * entry under the first writer's spelling.
  */
 static void check_canonical_pair(const char *label,
                                  const char *a,
@@ -174,9 +174,9 @@ static void check_canonical_pair(const char *label,
     PASS();
 }
 
-/* A name that is not well-formed UTF-8. On a folding sysroot the escape
- * stores it; on case-sensitive APFS the volume refuses it and the guest sees
- * EILSEQ, which is the divergence to pin.
+/* A name that is not well-formed UTF-8. On a folding sysroot the escape stores
+ * it; on case-sensitive APFS the volume refuses it and the guest sees EILSEQ,
+ * which is the divergence to pin.
  */
 static void check_invalid_utf8(const char *label, const char *name)
 {
@@ -293,14 +293,14 @@ int main(int argc, char **argv)
                        "sur\xed\xa0\x80"
                        "rogate");
 
-    /* Everything created above must still be reachable, so the escapes have
-     * not collided with each other.
+    /* Everything created above must still be reachable, so the escapes have not
+     * collided with each other.
      */
     TEST("every name is still readable");
     {
         /* The ill-formed name exists only where the escape stored it; the
-         * caf\xc3\xa9 spellings read the same file on csapfs and different
-         * ones elsewhere, but both must resolve either way.
+         * caf\xc3\xa9 spellings read the same file on csapfs and different ones
+         * elsewhere, but both must resolve either way.
          */
         char got[64];
         EXPECT_TRUE(

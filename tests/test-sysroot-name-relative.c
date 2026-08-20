@@ -8,8 +8,8 @@
  * directory or to a directory descriptor. Both must reach the same file. That
  * is not automatic here, because a name whose spelling the volume cannot hold
  * is stored escaped, so the translation has to run whichever way the guest
- * spelled it, and for a relative name there is no leading component to key
- * on, only the descriptor it is resolved against.
+ * spelled it, and for a relative name there is no leading component to key on,
+ * only the descriptor it is resolved against.
  *
  * This matters well beyond a shell doing cd: fts, find, git and rsync walk
  * trees with openat(dirfd, name) throughout, and never build an absolute path
@@ -18,9 +18,9 @@
  * Code under test: src/syscall/casefold-walk.c reached from
  * src/syscall/path.c's path_translate_at, for the case where the guest path
  * does not begin with '/'. A regression shows up as the same guest name
- * resolving to two different files depending on how it was spelled, so a
- * create through one spelling is invisible through the other, and an O_EXCL
- * create of a name that already exists succeeds instead of reporting EEXIST.
+ * resolving to two different files depending on how it was spelled, so a create
+ * through one spelling is invisible through the other, and an O_EXCL create of
+ * a name that already exists succeeds instead of reporting EEXIST.
  *
  * Run under --sysroot.
  */
@@ -62,8 +62,8 @@ static void section_outside_sysroot(const char *host_dir)
 {
     char abs[PATH_MAX];
 
-    /* Visible, so a manual run without the recipe's host fixture reads as
-     * fewer tests run, not as the section passing.
+    /* Visible, so a manual run without the recipe's host fixture reads as fewer
+     * tests run, not as the section passing.
      */
     if (!host_dir || !host_dir[0]) {
         printf("  (outside-sysroot section skipped: no host dir given)\n");
@@ -126,8 +126,8 @@ static void section_openat2_no_symlinks(int dirfd)
      */
 
     /* RESOLVE_NO_XDEV is answered by a third walker, which probes each
-     * component to see whether a symlink moves the path onto another mount.
-     * It probes by name too, so it has the same requirement. Only detection
+     * component to see whether a symlink moves the path onto another mount. It
+     * probes by name too, so it has the same requirement. Only detection
      * matters here, not where the link points, so the target need not resolve.
      */
     TEST("openat2 RESOLVE_NO_XDEV sees a symlink under an escaped name");
@@ -157,10 +157,10 @@ static void section_openat2_no_symlinks(int dirfd)
     }
 
     /* The walker sees host spellings, and an escape is longer than the name it
-     * stands for: past the guest limit once the name passes 125 bytes. A
-     * walker sized to the guest limit refuses those components with
-     * ENAMETOOLONG for a file openat opens without complaint, which is the
-     * two-answers disagreement again, in a length rather than a spelling.
+     * stands for: past the guest limit once the name passes 125 bytes. A walker
+     * sized to the guest limit refuses those components with ENAMETOOLONG for a
+     * file openat opens without complaint, which is the two-answers
+     * disagreement again, in a length rather than a spelling.
      */
     TEST("openat2 RESOLVE_NO_SYMLINKS opens a 126-byte escaped name");
     {

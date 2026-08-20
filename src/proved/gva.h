@@ -93,11 +93,10 @@
  * merely its first byte. "*off < guest_size" would be satisfied by off ==
  * guest_size - 8, which puts l1[511] past the end of the slab.
  *
- * The reject path leaves off alone, stated as a postcondition because
- * "assigns" permits writing it: without that clause a conforming
- * implementation could scribble on it before returning 0, and a caller reading
- * it on the failure path would be relying on the body rather than the
- * contract.
+ * The reject path leaves off alone, stated as a postcondition because "assigns"
+ * permits writing it: without that clause a conforming implementation could
+ * scribble on it before returning 0, and a caller reading it on the failure
+ * path would be relying on the body rather than the contract.
  */
 #define GVA_PT_TABLE_BYTES 4096ULL
 

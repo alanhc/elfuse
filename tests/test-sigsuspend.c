@@ -32,6 +32,7 @@ int passes = 0, fails = 0;
 
 static volatile sig_atomic_t alarm_ran;
 static volatile sig_atomic_t usr1_ran;
+
 /* Delivery count while only the process-directed signal is in flight. The
  * per-thread wakeups sent afterwards must not be able to satisfy the
  * shared-signal assertion, so they are counted in a separate phase.
@@ -60,8 +61,8 @@ static double elapsed_since(const struct timespec *t0)
     return (t1.tv_sec - t0->tv_sec) + (t1.tv_nsec - t0->tv_nsec) / 1e9;
 }
 
-/* sigsuspend must not return before a signal arrives, must run the handler,
- * and must restore the mask it was called with.
+/* sigsuspend must not return before a signal arrives, must run the handler, and
+ * must restore the mask it was called with.
  */
 static void test_blocks_until_signal(void)
 {
@@ -105,8 +106,8 @@ static void test_blocks_until_signal(void)
     sigprocmask(SIG_SETMASK, &orig, NULL);
 }
 
-/* An ignored signal is discarded without reaching the guest, so it must not
- * end the wait. The alarm is the escape hatch that keeps this bounded.
+/* An ignored signal is discarded without reaching the guest, so it must not end
+ * the wait. The alarm is the escape hatch that keeps this bounded.
  */
 static void test_ignored_signal_does_not_wake(void)
 {
@@ -137,6 +138,7 @@ static void test_ignored_signal_does_not_wake(void)
 
 static pthread_barrier_t ready;
 static volatile sig_atomic_t mask_leaked;
+
 /* Incremented immediately before each worker calls sigsuspend(). The barrier
  * only gates the threads up to that point, so waiting on this instead of a
  * wall-clock sleep keeps the test honest on a loaded or cross-checked host.

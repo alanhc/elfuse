@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 
-# Verify clang-format conformance for all tracked C/H files in src/ and
-# tests/. The repository's .clang-format is calibrated against
-# clang-format-22; older versions produce different output and are
-# rejected to keep CI deterministic.
+# Verify clang-format conformance for all tracked C/H files in src/ and tests/.
+# The repository's .clang-format is calibrated against clang-format-22; older
+# versions produce different output and are rejected to keep CI deterministic.
 
 set -u -o pipefail
 

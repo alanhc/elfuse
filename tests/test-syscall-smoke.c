@@ -243,6 +243,7 @@ static void test_at_path_ops(void)
         FAIL("mkdtemp");
         return;
     }
+
     /* Materialize cleanup paths up-front so that any early goto-out still
      * unlinks/rmdirs whatever the syscalls under test managed to create.
      */
@@ -291,6 +292,7 @@ out:
     if (subdir_path[0])
         rmdir(subdir_path);
     rmdir(dir_template);
+
     /* Body-side FAIL() already reported the specific step on failure; only
      * report PASS here. Adding a trailing else-FAIL would double-count.
      */
@@ -457,6 +459,7 @@ static void test_waitid(void)
         PASS();
         return;
     }
+
     /* waitid failed or returned the wrong siginfo; reap with waitpid so the
      * child does not linger as a zombie and skew later tests.
      */
@@ -544,6 +547,7 @@ static void test_stub_errnos(void)
     unsigned char vec = 0;
     errno = 0;
     long mr = syscall(SYS_mincore, mc, 4096, &vec);
+
     /* Mapped page: success with the residency LSB set. Unaligned addr: EINVAL.
      * A hole in the range: ENOMEM. Here the whole page is mapped.
      */

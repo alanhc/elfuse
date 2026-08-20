@@ -6,10 +6,10 @@
  *
  * A guest resolves '..' against its own root, where Linux clamps it: "/.."
  * names "/" and can never reach the directory holding the guest tree
- * (path_resolution(7)). The sysroot resolvers prefix the sysroot onto the
- * guest path, so a '..' that climbs above the guest root has to be rewritten
- * or it walks out of the tree; every other '..' must survive verbatim, so the
- * host kernel keeps deciding whether the component it pops exists and is a
+ * (path_resolution(7)). The sysroot resolvers prefix the sysroot onto the guest
+ * path, so a '..' that climbs above the guest root has to be rewritten or it
+ * walks out of the tree; every other '..' must survive verbatim, so the host
+ * kernel keeps deciding whether the component it pops exists and is a
  * directory.
  *
  * Code under test: proc_resolve_sysroot_path_flags() and
@@ -19,8 +19,8 @@
  * clamp has a real file to escape to rather than an absent path that hides the
  * bug.
  *
- * A regression reports ELOOP for an ordinary "/.." path, or reaches
- * beside.txt. Run under --sysroot.
+ * A regression reports ELOOP for an ordinary "/.." path, or reaches beside.txt.
+ * Run under --sysroot.
  */
 
 #include <errno.h>
@@ -157,10 +157,10 @@ static void section_relative(void)
     close(root);
 }
 
-/* An interior '..' must reach the host verbatim: the resolvers clamp '..'
- * only at the guest root and spell interior ones through untouched, leaving
- * the pop to the kernel's own resolution. What is asserted here is that the
- * pop arrives, not how the kernel type-checks the component it pops.
+/* An interior '..' must reach the host verbatim: the resolvers clamp '..' only
+ * at the guest root and spell interior ones through untouched, leaving the pop
+ * to the kernel's own resolution. What is asserted here is that the pop
+ * arrives, not how the kernel type-checks the component it pops.
  */
 static void section_interior(void)
 {

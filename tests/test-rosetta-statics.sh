@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
+
 # test-rosetta-statics.sh - Smoke test x86_64 statics under Rosetta
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
 #
 # Runs a curated set of static x86_64 binaries through elfuse and verifies
-# expected output. Aimed at fast-iteration regression coverage of the
-# rosetta runtime path (VZ ioctl gate, /proc/self/exe redirect, high-VA
-# mmap, kbuf alias). Distinct from test-matrix.sh elfuse-x86_64 which runs
-# the broader corpus.
+# expected output. Aimed at fast-iteration regression coverage of the rosetta
+# runtime path (VZ ioctl gate, /proc/self/exe redirect, high-VA mmap, kbuf
+# alias). Distinct from test-matrix.sh elfuse-x86_64 which runs the broader
+# corpus.
 #
 # Fixture source: the Alpine x86_64 staticbin tree assembled by
 # tests/fetch-fixtures.sh INCLUDE_X86_64=1. The tree contains busybox.static
 # plus a list of applet symlinks; both are statically-linked musl ELFs.
 #
 # Rosetta caps the binary-path field in its VZ_CAPS payload at 42 bytes
-# (ROSETTA_CAPS_BINARY_PATH_LEN). Keep these probes on the real checkout
-# path so they catch regressions in the runtime aliasing workaround rather
-# than masking them with a short-path staging tree.
+# (ROSETTA_CAPS_BINARY_PATH_LEN). Keep these probes on the real checkout path so
+# they catch regressions in the runtime aliasing workaround rather than masking
+# them with a short-path staging tree.
 #
 # Skips cleanly when:
 #   - Rosetta Linux is not installed on the host
@@ -40,9 +41,9 @@ ROSETTA_PATH="${MATRIX_ROSETTA_TRANSLATOR:-/Library/Apple/usr/libexec/oah/Rosett
 SHORTDIR=/tmp/elfuse-r
 STATICBIN=""
 
-# Shared report_pass / report_fail / report_skip + Results: summary
-# emitter. Matches the matrix runner's aarch64 per-binary format so
-# tests/test-matrix.sh elfuse-x86_64 output reads uniformly.
+# Shared report_pass / report_fail / report_skip + Results: summary emitter.
+# Matches the matrix runner's aarch64 per-binary format so tests/test-matrix.sh
+# elfuse-x86_64 output reads uniformly.
 # shellcheck source=tests/lib/report.sh
 . "$(dirname "$0")/lib/report.sh"
 
@@ -51,14 +52,14 @@ fail=0
 skip=0
 total=0
 
-# Run a binary, check exit code and (optionally) stdout regex.
-# Args: <label> <expected-stdout-regex|""> <expected-exit-code> <binary> [args...]
-# An empty regex skips the stdout check.
+# Run a binary, check exit code and (optionally) stdout regex. Args: <label>
+# <expected-stdout-regex|""> <expected-exit-code> <binary> [args...] An empty
+# regex skips the stdout check.
 #
-# Not named run_check: tests/lib/test-runner.sh, pulled in by report.sh
-# above, exports a run_check taking <tool> <pattern> and resolving the tool
-# through test_tool_path, which cannot serve the absolute binary paths and
-# expected exit codes used here.
+# Not named run_check: tests/lib/test-runner.sh, pulled in by report.sh above,
+# exports a run_check taking <tool> <pattern> and resolving the tool through
+# test_tool_path, which cannot serve the absolute binary paths and expected exit
+# codes used here.
 run_static_check()
 {
     local label="$1" expected_re="$2" expected_rc="$3"
@@ -110,10 +111,10 @@ staticbin_abs="$(cd "$STATICBIN_LONG" && pwd)"
 STATICBIN="$staticbin_abs"
 
 # Point HOME at the per-run tmp so the rosettad AOT cache lives at
-# $SHORTDIR/.cache/elfuse-rosettad and is empty on every invocation.
-# Without this, the cache from a previous run can satisfy rosetta via
-# the digest fast-path and silently bypass the /proc/self/fd/3 alias
-# that the long-path tests are meant to exercise.
+# $SHORTDIR/.cache/elfuse-rosettad and is empty on every invocation. Without
+# this, the cache from a previous run can satisfy rosetta via the digest
+# fast-path and silently bypass the /proc/self/fd/3 alias that the long-path
+# tests are meant to exercise.
 export HOME="$SHORTDIR"
 
 trap 'rm -rf "$SHORTDIR"' EXIT
@@ -122,21 +123,19 @@ printf 'elfuse:    %s\n' "$ELFUSE"
 printf 'fixtures:  %s\n' "$STATICBIN"
 printf 'rosetta:   %s\n\n' "$ROSETTA_PATH"
 
-# ---------------------------------------------------------------------------
 # busybox applets - statics validated to work end-to-end on M1.
-# ---------------------------------------------------------------------------
 
-# Simple stdout-producing applets. true/false return immediately; the
-# empty regex skips the stdout check.
+# Simple stdout-producing applets. true/false return immediately; the empty
+# regex skips the stdout check.
 run_static_check "echo" "^hello rosetta$" 0 "${STATICBIN}/echo" "hello rosetta"
 run_static_check "true" "" 0 "${STATICBIN}/true"
 run_static_check "false" "" 1 "${STATICBIN}/false"
 
-# env propagation: the host shell's environ reaches the rosetta guest's
-# printenv via execve auxiliary vector + ELF entry. env -i isolates the
-# environment so the probe variable is the only signal. The env wrapper
-# wraps the elfuse invocation; passing env -i as elfuse's argv[1] would
-# make elfuse try to load env as an ELF.
+# env propagation: the host shell's environ reaches the rosetta guest's printenv
+# via execve auxiliary vector + ELF entry. env -i isolates the environment so
+# the probe variable is the only signal. The env wrapper wraps the elfuse
+# invocation; passing env -i as elfuse's argv[1] would make elfuse try to load
+# env as an ELF.
 total=$((total + 1))
 set +e
 penv_out="$(env -i HOME=/ TZ=UTC ELFUSE_PROBE=elfuse-test \
@@ -149,8 +148,8 @@ else
     report_fail "printenv: rc=$penv_rc out=$(printf '%q' "$penv_out")"
 fi
 
-# Busybox expr returns 1 when the arithmetic result is zero (POSIX), and
-# 0 otherwise. expr-zero deliberately exercises the 0-result path.
+# Busybox expr returns 1 when the arithmetic result is zero (POSIX), and 0
+# otherwise. expr-zero deliberately exercises the 0-result path.
 run_static_check "expr-zero" "^0$" 1 "${STATICBIN}/expr" "1" "-" "1"
 run_static_check "expr-mul" "^42$" 0 "${STATICBIN}/expr" "6" "*" "7"
 
@@ -159,15 +158,15 @@ run_static_check "expr-mul" "^42$" 0 "${STATICBIN}/expr" "6" "*" "7"
 run_static_check "basename" "^rosetta$" 0 "${STATICBIN}/basename" "/some/path/rosetta"
 run_static_check "dirname" "^/a/b$" 0 "${STATICBIN}/dirname" "/a/b/c"
 
-# Filesystem read: stat the rosetta binary itself, prove that openat
-# against a real host path works.
+# Filesystem read: stat the rosetta binary itself, prove that openat against a
+# real host path works.
 run_static_check "stat-self" "regular file" 0 "${STATICBIN}/stat" "$ROSETTA_PATH"
 
 # Compute-heavy: factor a small number through libc / busybox arith.
 run_static_check "factor" "^60: 2 2 3 5$" 0 "${STATICBIN}/factor" "60"
 
-# seq writes one integer per line. Build the expected joined output and
-# match against the captured stdout via the helper.
+# seq writes one integer per line. Build the expected joined output and match
+# against the captured stdout via the helper.
 seq_out="$(printf '%s\n' 1 2 3 4 5)"
 out_seq="$("$TIMEOUT" 5 "$ELFUSE" "${STATICBIN}/seq" 1 5 2> /dev/null || true)"
 total=$((total + 1))
@@ -189,15 +188,16 @@ run_static_check "md5sum" "^[0-9a-f]{32}  " 0 \
 # Date + uname use clock_gettime and uname syscalls; their guest-side ABI
 # translation (translate_clockid, sys_uname) covers a different surface.
 run_static_check "uname-m" "^x86_64$" 0 "${STATICBIN}/uname" "-m"
+
 # Busybox 'arch' applet (separate dispatch from uname -m) confirms the
-# rosetta-translated guest reports its actual ISA via the dedicated
-# applet entry-point. Both forms must agree.
+# rosetta-translated guest reports its actual ISA via the dedicated applet
+# entry-point. Both forms must agree.
 run_static_check "arch" "^x86_64$" 0 "${STATICBIN}/busybox" "arch"
 run_static_check "busybox-arch-subcommand" "^x86_64$" 0 \
     "${STATICBIN}/busybox" "arch"
 
-# date: TZ propagates the same way as ELFUSE_PROBE above (wrap elfuse,
-# don't pass env to elfuse as argv[1]).
+# date: TZ propagates the same way as ELFUSE_PROBE above (wrap elfuse, don't
+# pass env to elfuse as argv[1]).
 total=$((total + 1))
 set +e
 date_out="$(env TZ=UTC "$ELFUSE" "${STATICBIN}/date" 2> /dev/null)"
@@ -213,14 +213,12 @@ fi
 run_static_check "id-u" "^0$|^[0-9]+$" 0 "${STATICBIN}/id" "-u"
 run_static_check "nproc" "^[1-9][0-9]*$" 0 "${STATICBIN}/nproc"
 
-# ---------------------------------------------------------------------------
 # Mid-process execve into x86_64 (rosetta re-bootstrap).
-# ---------------------------------------------------------------------------
 
-# env executes its argv[1] via execve. The post-reset rosetta re-bootstrap
-# path now handles x86_64 -> x86_64 mid-process execve, so the child
-# (env -> true) must exit 0. A timeout (rc=124) indicates a hang in the
-# re-bootstrap, distinct from a clean rejection.
+# env executes its argv[1] via execve. The post-reset rosetta re-bootstrap path
+# now handles x86_64 -> x86_64 mid-process execve, so the child (env -> true)
+# must exit 0. A timeout (rc=124) indicates a hang in the re-bootstrap, distinct
+# from a clean rejection.
 total=$((total + 1))
 set +e
 env_rc=$(
@@ -239,9 +237,9 @@ fi
 
 # Re-run the same execve with the rosettad AOT cache now warm for this digest.
 # The warm path returns from rosettad almost immediately, which historically
-# left stale TLB walk-cache entries alive across the exec page-table rebuild
-# and crashed the re-entry with an EL1 instruction abort (BAD_EXCEPTION
-# vec=0x200, exit 128). Guards the MMU-off _start re-entry in sys_execve.
+# left stale TLB walk-cache entries alive across the exec page-table rebuild and
+# crashed the re-entry with an EL1 instruction abort (BAD_EXCEPTION vec=0x200,
+# exit 128). Guards the MMU-off _start re-entry in sys_execve.
 total=$((total + 1))
 set +e
 env_warm_rc=$(
@@ -258,9 +256,7 @@ else
     report_fail "env-execve-warm: rc=$env_warm_rc (expected 0)"
 fi
 
-# ---------------------------------------------------------------------------
 # Summary
-# ---------------------------------------------------------------------------
 
 report_summary "$total"
 

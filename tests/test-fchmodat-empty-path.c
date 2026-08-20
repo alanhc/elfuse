@@ -6,8 +6,8 @@
  *
  * fchmodat(fd, "", mode, AT_EMPTY_PATH) chmods fd itself instead of a name
  * beneath it. This is the only way to chmod an O_PATH descriptor -- plain
- * fchmod() rejects FD_PATH with EBADF, matching Linux -- and AT_FDCWD
- * resolves to the current directory rather than being an error.
+ * fchmod() rejects FD_PATH with EBADF, matching Linux -- and AT_FDCWD resolves
+ * to the current directory rather than being an error.
  *
  * The classic fchmodat(2) syscall predates any flags argument, so libc's
  * fchmodat() wrapper (glibc and musl both) rejects any flag other than
@@ -40,10 +40,10 @@ static int fchmodat2(int dirfd, const char *path, mode_t mode, int flags)
     return (int) syscall(SYS_fchmodat2, dirfd, path, (long) mode, (long) flags);
 }
 
-/* fchmodat2(2) is Linux 6.6+ and reached here via a raw syscall() with no
- * libc fallback. A host kernel that predates it (or any environment where
- * syscall 452 is simply unwired) returns ENOSYS; treat that as a skip
- * instead of failing the whole binary.
+/* fchmodat2(2) is Linux 6.6+ and reached here via a raw syscall() with no libc
+ * fallback. A host kernel that predates it (or any environment where syscall
+ * 452 is simply unwired) returns ENOSYS; treat that as a skip instead of
+ * failing the whole binary.
  */
 static int fchmodat2_supported(const char *probe_path)
 {
@@ -68,8 +68,8 @@ static int setup_fixtures(void)
     }
     close(fd);
 
-    /* The AT_FDCWD case below needs a writable cwd; the process's inherited
-     * cwd may not be (e.g. a read-only rootfs in a VM test image).
+    /* The AT_FDCWD case below needs a writable cwd; the process's inherited cwd
+     * may not be (e.g. a read-only rootfs in a VM test image).
      */
     snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/elfuse-fchmodat-empty-dir-%d",
              (int) getpid());

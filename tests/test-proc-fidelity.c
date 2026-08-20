@@ -115,6 +115,7 @@ static void test_proc_oom_score_adj_rejects_out_of_range(void)
         FAIL("open");
         return;
     }
+
     /* Linux validates the input domain on the writer side; the kernel returns
      * EINVAL for any value outside [-1000, 1000].
      */
@@ -149,6 +150,7 @@ static void test_proc_oom_adj_scaling(void)
         FAIL("open /proc/self/oom_adj");
         return;
     }
+
     /* Linux fs/proc/base.c oom_adj_write special-cases OOM_ADJUST_MAX so 15
      * maps directly to OOM_SCORE_ADJ_MAX (1000), not 15*1000/17 = 882.
      */
@@ -223,6 +225,7 @@ static void test_proc_oom_adj_same_fd_roundtrip(void)
 static void test_proc_oom_score_no_write(void)
 {
     TEST("/proc/self/oom_score writes are rejected");
+
     /* Linux: open succeeds (root bypasses the 0444 check, non-root sees EACCES
      * from the permission gate); writes always fail because there is no write
      * handler. The test focuses on the write side, which is uniform across
@@ -240,6 +243,7 @@ static void test_proc_oom_score_no_write(void)
         FAIL("read");
         return;
     }
+
     /* Stub returns 0; real Linux computes a small positive score, but for a
      * userspace bridge a constant zero is acceptable.
      */
@@ -249,6 +253,7 @@ static void test_proc_oom_score_no_write(void)
 static void test_proc_oom_score_write_fails(void)
 {
     TEST("/proc/self/oom_score write is rejected");
+
     /* The intended coverage is the proc node's write handler returning EIO.
      * That handler is only reached when open succeeds with write access. Only
      * root can open the 0444 file O_WRONLY; non-root sees EACCES at open and
@@ -271,6 +276,7 @@ static void test_proc_oom_score_write_fails(void)
     ssize_t w = write(fd, "0\n", 2);
     int saved = errno;
     close(fd);
+
     /* Linux's proc_reg_write returns -EIO when the proc node has no write op.
      * Older or stripped kernels may return other errno; the load-bearing
      * assertion is that the write fails, not the exact errno value.
@@ -443,6 +449,7 @@ static void test_proc_oom_zero_length_writev(void)
         FAIL("open");
         return;
     }
+
     /* Two empty iovecs: total length zero. Linux returns 0; the previous
      * implementation returned EINVAL via proc_parse_int_write.
      */
@@ -465,6 +472,7 @@ static void test_proc_oom_stat_size_zero(void)
         FAIL("stat");
         return;
     }
+
     /* A non-zero st_size would cap stat-sized read buffers, truncating
      * "-1000\n" (6 bytes) to whatever size was hardcoded.
      */
@@ -517,6 +525,7 @@ static void test_proc_fdinfo_eventfd_count(void)
         FAIL("read");
         return;
     }
+
     /* Linux fs/eventfd.c emits "eventfd-count: %16llx" with a single space
      * separator (not a tab, unlike pos:/flags:/mnt_id:). Pin the exact prefix
      * so a regression to a tab is caught. Decimal 42 is 0x2a.
@@ -553,6 +562,7 @@ static void test_proc_fdinfo_signalfd_mask(void)
         FAIL("read");
         return;
     }
+
     /* Linux fs/signalfd.c emits "sigmask:\t%016llx" with a tab separator
      * (verified against a real /proc/self/fdinfo dump on Linux 6.x). Pin the
      * exact prefix so a regression to a space is caught.
@@ -600,6 +610,7 @@ static void test_proc_fdinfo_timerfd_periodic_value(void)
 
     long long value_sec = -1, value_nsec = -1;
     long long interval_sec = -1, interval_nsec = -1;
+
     /* Linux fs/timerfd.c emits "it_value: (S, NS)" with a single space after
      * the colon (unlike pos:/flags: which use tabs).
      */
@@ -615,6 +626,7 @@ static void test_proc_fdinfo_timerfd_periodic_value(void)
 
     long long value_total_ns = value_sec * 1000000000LL + value_nsec;
     long long interval_total_ns = interval_sec * 1000000000LL + interval_nsec;
+
     /* it_interval is the static settime value and must round-trip; Linux's
      * timerfd_get_remaining() reports 0 once the timer has fired, while elfuse
      * computes time-until-next from the kqueue arm time. Both are non-negative
@@ -628,6 +640,7 @@ static void test_proc_fdinfo_timerfd_periodic_value(void)
 static void test_proc_fdinfo_timerfd_ticks_drains_kqueue(void)
 {
     TEST("/proc/self/fdinfo/<N> ticks reflects pending kqueue fires");
+
     /* Arm a periodic timer, wait for several fires, then read fdinfo WITHOUT
      * first reading the timerfd. The pre-fix snapshot exported a stale
      * expirations counter (the kqueue events had not been folded in), so ticks
@@ -674,6 +687,7 @@ static void test_proc_fdinfo_timerfd_ticks_drains_kqueue(void)
         FAIL("parse ticks");
         return;
     }
+
     /* At minimum one fire should be visible; on a slow host more would be
      * expected. Pre-fix elfuse would report 0 here.
      */
@@ -683,6 +697,7 @@ static void test_proc_fdinfo_timerfd_ticks_drains_kqueue(void)
 static void test_proc_fdinfo_dir_concurrent_safe(void)
 {
     TEST("/proc/self/fdinfo dir tolerates concurrent re-open");
+
     /* Open the directory twice and verify both enumerate independently. The
      * earlier shared-dir design could mutate one open's backing files while
      * another iterated. Both Linux and the per-open scratch fix should at
@@ -764,6 +779,7 @@ static int bind_listen_loopback_tcp(void)
 static void test_proc_net_tcp_sl_dense(void)
 {
     TEST("/proc/net/tcp sl column stays dense across mixed sockets");
+
     /* Interleave non-TCP sockets BEFORE the bound TCP listeners so the
      * proc_pidinfo iterator visits the rejected sockets first and the pre-fix
      * sparse-slot bug would assign nonzero sl to the first emitted row. Two TCP

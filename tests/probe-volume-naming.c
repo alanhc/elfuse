@@ -55,8 +55,9 @@ static const char *verdict(const char *dir, const char *name)
 
     if (!d)
         return errno == ENOENT || errno == ENOTDIR ? "ABSENT" : "ERROR";
-    /* The probe reports the leaf's stored spelling, so compare against the
-     * leaf of what was asked for and not against the whole relative path.
+
+    /* The probe reports the leaf's stored spelling, so compare against the leaf
+     * of what was asked for and not against the whole relative path.
      */
     return !strcmp(d, leaf ? leaf + 1 : name) ? "EXACT" : "FOLDED";
 }

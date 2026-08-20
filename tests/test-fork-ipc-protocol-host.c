@@ -42,6 +42,7 @@ _Static_assert(offsetof(ipc_header_t, magic) == 0,
 _Static_assert(offsetof(ipc_header_t, ipa_bits) == sizeof(uint32_t),
                "ipa_bits must immediately follow magic; there is no version "
                "slot in the fork IPC header");
+
 /* Enforce the bool typing of has_shm / is_rosetta via _Generic so a silent
  * widening to uint8_t / uint32_t (which would still match sizeof(bool)) fails
  * the build instead of accidentally re-shaping the wire.
@@ -50,6 +51,7 @@ _Static_assert(_Generic(((ipc_header_t *) 0)->has_shm, bool: 1, default: 0),
                "has_shm must remain a bool field");
 _Static_assert(_Generic(((ipc_header_t *) 0)->is_rosetta, bool: 1, default: 0),
                "is_rosetta must remain a bool field");
+
 /* The wire is private to one build (FORK_IPC_PROTOCOL_MAGIC bumps on every
  * incompatible layout change), but parent and child still need to agree on the
  * width of the bool flags they exchange. Pin the assumption so a future

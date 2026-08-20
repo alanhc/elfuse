@@ -6,28 +6,28 @@
  *
  * test-sysroot-name-race aims ten processes at one narrow window; this is the
  * volume counterpart. Eight threads and two forked children hammer eight
- * directories with creates, renames, unlinks, stats, and listing scans over
- * one colliding set (four case spellings plus an NFC/NFD pair) for a
- * deadline given in seconds as argv[1]. Nothing serializes name creation (the
- * spelling is a function of the name alone), so this is the shape that would
- * surface a lost update or a decode landing on a sibling's entry.
+ * directories with creates, renames, unlinks, stats, and listing scans over one
+ * colliding set (four case spellings plus an NFC/NFD pair) for a deadline given
+ * in seconds as argv[1]. Nothing serializes name creation (the spelling is a
+ * function of the name alone), so this is the shape that would surface a lost
+ * update or a decode landing on a sibling's entry.
  *
- * Two invariants hold at every step, however the operations interleave:
- * every syscall returns success or the ENOENT/EEXIST that a concurrent
- * unlink or create legitimately produces, and every listing is a
- * duplicate-free subset of the colliding set: a duplicate means two disk
- * entries decoded to one guest name, an escape spelling means a decode was
- * skipped. After the deadline, workers join and a quiescent sweep checks
- * that whatever survived reads back a member's content and unlinks cleanly.
+ * Two invariants hold at every step, however the operations interleave: every
+ * syscall returns success or the ENOENT/EEXIST that a concurrent unlink or
+ * create legitimately produces, and every listing is a duplicate-free subset of
+ * the colliding set: a duplicate means two disk entries decoded to one guest
+ * name, an escape spelling means a decode was skipped. After the deadline,
+ * workers join and a quiescent sweep checks that whatever survived reads back a
+ * member's content and unlinks cleanly.
  *
  * A pass does not prove the absence of a race; it is evidence that sustained
- * churn lacks a reproducer today, and only a failure proves anything. Kept
- * out of `make check` for its runtime; run via test-sysroot-name-soak (or
+ * churn lacks a reproducer today, and only a failure proves anything. Kept out
+ * of `make check` for its runtime; run via test-sysroot-name-soak (or
  * check-soak) with --timeout 0.
  *
  * Code under test: the create/rename/unlink translation paths in
- * src/syscall/fs.c, the case-exact walk in src/syscall/casefold-walk.c, and
- * the dirent decode in src/syscall/path.c under contention.
+ * src/syscall/fs.c, the case-exact walk in src/syscall/casefold-walk.c, and the
+ * dirent decode in src/syscall/path.c under contention.
  */
 
 #include <dirent.h>
@@ -60,8 +60,8 @@ static const char *const names[] = {
 };
 #define N_NAMES (sizeof(names) / sizeof(names[0]))
 
-/* Monotonic seconds, so a wall-clock step during the run cannot stretch or
- * cut the soak (time(2) tracks CLOCK_REALTIME).
+/* Monotonic seconds, so a wall-clock step during the run cannot stretch or cut
+ * the soak (time(2) tracks CLOCK_REALTIME).
  */
 static time_t mono_now(void)
 {
@@ -112,9 +112,9 @@ static bool name_in_set(const char *n)
 }
 
 /* A listing must be a duplicate-free subset of the set at every instant:
- * entries come and go under churn, but two entries for one guest name mean
- * two disk spellings decoded onto it, and an escape prefix means one was
- * not decoded at all.
+ * entries come and go under churn, but two entries for one guest name mean two
+ * disk spellings decoded onto it, and an escape prefix means one was not
+ * decoded at all.
  */
 static void scan_listing(const char *dir)
 {
@@ -168,8 +168,9 @@ static void worker_loop(uint64_t seed)
                 soak_fail("create refused", path, name);
                 break;
             }
-            /* The content is the creating spelling, so any read landing on
-             * a sibling's file is visible to the quiescent sweep.
+
+            /* The content is the creating spelling, so any read landing on a
+             * sibling's file is visible to the quiescent sweep.
              */
             if (write(fd, name, strlen(name)) < 0)
                 soak_fail("write refused", path, name);
@@ -236,11 +237,9 @@ int main(int argc, char **argv)
     }
 
     /* Forked children first so they inherit no thread state; each is a full
-     * elfuse host process sharing the sysroot, which is the cross-process
-     * half of the churn.
-     */
-    /* Seeds are fixed so a failing interleaving can at least be retried
-     * with the same operation streams; distinct per worker so no two
+     * elfuse host process sharing the sysroot, which is the cross-process half
+     * of the churn. Seeds are fixed so a failing interleaving can at least be
+     * retried with the same operation streams; distinct per worker so no two
      * workers replay each other. The multiplier is the usual 64-bit
      * golden-ratio scatter constant.
      */
@@ -302,9 +301,9 @@ int main(int argc, char **argv)
                     continue;
                 }
                 got[n] = '\0';
+
                 /* Content is whichever member spelling last wrote the file;
-                 * anything else means a write landed through the wrong
-                 * entry.
+                 * anything else means a write landed through the wrong entry.
                  */
                 if (!name_in_set(got))
                     ok = false;

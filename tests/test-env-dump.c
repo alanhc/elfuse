@@ -4,9 +4,8 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Prints environ verbatim and in order so tests/test-launch-flags.sh can
- * hold the vector build_linux_stack copied to what --env asked for, entry
- * for entry.
+ * Prints environ verbatim and in order so tests/test-launch-flags.sh can hold
+ * the vector build_linux_stack copied to what --env asked for, entry for entry.
  */
 
 #include <stdio.h>
