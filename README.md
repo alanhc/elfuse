@@ -166,6 +166,14 @@ or process semantics. `make test-rosetta-all` covers the x86_64 acceptance
 suites in isolation. See [docs/testing.md](docs/testing.md) for the full
 target list, fixture flow, and validation-by-change-type guidance.
 
+The first `make` in a fresh clone installs Git hooks that run the same checks
+CI does, at commit and push time instead of after: staged formatting, comment
+reflow, banned APIs, whitespace and conflict markers, and the commit-message
+rules in [CONTRIBUTING.md](CONTRIBUTING.md). A missing local formatter warns
+rather than blocks, and a hook you already wrote is never replaced.
+`make uninstall-hooks` removes them, `make install-hooks` puts them back. They
+do not replace `make check`.
+
 ## Limitations
 
 `elfuse` runs single Linux user-space processes (and their `fork` /
