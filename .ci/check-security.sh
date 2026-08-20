@@ -25,8 +25,18 @@ comment_only='^[[:space:]]*(//|/\*|\*|\*/)'
 # place this appears.
 scratch_marker='(^|[^[:alnum:]_])ponytail:'
 
-# Only scan elfuse host source, not tests/ or assembly shim.
-#
+# Only scan elfuse host source, not tests/ or assembly shim. Named paths win
+# over the tracked set so the pre-commit hook can point this at an extracted
+# index and get the same patterns applied to staged content.
+list_files()
+{
+    if [ "$#" -gt 0 ]; then
+        printf '%s\0' "$@"
+    else
+        git ls-files -z -- 'src/*.c' 'src/*.h' 'src/**/*.c' 'src/**/*.h'
+    fi
+}
+
 # Each match uses process substitution rather than a shell pipeline: under
 # `pipefail`, an early `grep -q` exit closes its stdin, the upstream filter
 # receives SIGPIPE, and the pipeline returns non-zero even when the pattern
@@ -34,6 +44,15 @@ scratch_marker='(^|[^[:alnum:]_])ponytail:'
 # filter in a separate process whose exit status doesn't feed back into the
 # matcher.
 while IFS= read -r -d '' f; do
+
+    # A path that cannot be read matches nothing, and nothing matching is what
+    # this script reports as clean. A named path is supplied by a caller, so a
+    # stale or mistyped one would turn a security gate into a success message.
+    if [ ! -r "$f" ]; then
+        echo "Cannot read $f"
+        failed=1
+        continue
+    fi
     if grep -qE "$banned" < <(grep -vE "$comment_only" -- "$f"); then
         echo "Banned function in $f:"
         grep -nE "$banned" -- "$f" | grep -vE "$comment_only" || true
@@ -54,7 +73,7 @@ while IFS= read -r -d '' f; do
         grep -nE "$scratch_marker" -- "$f" || true
         failed=1
     fi
-done < <(git ls-files -z -- 'src/*.c' 'src/*.h' 'src/**/*.c' 'src/**/*.h')
+done < <(list_files "$@")
 
 if [ $failed -eq 0 ]; then
     echo "Security checks passed."

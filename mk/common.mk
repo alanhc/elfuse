@@ -18,6 +18,44 @@ $(BUILD_DIR):
 # Automatic header dependency generation (-MMD -MP)
 DEPFLAGS = -MMD -MP -MF $(BUILD_DIR)/$(subst /,_,$*).d
 
+# Git hooks, installed on the first make of a fresh clone.
+#
+# The hooks run the same checks CI does, at commit and push time instead of
+# after. Left to "make install-hooks" they are enforced on whoever read the
+# README carefully, which is not the population that needs them; the cost of
+# being wrong is a symlink, and uninstall-hooks removes it.
+#
+# Once per tree, not once per build: the stamp is what keeps a rebuild from
+# re-running this, and a hook removed by hand stays removed until the next
+# clean. A target rather than a read-time side effect, so a dry run or a query
+# leaves the checkout untouched. A tarball export has no git dir, which the
+# script exits 0 on. Where it does fail, and it can, the recipe below swallows
+# the status rather than the build stopping over a symlink.
+#
+# Hung off compilation and the help screen rather than off MAKECMDGOALS.
+# Naming the goals would give every one of them a rule, including the
+# misspelled ones: a typo that stops today with "No rule to make target" would
+# instead find an empty rule, report nothing to be done, and exit 0. A build
+# system that succeeds on "make check-fromat" is a worse trade than installing
+# a symlink one command later.
+#
+# Every binary this tree builds reaches the two object rules below, host unit
+# tests included, so one order-only prerequisite there covers every build
+# entry point without listing any of them. help covers the case that builds
+# nothing, which is what a bare make prints. clean, distclean and the two hook
+# targets reach neither, so they skip this without being named.
+HOOK_INSTALLER := scripts/install-git-hooks.sh
+HOOK_STAMP := $(BUILD_DIR)/.hooks-installed
+
+# The stamp records a run that reported success. An installer that could not
+# reach the hooks directory returns non-zero and leaves no stamp, so the next
+# make retries rather than remembering a failure as done; an unwritable build/
+# fails the touch and is likewise retried. Neither can fail the build, which is
+# what the trailing no-op is for: hooks are a convenience, and a checkout that
+# cannot take them still has to compile.
+$(HOOK_STAMP): | $(BUILD_DIR)
+	@$(HOOK_INSTALLER) --quiet && touch $@ 2> /dev/null || :
+
 # Build flavor guard.
 #
 # Objects compiled with -fsanitize=... cannot be linked into a binary built
@@ -97,12 +135,14 @@ endif
 # triggers a rebuild on input change (e.g., build/dispatch.h from
 # src/syscall/dispatch.tbl) use explicit normal prerequisites where needed.
 
-$(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR) $(GENERATED_HEADERS)
+help: | $(HOOK_STAMP)
+
+$(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR) $(GENERATED_HEADERS) $(HOOK_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	$(Q)$(CC) $(CFLAGS) $(DEPFLAGS) -I$(BUILD_DIR) -Isrc -c -o $@ $<
 
-$(BUILD_DIR)/%.o: tests/%.c | $(BUILD_DIR) $(GENERATED_HEADERS)
+$(BUILD_DIR)/%.o: tests/%.c | $(BUILD_DIR) $(GENERATED_HEADERS) $(HOOK_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	$(Q)$(CC) $(CFLAGS) $(DEPFLAGS) -I$(BUILD_DIR) -Isrc -c -o $@ $<

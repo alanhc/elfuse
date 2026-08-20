@@ -1229,9 +1229,23 @@ In addition, this project expects contributors to follow these additional rules:
   Excessive use of parentheses "()" can clutter the subject line, making it harder to quickly grasp
   the essential message.
 
-These conventions are enforced by continuous integration rather than by
-[githooks](https://git-scm.com/docs/githooks); see `.github/workflows/lint.yml` for the checks a
-pull request has to clear.
+The seven rules above are enforced by `scripts/git-commit-msg.sh`, which the
+"Commit messages" step of the `Lint (Linux)` job in `.github/workflows/lint.yml`
+runs over every commit in a pull request. See that workflow for the rest of the
+checks a pull request has to clear.
+
+The first `make` in a fresh clone installs the same script as a local hook, so
+a message is rejected while it is still cheap to rewrite rather than after the
+push. Alongside it go a pre-commit hook that checks staged formatting, comment
+reflow, banned APIs and whitespace, and a pre-push hook that validates every
+unpublished commit. A hook you already wrote is never replaced.
+`make uninstall-hooks` removes them, `make install-hooks` puts them back. The
+hooks only move the feedback earlier; CI runs the same checks either way.
+
+Two rules cannot be decided by a script. Imperative mood is checked by
+rejecting the past-tense, third-person and gerund forms of common verbs, so an
+unlisted verb passes. "What and why, not how" is checked only for a body that
+opens by announcing the mechanism. Both are guidance a reviewer still applies.
 
 ## References
 * [Linux kernel coding style](https://www.kernel.org/doc/html/latest/process/coding-style.html)
