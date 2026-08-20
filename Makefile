@@ -35,6 +35,8 @@ SRCS := \
     runtime/fork-state.c \
     runtime/procemu.c \
     runtime/procemu-pty.c \
+    runtime/usb-sysfs.c \
+    runtime/usb-desc.c \
     runtime/proctitle.c \
     syscall/syscall.c \
     syscall/fdtable.c \
@@ -83,7 +85,7 @@ OBJS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 DISPATCH_MANIFEST := src/syscall/dispatch.tbl
 DISPATCH_GENERATOR := scripts/gen-syscall-dispatch.py
 DISPATCH_HEADER := $(BUILD_DIR)/dispatch.h
-HVF_LDFLAGS := -framework Hypervisor -arch arm64
+HVF_LDFLAGS := -framework Hypervisor -framework IOKit -framework CoreFoundation -arch arm64
 
 # Generated headers under build/ that must exist before compiling sources that
 # include them.
@@ -263,6 +265,14 @@ $(BUILD_DIR)/test-string-builder-host: \
 # Header-only container; the test compiles it in through utils.h.
 $(BUILD_DIR)/test-dynamic-array-host: \
 		$(BUILD_DIR)/test-dynamic-array-host.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+## Build the USB descriptor walk host unit test (native macOS binary)
+# usb-desc.o is a pure leaf translation unit (byte bookkeeping, no IOKit and no
+# I/O), so the test links the code under test and nothing else.
+$(BUILD_DIR)/test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host.o \
+		$(BUILD_DIR)/runtime/usb-desc.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
