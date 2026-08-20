@@ -104,7 +104,7 @@ define link-and-sign
 endef
 
 # Main executable
-.PHONY: all elfuse
+.PHONY: all elfuse install-hooks uninstall-hooks
 .PHONY: gen-syscall-dispatch check-syscall-dispatch
 
 all: elfuse
@@ -128,6 +128,14 @@ $(BUILD_DIR)/syscall/syscall.o: $(DISPATCH_HEADER)
 
 ## Build the elfuse executable
 elfuse: $(ELFUSE_BIN)
+
+## Install the repository's Git hooks without replacing local hooks
+install-hooks:
+	@$(HOOK_INSTALLER)
+
+## Remove hooks that install-hooks created, leaving any local hook alone
+uninstall-hooks:
+	@$(HOOK_INSTALLER) --uninstall
 
 $(ELFUSE_BIN): $(OBJS) | $(BUILD_DIR)
 	$(call link-and-sign,$@,$(OBJS))

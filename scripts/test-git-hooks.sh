@@ -333,6 +333,47 @@ if ! (
 fi
 rm -rf "$tmp"
 
+# A linked worktree can carry these scripts before the primary worktree does.
+# Its installation still has to enumerate its own scripts and run pre-push.
+checks=$((checks + 1))
+tmp=$(mktemp -d) || exit 1
+if ! (
+    cd "$tmp" || exit 1
+    git init -q --bare remote.git
+    git init -q primary && cd primary || exit 1
+    git config user.email t@t && git config user.name T
+    echo base > README.md && git add README.md
+    git commit -q -m "Add base"
+    git branch old
+    git worktree add -q ../linked
+    cd ../linked || exit 1
+    git remote add origin ../remote.git
+    cp -R "$script_dir/../scripts" . && mkdir mk
+    cp "$script_dir/../mk/common.mk" mk/
+
+    make -sn -f mk/common.mk BUILD_DIR=build build/.hooks-installed > /dev/null
+    [ ! -e build/.hooks-installed ] || exit 1
+    [ ! -e "$(git rev-parse --git-path hooks)/pre-push" ] || exit 1
+    ! make -sq -f mk/common.mk BUILD_DIR=build build/.hooks-installed
+    [ ! -e build/.hooks-installed ] || exit 1
+    [ ! -e "$(git rev-parse --git-path hooks)/pre-push" ] || exit 1
+    make -s -f mk/common.mk BUILD_DIR=build build/.hooks-installed
+    [ -e build/.hooks-installed ] || exit 1
+    [ -L "$(git rev-parse --git-path hooks)/commit-msg" ] || exit 1
+
+    # The stamp only says the target ran. What has to be true is that the hooks
+    # it linked are live in this worktree, and a commit that must be refused is
+    # the only thing that shows it.
+    echo doc > linked.md && git add linked.md
+    ! git commit -q -m "Added a bad subject" > /dev/null 2>&1 || exit 1
+    git commit -q -m "Add linked doc" > /dev/null 2>&1 || exit 1
+    git push -q origin HEAD:refs/heads/linked > /dev/null 2>&1 || exit 1
+) > /dev/null 2>&1; then
+    echo 'FAIL: hooks do not install from a linked worktree' >&2
+    failures=$((failures + 1))
+fi
+rm -rf "$tmp"
+
 # git strips comments with core.commentChar, not with "#". Written with the
 # wrong one, the guidance survives into the message and becomes the subject.
 checks=$((checks + 1))
