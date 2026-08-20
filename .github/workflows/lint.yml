@@ -127,6 +127,7 @@ jobs:
           run_everything() {
             echo "c=true" >> "$GITHUB_OUTPUT"
             echo "sh=true" >> "$GITHUB_OUTPUT"
+            echo "cf=true" >> "$GITHUB_OUTPUT"
             echo "$1; running every check"
             exit 0
           }
@@ -152,9 +153,21 @@ jobs:
           # regenerates build/dispatch.h from dispatch.tbl through the
           # generator before it analyzes anything. A pull request editing only
           # one of those would otherwise change a check without running it.
-          c=false; sh=false
+          c=false; sh=false; cf=false
           pat='\.(c|h)$|^\.clang-format$|^\.ci/|^src/syscall/dispatch\.tbl$'
           pat="$pat"'|^scripts/gen-syscall-dispatch\.py$'
+          # commentflow reads a wider set than clang-format: it reflows shell
+          # and assembly too, and it takes its column limit from .clang-format,
+          # so a change to that file moves every comment in the tree.
+          cfpat='\.(c|h|s|S|sh|bash)$|^\.clang-format$'
+          # This workflow pins both formatters, commentflow by checksum below
+          # and clang-format through LINT_PKGS, so editing it can change what
+          # either gate enforces. Re-checking the tree is the only way that
+          # shows up before the next contributor hits it, so both patterns
+          # carry the workflow itself.
+          selfpat='|^\.github/workflows/lint\.yml$'
+          cfpat="$cfpat$selfpat"
+          pat="$pat$selfpat"
           # A here-string, not a pipeline into grep. Under pipefail a "grep -q"
           # that matches early exits while the writer still has bytes to push,
           # the writer takes SIGPIPE, and the pipeline reports non-zero even
@@ -164,9 +177,33 @@ jobs:
           # exactly the diff that must not skip a check.
           if grep -qE "$pat" <<< "$files"; then c=true; fi
           if grep -qE '^\.ci/.*\.sh$' <<< "$files"; then sh=true; fi
+          if grep -qE "$cfpat" <<< "$files"; then cf=true; fi
           echo "c=$c" >> "$GITHUB_OUTPUT"
           echo "sh=$sh" >> "$GITHUB_OUTPUT"
-          echo "C sources changed: $c; .ci shell changed: $sh"
+          echo "cf=$cf" >> "$GITHUB_OUTPUT"
+          echo "C sources changed: $c; .ci shell changed: $sh; reflow inputs changed: $cf"
+
+      # commentflow ships as a release binary rather than an apt package, and
+      # its only tag is a rolling "latest", so the checksum below is what
+      # actually pins the version. A mismatch means upstream republished the
+      # tag: read what changed in the reflow rules before updating the hash,
+      # because a formatter that moves under CI rewrites the tree without a
+      # commit here saying so. This is the same reason clang-format is held at
+      # exactly 22 rather than "22 or newer".
+      - name: Install commentflow
+        if: ${{ !cancelled() && steps.changed.outputs.cf == 'true' }}
+        env:
+          COMMENTFLOW_URL: https://github.com/sysprog21/commentflow/releases/download/latest/commentflow-x86_64-unknown-linux-gnu.tar.gz
+          COMMENTFLOW_SHA256: b9723611440cdfac0b17a4d226d3f36c36dca87f37fc5c95b3f00274830834f5
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/commentflow.tar.gz "$COMMENTFLOW_URL"
+          echo "$COMMENTFLOW_SHA256  /tmp/commentflow.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/commentflow.tar.gz -C /usr/local/bin commentflow
+
+      - name: Comment reflow
+        if: ${{ !cancelled() && steps.changed.outputs.cf == 'true' }}
+        run: .ci/check-commentflow.sh
 
       - name: Cache apt packages
         if: ${{ !cancelled() && (steps.changed.outputs.c == 'true' || steps.changed.outputs.sh == 'true') }}
