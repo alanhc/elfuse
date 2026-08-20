@@ -99,6 +99,71 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/proof-scope.py --self-test
 
+      - name: Commit messages
+        # CONTRIBUTING.md's "Git Commit Style" section states seven rules and
+        # said continuous integration enforced them. Nothing did: the hooks
+        # under scripts/ are opt-in, so a contributor who never ran
+        # "make install-hooks" was gated by a sentence. This is that gate.
+        #
+        # Pull requests only. A push to main carries commits that already came
+        # through one, and the merge queue re-validating them would only find
+        # what this already rejected.
+        #
+        # The checkout is shallow, so both ends of the range have to be
+        # fetched, and a range whose walk runs into the shallow boundary comes
+        # back wrong rather than failing: rev-list exits 0 having listed
+        # whatever it could reach. Both directions happen, and neither is
+        # acceptable, so both are guarded below. Depth is generous because
+        # merge commits inside a pull request make the walk deeper than the
+        # commit count alone.
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          COUNT: ${{ github.event.pull_request.commits }}
+        run: |
+          set -euo pipefail
+          : "${COUNT:?the pull_request payload carries no commit count}"
+          depth=$((COUNT * 2 + 50))
+          git fetch --no-tags --depth="$depth" origin "$HEAD"
+          # The same depth for the base, not 1. Fetched at depth 1 the base has
+          # no known ancestry, so "$BASE..$HEAD" excludes the base commit and
+          # nothing else: everything below the fork point stays in the range.
+          # The moment the base branch moves past the point the pull request
+          # forked from, which is the ordinary case, a two-commit pull request
+          # comes back as the whole fetched slice and the gate judges the
+          # project's history against today's rules.
+          git fetch --no-tags --depth="$depth" origin "$BASE"
+          # This is what catches that, and the count comparison cannot: a range
+          # truncated at the base end comes back longer than the pull request,
+          # not shorter. merge-base fails exactly when the boundary leaves the
+          # two ends with no common ancestor to compute the range from.
+          if ! git merge-base "$BASE" "$HEAD" > /dev/null; then
+            echo "::error::No common ancestor for this pull request's base and" \
+                 "head; the shallow boundary truncated the range. Raise the depth."
+            exit 1
+          fi
+          # And this catches the head end. A surplus past the guard above is not
+          # this check's business: the range and GitHub's count are derived
+          # differently, and the direction that means "some commits went
+          # unchecked" is fewer.
+          found=$(git rev-list --count "$BASE..$HEAD")
+          if [ "$found" -lt "$COUNT" ]; then
+            echo "::error::Reached $found of this pull request's $COUNT commits;" \
+                 "the shallow boundary truncated the range. Raise the fetch depth."
+            exit 1
+          fi
+          git rev-list --no-merges "$BASE..$HEAD" | scripts/check-commit-log.sh
+
+      - name: Git hook self-test
+        # The hooks and this job's commit-message gate are the same script, so
+        # a rule that regresses regresses in both places at once. Every case in
+        # the test was a live defect: a rejected merge subject leaves a merge
+        # half-finished, and a "git commit -v" message linted against its own
+        # appended diff fails on width for reasons the author cannot see.
+        if: ${{ !cancelled() }}
+        run: scripts/test-git-hooks.sh
+
       - name: Skill cross-references
         # The .claude/ skills cite files, make targets and sections by name.
         # Nothing else notices when one is renamed, and a skill that points at
@@ -176,7 +241,7 @@ jobs:
           # It needs a diff long enough to fill the pipe buffer, which is
           # exactly the diff that must not skip a check.
           if grep -qE "$pat" <<< "$files"; then c=true; fi
-          if grep -qE '^\.ci/.*\.sh$' <<< "$files"; then sh=true; fi
+          if grep -qE '^(\.ci|scripts)/.*\.sh$' <<< "$files"; then sh=true; fi
           if grep -qE "$cfpat" <<< "$files"; then cf=true; fi
           echo "c=$c" >> "$GITHUB_OUTPUT"
           echo "sh=$sh" >> "$GITHUB_OUTPUT"
@@ -239,12 +304,15 @@ jobs:
         run: .ci/check-format.sh
 
       - name: shellcheck
-        # Scoped to .ci/ -- tests/ has pre-existing warnings that the
-        # repository's own check-format target already surfaces.
+        # Scoped to .ci/ and scripts/ -- tests/ has pre-existing warnings that
+        # the repository's own check-format target already surfaces. scripts/
+        # is here because the git hooks live there and a hook that aborts on
+        # its own shell is worse than no hook: it teaches contributors to pass
+        # --no-verify, which costs the checks that do work.
         if: ${{ !cancelled() && steps.changed.outputs.sh == 'true' }}
         run: |
           set -euo pipefail
-          mapfile -d '' files < <(git ls-files -z -- '.ci/*.sh')
+          mapfile -d '' files < <(git ls-files -z -- '.ci/*.sh' 'scripts/*.sh')
           shellcheck --severity=warning "${files[@]}"
 
       - name: cppcheck
