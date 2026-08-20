@@ -27,16 +27,37 @@
 
 /* Linux Netlink protocol families. */
 #define NETLINK_ROUTE 0
+#define NETLINK_KOBJECT_UEVENT 15
 
 /* Linux socket types + flags. */
 #define LINUX_SOCK_STREAM 1
 #define LINUX_SOCK_DGRAM 2
+#define LINUX_SOCK_RAW 3
 #define LINUX_SOCK_SEQPACKET 5
 #define LINUX_SOCK_NONBLOCK 0x800
 #define LINUX_SOCK_CLOEXEC 0x80000
+/* SOCK_TYPE_MASK: the base type, with the two flag bits above masked off. */
+#define LINUX_SOCK_TYPE_MASK 0xF
 
 /* Linux SOL_SOCKET option level. */
 #define LINUX_SOL_SOCKET 1
+
+/* Linux SOL_NETLINK option level and the optnames netlink_setsockopt() and
+ * netlink_getsockopt() answer. NETLINK_RX_RING/TX_RING (6/7) are deliberately
+ * absent: mmap'd netlink was removed in Linux 4.10 and both spellings have
+ * reported ENOPROTOOPT ever since, which is the default arm here.
+ */
+#define LINUX_SOL_NETLINK 270
+#define LINUX_NETLINK_ADD_MEMBERSHIP 1
+#define LINUX_NETLINK_DROP_MEMBERSHIP 2
+#define LINUX_NETLINK_PKTINFO 3
+#define LINUX_NETLINK_BROADCAST_ERROR 4
+#define LINUX_NETLINK_NO_ENOBUFS 5
+#define LINUX_NETLINK_LISTEN_ALL_NSID 8
+#define LINUX_NETLINK_LIST_MEMBERSHIPS 9
+#define LINUX_NETLINK_CAP_ACK 10
+#define LINUX_NETLINK_EXT_ACK 11
+#define LINUX_NETLINK_GET_STRICT_CHK 12
 
 /* Linux cmsg types for AF_UNIX. */
 #define LINUX_SCM_CREDENTIALS 2
@@ -59,14 +80,23 @@ typedef struct {
 #define LINUX_SO_KEEPALIVE 9
 #define LINUX_SO_OOBINLINE 10
 #define LINUX_SO_LINGER 13
+
+/* 20/21 are the _OLD spellings, carrying a __kernel_old_timeval; 66/67 are the
+ * y2038 _NEW ones, carrying a __kernel_sock_timeval. Both are 16 bytes on LP64,
+ * so the two pairs differ only in name for the guest ABI elfuse targets.
+ */
 #define LINUX_SO_RCVTIMEO 20
 #define LINUX_SO_SNDTIMEO 21
+#define LINUX_SO_RCVTIMEO_NEW 66
+#define LINUX_SO_SNDTIMEO_NEW 67
 #define LINUX_SO_PASSCRED 16
 #define LINUX_SO_PEERCRED 17
 #define LINUX_SO_ACCEPTCONN 30
 #define LINUX_SO_REUSEPORT 15
 #define LINUX_SO_RCVLOWAT 18
 #define LINUX_SO_SNDLOWAT 19
+#define LINUX_SO_PROTOCOL 38
+#define LINUX_SO_DOMAIN 39
 
 /* Linux TCP level options. */
 #define LINUX_IPPROTO_TCP 6
@@ -246,16 +276,43 @@ void netlink_init(void);
 
 /* Create a synthetic netlink socket fd.
  *
- * Returns guest fd, or negative errno. Only NETLINK_ROUTE is supported; others
- * return -EAFNOSUPPORT.
+ * Returns guest fd, or negative errno. NETLINK_ROUTE (rtnetlink dump emulation)
+ * and NETLINK_KOBJECT_UEVENT (silent socket: no events are ever delivered) are
+ * supported; other protocols return -EAFNOSUPPORT.
+ *
+ * type is validated the way __sock_create() and netlink_create() validate it,
+ * in that order: an unknown bit outside SOCK_NONBLOCK|SOCK_CLOEXEC is -EINVAL,
+ * and a base type other than SOCK_RAW or SOCK_DGRAM is -ESOCKTNOSUPPORT.
  */
 int64_t netlink_socket(int protocol, int type);
 
-/* Netlink bind (always succeeds for NETLINK_ROUTE). */
+/* Netlink bind (always succeeds). nl_pid is recorded for getsockname and
+ * nl_groups is recorded as a membership mask readable through
+ * SOL_NETLINK/NETLINK_LIST_MEMBERSHIPS; no multicast event is ever synthesized
+ * to deliver on it.
+ */
 int64_t netlink_bind(int guest_fd,
                      guest_t *g,
                      uint64_t addr_gva,
                      uint32_t addrlen);
+
+/* setsockopt/getsockopt on a netlink fd. SOL_SOCKET and SOL_NETLINK options are
+ * emulated per-fd (never forwarded to a host socket: there is none); other
+ * levels report -ENOPROTOOPT.
+ */
+int64_t netlink_setsockopt(guest_t *g,
+                           int guest_fd,
+                           int level,
+                           int optname,
+                           uint64_t optval_gva,
+                           uint32_t optlen);
+
+int64_t netlink_getsockopt(guest_t *g,
+                           int guest_fd,
+                           int level,
+                           int optname,
+                           uint64_t optval_gva,
+                           uint64_t optlen_gva);
 
 /* Netlink sendmsg: parse the request and buffer a response. */
 int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags);
