@@ -104,6 +104,17 @@ static inline void host_fd_refs_close(host_fd_ref_t *refs, uint32_t n)
  */
 #define POLL_WRITE_EVENTS (POLLOUT | POLLWRBAND)
 
+/* One entry for poll_eval_unpollable(): the host descriptor the caller
+ * resolved, the events the guest asked about, and the answer written back. A
+ * negative fd marks an entry that is not part of the refused set, so the two
+ * callers can keep one array parallel to their own request list.
+ */
+typedef struct {
+    int fd;
+    short events;
+    short revents;
+} poll_unpollable_t;
+
 /* Evaluate the entries host poll() refused. macOS poll() answers POLLNVAL for
  * any descriptor it will not put on a kqueue: /dev/null, /dev/zero,
  * /dev/random, /dev/urandom, directories, and kqueue descriptors themselves.
@@ -118,11 +129,7 @@ static inline void host_fd_refs_close(host_fd_ref_t *refs, uint32_t n)
  *
  * Returns how many entries are ready.
  */
-static uint32_t poll_eval_unpollable(const struct pollfd *host_fds,
-                                     const host_fd_ref_t *refs,
-                                     const bool *unpollable,
-                                     short *revents,
-                                     uint32_t nfds)
+static uint32_t poll_eval_unpollable(poll_unpollable_t *entries, uint32_t n)
 {
     fd_set read_set, write_set, except_set;
     FD_ZERO(&read_set);
@@ -130,12 +137,12 @@ static uint32_t poll_eval_unpollable(const struct pollfd *host_fds,
     FD_ZERO(&except_set);
 
     int max_fd = -1;
-    for (uint32_t i = 0; i < nfds; i++) {
-        revents[i] = 0;
-        if (!unpollable[i] || !RANGE_CHECK(refs[i].fd, 0, FD_SETSIZE))
+    for (uint32_t i = 0; i < n; i++) {
+        entries[i].revents = 0;
+        int fd = entries[i].fd;
+        if (fd < 0 || !RANGE_CHECK(fd, 0, FD_SETSIZE))
             continue;
-        int fd = refs[i].fd;
-        short events = host_fds[i].events;
+        short events = entries[i].events;
         if (events & (POLLIN | POLLRDNORM))
             FD_SET(fd, &read_set);
         if (events & POLL_WRITE_EVENTS)
@@ -151,11 +158,11 @@ static uint32_t poll_eval_unpollable(const struct pollfd *host_fds,
                                          &except_set, &zero) >= 0;
 
     uint32_t ready = 0;
-    for (uint32_t i = 0; i < nfds; i++) {
-        if (!unpollable[i])
+    for (uint32_t i = 0; i < n; i++) {
+        int fd = entries[i].fd;
+        if (fd < 0)
             continue;
-        int fd = refs[i].fd;
-        short events = host_fds[i].events;
+        short events = entries[i].events;
         short got = 0;
         if (!RANGE_CHECK(fd, 0, FD_SETSIZE)) {
             got = (short) (events & (POLLIN | POLLRDNORM | POLL_WRITE_EVENTS));
@@ -169,7 +176,7 @@ static uint32_t poll_eval_unpollable(const struct pollfd *host_fds,
                 mask |= POLLPRI;
             got = (short) mask;
         }
-        revents[i] = got;
+        entries[i].revents = got;
         if (got)
             ready++;
     }
@@ -209,12 +216,12 @@ int64_t sys_ppoll(guest_t *g,
     /* Entries host poll() refuses with POLLNVAL even though their reference
      * resolved. See poll_eval_unpollable().
      */
-    bool unpollable[256] = {false};
-    short unpollable_revents[256] = {0};
+    poll_unpollable_t unpollable[256];
     uint32_t unpollable_count = 0;
     bool unpollable_checked = false;
     for (uint32_t i = 0; i < nfds; i++) {
         host_refs[i] = (host_fd_ref_t) {.fd = -1, .owned = false};
+        unpollable[i] = (poll_unpollable_t) {.fd = -1};
         int guest_fd = guest_fds[i].fd;
         int host_fd = -1;
         if (guest_fd >= 0) {
@@ -339,8 +346,7 @@ int64_t sys_ppoll(guest_t *g,
 ppoll_retry:
     do {
         if (unpollable_count > 0)
-            unpollable_ready = poll_eval_unpollable(
-                host_fds, host_refs, unpollable, unpollable_revents, nfds);
+            unpollable_ready = poll_eval_unpollable(unpollable, nfds);
 
         int slice = (poll_timeout_ms == 0 || unpollable_ready > 0)
                         ? 0
@@ -356,7 +362,8 @@ ppoll_retry:
             for (uint32_t i = 0; i < nfds; i++) {
                 if (need_pollnval[i] || !(host_fds[i].revents & POLLNVAL))
                     continue;
-                unpollable[i] = true;
+                unpollable[i].fd = host_refs[i].fd;
+                unpollable[i].events = host_fds[i].events;
                 host_fds[i].fd = -1;
                 unpollable_count++;
             }
@@ -405,8 +412,8 @@ ppoll_retry:
 
     if (ret >= 0 && unpollable_count > 0) {
         for (uint32_t i = 0; i < nfds; i++)
-            if (unpollable[i])
-                host_fds[i].revents = unpollable_revents[i];
+            if (unpollable[i].fd >= 0)
+                host_fds[i].revents = unpollable[i].revents;
         ret += (int) unpollable_ready;
     }
 
@@ -471,6 +478,90 @@ ppoll_retry:
     return ret;
 }
 
+/* State the pselect6 poll fallback carries across its passes. pselect6 falls
+ * back to poll() when a host descriptor is out of fd_set range, and poll() then
+ * refuses the descriptors kqueue will not take. Those leave the poll set and
+ * are answered through poll_eval_unpollable(), the way sys_ppoll answers them.
+ */
+typedef struct {
+    pselect_req_t *reqs;
+    /* Parallel to reqs; a non-negative fd marks an entry poll() refused. */
+    poll_unpollable_t *unp;
+    int req_count;
+    int wake_fd;      /* -1 when the wakeup pipe is not in this set */
+    uint32_t refused; /* entries taken out of the poll set */
+    uint32_t ready;   /* of those, the ones select() reports ready */
+    bool checked;     /* the refused set is found once, on the first pass */
+    bool wakeup_fired;
+} pselect_fallback_t;
+
+/* One pass of the fallback: answer the refused entries, poll the rest, and
+ * leave both results in reqs[].revents.
+ *
+ * Returns what poll() returned, or -1 with errno set. *restart asks for another
+ * pass, which happens once, on the pass that exposes the refused entries -- a
+ * refused entry makes poll() return at once, so that restart waits for nothing.
+ */
+static int pselect_fallback_pass(pselect_fallback_t *fb,
+                                 const struct timespec *wait_ts,
+                                 bool *restart)
+{
+    *restart = false;
+    if (fb->refused > 0)
+        fb->ready = poll_eval_unpollable(fb->unp, (uint32_t) fb->req_count);
+
+    struct pollfd poll_stack[64];
+    struct pollfd *poll_fds = poll_stack;
+    struct pollfd *poll_heap = NULL;
+    int poll_count = fb->req_count + (fb->wake_fd >= 0 ? 1 : 0);
+    if (poll_count > (int) ARRAY_SIZE(poll_stack)) {
+        poll_heap = malloc((size_t) poll_count * sizeof(*poll_heap));
+        if (!poll_heap) {
+            errno = ENOMEM;
+            return -1;
+        }
+        poll_fds = poll_heap;
+    }
+    for (int i = 0; i < fb->req_count; i++) {
+        poll_fds[i].fd = fb->unp[i].fd >= 0 ? -1 : fb->reqs[i].host_fd;
+        poll_fds[i].events = fb->reqs[i].events;
+        poll_fds[i].revents = 0;
+    }
+    if (fb->wake_fd >= 0) {
+        poll_fds[fb->req_count].fd = fb->wake_fd;
+        poll_fds[fb->req_count].events = POLLIN;
+        poll_fds[fb->req_count].revents = 0;
+    }
+
+    int timeout_ms =
+        fb->ready > 0 ? 0
+                      : timespec_to_poll_ms(wait_ts->tv_sec, wait_ts->tv_nsec);
+    int ret = poll(poll_fds, (nfds_t) poll_count, timeout_ms);
+    if (ret >= 0) {
+        for (int i = 0; i < fb->req_count; i++)
+            fb->reqs[i].revents = poll_fds[i].revents;
+        fb->wakeup_fired =
+            fb->wake_fd >= 0 && (poll_fds[fb->req_count].revents & POLLIN);
+    }
+    free(poll_heap);
+
+    /* Every guest fd resolved before the wait, so a POLLNVAL here is the host
+     * refusing the descriptor, not a closed one.
+     */
+    if (ret > 0 && !fb->checked) {
+        fb->checked = true;
+        for (int i = 0; i < fb->req_count; i++) {
+            if (!(fb->reqs[i].revents & POLLNVAL))
+                continue;
+            fb->unp[i].fd = fb->reqs[i].host_fd;
+            fb->unp[i].events = fb->reqs[i].events;
+            fb->refused++;
+        }
+        *restart = fb->refused > 0;
+    }
+    return ret;
+}
+
 int64_t sys_pselect6(guest_t *g,
                      int nfds,
                      uint64_t readfds_gva,
@@ -521,6 +612,13 @@ int64_t sys_pselect6(guest_t *g,
     pselect_req_t *reqs_heap = NULL;
     int req_count = 0;
 
+    /* One entry per request, filled in for the ones host poll() refuses. The
+     * heap copy rides in the reqs allocation so there is still one buffer to
+     * free.
+     */
+    poll_unpollable_t unp_stack[64];
+    poll_unpollable_t *unp = unp_stack;
+
     /* Translate fd_sets from guest. Linux fd_set uses unsigned long bitmask.
      * fdset_words proved nfds_words <= FDSET_MAX_WORDS, so bitmask_bytes below
      * cannot exceed what these three buffers hold.
@@ -562,10 +660,12 @@ int64_t sys_pselect6(guest_t *g,
             req_cap += bit_popcount64(requested);
         }
         if (req_cap > (int) (ARRAY_SIZE(reqs_stack))) {
-            reqs_heap = malloc((size_t) req_cap * sizeof(*reqs_heap));
+            reqs_heap =
+                malloc((size_t) req_cap * (sizeof(*reqs_heap) + sizeof(*unp)));
             if (!reqs_heap)
                 return -LINUX_ENOMEM;
             reqs = reqs_heap;
+            unp = (poll_unpollable_t *) (reqs_heap + req_cap);
         }
 
         for (int word = 0; word < nfds_words; word++) {
@@ -604,6 +704,7 @@ int64_t sys_pselect6(guest_t *g,
                 if (ebits && (ebits[word] & bit))
                     reqs[req_count].events |= POLLPRI;
                 reqs[req_count].ref = ref;
+                unp[req_count] = (poll_unpollable_t) {.fd = -1};
                 req_count++;
                 if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
                     if (host_fd > max_host_fd)
@@ -703,10 +804,16 @@ int64_t sys_pselect6(guest_t *g,
     if (added_wakeup && !RANGE_CHECK(wake_fd, 0, FD_SETSIZE))
         use_poll_fallback = true;
 
+    pselect_fallback_t fb = {
+        .reqs = reqs,
+        .unp = unp,
+        .req_count = req_count,
+        .wake_fd = added_wakeup ? wake_fd : -1,
+    };
+
     int ret;
-    bool poll_wakeup_fired = false;
 pselect_retry:
-    poll_wakeup_fired = false;
+    fb.wakeup_fired = false;
     for (int i = 0; i < req_count; i++)
         reqs[i].revents = 0;
     do {
@@ -720,42 +827,17 @@ pselect_retry:
         }
 
         if (use_poll_fallback) {
-            struct pollfd poll_stack[64];
-            struct pollfd *poll_fds = poll_stack;
-            struct pollfd *poll_heap = NULL;
-            int poll_count = req_count + (added_wakeup ? 1 : 0);
-            if (poll_count > (int) ARRAY_SIZE(poll_stack)) {
-                poll_heap = malloc((size_t) poll_count * sizeof(*poll_heap));
-                if (!poll_heap) {
-                    ret = -1;
-                    errno = ENOMEM;
-                    break;
-                }
-                poll_fds = poll_heap;
-            }
-            for (int i = 0; i < req_count; i++) {
-                poll_fds[i].fd = reqs[i].host_fd;
-                poll_fds[i].events = reqs[i].events;
-                poll_fds[i].revents = 0;
-            }
-            if (added_wakeup) {
-                poll_fds[req_count].fd = wake_fd;
-                poll_fds[req_count].events = POLLIN;
-                poll_fds[req_count].revents = 0;
-            }
+            bool restart;
+            ret = pselect_fallback_pass(&fb, has_timeout ? &ts : &poll_ts,
+                                        &restart);
 
-            const struct timespec *wait_ts = has_timeout ? &ts : &poll_ts;
-            int timeout_ms =
-                timespec_to_poll_ms(wait_ts->tv_sec, wait_ts->tv_nsec);
-
-            ret = poll(poll_fds, (nfds_t) poll_count, timeout_ms);
-            if (ret >= 0) {
-                for (int i = 0; i < req_count; i++)
-                    reqs[i].revents = poll_fds[i].revents;
-                poll_wakeup_fired =
-                    added_wakeup && (poll_fds[req_count].revents & POLLIN);
-            }
-            free(poll_heap);
+            /* The interrupt predicates below call into the runtime and can
+             * overwrite errno, so an allocation failure leaves the loop here.
+             */
+            if (ret < 0 && errno == ENOMEM)
+                break;
+            if (restart)
+                goto pselect_retry;
         } else {
             ret = pselect(max_host_fd + 1, read_setp, write_setp, except_setp,
                           has_timeout ? &ts : &poll_ts, NULL);
@@ -770,7 +852,7 @@ pselect_retry:
             errno = EINTR;
             break;
         }
-    } while (ret == 0 && !has_timeout);
+    } while (ret == 0 && fb.ready == 0 && !has_timeout);
 
     int save_errno = errno;
 
@@ -779,7 +861,7 @@ pselect_retry:
      */
     bool wakeup_fired =
         added_wakeup &&
-        (use_poll_fallback ? poll_wakeup_fired : FD_ISSET(wake_fd, &read_set));
+        (use_poll_fallback ? fb.wakeup_fired : FD_ISSET(wake_fd, &read_set));
     if (wakeup_fired) {
         wakeup_pipe_drain();
         if (!use_poll_fallback)
@@ -822,17 +904,28 @@ pselect_retry:
             memset(ebits_buf, 0, sizeof(ebits_buf));
             ebits = ebits_buf;
         }
+        int ready_bits = 0;
         for (int i = 0; i < req_count; i++) {
             int host_fd = reqs[i].host_fd, word = reqs[i].word;
             uint64_t bit = BIT64(reqs[i].bit_index);
             if (use_poll_fallback) {
-                short revents = reqs[i].revents;
-                if (rbits && (revents & (POLLIN | POLLHUP | POLLERR)))
+                /* An entry poll() refused holds its select() answer in unp, the
+                 * poll set having left reqs[i].revents at zero.
+                 */
+                short revents =
+                    unp[i].fd >= 0 ? unp[i].revents : reqs[i].revents;
+                if (rbits && (revents & (POLLIN | POLLHUP | POLLERR))) {
                     rbits[word] |= bit;
-                if (wbits && (revents & (POLLOUT | POLLHUP | POLLERR)))
+                    ready_bits++;
+                }
+                if (wbits && (revents & (POLLOUT | POLLHUP | POLLERR))) {
                     wbits[word] |= bit;
-                if (ebits && (revents & POLLPRI))
+                    ready_bits++;
+                }
+                if (ebits && (revents & POLLPRI)) {
                     ebits[word] |= bit;
+                    ready_bits++;
+                }
             } else if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
                 if (rbits && FD_ISSET(host_fd, &read_set))
                     rbits[word] |= bit;
@@ -842,6 +935,15 @@ pselect_retry:
                     ebits[word] |= bit;
             }
         }
+
+        /* poll() counts a descriptor once however many events it reports;
+         * select() counts it once per set it is reported in, so a descriptor
+         * ready to read and to write counts twice. The bits just written are
+         * that count for the descriptors the fallback answered.
+         */
+        if (use_poll_fallback)
+            ret = ready_bits;
+
         int bytes = nfds_words * 8;
         if (rbits && guest_write_small(g, readfds_gva, rbits, bytes) < 0)
             goto pselect_fault;
