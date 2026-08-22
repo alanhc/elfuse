@@ -170,10 +170,34 @@ INVENTORY = {
         "syscall_is_restarted(), so the retry waits the same connection out "
         "instead of starting a second one.",
     ),
+    "syscall/net.c::connect_or_interrupted": (
+        "restartable",
+        "Flips the socket nonblocking, forwards connect_nonblock_wait, and "
+        "restores the guest's flags. It consumes nothing of its own; the SYN "
+        "the wait below it already sent is sys_connect's problem, not this "
+        "one's.",
+    ),
+    "syscall/net.c::sys_connect": (
+        "restartable",
+        "The one caller whose restart needs a precondition rather than a ban: "
+        "the SYN is out, so it treats EALREADY as in-flight always and EISCONN "
+        "as in-flight only under syscall_is_restarted(), and the retry waits "
+        "the same connection out instead of opening a second one.",
+    ),
     "syscall/net.c::sys_sendto": (
         "restartable",
         "POLLOUT wait, then send. An interrupted wait has sent nothing, and a "
         "send that moved bytes returns the count.",
+    ),
+    "syscall/net.c::do_accept": (
+        "restartable",
+        "The readiness wait precedes accept, so an interrupted wait has not "
+        "removed a connection from the listen queue.",
+    ),
+    "syscall/net.c::sys_recvfrom": (
+        "restartable",
+        "The first wait precedes recvfrom, and later interrupted waits return "
+        "the accumulated count instead of EINTR.",
     ),
     "syscall/net-msg.c::sys_sendmsg": (
         "restartable",
@@ -185,6 +209,64 @@ INVENTORY = {
         "Interrupting message i reports i as the count when i > 0, so the "
         "restart never re-sends a delivered message; only an interrupt before "
         "the first send reaches the guest as EINTR.",
+    ),
+    "syscall/net-msg.c::sys_recvmsg": (
+        "restartable",
+        "The first wait precedes recvmsg, and later interrupted waits return "
+        "the accumulated count instead of EINTR.",
+    ),
+    "syscall/net-msg.c::sys_recvmmsg": (
+        "forbids",
+        "The finite initial poll consumes part of the guest's relative timeout, "
+        "so every exit past it refuses the restart that would start the timeout "
+        "over. The vlen==1 fast path runs only when no timeout was supplied and "
+        "never reaches the poll, so its EINTR stays restartable.",
+    ),
+    "syscall/fs.c::fcntl_flock_wait": (
+        "restartable",
+        "The nonblocking flock probe changes nothing before the backoff waits.",
+    ),
+    "syscall/io.c::sys_read": (
+        "restartable",
+        "io_xfer returns EINTR only before it has transferred a byte.",
+    ),
+    "syscall/io.c::sys_readv": (
+        "restartable",
+        "io_xfer returns EINTR only before it has transferred a byte.",
+    ),
+    "syscall/io.c::sys_write": (
+        "restartable",
+        "io_xfer returns EINTR only before it has transferred a byte.",
+    ),
+    "syscall/io.c::sys_writev": (
+        "restartable",
+        "io_xfer returns EINTR only before it has transferred a byte.",
+    ),
+    "syscall/io.c::sys_splice": (
+        "restartable",
+        "Adds no hazard of its own: the input-side io_xfer reports before the "
+        "first byte, and the one exit that has consumed something -- a chunk "
+        "read but not written -- is forbidden by splice_drain_chunk, which is "
+        "the only frame that knows how much never left.",
+    ),
+    "syscall/io.c::sys_vmsplice": (
+        "restartable",
+        "A partial transfer returns its count; EINTR reaches the guest only "
+        "before the first byte.",
+    ),
+    "syscall/proc.c::proc_wait_autoreap_children": (
+        "forbids",
+        "The loop can reap an exited child before its backoff reports EINTR, "
+        "so re-execution would observe different process state.",
+    ),
+    "syscall/syscall.c::sc_flock": (
+        "restartable",
+        "The nonblocking flock probe changes nothing before the backoff waits.",
+    ),
+    "syscall/sysvipc.c::sys_semop": (
+        "restartable",
+        "A failed IPC_NOWAIT probe applies none of the semaphore operations "
+        "before the backoff waits.",
     ),
     "syscall/netlink.c::nl_wait_readable_locked": (
         "restartable",
@@ -273,10 +355,35 @@ FORBID_MARKER = "syscall_restart_forbid()"
 # one of these as reporting EINTR, so the classification survives the cleanup
 # that hides the constant.
 #
-# A name belongs here when it can return -LINUX_EINTR to its caller. Callers of
-# a helper listed here are still free to be 'restartable': the entry states the
+# Listed by hand. Membership is a property of the code, that this helper hands
+# EINTR to its caller, and no spelling rule tracks it: connect_or_interrupted
+# and net_recv_zero_payload_gate sit on opposite sides of any suffix convention
+# and both report EINTR upward. Deriving the list from INVENTORY would also make
+# deleting an entry shrink the regex, which is the gate getting weaker at the
+# moment it should be complaining.
+#
+# A caller of a helper is still free to be 'restartable': the entry states the
 # decision, it does not presume one.
-EINTR_HELPERS = ("io_wait_fd_or_interrupted",)
+EINTR_HELPERS = (
+    "io_wait_fd_or_interrupted",
+    "net_wait_or_interrupted",
+    "net_recv_zero_payload_gate",
+    "connect_nonblock_wait",
+    "connect_or_interrupted",
+    "io_retry_backoff",
+    "io_xfer",
+)
+
+# Both directions the pair can drift. A helper missing from INVENTORY is one the
+# gate demands a classification of without carrying one itself; an empty tuple
+# builds the regex '\b()\s*\(', which matches every call in the tree and buries
+# the real answer under a thousand unclassified functions.
+assert EINTR_HELPERS, "EINTR_HELPERS must not be empty"
+for _helper in EINTR_HELPERS:
+    assert any(
+        key.endswith("::" + _helper) for key in INVENTORY
+    ), f"EINTR helper {_helper} is not classified in INVENTORY"
+
 HELPER_RE = re.compile(r"\b(" + "|".join(EINTR_HELPERS) + r")\s*\(")
 
 FUNC_START_RE = re.compile(r"^(\w[\w \t\*]*?)\b(\w+)\s*\([^;]*$")

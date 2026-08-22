@@ -2240,8 +2240,10 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
             return 0;
 
         int64_t wait_rc = io_retry_backoff(&backoff);
-        if (wait_rc < 0)
+        if (wait_rc < 0) {
+            syscall_restart_forbid();
             return wait_rc;
+        }
     }
 }
 

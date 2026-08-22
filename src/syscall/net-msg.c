@@ -1304,6 +1304,16 @@ int64_t sys_recvmmsg(guest_t *g,
             int timeout_ms = timespec_to_poll_ms(ts.tv_sec, ts.tv_nsec);
             struct pollfd pfd = {.fd = host_ref.fd, .events = POLLIN};
             int pr = poll(&pfd, 1, timeout_ms);
+
+            /* However that poll ended, it spent part of a relative timeout the
+             * guest supplied, and the per-message loop below carries no bound
+             * of its own. Every EINTR exit past this point therefore belongs to
+             * a call whose deadline a restart would begin again from zero,
+             * including the one that matters most: a poll that reported
+             * readable, a sibling that took the datagram, and an interrupted
+             * wait inside the first sys_recvmsg.
+             */
+            syscall_restart_forbid();
             host_fd_ref_close(&host_ref);
             if (pr == 0)
                 return -LINUX_EAGAIN;
