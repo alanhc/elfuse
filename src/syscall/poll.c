@@ -1150,6 +1150,14 @@ int epoll_dup_fd(int src_fd,
         return -1;
     }
     inst->refcount++;
+
+    /* The alias names the same open file description, so it carries the
+     * source's status flags and its ofd_id rather than a freshly built set;
+     * every alias sweep (O_NONBLOCK shadow, O_ASYNC, the SIGIO owner) matches
+     * on ofd_id, and a rebuilt one hides the alias from all of them.
+     */
+    int src_flags = fd_table[src_fd].linux_flags & FD_DESCRIPTION_FLAGS;
+    uint64_t src_ofd_id = fd_table[src_fd].ofd_id;
     int new_host_fd = dup(src_host_fd);
     if (new_host_fd < 0) {
         epoll_instance_unref_locked(inst);
@@ -1161,14 +1169,19 @@ int epoll_dup_fd(int src_fd,
 
     /* Publish type, host_fd, the shared dir, and flags in one fd_lock critical
      * section (fd_alloc_dir_*), so the slot is never observable as FD_EPOLL
-     * with a NULL dir -- matching sys_epoll_create1.
+     * with a NULL dir -- matching sys_epoll_create1. The access mode comes from
+     * fd_type_accmode on publish, the same as it does there.
      */
-    int lflags = linux_flags & LINUX_O_CLOEXEC;
-    int new_guest_fd = fixed_slot
-                           ? fd_alloc_dir_at(fixed_guest_fd, FD_EPOLL,
-                                             new_host_fd, NULL, inst, lflags)
-                           : fd_alloc_dir_from(min_guest_fd, FD_EPOLL,
-                                               new_host_fd, NULL, inst, lflags);
+    int lflags = src_flags | (linux_flags & LINUX_O_CLOEXEC);
+
+    /* The new slot aliases the source's description: the allocator installs its
+     * ofd_id, foreign_description and nonblock_owned inside the window that
+     * publishes the slot, rather than this path patching them on afterwards.
+     */
+    fd_alias_spec_t spec = fd_alias_identity(src_ofd_id, 0);
+    int new_guest_fd = fd_alloc_alias_dir(
+        &spec, fixed_slot ? fixed_guest_fd : -1, min_guest_fd, FD_EPOLL,
+        new_host_fd, NULL, inst, lflags);
     if (new_guest_fd < 0) {
         /* fd_alloc_dir_at fails only when fixed_guest_fd is out of range or
          * over RLIMIT_NOFILE; dup2/dup3 report that as EBADF, not the EMFILE
@@ -1183,6 +1196,7 @@ int epoll_dup_fd(int src_fd,
         errno = saved_errno;
         return -1;
     }
+
     return new_guest_fd;
 }
 
@@ -1290,6 +1304,10 @@ int64_t sys_epoll_create1(int flags)
         return -LINUX_ENOMEM;
     }
 
+    /* No access mode here: FD_EPOLL is in fd_type_accmode, and every publish
+     * forces the mode that table names back in (fd_flags_with_accmode), so a
+     * creator naming it again is a second place for one fact to live.
+     */
     int lflags = 0;
     if (flags & LINUX_EPOLL_CLOEXEC)
         lflags |= LINUX_O_CLOEXEC;

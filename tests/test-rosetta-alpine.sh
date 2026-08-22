@@ -33,7 +33,6 @@ esac
 
 FIXTURES="${FIXTURES_DIR:-externals/test-fixtures}"
 STATICBIN_LONG="${FIXTURES}/x86_64-musl/staticbin/bin"
-ROOTFS="${FIXTURES}/x86_64-musl/rootfs"
 ROSETTA_PATH="${MATRIX_ROSETTA_TRANSLATOR:-/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta}"
 
 SHORTDIR=/tmp/elfuse-ra
@@ -46,9 +45,6 @@ DATA="${SHORTDIR}/data"
 # shellcheck source=tests/lib/report.sh
 . "$(dirname "$0")/lib/report.sh"
 
-pass=0
-fail=0
-skip=0
 total=0
 
 # Pre-flight.

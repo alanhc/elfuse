@@ -285,6 +285,11 @@ static int parse_fd_magiclink(const char *path)
     return path_parse_proc_name(rest);
 }
 
+int path_fd_magiclink_guest_fd(const char *path)
+{
+    return parse_fd_magiclink(path);
+}
+
 int path_fd_magiclink_dup(const char *path)
 {
     int fd = parse_fd_magiclink(path);

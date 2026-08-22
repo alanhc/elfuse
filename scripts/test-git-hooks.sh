@@ -521,10 +521,14 @@ if ! (
     # leaves the hook writing into a closed pipe, and the 141 that comes back
     # would fail this check on the run where the note was actually printed.
     out=$(bash scripts/git-pre-commit.sh 2>&1)
+
+    # Ending the subshell on the case, rather than on a plain command, is what
+    # shfmt 3.13 mis-prints: it drops the ";" before "then" and leaves a script
+    # that no longer parses. Spelling the verdict out keeps the reformat stable.
     case "$out" in
-        *"format and API checks skipped"*) ;;
-        *) exit 1 ;;
+        *"format and API checks skipped"*) exit 0 ;;
     esac
+    exit 1
 ) > /dev/null 2>&1; then
     echo 'FAIL: unreachable .ci checkers are skipped without a word' >&2
     failures=$((failures + 1))

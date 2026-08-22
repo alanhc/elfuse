@@ -4985,14 +4985,12 @@ int mmap_fork_prepare_anon_shared(guest_t *g,
         uint64_t len = end - start;
         uint64_t aligned_len = ALIGN_UP(len, hps);
 
-        char tmpl[] = "/tmp/elfuse-anonsh-XXXXXX";
-        int fd = mkstemp(tmpl);
+        int fd = tmpfile_anon("anonsh");
         if (fd < 0) {
-            log_warn("fork-prep: mkstemp for anon-shared region: %s",
+            log_warn("fork-prep: temp file for anon-shared region: %s",
                      strerror(errno));
             continue;
         }
-        unlink(tmpl);
         if (ftruncate(fd, (off_t) aligned_len) < 0) {
             log_warn("fork-prep: ftruncate(%llu) failed: %s",
                      (unsigned long long) aligned_len, strerror(errno));

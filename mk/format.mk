@@ -31,10 +31,16 @@ check-format: check-syscall-dispatch
 	@echo "  MATRIX  skip lists"
 	$(Q)bash .ci/check-matrix-lists.sh
 	$(call require-tool,shellcheck,brew install shellcheck)
+	@# -x follows the "# shellcheck source=..." directives the scripts already
+	@# carry. Without it those directives are inert, every variable a sourced
+	@# lib sets reads as unassigned, and the counters in tests/lib/report.sh
+	@# had to be duplicated into each of its twelve callers to keep the gate
+	@# quiet -- which then failed the other way, as twelve assignments nobody
+	@# in that file uses.
 	@printf "  SHCHK   %d scripts\n" $(words $(SHELL_SCRIPTS))
 	@fail=0; \
 	for f in $(SHELL_SCRIPTS); do \
-		if shellcheck --severity=warning "$$f" 2>&1; then \
+		if shellcheck -x --severity=warning "$$f" 2>&1; then \
 			printf "  $(GREEN)OK$(RESET) %s\n" "$$f"; \
 		else \
 			printf "  $(RED)FAIL$(RESET) %s\n" "$$f"; \

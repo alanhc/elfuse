@@ -12,9 +12,18 @@ SYSROOT="${2:?Usage: $0 <elfuse-binary> <sysroot-dir> <guest-test-binary>}"
 TEST_BIN="${3:?Usage: $0 <elfuse-binary> <sysroot-dir> <guest-test-binary>}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TEST_LABEL_WIDTH=14
 TEST_TIMEOUT=20
 source "$SCRIPT_DIR/lib/test-runner.sh"
+
+# This suite reports its own tallies rather than sourcing lib/report.sh, so it
+# has to declare them. All four were only ever incremented, never set: a run
+# with no failures reached "[ "$fail" -gt 0 ]" with fail unset and bash answered
+# "integer expression expected" on stderr, and the summary line printed empty
+# fields for skip and xfail, which nothing here ever touches.
+pass=0
+fail=0
+skip=0
+expected_fail=0
 
 TEST_RUNNER=("$ELFUSE" --sysroot "$SYSROOT")
 

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <errno.h>
 #include <stddef.h>
 #include <time.h>
@@ -30,6 +31,7 @@
 #include "syscall/linux-wire.h"
 #include "syscall/fd.h"
 #include "syscall/internal.h"
+#include "syscall/io.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
@@ -222,8 +224,7 @@ int64_t sys_timerfd_create(int clockid, int flags)
      * access mode without re-deriving it.
      */
     fd_publish_linux_flags(
-        gfd, LINUX_O_RDWR |
-                 ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+        gfd, ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
                  ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
     return gfd;
 }
@@ -407,6 +408,7 @@ int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva)
     return 0;
 }
 
+
 /* Read from timerfd: collect pending timer events from the kqueue, return
  * accumulated expiration count as uint64_t. Resets count to 0 after read (Linux
  * timerfd semantics).
@@ -416,14 +418,7 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     if (count < 8)
         return -LINUX_EINVAL;
 
-    /* Snapshot the NONBLOCK status under fd_lock before sfd_lock to match the
-     * documented lock order (fd_lock=3 < sfd_lock=5a). The kqueue host fd
-     * rejects fcntl(F_SETFL, O_NONBLOCK) on macOS, so the flag lives in
-     * fd_table[guest_fd].linux_flags rather than on the host fd.
-     */
-    pthread_mutex_lock(&fd_lock);
-    bool nonblock = fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK;
-    pthread_mutex_unlock(&fd_lock);
+    bool nonblock = fd_guest_nonblock(guest_fd);
 
     pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(guest_fd);
@@ -453,28 +448,44 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             return -LINUX_EAGAIN;
         }
 
-        /* Blocking: release lock, wait for the timer, re-lock. Another thread
-         * may close the fd while the timerfd wait is active -- kevent() returns
-         * EBADF in that case, and the code re-validates the slot.
+        /* Blocking: release the lock and wait for the timer, interruptibly. A
+         * kevent() with a NULL timeout parks this vCPU thread where neither
+         * hv_vcpus_exit nor the wakeup pipe reaches it, so an execve teardown
+         * counts it as a sibling that will not leave; a kqueue descriptor is
+         * pollable, so the wait can watch it alongside the wakeup pipe and
+         * collect with a zero timeout once it says there is something. Another
+         * thread may close the fd meanwhile, which the re-validation below
+         * catches. Loop on the expiration count rather than on one wait: the
+         * collect below runs with a zero timeout, so a sibling reading this
+         * same timerfd can take the event the wait reported and leave nothing
+         * here. A blocking read owes the guest a wait, not a spurious EAGAIN,
+         * which is what the NULL-timeout kevent this replaced could not
+         * produce.
          */
-        struct kevent kev;
-        pthread_mutex_unlock(&sfd_lock);
-        int nev = kevent(kq, NULL, 0, &kev, 1, NULL);
-        pthread_mutex_lock(&sfd_lock);
-        /* Re-validate: slot may have been freed by timerfd_close() */
-        if (timerfd_state[slot].guest_fd != guest_fd) {
+        while (timerfd_state[slot].expirations == 0) {
+            struct kevent kev;
             pthread_mutex_unlock(&sfd_lock);
-            return -LINUX_EBADF;
-        }
-        if (nev > 0) {
-            uint64_t fires = (uint64_t) kev.data;
-            if (fires == 0)
-                fires = 1;
-            timerfd_state[slot].expirations += fires;
-        }
-        if (timerfd_state[slot].expirations == 0) {
-            pthread_mutex_unlock(&sfd_lock);
-            return -LINUX_EAGAIN;
+            int64_t waited = io_wait_fd_or_interrupted(kq, POLLIN);
+            if (waited < 0)
+                return waited;
+            struct timespec collect = {0, 0};
+            int nev = kevent(kq, NULL, 0, &kev, 1, &collect);
+            pthread_mutex_lock(&sfd_lock);
+            /* Re-validate: slot may have been freed by timerfd_close() */
+            if (timerfd_state[slot].guest_fd != guest_fd) {
+                pthread_mutex_unlock(&sfd_lock);
+                return -LINUX_EBADF;
+            }
+            if (nev < 0 && errno != EINTR) {
+                pthread_mutex_unlock(&sfd_lock);
+                return linux_errno();
+            }
+            if (nev > 0) {
+                uint64_t fires = (uint64_t) kev.data;
+                if (fires == 0)
+                    fires = 1;
+                timerfd_state[slot].expirations += fires;
+            }
         }
     }
 
@@ -560,7 +571,6 @@ static struct {
     int pipe_wr;      /* Write end of self-pipe */
     uint64_t counter; /* Accumulated event counter */
     int semaphore;    /* EFD_SEMAPHORE mode */
-    int nonblock;     /* O_NONBLOCK */
 } eventfd_state[EVENTFD_MAX];
 
 static int eventfd_owner[FD_TABLE_SIZE]; /* guest_fd -> slot, or -1 */
@@ -659,12 +669,16 @@ int64_t sys_eventfd2(unsigned int initval, int flags)
     eventfd_state[slot].pipe_wr = pipefd[1];
     eventfd_state[slot].counter = (uint64_t) initval;
     eventfd_state[slot].semaphore = (flags & LINUX_EFD_SEMAPHORE) ? 1 : 0;
-    eventfd_state[slot].nonblock = (flags & LINUX_EFD_NONBLOCK) ? 1 : 0;
     eventfd_owner[gfd] = slot;
     pthread_mutex_unlock(&sfd_lock);
 
-    fd_publish_linux_flags(gfd,
-                           (flags & LINUX_EFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
+    /* Linux opens the eventfd inode O_RDWR (anon_inode_getfd in fs/eventfd.c),
+     * and O_NONBLOCK lives here rather than on the internal pipe, which stays
+     * nonblocking so the emulation can do its own waiting.
+     */
+    fd_publish_linux_flags(
+        gfd, ((flags & LINUX_EFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                 ((flags & LINUX_EFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
 
     /* If initial counter > 0, make the pipe readable so poll sees it */
     if (initval > 0) {
@@ -734,6 +748,16 @@ int eventfd_dup_fd(int src_fd,
         return -1;
     }
     eventfd_state[slot].refcount++;
+
+    /* dup(2) hands back a second name for one open file description, so the
+     * alias has to carry the source's per-description state: the status flags
+     * (an eventfd keeps O_NONBLOCK and its access mode in the shadow, because
+     * the host fd behind it is elfuse's own pipe) and the ofd_id every alias
+     * sweep matches on. Rebuilding linux_flags from the dup argument alone left
+     * a dup of an EFD_NONBLOCK eventfd blocking forever on an empty read.
+     */
+    int src_flags = fd_table[src_fd].linux_flags & FD_DESCRIPTION_FLAGS;
+    uint64_t src_ofd_id = fd_table[src_fd].ofd_id;
     int new_host_fd = dup(eventfd_state[slot].pipe_rd);
     int original_pipe_rd = eventfd_state[slot].pipe_rd;
     if (new_host_fd < 0)
@@ -745,13 +769,15 @@ int eventfd_dup_fd(int src_fd,
 
     /* Publish the destination fd with eventfd_close as cleanup. The
      * eventfd_owner mapping is still -1, so a racing close here observes owner
-     * == -1 and does nothing; we detect that below.
+     * == -1 and does nothing; we detect that below. Aliases the source's
+     * description, so the allocator installs its identity with the slot rather
+     * than this path patching it on afterwards.
      */
-    int new_guest_fd =
-        fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, FD_EVENTFD,
-                                         new_host_fd, eventfd_close, NULL)
-                   : fd_alloc_from_relaxed(min_guest_fd, FD_EVENTFD,
-                                           new_host_fd, eventfd_close, NULL);
+    fd_alias_spec_t spec =
+        fd_alias_identity(src_ofd_id, src_flags | linux_flags);
+    int new_guest_fd = fd_alloc_alias_relaxed(
+        &spec, fixed_slot ? fixed_guest_fd : -1, min_guest_fd, FD_EVENTFD,
+        new_host_fd, eventfd_close, NULL);
     if (new_guest_fd < 0) {
         close(new_host_fd);
         pthread_mutex_lock(&sfd_lock);
@@ -791,7 +817,6 @@ int eventfd_dup_fd(int src_fd,
         return -1;
     }
     eventfd_owner[new_guest_fd] = slot;
-    fd_table[new_guest_fd].linux_flags = linux_flags;
     pthread_mutex_unlock(&sfd_lock);
     pthread_mutex_unlock(&fd_lock);
     return new_guest_fd;
@@ -805,6 +830,8 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     if (count < 8)
         return -LINUX_EINVAL;
 
+    bool nonblock = fd_guest_nonblock(guest_fd);
+
     pthread_mutex_lock(&sfd_lock);
     int slot = eventfd_find(guest_fd);
     if (slot < 0) {
@@ -813,43 +840,43 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     }
 
     if (eventfd_state[slot].counter == 0) {
-        if (eventfd_state[slot].nonblock) {
+        if (nonblock) {
             pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EAGAIN;
         }
 
-        /* Blocking mode: release lock, block on pipe, re-lock. The pipe is
-         * O_NONBLOCK, so temporarily make it blocking so read() actually waits
-         * for the writer. Matches signalfd_read. Another thread may close the
-         * fd while the eventfd wait is active; read() returns EBADF in that
-         * case, and the code re-validates the slot.
+        /* Blocking mode: release the lock and wait for the writer, without
+         * parking. The pipe stays nonblocking and the wait polls it alongside
+         * the wakeup pipe, so an execve teardown or a guest signal ends it;
+         * flipping the pipe to blocking for a read left this vCPU thread
+         * somewhere neither could reach. Another thread may close the fd
+         * meanwhile, which the slot re-validation below catches.
          */
-        int rd_fd = eventfd_state[slot].pipe_rd;
-        pthread_mutex_unlock(&sfd_lock);
-
-        uint8_t byte;
-        fd_update_status_flag(rd_fd, O_NONBLOCK,
-                              false); /* Make temporarily blocking */
-        ssize_t r = read(rd_fd, &byte, 1);
-        fd_set_nonblock(rd_fd); /* Restore non-blocking */
-        if (r < 0)
-            return linux_errno();
-
-        pthread_mutex_lock(&sfd_lock);
-
-        /* Re-validate via the owner table, not eventfd_state[slot].guest_fd:
-         * dup'd aliases bind multiple guest_fds to the same slot, so a
-         * legitimate caller's guest_fd may not equal the primary owner.
-         */
-        if (eventfd_owner[guest_fd] != slot ||
-            eventfd_state[slot].refcount <= 0) {
+        while (eventfd_state[slot].counter == 0) {
+            int rd_fd = eventfd_state[slot].pipe_rd;
             pthread_mutex_unlock(&sfd_lock);
-            return -LINUX_EBADF;
-        }
-        /* Counter was updated by the writer; re-check */
-        if (eventfd_state[slot].counter == 0) {
-            pthread_mutex_unlock(&sfd_lock);
-            return -LINUX_EAGAIN;
+
+            int64_t waited = io_wait_fd_or_interrupted(rd_fd, POLLIN);
+            if (waited < 0)
+                return waited;
+
+            uint8_t byte;
+            ssize_t r = read(rd_fd, &byte, 1);
+            if (r < 0 && errno != EAGAIN)
+                return linux_errno();
+
+            pthread_mutex_lock(&sfd_lock);
+
+            /* Re-validate via the owner table, not
+             * eventfd_state[slot].guest_fd: dup'd aliases bind multiple
+             * guest_fds to the same slot, so a legitimate caller's guest_fd may
+             * not equal the primary owner.
+             */
+            if (eventfd_owner[guest_fd] != slot ||
+                eventfd_state[slot].refcount <= 0) {
+                pthread_mutex_unlock(&sfd_lock);
+                return -LINUX_EBADF;
+            }
         }
     }
 
@@ -862,17 +889,45 @@ int64_t eventfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
         eventfd_state[slot].counter = 0;
     }
 
-    /* Drain pipe readability if counter is now 0. The pipe is O_NONBLOCK (see
-     * sys_eventfd2), so the loop returns once the pipe drains. readv (single
-     * iovec) is functionally identical to read here but bypasses clang's
-     * unix.BlockInCriticalSection checker, which flags read() while a pthread
-     * mutex is held.
+    /* The pipe is what poll, epoll and the blocking read above all watch, so
+     * its readability has to mean the same thing as counter > 0 rather than
+     * merely record the moment the counter left zero.
+     *
+     * Draining at zero is the whole story for a plain eventfd, whose read takes
+     * the counter to zero every time, and only half of it for EFD_SEMAPHORE,
+     * whose read decrements by one. A counter of 2 read once stays readable
+     * while the pipe goes empty -- the reader consumed the single byte
+     * eventfd_write posts on the 0-to-nonzero edge, and that edge will not come
+     * again until the counter returns to zero. Anything waiting on the pipe
+     * then sleeps through a count it was entitled to. Measured: two threads
+     * reading one EFD_SEMAPHORE eventfd hang here in three runs out of five and
+     * complete five out of five on the reference kernel.
+     *
+     * The pipe is O_NONBLOCK (see sys_eventfd2), so the drain loop ends once it
+     * is empty. readv with a single iovec is functionally identical to read but
+     * bypasses clang's unix.BlockInCriticalSection checker, which flags read()
+     * while a pthread mutex is held.
      */
+    uint8_t drain;
+    struct iovec iov = {.iov_base = &drain, .iov_len = 1};
     if (eventfd_state[slot].counter == 0) {
-        uint8_t drain;
-        struct iovec iov = {.iov_base = &drain, .iov_len = 1};
         while (readv(eventfd_state[slot].pipe_rd, &iov, 1) > 0)
             ;
+    } else if (eventfd_state[slot].semaphore) {
+        /* Semaphore mode only: the plain path cannot reach here, so nothing
+         * pays for this but the case that needs it. Drain first so the re-arm
+         * cannot pile bytes up on a pipe that already had one.
+         */
+        while (readv(eventfd_state[slot].pipe_rd, &iov, 1) > 0)
+            ;
+        uint8_t byte = 1;
+        ssize_t wr;
+        do {
+            wr = write(eventfd_state[slot].pipe_wr, &byte, 1);
+        } while (wr < 0 && errno == EINTR);
+        if (wr < 0)
+            log_error("eventfd_read: re-arm failed: %s (gfd=%d pipe_wr=%d)",
+                      strerror(errno), guest_fd, eventfd_state[slot].pipe_wr);
     }
     pthread_mutex_unlock(&sfd_lock);
 
@@ -987,7 +1042,6 @@ static struct {
     int pipe_rd;   /* Read end for poll/epoll readiness */
     int pipe_wr;   /* Write end for signaling */
     uint64_t mask; /* Signal mask (bitmask of signals to accept) */
-    int nonblock;  /* O_NONBLOCK */
 } signalfd_state[SIGNALFD_MAX];
 
 void signalfd_init(void)
@@ -1089,11 +1143,14 @@ int64_t sys_signalfd4(guest_t *g,
     signalfd_state[slot].pipe_rd = pipefd[0];
     signalfd_state[slot].pipe_wr = pipefd[1];
     signalfd_state[slot].mask = mask;
-    signalfd_state[slot].nonblock = (flags & LINUX_SFD_NONBLOCK) ? 1 : 0;
     pthread_mutex_unlock(&sfd_lock);
 
-    fd_publish_linux_flags(gfd,
-                           (flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
+    /* Linux opens the signalfd inode O_RDWR (anon_inode_getfd in
+     * fs/signalfd.c); same reasoning as eventfd for O_NONBLOCK.
+     */
+    fd_publish_linux_flags(
+        gfd, ((flags & LINUX_SFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                 ((flags & LINUX_SFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
 
     return gfd;
 }
@@ -1122,11 +1179,17 @@ int64_t signalfd_read(int guest_fd,
                       uint64_t buf_gva,
                       uint64_t count)
 {
+    int nonblock;
 retry:
     /* Capture slot state under sfd_lock, then release BEFORE calling
      * signal_get_state() which acquires sig_lock(4). Holding sfd_lock(5a) while
      * taking sig_lock(4) would violate lock ordering.
+     *
+     * Re-read per attempt: a sibling can change the flag while this one is
+     * parked, and the block-or-report decision below is made fresh each round.
      */
+    nonblock = fd_guest_nonblock(guest_fd);
+
     pthread_mutex_lock(&sfd_lock);
     int slot = signalfd_find(guest_fd);
     if (slot < 0) {
@@ -1135,7 +1198,6 @@ retry:
     }
 
     uint64_t mask = signalfd_state[slot].mask;
-    int nonblock = signalfd_state[slot].nonblock;
     int pipe_rd = signalfd_state[slot].pipe_rd;
     size_t max_signals = count / sizeof(linux_signalfd_siginfo_t);
     if (max_signals == 0) {
@@ -1179,16 +1241,40 @@ retry:
         if (nonblock)
             goto no_pending;
 
-        /* Blocking mode: wait for signalfd_notify() to write to the pipe.
-         * Re-validate slot after wake.
+        /* Blocking mode: wait for signalfd_notify() to write to the pipe, and
+         * wait interruptibly. Making the pipe blocking for the duration of a
+         * read parks this vCPU thread in a host call that neither hv_vcpus_exit
+         * nor the wakeup pipe reaches, which is the failure this tree removed
+         * from every transfer path; a synthetic reader is no different. The
+         * pipe stays nonblocking and the wait polls it with the wakeup pipe, so
+         * teardown and guest signals both end it.
          */
-        uint8_t byte;
+        int64_t waited = io_wait_fd_or_interrupted(pipe_rd, POLLIN);
+        if (waited < 0) {
+            /* Both allocations, like every other exit here: they are made
+             * together when the guest asks for more signals than the stack
+             * arrays hold, and this is the one path that was added after the
+             * rest of the function agreed on that.
+             */
+            free(heap);
+            free(src_heap);
+            return waited;
+        }
 
-        /* pipe_rd is O_NONBLOCK, so temporarily make it blocking for the wait
-         */
-        fcntl(pipe_rd, F_SETFL, 0);
+        uint8_t byte;
         ssize_t r = read(pipe_rd, &byte, 1);
-        fcntl(pipe_rd, F_SETFL, O_NONBLOCK);
+
+        /* The pipe stays nonblocking, so a sibling reading this same signalfd
+         * can take the byte the wait reported and leave EAGAIN here. A blocking
+         * read owes the guest a wait, not a spurious EAGAIN -- the same rule
+         * the drained-signal recheck below applies, and the reason the read
+         * used to be run with the pipe flipped blocking.
+         */
+        if (r < 0 && errno == EAGAIN) {
+            free(heap);
+            free(src_heap);
+            goto retry;
+        }
         if (r <= 0)
             goto no_pending;
 

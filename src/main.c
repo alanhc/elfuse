@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -523,6 +524,20 @@ int main(int argc, char **argv)
      */
     if (host_nofile_ensure_capacity() < 0)
         goto cleanup;
+
+    /* A host write to a pipe or socket whose reader is gone raises SIGPIPE in
+     * this process, and the default action is to die. Every such write is made
+     * on the guest's behalf, so the guest's own SIGPIPE is what the failure
+     * means: ignoring it here lets the write return EPIPE, which the transfer
+     * paths turn into a queued guest SIGPIPE (io_write_result).
+     *
+     * Without this a guest that writes to a pipe nobody is reading -- an
+     * ordinary shell pipeline whose reader exits first, `yes | head` -- takes
+     * the whole VM down with it, before the guest's own handler can run.
+     * Sockets were already covered one at a time by SO_NOSIGPIPE; pipes and
+     * fifos have no such option, so the disposition has to carry it.
+     */
+    signal(SIGPIPE, SIG_IGN);
 
     /* Block the vCPU-preemption signals and start the sigwait thread before any
      * vCPU thread exists, so both the normal path and the fork-child path below

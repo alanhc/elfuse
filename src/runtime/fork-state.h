@@ -19,7 +19,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C464FU /* "ELFO" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C4650U /* "ELFP" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -110,6 +110,14 @@ typedef struct {
     int32_t guest_fd, type, linux_flags, seals;
     uint64_t ofd_id;
     int32_t fasync_owner_type, fasync_owner;
+
+    /* The child rebuilds its table from descriptions this process already
+     * holds, so it inherits the status-flag answers rather than probing them
+     * again: whether the description came from outside elfuse (the launcher's
+     * stdio, or an alias of it) and whether elfuse owns its O_NONBLOCK. See
+     * fd_alias_carried.
+     */
+    int32_t foreign_description, nonblock_owned;
     char proc_path[FD_VIRTUAL_PATH_MAX];
 } ipc_fd_entry_t;
 

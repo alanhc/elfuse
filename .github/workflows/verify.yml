@@ -123,6 +123,31 @@ jobs:
           # empty and the macOS job does not start at all.
           extra=$(comm -23 <(printf '%s\n' "$targets" | sort -u) \
                            <(printf '%s\n' "$mutants" | sort -u))
+          # Write the split to the run summary. Someone reading a skipped
+          # "Frama-C WP proofs" job needs to see that its targets moved to the
+          # mutation legs rather than nowhere, without reading this file.
+          {
+            echo "### Proof scope"
+            echo
+            if [ -n "$mutants" ]; then
+              echo "Proved and mutated, in the mutation legs (each leg proves"
+              echo "its target unmutated first, as the control):"
+              echo
+              printf '%s\n' "$mutants" | sed 's/^/- /'
+            else
+              echo "No target's mutation verdict can change in this diff."
+            fi
+            echo
+            if [ -n "$extra" ]; then
+              echo "Proved in the standalone job, which nothing else covers:"
+              echo
+              printf '%s\n' "$extra" | sed 's/^/- /'
+            else
+              echo "The standalone proof job has nothing left to prove and"
+              echo "skips; every target above is proved in its mutation leg."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
           # rules is already prefixed, so the prove job needs no shell of its
           # own; mutants is JSON because it is a matrix. The guard matters:
           # printf runs its format once even with no arguments, so an empty
@@ -185,7 +210,11 @@ jobs:
   # a proof-only job would quietly stop enforcing half of what anyone requiring
   # it expected. The combined verdict keeps that name; see the last job here.
   verify-proofs:
-    name: Frama-C WP proofs
+    # The name says which targets, because the skip is the common case and a
+    # bare "Frama-C WP proofs: skipped" on a diff that edits a proof reads as
+    # though the proofs did not run. They did, inside the mutation legs, each
+    # of which proves its target unmutated before it mutates anything.
+    name: Frama-C WP proofs (targets no mutation leg covers)
     needs: proof-targets
     # Nothing to prove, so do not boot a macOS runner for it.
     if: ${{ needs.proof-targets.outputs.empty != 'true' }}

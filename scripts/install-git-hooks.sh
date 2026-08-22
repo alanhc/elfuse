@@ -75,7 +75,7 @@ if [ "$mode" = uninstall ]; then
                 say RM "$name"
                 break
             fi
-        done <<EOF
+        done << EOF
 $(git worktree list --porcelain | sed -n 's/^worktree //p')
 EOF
     done
@@ -90,7 +90,10 @@ for hook in "$script_dir"/git-*.sh; do
     source="$root/scripts/${hook##*/}"
     [ -e "$source" ] || source=$hook
 
-    mkdir -p "$hooks" || { failed=1; continue; }
+    mkdir -p "$hooks" || {
+        failed=1
+        continue
+    }
     if [ -e "$target" ] || [ -L "$target" ]; then
         say KEEP "$target"
     elif ln -s "$source" "$target" 2> /dev/null; then

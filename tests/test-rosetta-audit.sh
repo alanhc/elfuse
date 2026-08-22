@@ -13,7 +13,6 @@ case "$ELFUSE_INPUT" in
     *) ELFUSE="$(pwd)/$ELFUSE_INPUT" ;;
 esac
 
-FIXTURES="${FIXTURES_DIR:-externals/test-fixtures}"
 ROSETTA_PATH="${MATRIX_ROSETTA_TRANSLATOR:-/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta}"
 AUDIT_BIN="$(pwd)/tests/fixtures/rosetta/x86_64-rosetta-audit"
 TLS0_BIN="$(pwd)/tests/fixtures/rosetta/x86_64-rosetta-tls0"
@@ -21,9 +20,6 @@ TLS0_BIN="$(pwd)/tests/fixtures/rosetta/x86_64-rosetta-tls0"
 # shellcheck source=tests/lib/report.sh
 . "$(dirname "$0")/lib/report.sh"
 
-pass=0
-fail=0
-skip=0
 total=0
 
 if [ ! -x "$ROSETTA_PATH" ]; then

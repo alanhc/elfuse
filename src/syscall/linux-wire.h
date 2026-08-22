@@ -458,8 +458,11 @@ typedef struct {
 #define STATX_BASIC_STATS 0x07FFU
 #define STATX_BTIME 0x0800U
 
-/* FD table. */
-#define FD_TABLE_SIZE 1024
+/* FD table. The bound itself lives in elfuse-limits.h, which is also where the
+ * host descriptor reserve is derived from it; two copies of the same 1024 would
+ * be a legal redefinition rather than a build error, so this includes it.
+ */
+#include "elfuse-limits.h"
 
 #define FD_CLOSED 0
 #define FD_STDIO 1
@@ -569,6 +572,17 @@ typedef struct {
                      * once at allocation via fstat so the interruptible wait
                      * path can skip fds that never block.
                      */
+    bool foreign_description; /* The open file description behind this fd came
+                               * from outside elfuse -- the launcher's stdio,
+                               * or an alias of it -- so its status flags are
+                               * not elfuse's to change. Inherited by every
+                               * alias; see fd_init_entry.
+                               */
+    bool nonblock_owned; /* elfuse set O_NONBLOCK on the host fd and emulates
+                          * the guest's blocking semantics on top of it, so
+                          * linux_flags -- not the host flag -- is what the
+                          * guest asked for. See fd_init_entry.
+                          */
     int32_t fasync_owner_type; /* FASYNC_OWNER_* recipient kind (0 = none) */
     int32_t fasync_owner;      /* pid/pgrp/tid for SIGIO/SIGURG delivery */
     sock_opt_cache_t sock; /* Socket option cache (zeroed for non-sockets) */

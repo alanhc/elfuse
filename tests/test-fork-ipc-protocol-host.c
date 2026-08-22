@@ -20,9 +20,10 @@
 #define PREVIOUS_ELFL_MAGIC 0x454C464CU
 #define PREVIOUS_ELFM_MAGIC 0x454C464DU
 #define PREVIOUS_ELFN_MAGIC 0x454C464EU
+#define PREVIOUS_ELFO_MAGIC 0x454C464FU
 
-_Static_assert(FORK_IPC_PROTOCOL_MAGIC == 0x454C464FU,
-               "fork IPC protocol magic must remain ELFO until the next "
+_Static_assert(FORK_IPC_PROTOCOL_MAGIC == 0x454C4650U,
+               "fork IPC protocol magic must remain ELFP until the next "
                "incompatible wire-format change");
 _Static_assert(IPC_MAGIC_HEADER == FORK_IPC_PROTOCOL_MAGIC,
                "header magic must be the protocol identity");
@@ -34,6 +35,8 @@ _Static_assert(FORK_IPC_PROTOCOL_MAGIC != PREVIOUS_ELFM_MAGIC,
                "start_stack header field requires rejecting ELFM peers");
 _Static_assert(FORK_IPC_PROTOCOL_MAGIC != PREVIOUS_ELFN_MAGIC,
                "region fork metadata requires rejecting ELFN peers");
+_Static_assert(FORK_IPC_PROTOCOL_MAGIC != PREVIOUS_ELFO_MAGIC,
+               "per-fd description ownership requires rejecting ELFO peers");
 _Static_assert(IPC_MAGIC_SENTINEL != FORK_IPC_PROTOCOL_MAGIC,
                "process-state sentinel must not alias the header protocol");
 

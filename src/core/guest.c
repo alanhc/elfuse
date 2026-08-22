@@ -519,11 +519,9 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
          * silently to MAP_ANON; fork will then use the IPC region-copy path
          * instead of SCM_RIGHTS fd passing.
          */
-        char tmppath[] = "/tmp/elfuse-XXXXXX";
         t0 = startup_trace_now_ns();
-        int sfd = mkstemp(tmppath);
+        int sfd = tmpfile_anon("slab");
         if (sfd >= 0) {
-            unlink(tmppath); /* Unlink immediately; fd keeps file alive */
             if (ftruncate(sfd, (off_t) try_size) == 0) {
                 void *p = mmap(g->host_base, try_size, PROT_READ | PROT_WRITE,
                                MAP_SHARED | MAP_FIXED, sfd, 0);

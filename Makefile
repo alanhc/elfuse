@@ -277,6 +277,14 @@ $(BUILD_DIR)/test-guest-env-host: $(BUILD_DIR)/test-guest-env-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+# test-stdio-nonblock-host launches elfuse with a pipe as stdin and checks the
+# flags on its own end of that pipe afterwards, so it is a host binary. It sits
+# outside the guest-binary guard below because check requires it through
+# CHECK_HOST_UNIT_BINS whether or not the guest binaries are pre-built.
+$(BUILD_DIR)/test-stdio-nonblock-host: tests/test-stdio-nonblock-host.c | $(BUILD_DIR)
+	@echo "  CC      $<"
+	$(Q)$(CC) $(CFLAGS) -Itests -o $@ $<
+
 # Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
 
@@ -297,6 +305,29 @@ CROSS_TEST_CFLAGS = -D_GNU_SOURCE -static -O2 -MMD -MP
 $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 	@echo "  CROSS   $<"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $<
+
+# test-eventfd-semaphore-contended races two blocking readers on one eventfd.
+$(BUILD_DIR)/test-eventfd-semaphore-contended: \
+		tests/test-eventfd-semaphore-contended.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-socket-accept-contended parks two threads on one listener.
+$(BUILD_DIR)/test-socket-accept-contended: \
+		tests/test-socket-accept-contended.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-socket-waitall drips the tail of a MSG_WAITALL request from a second
+# thread.
+$(BUILD_DIR)/test-socket-waitall: tests/test-socket-waitall.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-dup-setfl-race races a dup against an F_SETFL sweep from a second thread.
+$(BUILD_DIR)/test-dup-setfl-race: tests/test-dup-setfl-race.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
 # test-pthread needs -lpthread
 $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
@@ -328,6 +359,16 @@ $(BUILD_DIR)/test-thread-churn: tests/test-thread-churn.c | $(BUILD_DIR)
 $(BUILD_DIR)/test-threaded-exec: tests/test-threaded-exec.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-sigpipe needs a thread to close the reader mid-write.
+$(BUILD_DIR)/test-sigpipe: tests/test-sigpipe.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -Itests -o $@ $< -lpthread
+
+# test-pipe-steal contends several readers for one byte, then execs on top.
+$(BUILD_DIR)/test-pipe-steal: tests/test-pipe-steal.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -Itests -o $@ $< -lpthread
 
 # test-exec-handoff parks the leader while a worker hands it a failing execve.
 $(BUILD_DIR)/test-exec-handoff: tests/test-exec-handoff.c | $(BUILD_DIR)
@@ -444,6 +485,12 @@ $(BUILD_DIR)/test-lowbase-mem-300000: tests/test-lowbase-mem.c | $(BUILD_DIR)
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -no-pie \
 		-Wl,-Ttext-segment=0x300000 -o $@ $<
 
+# bench-hot-guard grew a bulk lane with a draining thread and a lane that runs
+# with a sibling alive, so it needs -lpthread; the pattern rule does not link it.
+$(BUILD_DIR)/bench-hot-guard: tests/bench-hot-guard.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # bench-hot-guard-glibc is the dynamic-glibc twin of bench-hot-guard.
 # Built only when the cross-glibc toolchain ships its own sysroot
 # (so a host without that toolchain can still run the rest of the
@@ -460,7 +507,7 @@ ifneq ($(wildcard $(LINUX_TOOLCHAIN)/aarch64-unknown-linux-gnu/sysroot/.),)
 $(BUILD_DIR)/bench-hot-guard-glibc: tests/bench-hot-guard.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (dynamic glibc)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -DGUARD_USE_LIBC_CG=1 -O2 \
-		-o $@ $<
+		-o $@ $< -lpthread
 endif
 
 endif

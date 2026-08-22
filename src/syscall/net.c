@@ -47,6 +47,8 @@
 #define LINUX_MSG_OOB 0x01
 /* Linux MSG_DONTWAIT: recv/send skip the interruptible wait when set. */
 #define LINUX_MSG_DONTWAIT 0x40
+#define LINUX_MSG_PEEK 0x02
+#define LINUX_MSG_WAITALL 0x100
 
 /* Wait for a blocking socket op (recv/accept/connect/send) to become ready or
  * be interrupted by a guest signal, so a vCPU thread parked in the host call
@@ -56,14 +58,41 @@
  *
  * Returns 0 to proceed or a negative Linux errno (EINTR) to abort.
  */
-int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags)
+int64_t net_wait_or_interrupted(const fd_block_state_t *st,
+                                int host_fd,
+                                short events,
+                                int msg_flags)
 {
-    if (msg_flags & LINUX_MSG_DONTWAIT)
-        return 0;
-    int fl = fcntl(host_fd, F_GETFL);
-    if (fl < 0 || (fl & O_NONBLOCK))
+    if (!sock_op_should_block(st, host_fd, msg_flags))
         return 0;
     return io_wait_fd_or_interrupted(host_fd, events);
+}
+
+/* Is there anything for a zero-length receive to return, asked without
+ * consuming it?
+ *
+ * poll answers a different question -- "the descriptor is readable" -- and its
+ * answer is already stale by the time the guest's call runs: a sibling on the
+ * same socket can take the byte in between, and the zero-length recv then
+ * returns 0 to a guest that asked to block until something arrived. A one-byte
+ * MSG_PEEK asks the socket buffer itself, atomically against it, and takes
+ * nothing away from whoever ends up reading it.
+ *
+ * A peek of 0 is end of file, which is also a case where Linux lets a
+ * zero-length recv through, so it counts as ready. Same for a zero-length
+ * datagram, which is indistinguishable here and wants the same answer.
+ *
+ * Returns 1 ready, 0 nothing there, -1 with errno set on a real failure.
+ */
+static int zero_len_ready(int host_fd)
+{
+    char probe;
+    ssize_t n = recv(host_fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n >= 0)
+        return 1;
+    if (errno == EAGAIN)
+        return 0;
+    return -1;
 }
 
 /* Linux clamps a socket receive's low-water target to one byte (sock_rcvlowat
@@ -71,47 +100,106 @@ int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags)
  * blocks -- or fails EAGAIN when nonblocking -- instead of returning 0 the way
  * the macOS host call does. (read() is the exception: sock_read_iter returns 0
  * for a zero count, so sys_read stays untouched.) Gate the host call on
- * readability: an interruptible wait for blocking callers, a zero-timeout
- * readiness probe for nonblocking ones. EOF counts as readable in both, and the
- * host call then returns 0 like Linux.
+ * readability: an interruptible wait for blocking callers, an immediate probe
+ * for nonblocking ones, both answered by zero_len_ready below. EOF counts as
+ * ready in both, and the host call then returns 0 like Linux.
  *
  * Returns 0 to proceed or a negative Linux errno (EINTR/EAGAIN).
  */
-int64_t net_recv_zero_payload_gate(int host_fd, int msg_flags)
+
+int64_t net_recv_zero_payload_gate(const fd_block_state_t *st,
+                                   int host_fd,
+                                   int msg_flags)
 {
     /* Linux's urgent-data receive path never waits for readiness: with no
-     * urgent data queued, recv(MSG_OOB) fails EINVAL immediately whether the
-     * socket blocks or not (tcp_recv_urg, unix_stream_recv_urg; verified on
-     * 6.12). Pass straight to the host call, which fails the same way.
+     * urgent data queued, recv(MSG_OOB) fails immediately whether the socket
+     * blocks or not (tcp_recv_urg, unix_stream_recv_urg; verified on 6.12).
+     * Pass straight to the host call, which also fails immediately.
+     *
+     * It does not fail with the same errno on AF_UNIX, and this used to claim
+     * it did. Linux supports out-of-band data there and answers EINVAL when
+     * none is queued; macOS does not support it on AF_UNIX at all and answers
+     * EOPNOTSUPP. Measured against the reference kernel, 22 against 95. The
+     * errno is left as the host gives it rather than rewritten, because a guest
+     * that reads EOPNOTSUPP as "no OOB here" is being told the truth about this
+     * host, while EINVAL would invite it to keep asking.
      */
     if (msg_flags & LINUX_MSG_OOB)
         return 0;
-    if (sock_op_should_block(host_fd, msg_flags))
-        return io_wait_fd_or_interrupted(host_fd, POLLIN);
-    struct pollfd pfd = {.fd = host_fd, .events = POLLIN};
-    int ready = poll(&pfd, 1, 0);
+
+    if (sock_op_should_block(st, host_fd, msg_flags)) {
+        /* Wait, then ask the buffer, and go back to waiting if a sibling got
+         * there first. Each round blocks until the socket says something, so
+         * this cannot spin.
+         */
+        for (;;) {
+            int64_t waited = io_wait_fd_or_interrupted(host_fd, POLLIN);
+            if (waited < 0)
+                return waited;
+            int ready = zero_len_ready(host_fd);
+            if (ready < 0)
+                return linux_errno();
+            if (ready > 0)
+                return 0;
+        }
+    }
+
+    int ready = zero_len_ready(host_fd);
     if (ready < 0)
         return linux_errno();
-    if (ready == 0)
-        return -LINUX_EAGAIN;
-    return 0;
+    return ready > 0 ? 0 : -LINUX_EAGAIN;
 }
 
 /* True when a socket send/recv should wait interruptibly and retry rather than
  * surface EAGAIN: the guest asked for blocking semantics (no MSG_DONTWAIT, fd
- * not O_NONBLOCK). The send/recv paths probe with a per-call MSG_DONTWAIT and
- * loop on EAGAIN when this holds, so a post-readiness buffer-full/steal race
- * retries instead of parking the vCPU in an uninterruptible host call. Using
- * MSG_DONTWAIT rather than toggling the fd's O_NONBLOCK keeps the flag off the
- * shared open file description, so a sibling thread on the same fd is never hit
- * with a spurious EAGAIN.
+ * not O_NONBLOCK). The send/recv paths loop on EAGAIN when this holds, so a
+ * post-readiness buffer-full/steal race retries instead of parking the vCPU in
+ * an uninterruptible host call.
+ *
+ * The answer comes from the pinned state and not from the host descriptor.
+ * elfuse owns O_NONBLOCK on the sockets it creates, so their host flag is
+ * always set and records nothing about what the guest asked for. Ownership is
+ * what makes the retry loop real: this used to lean on a per-call MSG_DONTWAIT
+ * instead, and macOS does not honour that flag on AF_UNIX -- a send on a full
+ * stream socket writes what fits and then blocks in the kernel for the rest,
+ * with the flag set (measured: one send moved 8192 bytes and sat for three
+ * seconds).
+ *
+ * A description elfuse did not create -- one that arrived over SCM_RIGHTS -- is
+ * not owned, and there the host flag is still the only record of it.
  */
-bool sock_op_should_block(int host_fd, int msg_flags)
+bool sock_op_should_block(const fd_block_state_t *st,
+                          int host_fd,
+                          int msg_flags)
 {
     if (msg_flags & LINUX_MSG_DONTWAIT)
         return false;
+    if (fd_nonblock_shadowed(st->type, st->nonblock_owned))
+        return !st->guest_nonblock;
     int fl = fcntl(host_fd, F_GETFL);
     return fl >= 0 && !(fl & O_NONBLOCK);
+}
+
+int sock_creation_flags(int nonblock, int cloexec)
+{
+    return (nonblock ? LINUX_O_NONBLOCK : 0) | (cloexec ? LINUX_O_CLOEXEC : 0);
+}
+
+bool net_recv_should_retry(const fd_block_state_t *st,
+                           int host_fd,
+                           int msg_flags,
+                           ssize_t ret)
+{
+    if (ret >= 0 || errno != EAGAIN)
+        return false;
+
+    /* sock_op_should_block may run an fcntl for a description elfuse does not
+     * own, and the caller reports the transfer's errno when this says no.
+     */
+    int saved_errno = errno;
+    bool retry = sock_op_should_block(st, host_fd, msg_flags);
+    errno = saved_errno;
+    return retry;
 }
 
 /* Drive an already-nonblocking connect to completion or interruption: start it,
@@ -168,13 +256,34 @@ static int64_t connect_nonblock_wait(int host_fd,
  * or one that cannot be flipped, falls back to a plain connect (best-effort
  * interruptibility, never a lost connect); its EINPROGRESS surfaces unchanged.
  */
-static int64_t connect_or_interrupted(int host_fd,
+static int64_t connect_or_interrupted(const fd_block_state_t *st,
+                                      int host_fd,
                                       const struct sockaddr *sa,
                                       socklen_t len)
 {
+    /* The guest asked for a nonblocking connect: hand it straight through, and
+     * EINPROGRESS with it.
+     */
+    if (!sock_op_should_block(st, host_fd, 0))
+        return connect(host_fd, sa, len) < 0 ? linux_errno() : 0;
+
+    /* An owned socket is already nonblocking at the host and has to stay that
+     * way -- the flag is elfuse's, not the guest's, and putting it back would
+     * park the next transfer. Nothing to toggle, so just drive the connect.
+     *
+     * Reading the host flag here instead of the shadow is what broke when
+     * sockets became owned: every socket looked nonblocking, so every blocking
+     * connect returned EINPROGRESS to a guest that had asked to wait
+     * (tests/test-exec-handoff.c caught it).
+     */
+    if (st->nonblock_owned)
+        return connect_nonblock_wait(host_fd, sa, len);
+
+    /* A description elfuse does not own, whose flag really is the guest's:
+     * borrow O_NONBLOCK for the wait and give it back.
+     */
     int fl = fcntl(host_fd, F_GETFL);
-    bool blocking = fl >= 0 && !(fl & O_NONBLOCK);
-    if (!blocking || fcntl(host_fd, F_SETFL, fl | O_NONBLOCK) < 0)
+    if (fl < 0 || fcntl(host_fd, F_SETFL, fl | O_NONBLOCK) < 0)
         return connect(host_fd, sa, len) < 0 ? linux_errno() : 0;
 
     int64_t result = connect_nonblock_wait(host_fd, sa, len);
@@ -263,8 +372,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
             close(fd);
             return -LINUX_EMFILE;
         }
-        if (cloexec)
-            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
+        fd_table[gfd].linux_flags |= sock_creation_flags(nonblock, cloexec);
         net_socket_cache_init_defaults(gfd, domain, original_type);
         return gfd;
     }
@@ -290,10 +398,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
         return -LINUX_EMFILE;
     }
 
-    int linux_flags = 0;
-    if (cloexec)
-        linux_flags |= LINUX_O_CLOEXEC;
-    fd_table[gfd].linux_flags = linux_flags;
+    fd_table[gfd].linux_flags = sock_creation_flags(nonblock, cloexec);
     net_socket_cache_init_defaults(gfd, domain, original_type);
 
     return gfd;
@@ -345,7 +450,7 @@ int64_t sys_socketpair(guest_t *g,
         return -LINUX_EMFILE;
     }
 
-    int linux_flags = cloexec ? LINUX_O_CLOEXEC : 0;
+    int linux_flags = sock_creation_flags(nonblock, cloexec);
     fd_table[gfd0].linux_flags = linux_flags;
     fd_table[gfd1].linux_flags = linux_flags;
     net_socket_cache_init_defaults(gfd0, domain, original_type);
@@ -453,9 +558,10 @@ static int64_t do_accept(guest_t *g,
     uint64_t listener_generation = 0;
     int listener_passcred_fallback = 0;
     int listener_type = FD_CLOSED;
+    fd_block_state_t sock_st = {.type = FD_CLOSED};
 
     if (thread_is_single_active()) {
-        if (host_fd_ref_open(fd, &host_ref) < 0)
+        if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
             return -LINUX_EBADF;
         listener_type = fd_table[fd].type;
         listener_generation = fd_table[fd].generation;
@@ -469,6 +575,7 @@ static int64_t do_accept(guest_t *g,
             return -LINUX_EBADF;
         host_ref.fd = host_fd;
         host_ref.owned = true;
+        sock_st = fd_block_state_of(&listener_snap);
         listener_type = listener_snap.type;
         listener_generation = listener_snap.generation;
         if (listener_type == FD_SOCKET)
@@ -481,19 +588,34 @@ static int64_t do_accept(guest_t *g,
         return -LINUX_ENOTSOCK;
     }
 
-    int64_t waited = net_wait_or_interrupted(host_ref.fd, POLLIN, 0);
-    if (waited < 0) {
-        host_fd_ref_close(&host_ref);
-        return waited;
-    }
-
     struct sockaddr_storage mac_sa;
-    socklen_t mac_len = sizeof(mac_sa);
+    socklen_t mac_len;
+    int new_fd;
 
-    int new_fd = accept(host_ref.fd, (struct sockaddr *) &mac_sa, &mac_len);
+    /* Wait, accept, and retry the EAGAIN a blocking guest must not see. elfuse
+     * owns O_NONBLOCK on the listener, so a sibling that takes the connection
+     * this wait reported leaves EAGAIN here rather than leaving the accept to
+     * block, which is the same race the recv paths run and the same answer: the
+     * guest asked to wait, so wait again.
+     */
+    for (;;) {
+        int64_t waited =
+            net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, 0);
+        if (waited < 0) {
+            host_fd_ref_close(&host_ref);
+            return waited;
+        }
+
+        mac_len = sizeof(mac_sa);
+        new_fd = accept(host_ref.fd, (struct sockaddr *) &mac_sa, &mac_len);
+        if (new_fd >= 0)
+            break;
+        if (!net_recv_should_retry(&sock_st, host_ref.fd, 0, -1)) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+    }
     host_fd_ref_close(&host_ref);
-    if (new_fd < 0)
-        return linux_errno();
 
     int listener_passcred = listener_passcred_fallback;
     (void) net_socket_cached_int_get_if_generation(
@@ -514,7 +636,7 @@ static int64_t do_accept(guest_t *g,
         close(new_fd);
         return -LINUX_EMFILE;
     }
-    fd_table[gfd].linux_flags = cloexec ? LINUX_O_CLOEXEC : 0;
+    fd_table[gfd].linux_flags = sock_creation_flags(nonblock, cloexec);
     net_socket_cache_init_accept(gfd, listener_passcred);
 
     /* Write back peer address if requested. The accept has already succeeded
@@ -576,7 +698,8 @@ int64_t sys_accept4(guest_t *g,
 int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
+    fd_block_state_t sock_st;
+    if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
         return -LINUX_EBADF;
 
     uint8_t linux_sa[128];
@@ -649,10 +772,17 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
         setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
         setsockopt(pair[1], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 
-        int old_status = fcntl(host_ref.fd, F_GETFL, 0);
+        /* pair[0] is a fresh description wearing the old slot's identity, so
+         * the host flag has to be set here rather than inherited. The alias
+         * spec below claims nonblock_owned from the snapshot and the allocator
+         * takes that claim at its word -- an alias normally shares a
+         * description that already carries the flag, and this one does not.
+         * Testing the old host status instead would have been vacuous now that
+         * every socket elfuse opens carries O_NONBLOCK.
+         */
         fd_entry_t snap;
         bool have_snap = fd_snapshot(fd, &snap);
-        if ((old_status >= 0 && (old_status & O_NONBLOCK) &&
+        if ((have_snap && snap.nonblock_owned &&
              fd_set_nonblock(pair[0]) < 0) ||
             (have_snap && (snap.linux_flags & LINUX_O_CLOEXEC) &&
              fd_set_cloexec(pair[0]) < 0)) {
@@ -662,8 +792,25 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
             return linux_errno();
         }
 
-        if (fd_alloc_at(fd, FD_SOCKET, pair[0], absock_unregister_fd, NULL) <
-            0) {
+        /* Rebuilding the slot must not mint a fresh description identity: any
+         * dup alias of this fd keeps the old ofd_id, and the two would stop
+         * being swept together by the O_NONBLOCK, O_ASYNC and SIGIO-owner
+         * walks. The aliases still carry the pre-upgrade host fd, which is a
+         * deeper divergence recorded in TODO.md; keeping the identity is what
+         * stops this path from also breaking the sweeps.
+         */
+        fd_alias_spec_t spec;
+        if (have_snap)
+
+            /* -1, not fd: this path is rebuilding the very slot it snapshotted,
+             * so re-reading it under the publish lock would find the
+             * replacement being installed rather than the source.
+             */
+            spec = fd_alias_of(-1, &snap);
+        int alloc_rc =
+            fd_alloc_alias_at(have_snap ? &spec : NULL, fd, FD_SOCKET, pair[0],
+                              absock_unregister_fd, NULL);
+        if (alloc_rc < 0) {
             close(pair[0]);
             close(pair[1]);
             host_fd_ref_close(&host_ref);
@@ -689,8 +836,9 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
         return -LINUX_EPROTOTYPE;
     }
 
-    int64_t crc = connect_or_interrupted(
-        host_ref.fd, (struct sockaddr *) &mac_sa, (socklen_t) mac_len);
+    int64_t crc = connect_or_interrupted(&sock_st, host_ref.fd,
+                                         (struct sockaddr *) &mac_sa,
+                                         (socklen_t) mac_len);
     host_fd_ref_close(&host_ref);
     return crc;
 }
@@ -833,7 +981,8 @@ int64_t sys_sendto(guest_t *g,
         return netlink_send(fd, g, buf_gva, len);
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
+    fd_block_state_t send_st;
+    if (host_fd_ref_open_state(fd, &host_ref, &send_st) < 0)
         return -LINUX_EBADF;
 
     uint64_t avail = 0;
@@ -876,7 +1025,8 @@ int64_t sys_sendto(guest_t *g,
         dest_len = (socklen_t) mac_len;
     }
 
-    bool blocking = len > 0 && sock_op_should_block(host_ref.fd, linux_flags);
+    bool blocking =
+        len > 0 && sock_op_should_block(&send_st, host_ref.fd, linux_flags);
     int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
     ssize_t ret;
     for (;;) {
@@ -900,6 +1050,58 @@ int64_t sys_sendto(guest_t *g,
     return ret;
 }
 
+/* MSG_WAITALL never reaches the host, and this says whether elfuse then has to
+ * gather the request itself.
+ *
+ * Two separate things, because the answers differ. macOS does not answer for
+ * that flag the way Linux does under any of the shapes measured here, so it is
+ * stripped unconditionally by recv_strip_waitall below. Whether to loop
+ * afterwards is the narrower question, and only a stream socket without
+ * MSG_PEEK says yes.
+ *
+ * Every rule here is a measurement against the qemu reference kernel, not a
+ * reading of the manual page, and two of them contradict what the manual page
+ * suggests:
+ *
+ *   plain stream, 2 of 16 queued: Linux blocks for the rest, macOS blocks
+ *     forever even with MSG_DONTWAIT also set. Gathered here.
+ *   MSG_PEEK on a stream, 2 of 16 queued: Linux returns 2 and does not wait,
+ *     because a peek does not consume and it will not spin re-reading the same
+ *     bytes. macOS returns 16, reporting fourteen bytes of whatever the guest
+ *     buffer already held as received data. One host call, no gather.
+ *   SOCK_SEQPACKET, two 4-byte messages queued, 16 requested: Linux returns 4.
+ *     One recv is one message and MSG_WAITALL does not join them. Gathering
+ *     would concatenate them and destroy the boundary.
+ *   SOCK_DGRAM: Linux ignores MSG_WAITALL entirely.
+ */
+/* buf + total, with NULL preserved.
+ *
+ * A zero-length recv passes a NULL buffer, and NULL + 0 is undefined even
+ * though every compiler here folds it to NULL; UBSan says so out loud.
+ */
+static void *recv_at(void *buf, uint64_t total)
+{
+    return buf ? (char *) buf + total : NULL;
+}
+
+bool recv_strip_waitall(int linux_flags)
+{
+    return (linux_flags & LINUX_MSG_WAITALL) != 0;
+}
+
+bool recv_gathers_waitall(int host_fd, int linux_flags)
+{
+    if (!(linux_flags & LINUX_MSG_WAITALL) || (linux_flags & LINUX_MSG_PEEK))
+        return false;
+
+    int sotype = 0;
+    socklen_t sotype_len = sizeof(sotype);
+    if (getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &sotype, &sotype_len) < 0)
+        return false;
+    return sotype == SOCK_STREAM;
+}
+
+
 int64_t sys_recvfrom(guest_t *g,
                      int fd,
                      uint64_t buf_gva,
@@ -912,7 +1114,8 @@ int64_t sys_recvfrom(guest_t *g,
         return netlink_recv(fd, g, buf_gva, len, flags, src_gva, addrlen_gva);
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
+    fd_block_state_t recv_st;
+    if (host_fd_ref_open_state(fd, &host_ref, &recv_st) < 0)
         return -LINUX_EBADF;
 
     uint64_t avail = 0;
@@ -927,29 +1130,86 @@ int64_t sys_recvfrom(guest_t *g,
 
     int mac_flags = translate_msg_flags(flags);
 
-    /* A single interruptible wait (not a MSG_DONTWAIT probe loop) preserves
-     * MSG_WAITALL semantics; the tiny ready-then-stolen window can still block,
-     * matching sys_read. A zero-length recv takes the readiness gate instead:
-     * unlike read(), Linux blocks it on an empty socket.
+    /* Wait interruptibly, then retry the recv for as long as the guest asked
+     * for blocking semantics. The retry is what preserves them now that elfuse
+     * owns O_NONBLOCK on the host socket: the descriptor answers EAGAIN both
+     * when a sibling took the readiness this wait reported and when MSG_WAITALL
+     * has less than the full request queued. A zero-length recv takes the
+     * readiness gate instead: unlike read(), Linux blocks it on an empty
+     * socket.
      */
-    int64_t waited = len > 0
-                         ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
-                         : net_recv_zero_payload_gate(host_ref.fd, flags);
+    int64_t waited =
+        len > 0 ? net_wait_or_interrupted(&recv_st, host_ref.fd, POLLIN, flags)
+                : net_recv_zero_payload_gate(&recv_st, host_ref.fd, flags);
     if (waited < 0) {
         host_fd_ref_close(&host_ref);
         return waited;
     }
 
     struct sockaddr_storage mac_sa;
-    socklen_t mac_len = sizeof(mac_sa);
+    socklen_t mac_len;
+
+    bool gather = recv_gathers_waitall(host_ref.fd, flags);
+    if (recv_strip_waitall(flags))
+        mac_flags &= ~MSG_WAITALL;
 
     ssize_t ret;
-    if (src_gva && addrlen_gva) {
-        ret = recvfrom(host_ref.fd, buf, len, mac_flags,
-                       (struct sockaddr *) &mac_sa, &mac_len);
-    } else {
-        ret = recv(host_ref.fd, buf, len, mac_flags);
+    uint64_t total = 0;
+    for (;;) {
+        /* Reset per round: a recvfrom that failed may still have written it. */
+        mac_len = sizeof(mac_sa);
+        if (src_gva && addrlen_gva) {
+            ret = recvfrom(host_ref.fd, recv_at(buf, total), len - total,
+                           mac_flags, (struct sockaddr *) &mac_sa, &mac_len);
+        } else {
+            ret =
+                recv(host_ref.fd, recv_at(buf, total), len - total, mac_flags);
+        }
+
+        if (ret > 0) {
+            total += (uint64_t) ret;
+
+            /* Whole request in hand, or nothing asked us to gather more. */
+            if (!gather || total >= len)
+                break;
+
+            /* Linux stops a gathering recv at the first partial return when the
+             * guest asked not to wait, rather than reporting EAGAIN over bytes
+             * it has already moved.
+             */
+            if (!sock_op_should_block(&recv_st, host_ref.fd, flags))
+                break;
+
+            waited =
+                net_wait_or_interrupted(&recv_st, host_ref.fd, POLLIN, flags);
+            if (waited < 0)
+                break; /* interrupted after moving bytes: report the count */
+            continue;
+        }
+
+        /* EOF, or an error. Either ends the gathering: what has been moved is
+         * the answer, and a stream that has closed will not deliver the rest.
+         */
+        if (ret == 0)
+            break;
+        if (!net_recv_should_retry(&recv_st, host_ref.fd, flags, ret))
+            break;
+        waited = net_wait_or_interrupted(&recv_st, host_ref.fd, POLLIN, flags);
+        if (waited < 0) {
+            if (total > 0)
+                break;
+            host_fd_ref_close(&host_ref);
+            return waited;
+        }
     }
+
+    /* Bytes already delivered outrank whatever ended the loop, which is what
+     * Linux reports and what keeps a partial gather from being retried by a
+     * guest that would then read the same stream twice.
+     */
+    if (total > 0)
+        ret = (ssize_t) total;
+
     if (ret < 0) {
         int64_t result = recv_eof_or_errno(host_ref.fd, fd);
         if (result < 0) {

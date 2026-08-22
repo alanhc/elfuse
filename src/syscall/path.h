@@ -282,6 +282,15 @@ int path_openat2_check_fd_xdev(int guest_fd, int start_class);
  */
 int path_parse_proc_name(const char *name);
 
+/* The guest descriptor an absolute fd magic link names, or -1 when the path is
+ * not that shape. Unlike path_fd_magiclink_dup this hands back the guest fd
+ * number itself, for callers that need the table entry rather than the object:
+ * opening one of these paths produces a second name for a description the
+ * process already holds, so the new slot has to inherit that entry's answers
+ * instead of probing (see fd_alias_host_shared).
+ */
+int path_fd_magiclink_guest_fd(const char *path);
+
 /* An owned dup of the descriptor an absolute fd magic link names
  * ("/proc/self/fd/<n>", the own-pid spelling, "/dev/fd/<n>", "/dev/std*"), or
  * -1 when the path is not that shape or its descriptor is not backed by a plain

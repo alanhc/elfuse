@@ -317,6 +317,9 @@ int fork_ipc_send_fd_table(int ipc_sock)
         fd_entries[num_fds].guest_fd = i;
         fd_entries[num_fds].type = fd_table[i].type;
         fd_entries[num_fds].linux_flags = fd_table[i].linux_flags;
+        fd_entries[num_fds].foreign_description =
+            fd_table[i].foreign_description;
+        fd_entries[num_fds].nonblock_owned = fd_table[i].nonblock_owned;
         fd_entries[num_fds].seals = fd_table[i].seals;
         fd_entries[num_fds].ofd_id = fd_table[i].ofd_id;
         fd_entries[num_fds].fasync_owner_type = fd_table[i].fasync_owner_type;
@@ -469,7 +472,17 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             continue;
         } else {
             void (*cleanup)(int) = fd_cleanup_for_type(fd_entries[i].type);
-            fd_alloc_at(gfd, fd_entries[i].type, host_fds[i], cleanup, NULL);
+
+            /* Every descriptor here aliases a description the parent already
+             * had, so the allocator takes the parent's answers rather than
+             * probing: a slot that aliases the launcher's stdio must not have
+             * O_NONBLOCK set on it here any more than it did there.
+             */
+            fd_alias_spec_t spec =
+                fd_alias_carried(fd_entries[i].foreign_description != 0,
+                                 fd_entries[i].nonblock_owned != 0);
+            fd_alloc_alias_at(&spec, gfd, fd_entries[i].type, host_fds[i],
+                              cleanup, NULL);
             fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
             fd_refresh_urandom_bitmap(gfd);
             memcpy(fd_table[gfd].proc_path, fd_entries[i].proc_path,

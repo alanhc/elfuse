@@ -65,7 +65,8 @@ elfuse_resolve_host_nofile()
 elfuse_test_host_nofile()
 {
     local manifest="$1"
-    local name="$(basename "$2")"
+    local name
+    name="$(basename "$2")"
     local spec
     spec=$(awk -v wanted="$name" '
         $1 == wanted {

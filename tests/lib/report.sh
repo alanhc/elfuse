@@ -6,9 +6,17 @@
 # Sources tests/lib/test-runner.sh and exposes report_pass / report_fail /
 # report_skip on top of test_report so per-binary output matches the matrix
 # runner's aarch64 format ([ OK ] / [ FAIL ] / [ SKIP ] aligned to
-# TEST_LABEL_WIDTH). Each script still owns its pass/fail /skip/total counters;
-# this lib only centralizes the report sites and the trailing Results: summary
-# line that tests/test-matrix.sh scrapes.
+# TEST_LABEL_WIDTH) and the trailing Results: summary line that
+# tests/test-matrix.sh scrapes.
+#
+# The pass/fail/skip counters the report functions increment are initialized by
+# tests/lib/test-runner.sh, which this sources below and which eight scripts
+# source without going through here. That is where they have to live for those
+# eight, so setting them here as well would be dead code: the source that
+# follows re-runs the same three assignments. Twelve scripts used to declare
+# them a third time at their own top level, which shellcheck reads, correctly,
+# as assignments nobody in that file goes on to use. A script that wants its own
+# total still keeps it: report_results takes one as an argument.
 
 # Align the LABEL column with tests/test-matrix.sh so the aggregated matrix
 # output looks uniform across aarch64 and x86_64 modes.

@@ -728,6 +728,46 @@ MUTATIONS = [
         "    *pad_start = DIRENT64_HDR_BYTES + name_len + 1;",
         "    *pad_start = DIRENT64_HDR_BYTES + name_len;",
     ),
+    # ---- verify-asyncudata -------------------------------------------------
+    # Not "drop the reduction": (g % 2^48) * 2^16 and g * 2^16 are the same
+    # value in 64-bit arithmetic, since the multiply discards the high bits the
+    # reduction would have. That mutant is equivalent, and a target that
+    # "catches" it is only reporting that the prover could not see the identity.
+    # Reduce by the wrong span instead, which really does lose generation bits.
+    (
+        "asyncudata",
+        "src/proved/asyncudata.h",
+        "async_udata_pack",
+        "reduce the generation by the fd span, truncating it to 16 bits",
+        "    return (generation % ASYNC_UDATA_GEN_SPAN) * ASYNC_UDATA_FD_SPAN +",
+        "    return (generation % ASYNC_UDATA_FD_SPAN) * ASYNC_UDATA_FD_SPAN +",
+    ),
+    (
+        "asyncudata",
+        "src/proved/asyncudata.h",
+        "async_udata_pack",
+        "scale the fd instead of the generation (the two fields swap places)",
+        "    return (generation % ASYNC_UDATA_GEN_SPAN) * ASYNC_UDATA_FD_SPAN +\n"
+        "           (uint64_t) guest_fd;",
+        "    return (generation % ASYNC_UDATA_GEN_SPAN) +\n"
+        "           (uint64_t) guest_fd * ASYNC_UDATA_FD_SPAN;",
+    ),
+    (
+        "asyncudata",
+        "src/proved/asyncudata.h",
+        "async_udata_fd",
+        "read the fd out of the generation field",
+        "    return (int) (v % ASYNC_UDATA_FD_SPAN);",
+        "    return (int) (v / ASYNC_UDATA_FD_SPAN);",
+    ),
+    (
+        "asyncudata",
+        "src/proved/asyncudata.h",
+        "async_udata_gen",
+        "drop the shift, so the generation carries the fd bits with it",
+        "    return (v / ASYNC_UDATA_FD_SPAN) % ASYNC_UDATA_GEN_SPAN;",
+        "    return v % ASYNC_UDATA_GEN_SPAN;",
+    ),
     # ---- verify-iov --------------------------------------------------------
     (
         "iov",
@@ -752,6 +792,24 @@ MUTATIONS = [
         "accept iovcnt 0 (an empty vector reaches the per-entry loop)",
         "    return iovcnt >= 1 && iovcnt <= IOV_COUNT_MAX;",
         "    return iovcnt >= 0 && iovcnt <= IOV_COUNT_MAX;",
+    ),
+    (
+        "iov",
+        "src/proved/iov.h",
+        "iov_advance_index",
+        "consume an entry the transfer only partly filled (the remainder is "
+        "no longer strictly inside the survivor)",
+        "    while (spent < iovcnt && rem >= iov[spent].iov_len) {",
+        "    while (spent < iovcnt && rem >= iov[spent].iov_len - 1) {",
+    ),
+    (
+        "iov",
+        "src/proved/iov.h",
+        "iov_advance_index",
+        "stop subtracting the entries already spent, so the remainder can "
+        "exceed the entry it indexes",
+        "        rem -= iov[spent].iov_len;\n",
+        "",
     ),
     (
         "iov",

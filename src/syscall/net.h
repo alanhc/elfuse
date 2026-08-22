@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include "core/guest.h"
 #include "syscall/linux-wire.h" /* linux_iovec_t */
+#include "syscall/internal.h"   /* fd_block_state_t */
 
 /* Linux address families. */
 #define LINUX_AF_UNSPEC 0
@@ -164,7 +165,10 @@ int64_t sys_shutdown(int fd, int how);
  *
  * Returns 0 to proceed or a negative Linux errno (EINTR).
  */
-int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags);
+int64_t net_wait_or_interrupted(const fd_block_state_t *st,
+                                int host_fd,
+                                short events,
+                                int msg_flags);
 
 /* Readiness gate for a zero-payload recv/recvfrom/recvmsg: Linux clamps the
  * receive low-water target to one byte, so an empty socket blocks (EINTR on
@@ -174,7 +178,9 @@ int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags);
  *
  * Returns 0 to proceed or a negative Linux errno (EINTR/EAGAIN).
  */
-int64_t net_recv_zero_payload_gate(int host_fd, int msg_flags);
+int64_t net_recv_zero_payload_gate(const fd_block_state_t *st,
+                                   int host_fd,
+                                   int msg_flags);
 
 /* True when a socket send/recv should wait interruptibly and retry on EAGAIN
  * rather than surface it (guest wants blocking semantics: no MSG_DONTWAIT, fd
@@ -182,7 +188,43 @@ int64_t net_recv_zero_payload_gate(int host_fd, int msg_flags);
  * so the interruptible wait cannot be defeated by a post-readiness buffer-full
  * or steal race, without toggling the fd's shared O_NONBLOCK flag.
  */
-bool sock_op_should_block(int host_fd, int msg_flags);
+bool sock_op_should_block(const fd_block_state_t *st,
+                          int host_fd,
+                          int msg_flags);
+
+/* The guest-visible status flags a socket created with SOCK_NONBLOCK and/or
+ * SOCK_CLOEXEC carries.
+ *
+ * O_NONBLOCK has to be recorded here and not only on the host descriptor:
+ * elfuse owns the host flag on every socket it opens (fd_init_entry), so the
+ * host flag is set whatever the guest asked for, and the shadow is the only
+ * record left. Without it a SOCK_NONBLOCK socket read as blocking everywhere
+ * that matters -- F_GETFL reported no O_NONBLOCK, connect waited instead of
+ * reporting EINPROGRESS, and a read of an empty socket never returned.
+ */
+int sock_creation_flags(int nonblock, int cloexec);
+
+/* True when MSG_WAITALL is removed before this recv reaches the host. */
+bool recv_strip_waitall(int linux_flags);
+
+/* True when this recv must gather MSG_WAITALL itself. See the definition in
+ * net.c for the measurement.
+ */
+bool recv_gathers_waitall(int host_fd, int linux_flags);
+
+/* True when a socket receive that just reported EAGAIN has to be waited out and
+ * retried rather than reported to the guest.
+ *
+ * elfuse owns O_NONBLOCK on the sockets it opens, so a host recv answers EAGAIN
+ * in two cases a blocking guest socket must not see: the readiness the wait
+ * reported was taken by a sibling, and MSG_WAITALL with less than the full
+ * request queued, which macOS reports as EWOULDBLOCK while consuming nothing.
+ * Preserves errno, which the caller reports when this returns false.
+ */
+bool net_recv_should_retry(const fd_block_state_t *st,
+                           int host_fd,
+                           int msg_flags,
+                           ssize_t ret);
 int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int flags);
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags);
 int64_t sys_sendmmsg(guest_t *g,

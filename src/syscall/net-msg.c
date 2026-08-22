@@ -17,6 +17,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include "proved/iov.h"
 #include "utils.h"
 
 #include "proved/cmsg.h"
@@ -148,7 +149,8 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
         return netlink_sendmsg(fd, g, msg_gva, linux_flags);
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
+    fd_block_state_t sock_st;
+    if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
         return -LINUX_EBADF;
 
     linux_msghdr_t lmsg;
@@ -189,7 +191,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
         }
 
         bool blocking =
-            len > 0 && sock_op_should_block(host_ref.fd, linux_flags);
+            len > 0 && sock_op_should_block(&sock_st, host_ref.fd, linux_flags);
         int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
         ssize_t ret;
         for (;;) {
@@ -381,7 +383,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
     };
 
     bool blocking = host_iov_has_payload(&host_iov, send_iovcnt) &&
-                    sock_op_should_block(host_ref.fd, linux_flags);
+                    sock_op_should_block(&sock_st, host_ref.fd, linux_flags);
     int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
     ssize_t ret;
     for (;;) {
@@ -411,6 +413,54 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
     return ret;
 }
 
+/* The gathering form of MSG_WAITALL for the msghdr paths.
+ *
+ * Same reason as recv_gathers_waitall, which this defers to: the host does not
+ * answer for the flag, and a guest recvmsg(MSG_WAITALL) that reaches it parks
+ * the vCPU for good. Stripping the flag alone would fix the hang and leave a
+ * blocking recvmsg reporting a short count where Linux waits, so the loop
+ * gathers across the iovec with iov_advance_index, the same proved bound the
+ * transfer path uses.
+ *
+ * A caller that asked for ancillary data is excluded rather than gathered. A
+ * second round would have to either overwrite the control buffer, losing the
+ * SCM_RIGHTS descriptors the first round installed, or refuse it and let the
+ * kernel discard them. Neither is worth doing to a message that has already
+ * been delivered, so those calls get the flag stripped and a single round --
+ * the hang is gone, and MSG_WAITALL with ancillary data still short-counts.
+ */
+static bool msg_gathers_waitall(int host_fd, int linux_flags, size_t controllen)
+{
+    if (controllen != 0)
+        return false;
+    return recv_gathers_waitall(host_fd, linux_flags);
+}
+
+/* Advance an iovec past bytes already received, so the next round writes after
+ * them.
+ *
+ * Returns the number of leading entries fully consumed.
+ */
+static int msg_iov_advance(struct iovec *iov, int iovcnt, size_t moved)
+{
+    size_t rem = 0;
+    int spent = iov_advance_index(iov, iovcnt, moved, &rem);
+    if (spent < iovcnt && rem > 0) {
+        iov[spent].iov_base = (char *) iov[spent].iov_base + rem;
+        iov[spent].iov_len -= rem;
+    }
+    return spent;
+}
+
+/* Total bytes an iovec can still accept. */
+static size_t msg_iov_total(const struct iovec *iov, int iovcnt)
+{
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++)
+        total += iov[i].iov_len;
+    return total;
+}
+
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 {
@@ -418,7 +468,8 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         return netlink_recvmsg(fd, g, msg_gva, flags);
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
+    fd_block_state_t sock_st;
+    if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
         return -LINUX_EBADF;
 
     linux_msghdr_t lmsg;
@@ -457,8 +508,9 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         }
 
         int64_t waited =
-            len > 0 ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
-                    : net_recv_zero_payload_gate(host_ref.fd, flags);
+            len > 0
+                ? net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags)
+                : net_recv_zero_payload_gate(&sock_st, host_ref.fd, flags);
         if (waited < 0) {
             host_fd_ref_close(&host_ref);
             return waited;
@@ -474,7 +526,51 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
             .msg_flags = 0,
         };
 
-        ssize_t ret = recvmsg(host_ref.fd, &msg, mac_flags);
+        /* Retry the EAGAIN a blocking guest socket must not see: elfuse owns
+         * O_NONBLOCK on the host descriptor, so it reports one for a readiness
+         * a sibling took. MSG_WAITALL is gathered here rather than handed to
+         * the host, which does not answer for it (msg_gathers_waitall). This
+         * branch carries no ancillary buffer, so the gather is unconditional
+         * once the predicate holds.
+         */
+        bool gather = msg_gathers_waitall(host_ref.fd, flags, 0);
+        if (recv_strip_waitall(flags))
+            mac_flags &= ~MSG_WAITALL;
+
+        ssize_t ret;
+        uint64_t total = 0;
+        for (;;) {
+            msg.msg_flags = 0;
+            ret = recvmsg(host_ref.fd, &msg, mac_flags);
+
+            if (ret > 0 && gather) {
+                total += (uint64_t) ret;
+                if (total >= len ||
+                    !sock_op_should_block(&sock_st, host_ref.fd, flags))
+                    break;
+                host_iov.iov_base = (char *) base + total;
+                host_iov.iov_len = len - total;
+                waited = net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN,
+                                                 flags);
+                if (waited < 0)
+                    break; /* interrupted after moving bytes: report the count
+                            */
+                continue;
+            }
+
+            if (!net_recv_should_retry(&sock_st, host_ref.fd, flags, ret))
+                break;
+            waited =
+                net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags);
+            if (waited < 0) {
+                if (total > 0)
+                    break;
+                host_fd_ref_close(&host_ref);
+                return waited;
+            }
+        }
+        if (total > 0)
+            ret = (ssize_t) total;
         if (ret < 0) {
             int64_t r = recv_eof_or_errno(host_ref.fd, fd);
             if (r != 0) {
@@ -516,9 +612,10 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         host_fd_ref_close(&host_ref);
         return iov_err;
     }
-    int64_t waited = host_iov_has_payload(&host_iov, recv_iovcnt)
-                         ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
-                         : net_recv_zero_payload_gate(host_ref.fd, flags);
+    int64_t waited =
+        host_iov_has_payload(&host_iov, recv_iovcnt)
+            ? net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags)
+            : net_recv_zero_payload_gate(&sock_st, host_ref.fd, flags);
     if (waited < 0) {
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
@@ -566,7 +663,59 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     int scm_hfds[128];
     int scm_nfds = 0;
 
-    ssize_t ret = recvmsg(host_ref.fd, &msg, mac_flags);
+    /* Retry the EAGAIN a blocking guest socket must not see; see the single-iov
+     * branch above.
+     */
+    bool gather = msg_gathers_waitall(host_ref.fd, flags, ctrl_alloc);
+    if (recv_strip_waitall(flags))
+        mac_flags &= ~MSG_WAITALL;
+    size_t want = gather ? msg_iov_total(msg.msg_iov, (int) msg.msg_iovlen) : 0;
+
+    ssize_t ret;
+    uint64_t total = 0;
+    for (;;) {
+        msg.msg_namelen = lmsg.msg_name ? sa_len : 0;
+        msg.msg_controllen = ctrl_alloc;
+        msg.msg_flags = 0;
+        ret = recvmsg(host_ref.fd, &msg, mac_flags);
+
+        if (ret > 0 && gather) {
+            total += (uint64_t) ret;
+            if (total >= want ||
+                !sock_op_should_block(&sock_st, host_ref.fd, flags))
+                break;
+            int spent = msg_iov_advance(msg.msg_iov, (int) msg.msg_iovlen,
+                                        (size_t) ret);
+            msg.msg_iov += spent;
+            msg.msg_iovlen -= spent;
+            if (msg.msg_iovlen == 0)
+                break;
+
+            /* Only the first round may deliver a name; a later one would
+             * overwrite it with the same peer's address for no gain.
+             */
+            msg.msg_name = NULL;
+            waited =
+                net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags);
+            if (waited < 0)
+                break; /* interrupted after moving bytes: report the count */
+            continue;
+        }
+
+        if (!net_recv_should_retry(&sock_st, host_ref.fd, flags, ret))
+            break;
+        waited = net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN, flags);
+        if (waited < 0) {
+            if (total > 0)
+                break;
+            free(mac_ctrl_heap);
+            host_iov_free(&host_iov);
+            host_fd_ref_close(&host_ref);
+            return waited;
+        }
+    }
+    if (total > 0)
+        ret = (ssize_t) total;
     if (ret < 0) {
         int64_t r = recv_eof_or_errno(host_ref.fd, fd);
         free(mac_ctrl_heap);
@@ -723,7 +872,36 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                 size_t nfds = data_len / sizeof(int);
                 for (size_t i = 0; i < nfds; i++) {
                     int host_recv_fd = fds[i];
-                    int gfd = fd_alloc(FD_REGULAR, fds[i], NULL);
+
+                    /* A received descriptor belongs to whoever sent it, so
+                     * elfuse never sets O_NONBLOCK on one: that would mutate a
+                     * description this process did not create, and a guest that
+                     * passes fd 0 to itself would leave the launching shell's
+                     * terminal nonblocking after exit. Marked foreign so a dup
+                     * of it inherits the same restraint.
+                     *
+                     * Which view of the flag is the guest's still has to be
+                     * decided, and the flag as found answers it. A description
+                     * already carrying O_NONBLOCK is one elfuse itself owns:
+                     * every pipe and fifo it opens carries the flag precisely
+                     * because it emulates blocking on top, and an ordinary
+                     * program's description does not. Adopting that emulation
+                     * here sets nothing (the flag is already there) and gives a
+                     * plain read the wait it asked for. Reading the host flag
+                     * as the guest's view instead would hand a blocking read a
+                     * spurious EAGAIN, which a program that never requested
+                     * O_NONBLOCK has no handling for.
+                     *
+                     * What stays wrong is a sender that meant the description
+                     * to be nonblocking: the receiver sees blocking. That is
+                     * the cross-process divergence in TODO.md, and this is its
+                     * survivable direction -- a wait the sender would not have
+                     * waited, rather than an error on an fd that has none.
+                     */
+                    int recv_fl = fcntl(host_recv_fd, F_GETFL);
+                    fd_alias_spec_t spec = fd_alias_carried(
+                        true, recv_fl >= 0 && (recv_fl & O_NONBLOCK));
+                    int gfd = fd_alloc_alias(&spec, FD_REGULAR, fds[i], NULL);
                     if (gfd < 0) {
                         close(fds[i]);
                         fds[i] = -1;
@@ -882,7 +1060,8 @@ int64_t sys_sendmmsg(guest_t *g,
         bool suppress_sigpipe = (flags & 0x4000) != 0;
         host_fd_ref_t host_ref;
 
-        if (host_fd_ref_open(fd, &host_ref) < 0)
+        fd_block_state_t sock_st;
+        if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
             return -LINUX_EBADF;
         if (guest_read_small(g, msg_gva, &lmsg, sizeof(lmsg)) < 0) {
             host_fd_ref_close(&host_ref);
@@ -916,7 +1095,8 @@ int64_t sys_sendmmsg(guest_t *g,
                     len = (size_t) avail;
             }
 
-            bool blocking = len > 0 && sock_op_should_block(host_ref.fd, flags);
+            bool blocking =
+                len > 0 && sock_op_should_block(&sock_st, host_ref.fd, flags);
             int host_flags = mac_flags | (blocking ? MSG_DONTWAIT : 0);
             ssize_t ret;
             for (;;) {
@@ -979,7 +1159,8 @@ int64_t sys_recvmmsg(guest_t *g,
         int mac_flags = translate_msg_flags(flags);
         host_fd_ref_t host_ref;
 
-        if (host_fd_ref_open(fd, &host_ref) < 0)
+        fd_block_state_t sock_st;
+        if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
             return -LINUX_EBADF;
         if (guest_read_small(g, msg_gva, &lmsg, sizeof(lmsg)) < 0) {
             host_fd_ref_close(&host_ref);
@@ -1018,14 +1199,55 @@ int64_t sys_recvmmsg(guest_t *g,
                 .msg_iov = &host_iov,
                 .msg_iovlen = 1,
             };
-            int64_t waited =
-                len > 0 ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
-                        : net_recv_zero_payload_gate(host_ref.fd, flags);
+            int64_t waited = len > 0 ? net_wait_or_interrupted(
+                                           &sock_st, host_ref.fd, POLLIN, flags)
+                                     : net_recv_zero_payload_gate(
+                                           &sock_st, host_ref.fd, flags);
             if (waited < 0) {
                 host_fd_ref_close(&host_ref);
                 return waited;
             }
-            ssize_t ret = recvmsg(host_ref.fd, &host_msg, mac_flags);
+
+            /* Retry the EAGAIN a blocking guest socket must not see, and gather
+             * MSG_WAITALL rather than hand it to the host; see sys_recvmsg.
+             */
+            bool gather = msg_gathers_waitall(host_ref.fd, flags, 0);
+            if (recv_strip_waitall(flags))
+                mac_flags &= ~MSG_WAITALL;
+
+            ssize_t ret;
+            uint64_t total = 0;
+            for (;;) {
+                host_msg.msg_flags = 0;
+                ret = recvmsg(host_ref.fd, &host_msg, mac_flags);
+
+                if (ret > 0 && gather) {
+                    total += (uint64_t) ret;
+                    if (total >= len ||
+                        !sock_op_should_block(&sock_st, host_ref.fd, flags))
+                        break;
+                    host_iov.iov_base = (char *) base + total;
+                    host_iov.iov_len = len - total;
+                    waited = net_wait_or_interrupted(&sock_st, host_ref.fd,
+                                                     POLLIN, flags);
+                    if (waited < 0)
+                        break;
+                    continue;
+                }
+
+                if (!net_recv_should_retry(&sock_st, host_ref.fd, flags, ret))
+                    break;
+                waited = net_wait_or_interrupted(&sock_st, host_ref.fd, POLLIN,
+                                                 flags);
+                if (waited < 0) {
+                    if (total > 0)
+                        break;
+                    host_fd_ref_close(&host_ref);
+                    return waited;
+                }
+            }
+            if (total > 0)
+                ret = (ssize_t) total;
             if (ret < 0) {
                 int64_t r = recv_eof_or_errno(host_ref.fd, fd);
                 if (r != 0) {

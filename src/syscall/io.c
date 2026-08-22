@@ -25,6 +25,7 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <termios.h>
@@ -36,8 +37,8 @@
 #include "core/rosetta.h"
 #include "core/shim-globals.h"
 #include "hvutil.h"
+#include "runtime/futex.h" /* futex_interrupt_consume, in the tty drain */
 #include "runtime/procemu.h"
-#include "runtime/futex.h"
 #include "runtime/thread.h"
 
 #include "syscall/linux-wire.h"
@@ -59,6 +60,7 @@
 /* Linux terminal struct types. */
 
 /* Linux struct winsize (same layout as macOS) */
+
 typedef struct {
     uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel;
 } linux_winsize_t;
@@ -192,6 +194,32 @@ static int64_t linux_siocgifhwaddr(guest_t *g, uint64_t arg)
     return 0;
 }
 
+/* One backoff step, without asking whether anything wants this thread out.
+ *
+ * Split from io_retry_backoff for the callers that cannot honor an interrupt:
+ * the two stream copiers hold a chunk already drained out of an unrewindable
+ * input, so abandoning the write drops the guest's bytes and the only thing
+ * left is to keep trying. Doing that at full speed costs a whole core -- a
+ * splice into a full pipe with a pending SIGALRM burned 6.9 s of CPU in 8 s of
+ * wall clock -- because io_xfer answers the pending signal immediately and
+ * every round is a bare retry. The sleep bounds the cost without changing who
+ * decides to stop.
+ */
+static void io_backoff_sleep(unsigned *backoff_us)
+{
+    if (*backoff_us == 0) {
+        sched_yield();
+        *backoff_us = IO_RETRY_BACKOFF_START_US;
+        return;
+    }
+
+    unsigned us = *backoff_us;
+    usleep(us);
+
+    us *= 2;
+    *backoff_us = us > IO_RETRY_BACKOFF_MAX_US ? IO_RETRY_BACKOFF_MAX_US : us;
+}
+
 int64_t io_retry_backoff(unsigned *backoff_us)
 {
     /* Materialize an expired guest interval timer first. ITIMER_REAL is virtual
@@ -216,17 +244,7 @@ int64_t io_retry_backoff(unsigned *backoff_us)
      * the current scheduling quantum is the common case, and a sleep would turn
      * it into a timer round trip that macOS rounds up well past the request.
      */
-    if (*backoff_us == 0) {
-        sched_yield();
-        *backoff_us = IO_RETRY_BACKOFF_START_US;
-        return 0;
-    }
-
-    unsigned us = *backoff_us;
-    usleep(us);
-
-    us *= 2;
-    *backoff_us = us > IO_RETRY_BACKOFF_MAX_US ? IO_RETRY_BACKOFF_MAX_US : us;
+    io_backoff_sleep(backoff_us);
     return 0;
 }
 
@@ -270,17 +288,24 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
         /* Ignored/default-ignore signals do not interrupt; restartable handlers
          * still need to run promptly through the syscall epilogue.
          *
-         * The futex interrupt is left alone on the leader-work path, which the
-         * single ||-chain this replaced did by short-circuiting. It is a
-         * process-wide one-shot standing in for SIGCHLD when the last
-         * clone-thread exits, and consuming it here would hand its EINTR to a
-         * restart that swallows it, so no thread would ever observe the edge.
-         * Left set, it is still there for the next interruptible wait in any
-         * thread, which is the ordering this wants: a ready fd is reported
-         * first and the one-shot keeps until something waits again.
+         * The futex interrupt one-shot is deliberately not consulted here. It
+         * is process-wide, raised when the last clone-thread exits to unstick a
+         * futex wait that would otherwise miss the edge, and every caller of
+         * this wait is a data transfer rather than a futex waiter. Consuming it
+         * here truncates the transfer: a 1 MiB blocking write that has moved
+         * one pipe buffer reports 65536 and the guest, which asked for a
+         * blocking write and saw no signal, is handed a short count Linux would
+         * never produce. Measured, not theorized -- a sibling thread exiting
+         * before an unrelated big write was enough, and the reader waiting for
+         * the rest of the stream deadlocked.
+         *
+         * Nothing is lost by leaving it set. Teardown is answered above by
+         * thread_stop_requested, a real signal by the test below, and the
+         * wakeup pipe plus thread_interrupt_all -- which the one-shot's raiser
+         * sends alongside it -- already break this poll. The edge stays where
+         * it belongs, for the next futex or poll wait that is entitled to it.
          */
-        if ((!leader_only && futex_interrupt_consume()) ||
-            signal_pending_interruption(NULL))
+        if (signal_pending_interruption(NULL))
             return -LINUX_EINTR;
 
         /* Bounded wait even when the wakeup pipe exists: the pipe is a
@@ -302,27 +327,307 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
     }
 }
 
-/* Route a blocking read/write on a fd that can block (pipe, socket, fifo,
- * char/tty) through the interruptible wait so the vCPU thread stays reachable
- * by hv_vcpus_exit + the wakeup pipe. No-op for regular files, nonblocking fds,
- * and direction mismatches (a POLLIN wait on an O_WRONLY fd would hang; the
- * read then fails EBADF like Linux).
- *
- * Returns 0 to proceed or a negative Linux errno (EINTR) to abort.
+/* True when a transfer in this direction can work on a description opened with
+ * these status flags. A POLLIN wait on an O_WRONLY description would never
+ * return, and the transfer that follows reports EBADF the way Linux does.
  */
-static int64_t io_block_wait(int fd, int host_fd, short events)
+static bool io_fl_direction_ok(int fl, short events)
 {
-    if (!fd_can_block(fd))
-        return 0;
-    int fl = fcntl(host_fd, F_GETFL);
-    if (fl < 0 || (fl & O_NONBLOCK))
-        return 0;
     int acc = fl & O_ACCMODE;
     if ((events & POLLIN) && acc == O_WRONLY)
-        return 0;
+        return false;
     if ((events & POLLOUT) && acc == O_RDONLY)
+        return false;
+    return true;
+}
+
+/* True when a transfer on a description elfuse does not own has to be gated on
+ * a wait: the guest has not asked for O_NONBLOCK and the direction matches the
+ * access mode. Only inherited stdio and its aliases reach here, and only they
+ * pay the fcntl: an owned fd answers from the shadow and a socket is asked
+ * later, once its transfer has actually reported EAGAIN.
+ */
+static bool io_foreign_should_block(int host_fd, short events)
+{
+    int fl = fcntl(host_fd, F_GETFL);
+    if (fl < 0 || (fl & O_NONBLOCK))
+        return false;
+    return io_fl_direction_ok(fl, events);
+}
+
+/* After a transfer reported EAGAIN on an fd whose transfer cannot block: does
+ * the guest's mode say to wait and retry, or to report it?
+ *
+ * Asking here rather than before the transfer is what keeps a host call off
+ * every successful read and write. An owned fd answers from the shadow with no
+ * host call at all, which now includes sockets; only a description elfuse did
+ * not open costs an fcntl, and only on the path that was going to wait anyway.
+ */
+static bool io_eagain_should_wait(const fd_block_state_t *st, int host_fd)
+{
+    if (st->nonblock_owned)
+        return !st->guest_nonblock;
+    return sock_op_should_block(st, host_fd, 0);
+}
+
+/* One transfer attempt, in the form that reports EAGAIN rather than parking the
+ * caller.
+ *
+ * Sockets take a per-call MSG_DONTWAIT, which leaves the open file description
+ * alone. Everything else relies on elfuse owning O_NONBLOCK on the host fd
+ * (fd_init_entry); macOS has no per-call equivalent for a pipe and no private
+ * open file description to borrow either, since dup shares the status flags
+ * (measured) and a pipe has no path to reopen. The one kind of fd elfuse does
+ * not own is inherited stdio, where this blocks: the loop above it goes round
+ * again only if a host signal truncated the transfer, which is the residual
+ * parking window TODO.md records for those three descriptors.
+ */
+static ssize_t io_xfer_once(int host_fd,
+                            bool is_socket,
+                            bool is_read,
+                            struct iovec *iov,
+                            int iovcnt)
+{
+    if (is_socket) {
+        /* Every read/write caller has one buffer, and the flat form skips a
+         * msghdr the kernel would only have to walk back.
+         */
+        if (iovcnt == 1)
+            return is_read ? recv(host_fd, iov->iov_base, iov->iov_len,
+                                  MSG_DONTWAIT)
+                           : send(host_fd, iov->iov_base, iov->iov_len,
+                                  MSG_DONTWAIT);
+        struct msghdr msg = {.msg_iov = iov, .msg_iovlen = iovcnt};
+        return is_read ? recvmsg(host_fd, &msg, MSG_DONTWAIT)
+                       : sendmsg(host_fd, &msg, MSG_DONTWAIT);
+    }
+    if (iovcnt == 1)
+        return is_read ? read(host_fd, iov->iov_base, iov->iov_len)
+                       : write(host_fd, iov->iov_base, iov->iov_len);
+    return is_read ? readv(host_fd, iov, iovcnt) : writev(host_fd, iov, iovcnt);
+}
+
+/* Drop the entries a partial transfer already moved and trim the first
+ * survivor.
+ *
+ * Returns how many entries are now spent, so the caller resumes at iov + spent
+ * with iovcnt - spent entries.
+ */
+static int iov_advance(struct iovec *iov, int iovcnt, size_t moved)
+{
+    /* The index arithmetic is proved in proved/iov.h, which is where the two
+     * facts this trim depends on come from: the index is in range, and the
+     * remainder is strictly inside the entry it names, so neither subtracting
+     * it from iov_len nor adding it to iov_base can leave the entry. What is
+     * left here is the pointer bump, which no contract in this tree can carry:
+     * iov_base points into guest memory whose extent the analyzer cannot name.
+     */
+    size_t rem = 0;
+    int spent = iov_advance_index(iov, iovcnt, moved, &rem);
+    if (spent < iovcnt) {
+        iov[spent].iov_base = (char *) iov[spent].iov_base + rem;
+        iov[spent].iov_len -= rem;
+    }
+    return spent;
+}
+
+
+int64_t io_xfer(int fd,
+                int host_fd,
+                short events,
+                struct iovec *iov,
+                int iovcnt,
+                ssize_t *out,
+                const fd_block_state_t *pinned)
+{
+    bool is_read = (events & POLLIN) != 0;
+    fd_block_state_t st = *pinned;
+    bool is_socket = st.type == FD_SOCKET;
+
+    /* Nothing that can block: a regular file, a directory, or a closed slot on
+     * its way to EBADF. One host call, nothing asked before it.
+     */
+    if (st.type == FD_CLOSED || !st.can_block) {
+        *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
         return 0;
-    return io_wait_fd_or_interrupted(host_fd, events);
+    }
+
+    /* An owned fd transfers without blocking, so the transfer runs first and
+     * answers the readiness question itself. A description elfuse does not own
+     * has a transfer that really blocks, so it keeps the gate in front of it.
+     *
+     * Ownership rather than type: a socket used to be counted as nonblocking on
+     * the strength of the MSG_DONTWAIT that io_xfer_once passes, and macOS does
+     * not honour that on AF_UNIX. A socket elfuse opened is now owned and lands
+     * on the left of this; one that arrived over SCM_RIGHTS is not owned, and
+     * belongs on the right with the other foreign descriptions.
+     */
+    bool nb_transfer = st.nonblock_owned;
+    bool wait_first = false;
+    if (!nb_transfer) {
+        if (!io_foreign_should_block(host_fd, events)) {
+            *out = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
+            return 0;
+        }
+        wait_first = true;
+    }
+
+    /* Sum through the proved add rather than by hand: the total feeds the
+     * completion test below, and iov_total_add is where this tree states that
+     * an iovec sum cannot carry past SSIZE_MAX. Every caller reaching here has
+     * already been clamped, so the reject is unreachable today -- which is the
+     * same "unreachable by provenance rather than by construction" the header
+     * was written about.
+     */
+    uint64_t want = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        if (!iov_total_add(want, iov[i].iov_len, &want))
+            return -LINUX_EINVAL;
+    }
+
+    /* Nothing to move: read(fd, buf, 0) and write(fd, buf, 0) report 0 on a
+     * blocking fd rather than waiting for one. Every caller guards this today,
+     * and the wait below would never end if one stopped.
+     */
+    if (want == 0) {
+        *out = 0;
+        return 0;
+    }
+
+    /* Every way a round can end badly leaves through the tail below, which
+     * states the reporting rule once: a partial count outranks the failure, the
+     * way an interrupted write(2) reports what it moved. `fail` carries a
+     * negative Linux errno for the failures elfuse names itself; a zero `fail`
+     * with a negative `xfer_ret` means the host transfer failed and its own
+     * return and errno are the answer. Both are set only on the round that
+     * breaks, so neither can go stale.
+     */
+    ssize_t total = 0, xfer_ret = 0;
+    int xfer_errno = 0;
+    int64_t fail = 0;
+    unsigned backoff = 0, spins = 0;
+    for (;;) {
+        if (wait_first) {
+            int64_t waited = io_wait_fd_or_interrupted(host_fd, events);
+            if (waited < 0) {
+                /* Interrupted, by a guest signal or by elfuse's own teardown
+                 * and execve-handoff wakes.
+                 */
+                fail = waited;
+                break;
+            }
+        }
+
+        ssize_t ret = io_xfer_once(host_fd, is_socket, is_read, iov, iovcnt);
+        if (ret < 0) {
+            /* Everything below can call something that sets errno -- the pty
+             * lookup takes two locks, and the socket case of
+             * io_eagain_should_wait runs an fcntl -- so hold the transfer's own
+             * errno and put it back on the paths that report it.
+             */
+            xfer_ret = ret;
+            xfer_errno = errno;
+            if (xfer_errno != EAGAIN)
+                break;
+
+            /* Nothing there, and the pty this reads from has lost every slave:
+             * Linux answers EIO, and waiting cannot help because elfuse's own
+             * keepalive slave holds the pty open, so no hangup will ever arrive
+             * to end the wait. A pty master is a char device, so pipes and
+             * sockets -- every contended transfer -- skip the lookup, which
+             * costs two locks and a table scan to answer "no".
+             */
+            if (is_read && st.type != FD_PIPE && !is_socket &&
+                proc_pty_master_hung_up(fd, st.generation)) {
+                fail = -LINUX_EIO;
+                break;
+            }
+
+            /* The guest asked for a nonblocking fd, so EAGAIN is the answer
+             * rather than something to wait out.
+             */
+            if (nb_transfer && !io_eagain_should_wait(&st, host_fd))
+                break;
+
+            /* The bytes the transfer wanted went to somebody else, or never
+             * arrived. Wait for the next lot.
+             *
+             * The wait reports ready on any revents, POLLHUP and POLLERR
+             * included, so an fd whose readiness a nonblocking transfer keeps
+             * answering with EAGAIN would spin here at the cost of a whole
+             * core. Back off once that repeats, which also puts an interrupt
+             * check in the loop.
+             */
+            wait_first = true;
+            if (++spins >= IO_XFER_SPIN_LIMIT) {
+                int64_t rc = io_retry_backoff(&backoff);
+                if (rc < 0) {
+                    fail = rc;
+                    break;
+                }
+            }
+            continue;
+        }
+        spins = 0;
+        backoff = 0;
+        xfer_ret = 0;
+
+        total += ret;
+
+        /* A read stops on the first return: Linux gives a reader whatever has
+         * arrived rather than waiting for the whole request.
+         */
+        if (is_read || ret == 0 || (uint64_t) total == want)
+            break;
+
+        /* A writer that asked for a nonblocking fd gets the partial count.
+         *
+         * A socket used to stop here unconditionally, one clause above, because
+         * nothing maintained its shadow: st.guest_nonblock read false for every
+         * socket including one the guest had set nonblocking, so the general
+         * test could not be trusted and a nonblocking socket write that filled
+         * the buffer would have waited for a reader instead of reporting what
+         * it moved (tests/test-socket-shortwrite.c). Now that sockets are owned
+         * the shadow is true for them and the general test covers both: a
+         * nonblocking socket write reports its short count here, and a blocking
+         * one goes round again for the remainder, which is what Linux does and
+         * what the old unconditional stop could not express.
+         */
+        if (st.guest_nonblock)
+            break;
+
+        /* Wait before the next round. Every round asks for the whole remainder,
+         * so a short return means the buffer filled, and retrying the transfer
+         * first would only add a failing syscall: the reader would have to
+         * drain in the microseconds between two calls for it to pay off.
+         * Measured both ways on a 1 MiB pipe write, no difference outside
+         * noise, so this keeps the cheaper shape.
+         */
+        wait_first = true;
+        int spent = iov_advance(iov, iovcnt, (size_t) ret);
+        iov += spent;
+        iovcnt -= spent;
+    }
+
+    /* A write that moved bytes and then found the reader gone reports the
+     * count, and Linux still raises SIGPIPE: pipe_write sends the signal even
+     * when it has something to return. io_write_result cannot do it, since the
+     * value it sees is a non-negative count with no errno attached, so the
+     * round that ended the loop says so here. Measured against qemu-aarch64:
+     * both sides return the same partial count, and only Linux signalled.
+     */
+    if (!is_read && total > 0 && xfer_ret < 0 && xfer_errno == EPIPE)
+        signal_queue(LINUX_SIGPIPE);
+
+    if (total == 0 && fail < 0)
+        return fail;
+    if (total == 0 && xfer_ret < 0) {
+        *out = xfer_ret;
+        errno = xfer_errno;
+        return 0;
+    }
+    *out = total;
+    return 0;
 }
 
 static int64_t io_check_access(int host_fd, short events)
@@ -330,12 +635,7 @@ static int64_t io_check_access(int host_fd, short events)
     int fl = fcntl(host_fd, F_GETFL);
     if (fl < 0)
         return linux_errno();
-    int acc = fl & O_ACCMODE;
-    if ((events & POLLIN) && acc == O_WRONLY)
-        return -LINUX_EBADF;
-    if ((events & POLLOUT) && acc == O_RDONLY)
-        return -LINUX_EBADF;
-    return 0;
+    return io_fl_direction_ok(fl, events) ? 0 : -LINUX_EBADF;
 }
 
 /* Interruptible output drain, mirroring tty_wait_until_sent(): the Linux kernel
@@ -1006,27 +1306,34 @@ static uint32_t mac_lflag_to_linux(tcflag_t mf)
 
 /* read/write and positional variants. */
 
-/* Open a host fd reference for regular I/O, checking type and seals under
- * fd_lock for thread safety.
+/* Open a host fd reference for regular I/O, rejecting path-only fds and
+ * write-sealed memfds.
  *
  * Returns -LINUX_EBADF for path-only or closed fds, -LINUX_EPERM for
- * write-sealed fds (when check_write_seal is set), or 0 on success.
+ * write-sealed ones, 0 on success. st_out, when given, receives the
+ * classification taken with the descriptor rather than looked up afterwards; a
+ * transfer needs that pairing, since the guest fd number can be reused for
+ * another kind of object in between. The checks read that same state, so the
+ * seal that is enforced belongs to the description being written to and not to
+ * whatever occupied the slot a moment earlier.
  */
 static int64_t host_fd_ref_open_checked(int guest_fd,
                                         host_fd_ref_t *ref,
-                                        bool check_write_seal)
+                                        fd_block_state_t *st_out)
 {
-    if (check_write_seal) {
-        fd_entry_t snap;
-        if (!fd_snapshot(guest_fd, &snap))
-            return -LINUX_EBADF;
-        if (snap.type == FD_PATH)
-            return -LINUX_EBADF;
-        if (snap.seals & LINUX_F_SEAL_WRITE)
-            return -LINUX_EPERM;
-        return host_fd_ref_open(guest_fd, ref) < 0 ? -LINUX_EBADF : 0;
+    fd_block_state_t st;
+    if (host_fd_ref_open_state(guest_fd, ref, &st) < 0)
+        return -LINUX_EBADF;
+
+    if (st.type == FD_PATH || (st.seals & LINUX_F_SEAL_WRITE)) {
+        int64_t err = (st.type == FD_PATH) ? -LINUX_EBADF : -LINUX_EPERM;
+        host_fd_ref_close(ref);
+        return err;
     }
-    return host_fd_ref_open_io(guest_fd, ref);
+
+    if (st_out)
+        *st_out = st;
+    return 0;
 }
 
 /* True when a read on this pty master must fail with EIO.
@@ -1049,20 +1356,7 @@ static bool pty_read_hangs_up(int guest_fd, uint64_t gen, int host_fd)
     return poll(&drain, 1, 0) <= 0 || !(drain.revents & POLLIN);
 }
 
-static int64_t host_fd_ref_open_regular_io(int guest_fd, host_fd_ref_t *ref)
-{
-    return host_fd_ref_open_io(guest_fd, ref);
-}
 
-/* host_fd_ref_open_regular_io() that also pins the generation the reference was
- * resolved against, in the same fd_lock window. See host_fd_ref_open_io_gen().
- */
-static int64_t host_fd_ref_open_regular_io_gen(int guest_fd,
-                                               host_fd_ref_t *ref,
-                                               uint64_t *out_gen)
-{
-    return host_fd_ref_open_io_gen(guest_fd, ref, out_gen);
-}
 
 static int64_t proc_try_read_intercept(int fd,
                                        int host_fd,
@@ -1205,7 +1499,8 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         return netlink_send(fd, g, buf_gva, count);
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
+    fd_block_state_t write_st;
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, &write_st);
     if (err < 0)
         return err;
 
@@ -1242,20 +1537,18 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         }
     }
 
-    /* A blocking write on a full pipe/socket buffer would park this vCPU thread
-     * in an uninterruptible host write() where the preempt thread's
-     * hv_vcpus_exit cannot reach it. Wait for POLLOUT (or a guest signal)
-     * first. Unlike the socket send paths there is no per-call nonblocking flag
-     * for write(), so the tiny window where the buffer refills between the wait
-     * and write() can still block; that matches sys_read and the receive paths.
+    /* Wait for POLLOUT (or a guest signal) and transfer without ever parking
+     * this vCPU thread in a host call. io_xfer completes short pipe writes and
+     * returns a short socket write.
      */
-    int64_t wwait = io_block_wait(fd, host_ref.fd, POLLOUT);
+    struct iovec iov = {.iov_base = buf, .iov_len = count};
+    ssize_t ret;
+    int64_t wwait = io_xfer(fd, host_ref.fd, POLLOUT, &iov, 1, &ret, &write_st);
     if (wwait < 0) {
         host_fd_ref_close(&host_ref);
         return wwait;
     }
 
-    ssize_t ret = write(host_ref.fd, buf, count);
     host_fd_ref_close(&host_ref);
     return io_write_result(ret);
 }
@@ -1292,7 +1585,8 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      */
     host_fd_ref_t host_ref;
     uint64_t read_gen;
-    int64_t err = host_fd_ref_open_regular_io_gen(fd, &host_ref, &read_gen);
+    fd_block_state_t read_st;
+    int64_t err = host_fd_ref_open_io_state(fd, &host_ref, &read_gen, &read_st);
     if (err < 0)
         return err;
 
@@ -1336,15 +1630,17 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     }
 
     /* Wait interruptibly when the fd can block on a read (pipe, socket, fifo,
-     * char/tty). Regular files never block and skip this.
+     * char/tty), then take the bytes without parking. Regular files never block
+     * and transfer straight through.
      */
-    int64_t rwait = io_block_wait(fd, host_ref.fd, POLLIN);
+    struct iovec iov = {.iov_base = buf, .iov_len = count};
+    ssize_t ret;
+    int64_t rwait = io_xfer(fd, host_ref.fd, POLLIN, &iov, 1, &ret, &read_st);
     if (rwait < 0) {
         host_fd_ref_close(&host_ref);
         return rwait;
     }
 
-    ssize_t ret = read(host_ref.fd, buf, count);
     int64_t result = ret < 0 ? recv_eof_or_errno(host_ref.fd, fd) : ret;
     host_fd_ref_close(&host_ref);
     return result;
@@ -1360,7 +1656,7 @@ int64_t sys_pread64(guest_t *g,
         return fuse_pread_fd(g, fd, buf_gva, count, offset);
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
     if (err < 0)
         return err;
 
@@ -1396,7 +1692,7 @@ int64_t sys_pwrite64(guest_t *g,
                      int64_t offset)
 {
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
     if (err < 0)
         return err;
 
@@ -1706,7 +2002,9 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 
     host_fd_ref_t host_ref;
     uint64_t readv_gen;
-    int64_t err = host_fd_ref_open_regular_io_gen(fd, &host_ref, &readv_gen);
+    fd_block_state_t readv_st;
+    int64_t err =
+        host_fd_ref_open_io_state(fd, &host_ref, &readv_gen, &readv_st);
     if (err < 0)
         return err;
 
@@ -1747,14 +2045,15 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         }
     }
 
-    int64_t rwait = io_block_wait(fd, host_ref.fd, POLLIN);
+    ssize_t ret;
+    int64_t rwait =
+        io_xfer(fd, host_ref.fd, POLLIN, host_iov.iov, iovcnt, &ret, &readv_st);
     if (rwait < 0) {
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
         return rwait;
     }
 
-    ssize_t ret = readv(host_ref.fd, host_iov.iov, iovcnt);
     int64_t result = ret < 0 ? recv_eof_or_errno(host_ref.fd, fd) : ret;
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
@@ -1795,7 +2094,8 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
     }
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
+    fd_block_state_t writev_st;
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, &writev_st);
     if (err < 0)
         return err;
 
@@ -1823,14 +2123,15 @@ int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         }
     }
 
-    int64_t wwait = io_block_wait(fd, host_ref.fd, POLLOUT);
+    ssize_t ret;
+    int64_t wwait = io_xfer(fd, host_ref.fd, POLLOUT, host_iov.iov, iovcnt,
+                            &ret, &writev_st);
     if (wwait < 0) {
         host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
         return wwait;
     }
 
-    ssize_t ret = writev(host_ref.fd, host_iov.iov, iovcnt);
     int64_t result = io_write_result(ret);
     host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
@@ -1861,7 +2162,7 @@ int64_t sys_preadv(guest_t *g,
     }
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
     if (err < 0)
         return err;
 
@@ -1908,7 +2209,7 @@ int64_t sys_pwritev(guest_t *g,
     }
 
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
     if (err < 0)
         return err;
 
@@ -1941,7 +2242,7 @@ static int64_t sys_pwritev_append(guest_t *g,
                                   bool update_file_offset)
 {
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
+    int64_t err = host_fd_ref_open_checked(fd, &host_ref, NULL);
     if (err < 0)
         return err;
 
@@ -2040,7 +2341,7 @@ int64_t sys_pwritev2(guest_t *g,
     /* RWF_SYNC/RWF_DSYNC: sync after successful write */
     if (r > 0 && (flags & (RWF_SYNC | RWF_DSYNC))) {
         host_fd_ref_t host_ref;
-        if (host_fd_ref_open_regular_io(fd, &host_ref) == 0) {
+        if (host_fd_ref_open_io(fd, &host_ref) == 0) {
             fsync(host_ref.fd);
             host_fd_ref_close(&host_ref);
         }
@@ -2229,12 +2530,12 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
      * host fd's FD_CLOEXEC, which is per-descriptor and would be lost on the
      * dup that host_fd_ref hands multi-threaded callers, so mirror the F_SETFD
      * path in sys_fcntl). They need no host fd, so dispatch them before
-     * host_fd_ref_open_regular_io(): that helper rejects O_PATH (FD_PATH) fds
-     * with EBADF, but Linux allows these ioctls -- like fcntl(F_SETFD) -- on
-     * O_PATH descriptors. Validate the slot and mutate the flag in a single
-     * fd_lock section so there is no validate-then-mutate window in which a
-     * concurrent close/reuse could flip CLOEXEC on a different file that took
-     * the slot. The arg is ignored.
+     * host_fd_ref_open_io(): that helper rejects O_PATH (FD_PATH) fds with
+     * EBADF, but Linux allows these ioctls -- like fcntl(F_SETFD) -- on O_PATH
+     * descriptors. Validate the slot and mutate the flag in a single fd_lock
+     * section so there is no validate-then-mutate window in which a concurrent
+     * close/reuse could flip CLOEXEC on a different file that took the slot.
+     * The arg is ignored.
      */
     if (request == LINUX_FIOCLEX || request == LINUX_FIONCLEX) {
         if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
@@ -2265,7 +2566,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
 
     host_fd_ref_t host_ref;
     uint64_t ioctl_gen;
-    int64_t err = host_fd_ref_open_regular_io_gen(fd, &host_ref, &ioctl_gen);
+    int64_t err = host_fd_ref_open_io_gen(fd, &host_ref, &ioctl_gen);
     if (err < 0)
         return err;
     int host_fd = host_ref.fd;
@@ -2895,6 +3196,17 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
+
+        /* An owned fd stays nonblocking on the host whatever the guest asks for
+         * here, the same way F_SETFL treats it: the request goes to the shadow,
+         * which is where F_GETFL and the transfer paths read it, and reaches
+         * every dup alias of the same open file description.
+         */
+        if (fd_apply_guest_nonblock(fd, on != 0)) {
+            host_fd_ref_close(&host_ref);
+            return 0;
+        }
+
         int r = fd_update_status_flag(host_fd, O_NONBLOCK, on != 0);
         host_fd_ref_close(&host_ref);
         return r < 0 ? linux_errno() : 0;
@@ -2911,7 +3223,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
 int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
 {
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
+    int64_t err = host_fd_ref_open_io(fd, &host_ref);
     if (err < 0)
         return err;
 
@@ -3045,15 +3357,78 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
  *
  * Returns the byte count moved, or a negative Linux errno only when the very
  * first read or write failed (partial transfers report the count so the caller
- * can still write offsets back).
+ * can still write offsets back). Rewind a position-based input by the bytes a
+ * read consumed but the write never sent, so the fd's position matches what
+ * Linux advances it by.
+ *
+ * Returns false when the input cannot be put back: offset-based input never
+ * consumed anything, but a pipe cannot seek, and a pipe is the usual splice
+ * input. A caller reporting an interrupted transfer over an input it could not
+ * rewind must forbid the SVC restart, since re-running the original arguments
+ * would read past the bytes that went missing.
  */
-static int64_t copy_fd_range(int in_gfd,
-                             int in_hfd,
-                             int out_hfd,
+static bool io_rewind_unsent(int64_t off_in, int in_hfd, ssize_t unsent)
+{
+    if (off_in >= 0)
+        return true;
+
+    /* Nothing to put back, and the guard is not only for the caller's benefit:
+     * negating SSIZE_MIN is undefined, and this is the one expression in the
+     * transfer path that negates a signed count it did not compute itself.
+     * Every caller passes a chunk-bounded value today, so this is unreachable
+     * by provenance; the comparison makes it unreachable by construction.
+     */
+    if (unsent <= 0)
+        return true;
+
+    return lseek(in_hfd, (off_t) -unsent, SEEK_CUR) >= 0;
+}
+
+/* An interrupted write of a chunk already drained out of the input: give up on
+ * it, or keep writing?
+ *
+ * If the unsent tail can be put back, the interruption is reportable and the
+ * guest loses nothing. If it cannot -- a pipe, the usual splice input --
+ * abandoning it drops those bytes outright, so the write has to continue: an
+ * ordinary SIGCHLD arriving mid-splice must not eat 64 KiB of the guest's
+ * stream. Teardown is the one interruption that wins anyway, because the thread
+ * is going away and the image with it, so there is nobody left for the bytes to
+ * reach; without it the caller would spin, since io_xfer reports the stop
+ * request every time it is asked.
+ *
+ * Both stream copiers ask this, and they asked it in opposite spellings before
+ * it was one function. *rewound_out says which of the two answers a true return
+ * came from, because only the caller can spell syscall_restart_forbid() where
+ * scripts/check-eintr-contract.py can see it, and only the teardown answer owes
+ * it: an input the rewind put back is one the restart may safely re-read.
+ */
+static bool io_give_up_unsent(int64_t off_in,
+                              int in_hfd,
+                              ssize_t unsent,
+                              bool *rewound_out)
+{
+    bool rewound = io_rewind_unsent(off_in, in_hfd, unsent);
+    *rewound_out = rewound;
+    return rewound || thread_stop_requested();
+}
+
+typedef struct {
+    int in_gfd, in_hfd;
+    int out_gfd, out_hfd;
+    fd_block_state_t in_st, out_st;
+} copy_ends_t;
+
+static int64_t copy_fd_range(const copy_ends_t *ends,
                              int64_t *off_in,
                              int64_t *off_out,
                              uint64_t len)
 {
+    int in_gfd = ends->in_gfd, in_hfd = ends->in_hfd;
+    int out_gfd = ends->out_gfd, out_hfd = ends->out_hfd;
+
+    fd_block_state_t in_st = ends->in_st;
+    fd_block_state_t out_st = ends->out_st;
+
     char *buf = malloc(IO_COPY_BUF_SIZE);
     if (!buf)
         return -LINUX_ENOMEM;
@@ -3073,8 +3448,20 @@ static int64_t copy_fd_range(int in_gfd,
         } else {
             int64_t intercepted =
                 proc_try_chunk_read_intercept(in_gfd, in_hfd, buf, chunk, 0, 0);
-            nr = (intercepted != INT64_MIN) ? intercepted
-                                            : read(in_hfd, buf, chunk);
+            if (intercepted != INT64_MIN) {
+                nr = intercepted;
+            } else {
+                /* An owned input fd is nonblocking on the host, so the read has
+                 * to go through io_xfer to keep the guest's blocking semantics.
+                 */
+                struct iovec iov = {.iov_base = buf, .iov_len = chunk};
+                int64_t waited =
+                    io_xfer(in_gfd, in_hfd, POLLIN, &iov, 1, &nr, &in_st);
+                if (waited < 0) {
+                    ret = total > 0 ? (int64_t) total : waited;
+                    goto done;
+                }
+            }
         }
         if (nr < 0) {
             ret = total > 0 ? (int64_t) total : linux_errno();
@@ -3083,8 +3470,44 @@ static int64_t copy_fd_range(int in_gfd,
         if (nr == 0)
             break; /* EOF */
 
-        ssize_t nw = (*off_out >= 0) ? pwrite(out_hfd, buf, nr, *off_out)
-                                     : write(out_hfd, buf, nr);
+        ssize_t nw;
+        if (*off_out >= 0) {
+            nw = pwrite(out_hfd, buf, nr, *off_out);
+        } else {
+            struct iovec iov = {.iov_base = buf, .iov_len = (size_t) nr};
+            unsigned backoff = 0;
+            for (;;) {
+                int64_t waited =
+                    io_xfer(out_gfd, out_hfd, POLLOUT, &iov, 1, &nw, &out_st);
+                if (waited >= 0)
+                    break;
+
+                /* The retry has to be this inner loop and not the outer one:
+                 * continuing there would read a fresh chunk over the nr bytes
+                 * still sitting in buf and drop them, which is exactly what
+                 * keeping the write alive exists to prevent. io_xfer leaves iov
+                 * untouched when it reports a negative, since it only rewrites
+                 * the vector once something has moved and never fails after
+                 * that, so the same iov is safe to hand back. sendfile does not
+                 * reject a pipe in_fd the way Linux does, so an unrewindable
+                 * input is reachable here too.
+                 */
+                bool rewound;
+                if (io_give_up_unsent(*off_in, in_hfd, nr, &rewound)) {
+                    if (!rewound)
+                        syscall_restart_forbid();
+                    ret = total > 0 ? (int64_t) total : waited;
+                    goto done;
+                }
+
+                /* Nothing to give up on and nothing tearing this thread down,
+                 * so the write has to keep going. io_xfer answers the pending
+                 * signal on entry, so retrying it bare is a spin; sleep between
+                 * rounds instead.
+                 */
+                io_backoff_sleep(&backoff);
+            }
+        }
         if (nw < 0) {
             if (errno == EPIPE)
                 signal_queue(LINUX_SIGPIPE);
@@ -3108,8 +3531,7 @@ static int64_t copy_fd_range(int in_gfd,
              * (which sendfile/copy_file_range do not accept) simply keeps the
              * prior behavior.
              */
-            if (*off_in < 0)
-                (void) lseek(in_hfd, (off_t) (nw - nr), SEEK_CUR);
+            (void) io_rewind_unsent(*off_in, in_hfd, nr - nw);
             break;
         }
     }
@@ -3127,10 +3549,11 @@ int64_t sys_sendfile(guest_t *g,
                      uint64_t count)
 {
     host_fd_ref_t out_ref, in_ref;
-    int64_t err = host_fd_ref_open_regular_io(out_fd, &out_ref);
+    fd_block_state_t out_st, in_st;
+    int64_t err = host_fd_ref_open_io_state(out_fd, &out_ref, NULL, &out_st);
     if (err < 0)
         return err;
-    err = host_fd_ref_open_regular_io(in_fd, &in_ref);
+    err = host_fd_ref_open_io_state(in_fd, &in_ref, NULL, &in_st);
     if (err < 0) {
         host_fd_ref_close(&out_ref);
         return err;
@@ -3153,8 +3576,13 @@ int64_t sys_sendfile(guest_t *g,
 
     /* sendfile has no output offset, so out always uses write(). */
     int64_t off_out = -1;
-    int64_t moved =
-        copy_fd_range(in_fd, in_ref.fd, out_ref.fd, &offset, &off_out, count);
+    int64_t moved = copy_fd_range(&(copy_ends_t) {.in_gfd = in_fd,
+                                                  .in_hfd = in_ref.fd,
+                                                  .in_st = in_st,
+                                                  .out_gfd = out_fd,
+                                                  .out_hfd = out_ref.fd,
+                                                  .out_st = out_st},
+                                  &offset, &off_out, count);
     if (moved < 0) {
         err = moved;
         goto out_sendfile;
@@ -3191,10 +3619,11 @@ int64_t sys_copy_file_range(guest_t *g,
         return -LINUX_EINVAL;
 
     host_fd_ref_t in_ref, out_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd_in, &in_ref);
+    fd_block_state_t in_st, out_st;
+    int64_t err = host_fd_ref_open_io_state(fd_in, &in_ref, NULL, &in_st);
     if (err < 0)
         return err;
-    err = host_fd_ref_open_regular_io(fd_out, &out_ref);
+    err = host_fd_ref_open_io_state(fd_out, &out_ref, NULL, &out_st);
     if (err < 0) {
         host_fd_ref_close(&in_ref);
         return err;
@@ -3216,8 +3645,13 @@ int64_t sys_copy_file_range(guest_t *g,
     }
 
     /* Emulate with a pread/pwrite loop. */
-    int64_t moved =
-        copy_fd_range(fd_in, in_ref.fd, out_ref.fd, &off_in, &off_out, len);
+    int64_t moved = copy_fd_range(&(copy_ends_t) {.in_gfd = fd_in,
+                                                  .in_hfd = in_ref.fd,
+                                                  .in_st = in_st,
+                                                  .out_gfd = fd_out,
+                                                  .out_hfd = out_ref.fd,
+                                                  .out_st = out_st},
+                                  &off_in, &off_out, len);
     if (moved < 0) {
         err = moved;
         goto out_copy_file_range;
@@ -3246,7 +3680,105 @@ out_copy_file_range:
 
 /* splice/tee. */
 
-/* splice: emulate by reading from in_fd and writing to out_fd */
+/* splice: emulate by reading from in_fd and writing to out_fd One splice chunk
+ * in flight: the two ends, and the guest offsets that advance with it. Kept
+ * together so the drain below can be a function rather than a fourth level of
+ * nesting inside sys_splice.
+ */
+typedef struct {
+    int fd_in, in_hfd;
+    int fd_out, out_hfd;
+    int64_t off_in, off_out; /* -1 when the guest passed no offset */
+
+    /* Both ends classified once, from the descriptors sys_splice pinned. The
+     * per-chunk alternative lets a sibling reusing either fd number change the
+     * transfer form partway through a copy that is still holding the old
+     * descriptors.
+     */
+    fd_block_state_t in_st, out_st;
+} splice_state_t;
+
+/* Why the drain stopped, when it stopped early. */
+typedef struct {
+    bool stop;        /* the outer loop must end */
+    bool rw_error;    /* a write failed; errno is in saved_errno */
+    int saved_errno;  /* preserved across the guest writes at done */
+    int64_t wait_err; /* interrupted wait, reported only if nothing moved */
+} splice_fail_t;
+
+/* Drain one read chunk to the output the way splice does: a short write is
+ * continued rather than reported, so the chunk either lands whole or the caller
+ * stops.
+ *
+ * Returns the bytes written, which is the caller's whole accounting; the input
+ * rewind that a partial chunk needs happens here, since only this loop knows
+ * how much of the chunk never left.
+ */
+static size_t splice_drain_chunk(splice_state_t *st,
+                                 uint8_t *buf,
+                                 size_t n,
+                                 splice_fail_t *f)
+{
+    size_t written = 0;
+    unsigned backoff = 0;
+    while (written < n) {
+        ssize_t w;
+        if (st->off_out >= 0) {
+            w = pwrite(st->out_hfd, buf + written, n - written, st->off_out);
+        } else {
+            struct iovec iov = {.iov_base = buf + written,
+                                .iov_len = n - written};
+            int64_t waited = io_xfer(st->fd_out, st->out_hfd, POLLOUT, &iov, 1,
+                                     &w, &st->out_st);
+            if (waited < 0) {
+                bool rewound;
+                if (io_give_up_unsent(st->off_in, st->in_hfd,
+                                      (ssize_t) (n - written), &rewound)) {
+                    if (!rewound)
+                        syscall_restart_forbid();
+                    f->wait_err = waited;
+                    f->stop = true;
+                    return written;
+                }
+
+                /* Nothing to give up on and nothing tearing this thread down,
+                 * so the write has to keep going. io_xfer answers the pending
+                 * signal on entry, so retrying it bare is a spin; sleep between
+                 * rounds instead.
+                 */
+                io_backoff_sleep(&backoff);
+                continue;
+            }
+            backoff = 0;
+        }
+        if (w <= 0) {
+            if (w < 0) {
+                f->rw_error = true;
+                f->saved_errno = errno;
+                if (f->saved_errno == EPIPE)
+                    signal_queue(LINUX_SIGPIPE);
+            }
+
+            /* Position-based input: read() consumed all n bytes but only
+             * written were moved, so rewind the input by the difference to
+             * match Linux advancing only by bytes transferred. Best-effort; a
+             * pipe input, the common splice case, cannot seek and keeps the
+             * prior behavior.
+             */
+            (void) io_rewind_unsent(st->off_in, st->in_hfd,
+                                    (ssize_t) (n - written));
+            f->stop = true;
+            return written;
+        }
+        written += (size_t) w;
+        if (st->off_in >= 0)
+            st->off_in += w;
+        if (st->off_out >= 0)
+            st->off_out += w;
+    }
+    return written;
+}
+
 int64_t sys_splice(guest_t *g,
                    int fd_in,
                    uint64_t off_in_gva,
@@ -3257,10 +3789,11 @@ int64_t sys_splice(guest_t *g,
 {
     (void) flags;
     host_fd_ref_t in_ref, out_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd_in, &in_ref);
+    fd_block_state_t in_st, out_st;
+    int64_t err = host_fd_ref_open_io_state(fd_in, &in_ref, NULL, &in_st);
     if (err < 0)
         return err;
-    err = host_fd_ref_open_regular_io(fd_out, &out_ref);
+    err = host_fd_ref_open_io_state(fd_out, &out_ref, NULL, &out_st);
     if (err < 0) {
         host_fd_ref_close(&in_ref);
         return err;
@@ -3284,8 +3817,8 @@ int64_t sys_splice(guest_t *g,
     }
 
     /* Emulate with a read/write loop over a heap buffer. splice fully drains
-     * each read chunk (inner write loop) rather than stopping on a short write,
-     * so it does not share copy_fd_range.
+     * each read chunk rather than stopping on a short write, which is why it
+     * does not share copy_fd_range; splice_drain_chunk is that drain.
      */
     uint8_t *buf = malloc(IO_COPY_BUF_SIZE);
     if (!buf) {
@@ -3295,54 +3828,45 @@ int64_t sys_splice(guest_t *g,
     }
     size_t chunk = len > IO_COPY_BUF_SIZE ? IO_COPY_BUF_SIZE : len;
 
+    splice_state_t st = {.fd_in = fd_in,
+                         .in_hfd = in_ref.fd,
+                         .fd_out = fd_out,
+                         .out_hfd = out_ref.fd,
+                         .off_in = off_in,
+                         .off_out = off_out,
+                         .in_st = in_st,
+                         .out_st = out_st};
+    splice_fail_t f = {0};
     size_t total = 0;
-    int saved_errno = 0;   /* Preserve errno across guest_write */
-    bool rw_error = false; /* Track whether read or write failed */
     int64_t ret;
     while (total < len) {
         size_t n = (len - total) > chunk ? chunk : (len - total);
-        ssize_t r = (off_in >= 0) ? pread(in_ref.fd, buf, n, off_in)
-                                  : read(in_ref.fd, buf, n);
+        ssize_t r;
+        if (st.off_in >= 0) {
+            r = pread(st.in_hfd, buf, n, st.off_in);
+        } else {
+            /* An owned fd is nonblocking on the host, so the transfer keeps the
+             * guest's blocking semantics only by going through io_xfer.
+             */
+            struct iovec iov = {.iov_base = buf, .iov_len = n};
+            int64_t waited =
+                io_xfer(st.fd_in, st.in_hfd, POLLIN, &iov, 1, &r, &st.in_st);
+            if (waited < 0) {
+                f.wait_err = waited;
+                goto done;
+            }
+        }
         if (r < 0) {
-            rw_error = true;
-            saved_errno = errno;
+            f.rw_error = true;
+            f.saved_errno = errno;
             break;
         }
         if (r == 0)
             break; /* EOF */
-        if (off_in >= 0)
-            off_in += r;
 
-        size_t written = 0;
-        while (written < (size_t) r) {
-            ssize_t w =
-                (off_out >= 0)
-                    ? pwrite(out_ref.fd, buf + written, r - written, off_out)
-                    : write(out_ref.fd, buf + written, r - written);
-            if (w <= 0) {
-                if (w < 0) {
-                    rw_error = true;
-                    saved_errno = errno;
-                }
-                if (w < 0 && saved_errno == EPIPE)
-                    signal_queue(LINUX_SIGPIPE);
-                total += written; /* Account for partial bytes written */
-                /* Position-based input: read() consumed all r bytes but only
-                 * written were moved, so rewind the input fd by r - written to
-                 * match Linux advancing only by bytes transferred. Best-effort;
-                 * a pipe input (common for splice) cannot seek and keeps the
-                 * prior behavior. saved_errno is restored at done.
-                 */
-                if (off_in < 0 && written < (size_t) r)
-                    (void) lseek(in_ref.fd, (off_t) ((ssize_t) written - r),
-                                 SEEK_CUR);
-                goto done;
-            }
-            written += w;
-            if (off_out >= 0)
-                off_out += w;
-        }
-        total += r;
+        total += splice_drain_chunk(&st, buf, (size_t) r, &f);
+        if (f.stop)
+            goto done;
     }
 
 done:
@@ -3352,18 +3876,20 @@ done:
      * sendfile/copy_file_range). A failed off_in writeback skips the off_out
      * writeback, matching the kernel.
      */
-    if (off_in_gva && off_in >= 0 &&
-        guest_write_small(g, off_in_gva, &off_in, sizeof(off_in)) < 0) {
+    if (off_in_gva && st.off_in >= 0 &&
+        guest_write_small(g, off_in_gva, &st.off_in, sizeof(st.off_in)) < 0) {
         ret = total > 0 ? (int64_t) total : -LINUX_EFAULT;
-    } else if (off_out_gva && off_out >= 0 &&
-               guest_write_small(g, off_out_gva, &off_out, sizeof(off_out)) <
-                   0) {
+    } else if (off_out_gva && st.off_out >= 0 &&
+               guest_write_small(g, off_out_gva, &st.off_out,
+                                 sizeof(st.off_out)) < 0) {
         ret = total > 0 ? (int64_t) total : -LINUX_EFAULT;
     } else if (total > 0) {
         ret = (int64_t) total;
-    } else if (rw_error) {
+    } else if (f.wait_err) {
+        ret = f.wait_err;
+    } else if (f.rw_error) {
         /* Restore saved_errno; the guest writes above may have clobbered it. */
-        errno = saved_errno;
+        errno = f.saved_errno;
         ret = linux_errno();
     } else {
         ret = 0;
@@ -3383,8 +3909,15 @@ int64_t sys_vmsplice(guest_t *g,
                      unsigned int flags)
 {
     (void) flags;
+
+    /* One pin and one classification for the whole call: the descriptor is
+     * pinned here and every segment below transfers on it, so re-resolving the
+     * slot per segment would let a sibling reusing this fd number change the
+     * transfer form partway through, up to 1024 times.
+     */
     host_fd_ref_t host_ref;
-    int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
+    fd_block_state_t vm_st;
+    int64_t err = host_fd_ref_open_io_state(fd, &host_ref, NULL, &vm_st);
     if (err < 0)
         return err;
     if (nr_segs > 1024) {
@@ -3413,7 +3946,13 @@ int64_t sys_vmsplice(guest_t *g,
         if (len > avail)
             len = avail;
 
-        ssize_t w = write(host_ref.fd, src, len);
+        struct iovec iov = {.iov_base = src, .iov_len = len};
+        ssize_t w;
+        int64_t waited = io_xfer(fd, host_ref.fd, POLLOUT, &iov, 1, &w, &vm_st);
+        if (waited < 0) {
+            host_fd_ref_close(&host_ref);
+            return total > 0 ? (int64_t) total : waited;
+        }
         if (w < 0) {
             if (errno == EPIPE)
                 signal_queue(LINUX_SIGPIPE);

@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <stdlib.h>
+#include <poll.h>
 #include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -40,9 +41,9 @@
 #include "syscall/linux-wire.h"
 #include "syscall/inotify.h"
 #include "syscall/internal.h"
+#include "syscall/io.h" /* io_wait_fd_or_interrupted */
 #include "syscall/path.h"
-#include "runtime/thread.h" /* thread_stop_requested */
-#include "syscall/proc.h"   /* proc_exit_group_requested */
+#include "syscall/proc.h" /* proc_exit_group_requested */
 
 static void inotify_close(int guest_fd);
 
@@ -100,7 +101,6 @@ typedef struct {
     int pipe_rd;    /* Self-pipe read end (poll/epoll) */
     int pipe_wr;    /* Self-pipe write end */
     int wd_counter; /* Next WD to allocate (1-based) */
-    int nonblock;   /* IN_NONBLOCK flag */
     inotify_watch_t watches[INOTIFY_WATCHES]; /* Watch table */
     uint8_t event_buf[INOTIFY_BUFSIZE];       /* Queued inotify events */
     size_t event_used;                        /* Bytes used in event_buf */
@@ -642,12 +642,18 @@ int64_t sys_inotify_init1(int flags)
     inst->pipe_rd = pipefd[0];
     inst->pipe_wr = pipefd[1];
     inst->wd_counter = 1; /* WDs are 1-based */
-    inst->nonblock = (flags & IN_NONBLOCK) ? 1 : 0;
     inst->event_used = 0;
     memset(inst->watches, 0, sizeof(inst->watches));
     pthread_mutex_unlock(&inotify_lock);
 
-    fd_publish_linux_flags(gfd, (flags & IN_CLOEXEC) ? LINUX_O_CLOEXEC : 0);
+    /* Linux opens the inotify inode O_RDONLY (anon_inode_getfd in
+     * fs/notify/inotify/inotify_user.c), and O_NONBLOCK goes to the shadow
+     * rather than the internal pipe, which stays nonblocking so the emulation
+     * can do its own waiting.
+     */
+    fd_publish_linux_flags(gfd,
+                           ((flags & IN_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+                               ((flags & IN_NONBLOCK) ? LINUX_O_NONBLOCK : 0));
 
     return gfd;
 }
@@ -869,6 +875,12 @@ int64_t sys_inotify_rm_watch(int inotify_fd, int wd)
 
 int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 {
+    /* Before inotify_lock: fd_guest_nonblock takes fd_lock, which orders ahead
+     * of this one. The guest's O_NONBLOCK lives in the fd_table shadow because
+     * the host fd behind an inotify fd is elfuse's own pipe.
+     */
+    bool nonblock = fd_guest_nonblock(guest_fd);
+
     pthread_mutex_lock(&inotify_lock);
     int slot = inotify_find(guest_fd);
     if (slot < 0) {
@@ -880,7 +892,7 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
     /* If no buffered events, poll kqueue for new ones */
     if (inst->event_used == 0) {
-        int n = collect_events(inst);
+        collect_events(inst);
 
         /* collect_events may release the lock for directory I/O; bail if the
          * instance was closed in that window.
@@ -890,34 +902,39 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
             return -LINUX_EBADF;
         }
 
-        if (n == 0) {
-            if (inst->nonblock) {
+        /* Nothing buffered: wait for an event rather than reporting one of the
+         * two things a blocking inotify read cannot return. Linux blocks here
+         * until a watch fires; the loop this replaced polled the kqueue 300
+         * times at a second each and then answered EAGAIN, and a kevent that
+         * woke with no event fell through to report EAGAIN as well.
+         *
+         * Looping on event_used rather than on the kevent result is what makes
+         * that hold. A vnode event the watch mask filters out leaves the buffer
+         * empty, and this thread has to go back to waiting exactly as it does
+         * when it lost the readiness to a sibling.
+         */
+        while (inst->event_used == 0) {
+            if (nonblock) {
                 pthread_mutex_unlock(&inotify_lock);
                 return -LINUX_EAGAIN;
             }
 
-            /* Blocking read: release lock, wait on the kqueue for events. The
-             * self-pipe makes poll/select/epoll work, but for direct read()
-             * calls inotify emulation polls the kqueue with a moderate timeout
-             * and retry to avoid hanging indefinitely (allows signal delivery).
+            /* The kqueue is pollable on macOS, so the shared wait covers it:
+             * teardown and guest signals end this read on the same terms as
+             * every other synthetic reader, and no vCPU parks in kevent.
              */
             int kq_fd = inst->kq_fd;
             pthread_mutex_unlock(&inotify_lock);
 
+            int64_t waited = io_wait_fd_or_interrupted(kq_fd, POLLIN);
+            if (waited < 0)
+                return waited;
+
             struct kevent kev;
-            struct timespec ts = {1, 0}; /* 1 second per attempt */
-            int nev = 0;
-            for (int attempt = 0; attempt < 300; attempt++) {
-                nev = kevent(kq_fd, NULL, 0, &kev, 1, &ts);
-                if (nev > 0)
-                    break;
-                if (nev < 0 && errno != EINTR)
-                    return linux_errno();
-                if (thread_stop_requested())
-                    return -LINUX_EINTR;
-            }
-            if (nev <= 0)
-                return -LINUX_EAGAIN;
+            struct timespec collect = {0, 0};
+            int nev = kevent(kq_fd, NULL, 0, &kev, 1, &collect);
+            if (nev < 0 && errno != EINTR)
+                return linux_errno();
 
             /* Re-acquire lock and re-validate slot */
             pthread_mutex_lock(&inotify_lock);
@@ -926,6 +943,13 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
                 return -LINUX_EBADF;
             }
             inst = &inotify_state[slot];
+
+            /* No event to read after all: a sibling on this same inotify fd
+             * took the one the wait reported. kev holds nothing, so wait again
+             * rather than decoding it.
+             */
+            if (nev <= 0)
+                continue;
 
             /* Process the received event (same named-directory diff as the
              * non-blocking collect path).

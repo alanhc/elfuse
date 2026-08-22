@@ -118,8 +118,25 @@ ifdef BUILD_FLAVOR_STALE
 # having succeeded, and a removal that failed silently is invisible to stderr.
 # Stopping is the point. Carrying on writes a stamp claiming a flavor the
 # leftover objects do not have.
-BUILD_FLAVOR_RM := $(shell find $(BUILD_DIR) \( -name '*.o' -o -name '*.d' \) -delete 2>/dev/null; \
-    find $(BUILD_DIR) \( -name '*.o' -o -name '*.d' \) 2>/dev/null | head -3)
+# Only the host objects and the dependency files that belong to them. A find
+# over the whole tree also takes the .d files of the cross-compiled guest
+# binaries, which are built with CROSS_TEST_CFLAGS and so have no flavor: the
+# binary survives the wipe while the record of which headers it depends on does
+# not, and editing tests/test-harness.h then stops rebuilding any of them. That
+# was invisible while the sanitizer lanes still depended on "clean", which
+# removed binary and .d together; dropping that prerequisite made the mismatch
+# permanent, so the wipe's unit has to match the flavor's unit.
+#
+# A .d does not sit beside its object. DEPFLAGS above writes it flat under
+# build/ with the path separators replaced by underscores, so the object
+# build/syscall/casefold.o is described by build/syscall_casefold.d. Deriving
+# the name by suffix substitution alone names a file that has never existed on
+# this tree, which is a wipe that silently keeps every stale record it claims
+# to remove.
+BUILD_FLAVOR_DEPS := $(foreach o,$(BUILD_FLAVOR_OBJS),\
+    $(BUILD_DIR)/$(subst /,_,$(patsubst $(BUILD_DIR)/%,%,$(basename $(o)))).d)
+BUILD_FLAVOR_RM := $(shell rm -f $(BUILD_FLAVOR_OBJS) $(BUILD_FLAVOR_DEPS) \
+    2>/dev/null; ls $(BUILD_FLAVOR_OBJS) $(BUILD_FLAVOR_DEPS) 2>/dev/null | head -3)
 ifneq ($(BUILD_FLAVOR_RM),)
 $(error FLAVOR: stale objects under $(BUILD_DIR) survived removal: $(BUILD_FLAVOR_RM))
 endif

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -108,8 +109,15 @@ static bool host_fd_may_block(int host_fd)
  * and sockets always can; regular-file slots may actually be a fifo or char
  * device (opened_fd_type does not split those out) and stdio may be a tty, so
  * both need an fstat; everything else (dir, path, urandom, fuse, synthetic)
- * never reaches the blocking wait path. Avoiding the fstat for the common
- * pipe/socket/synthetic allocations keeps it off the fd-creation lock hold.
+ * never reaches the blocking wait path.
+ *
+ * Resolving the common pipe/socket/synthetic cases from the type keeps an fstat
+ * off the fd-creation lock hold, but does not empty it: fd_init_entry still
+ * takes O_NONBLOCK ownership with two fcntls in the same window. Measured
+ * against a build that skips them, the whole cost of both is 4.4% of a
+ * pipe()+close pair and 2.7% of an open()+close, so hoisting them out of the
+ * lock was not done -- it would not remove the syscalls, only the lock hold,
+ * and nothing measures a contended fd-creation path today.
  */
 static bool type_may_block(int type, int host_fd)
 {
@@ -125,27 +133,249 @@ static bool type_may_block(int type, int host_fd)
     }
 }
 
+/* The pending alias inheritance, handed from an fd_alloc_alias_* wrapper to the
+ * fd_init_entry call it makes. Thread-local because the allocators take fd_lock
+ * themselves and cannot take a parameter through it without changing all eight
+ * signatures; private to this file because a caller that could set it directly
+ * could also forget to clear it. Every wrapper below clears it on the way out,
+ * including when the allocation fails.
+ */
+static _Thread_local bool fd_alias_pending;
+static _Thread_local fd_alias_spec_t fd_alias_spec;
+
+static void fd_alias_begin(const fd_alias_spec_t *spec)
+{
+    fd_alias_pending = spec != NULL;
+    if (spec)
+        fd_alias_spec = *spec;
+}
+
+static int fd_alias_end(int fd)
+{
+    fd_alias_pending = false;
+    return fd;
+}
+
+/* The access mode Linux reports for an fd elfuse serves out of its own host
+ * description. A synthetic fd is backed by a pipe or a kqueue elfuse opened, so
+ * F_GETFL cannot ask the host what the guest opened; the answer is a property
+ * of the type and belongs in one table rather than at each creation site. Three
+ * types were missed when it was the creators' job, and each reported O_RDONLY
+ * where Linux reports O_RDWR.
+ *
+ * A type absent from here answers from the host description, which is right for
+ * regular files, directories, sockets and inherited stdio.
+ */
+static int fd_type_accmode(int type)
+{
+    switch (type) {
+    case FD_EVENTFD:  /* anon_inode_getfd(O_RDWR), fs/eventfd.c */
+    case FD_SIGNALFD: /* fs/signalfd.c */
+    case FD_TIMERFD:  /* fs/timerfd.c */
+    case FD_EPOLL:    /* fs/eventpoll.c */
+    case FD_PIDFD:    /* kernel/pid.c */
+    case FD_NETLINK:  /* a socket: O_RDWR */
+        return LINUX_O_RDWR;
+    case FD_INOTIFY: /* anon_inode_getfd(O_RDONLY), inotify_user.c */
+        return LINUX_O_RDONLY;
+    default:
+        return -1;
+    }
+}
+
+/* Status flags a creator wants to publish, with the type's access mode forced
+ * back in. Publishing overwrites the field, so a creator that passes only its
+ * CLOEXEC/NONBLOCK bits would otherwise erase the mode fd_init_entry seeded --
+ * which is how three synthetic types came to report O_RDONLY.
+ */
+static int fd_flags_with_accmode(int type, int linux_flags)
+{
+    int accmode = fd_type_accmode(type);
+    if (accmode < 0)
+        return linux_flags;
+    return (linux_flags & ~LINUX_O_ACCMODE) | accmode;
+}
+
+/* The two answers fd_init_entry needs from the host descriptor, taken before
+ * fd_lock rather than under it.
+ *
+ * Both are host syscalls: type_may_block fstats a regular or stdio fd, and
+ * fd_set_nonblock is an F_GETFL/F_SETFL pair. Holding the table lock across
+ * them puts up to three host calls in front of every read, write and close that
+ * wants the table, and the design note above fd_alloc says the lock is held for
+ * table mutation only.
+ *
+ * Nothing races: the host fd is not published until fd_init_entry writes the
+ * slot, so this thread is the only one that can see it. The alias state is
+ * thread-local for the same reason, and an alias needs no probe at all -- it
+ * shares a description whose flag the source already answers for.
+ */
+typedef struct {
+    bool can_block;
+    bool nonblock_owned;
+
+    /* The host status flags to put back if no slot is published after all, or
+     * -1 when the probe changed nothing. Taking the answers before the lock
+     * means taking them before the allocation can fail, and the probe is not a
+     * pure question: it sets O_NONBLOCK. A call that then returns EMFILE would
+     * leave the caller's descriptor mutated by a function that did nothing
+     * else, so the mutation is undone on the way out.
+     */
+    int restore_flags;
+} fd_host_probe_t;
+
+/* Put back what fd_probe_host changed, for a caller whose allocation failed. */
+static void fd_probe_rollback(const fd_host_probe_t *probe, int host_fd)
+{
+    if (probe->restore_flags < 0)
+        return;
+    int saved_errno = errno;
+    (void) fcntl(host_fd, F_SETFL, probe->restore_flags);
+    errno = saved_errno;
+}
+
+static fd_host_probe_t fd_probe_host(int type, int host_fd)
+{
+    fd_host_probe_t probe = {.can_block = type_may_block(type, host_fd),
+                             .restore_flags = -1};
+
+    if (fd_alias_pending) {
+        probe.nonblock_owned = fd_alias_spec.nonblock_owned;
+        return probe;
+    }
+
+    bool foreign = (type == FD_STDIO);
+    if (!probe.can_block || foreign)
+        return probe;
+
+    /* Remember the flags only when this call is the one adding O_NONBLOCK. A
+     * descriptor that already carried it is left alone on rollback, since
+     * putting back what was already there is not this function's to undo.
+     */
+    int old_flags = fcntl(host_fd, F_GETFL);
+    probe.nonblock_owned = fd_set_nonblock(host_fd) >= 0;
+    if (probe.nonblock_owned && old_flags >= 0 && !(old_flags & O_NONBLOCK))
+        probe.restore_flags = old_flags;
+    return probe;
+}
+
 static inline void fd_init_entry(int fd,
                                  int type,
                                  int host_fd,
-                                 void (*cleanup)(int))
+                                 void (*cleanup)(int),
+                                 const fd_host_probe_t *probe)
 {
     fd_bitmap_set_used(fd);
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
-    fd_table[fd].ofd_id = fd_next_ofd_id++;
+
+    /* Take the description state again, here, from the live source. The spec
+     * carries a snapshot the caller made before this lock was held, and an
+     * F_SETFL that lands in between sweeps the aliases that exist at that
+     * moment -- which cannot include the one being built. Publishing from the
+     * snapshot would leave the new name holding flags the rest of the
+     * description has already moved past, for the life of the description, with
+     * no generation change for a later check to notice.
+     *
+     * The generation is what makes this safe to do at all: a close+reopen in
+     * the same window puts a different description behind the same number, and
+     * copying from it would be worse than the staleness. When it has moved the
+     * snapshot stands, which is exactly the behaviour this replaces.
+     */
+    if (fd_alias_pending && fd_alias_spec.src_guest_fd >= 0 &&
+        RANGE_CHECK(fd_alias_spec.src_guest_fd, 0, FD_TABLE_SIZE)) {
+        const fd_entry_t *src = &fd_table[fd_alias_spec.src_guest_fd];
+        if (src->type != FD_CLOSED &&
+            src->generation == fd_alias_spec.src_generation) {
+            fd_alias_spec.ofd_id = src->ofd_id;
+
+            /* Only the description's own bits. The caller may have ORed its own
+             * on top of the snapshot -- a dup3 asking for CLOEXEC -- and those
+             * belong to the new descriptor, not to the description, so a
+             * wholesale overwrite would drop them.
+             */
+            fd_alias_spec.linux_flags =
+                (fd_alias_spec.linux_flags & ~FD_DESCRIPTION_FLAGS) |
+                (src->linux_flags & FD_DESCRIPTION_FLAGS);
+            fd_alias_spec.foreign_description = src->foreign_description;
+            fd_alias_spec.nonblock_owned = src->nonblock_owned;
+        }
+    }
+
+    /* An alias names the description it was made from. Installed here, inside
+     * the same fd_lock window that publishes the slot, so there is no gap in
+     * which the slot is visible with a fresh identity: a close+reopen in such a
+     * gap would take the alias's ofd_id and be swept as though it shared a
+     * description it never saw.
+     */
+    fd_table[fd].ofd_id = (fd_alias_pending && fd_alias_spec.ofd_id)
+                              ? fd_alias_spec.ofd_id
+                              : fd_next_ofd_id++;
     fd_table[fd].generation = fd_next_generation++;
-    fd_table[fd].linux_flags = 0;
+
+    /* Seed the guest-visible flags with what the type alone decides. Creators
+     * OR in their own CLOEXEC/NONBLOCK afterwards; none of them has to know the
+     * access mode.
+     *
+     * An alias says its flags up front instead, and they land here rather than
+     * in a second window after the slot is published. That ordering is not
+     * cosmetic: the new slot joins an alias set other threads sweep by ofd_id,
+     * so a concurrent F_SETFL on the source can reach it in the gap and have
+     * its write clobbered by a publish that follows.
+     */
+    int accmode = fd_type_accmode(type);
+    if (fd_alias_pending && fd_alias_spec.linux_flags)
+        fd_table[fd].linux_flags =
+            fd_flags_with_accmode(type, fd_alias_spec.linux_flags);
+    else
+        fd_table[fd].linux_flags = accmode < 0 ? 0 : accmode;
     fd_table[fd].dir = NULL;
     fd_table[fd].proc_path[0] = '\0';
     fd_table[fd].seals = 0;
 
-    /* Cache whether a host read/write can block so the fast-path and slow-path
+    /* Whether a host read/write can block, so the fast-path and slow-path
      * readers can decide whether to divert into the interruptible wait without
-     * re-stating on every call. Only regular-file and stdio slots pay an fstat
-     * here; pipes/sockets/synthetic fds resolve from the type alone.
+     * re-stating it on every call. Taken by fd_probe_host before the lock.
      */
-    fd_table[fd].can_block = type_may_block(type, host_fd);
+    fd_table[fd].can_block = probe->can_block;
+
+    /* Own O_NONBLOCK on every fd whose host transfer could otherwise park a
+     * vCPU thread, and emulate the guest's blocking semantics on top of it
+     * (io_xfer). A readiness poll reserves nothing: the bytes it promised can
+     * be taken by a sibling thread or a forked process before the transfer
+     * runs, and a transfer that blocks there is reachable by neither
+     * hv_vcpus_exit nor the wakeup pipe. From here on linux_flags carries what
+     * the guest asked for, and sys_fcntl reports it from there.
+     *
+     * Sockets are owned like everything else that can block. They used to be
+     * excluded on the grounds that a per-call MSG_DONTWAIT made ownership
+     * unnecessary, and macOS does not honour that flag on AF_UNIX: a send on a
+     * full stream socket writes what fits and then blocks in the kernel for the
+     * rest, flag set, so the parked vCPU this whole mechanism exists to prevent
+     * was still reachable through every socket write.
+     *
+     * The inherited stdio descriptors are still left alone, because their open
+     * file description belongs to whoever launched elfuse -- a shell handing
+     * over its terminal would keep the flag long after elfuse exits. A dup of
+     * one of those descriptors is typed FD_REGULAR and so escapes the type
+     * test; an fd_alias_spec_t is how the dup path, and the fork restore, say
+     * the description is one that already exists. A socket that arrived over
+     * SCM_RIGHTS comes in the same way and stays unowned for the same reason:
+     * elfuse did not open it.
+     */
+    fd_table[fd].foreign_description =
+        fd_alias_pending ? fd_alias_spec.foreign_description : type == FD_STDIO;
+
+    /* An alias takes it from the spec, which the refresh above may have moved
+     * on from what fd_probe_host saw: the probe runs before this lock and for
+     * an alias only copies the caller's snapshot, so publishing the probe's
+     * copy here would quietly undo the one field the refresh had to work for.
+     * The two agree in every case measured so far -- ownership is decided when
+     * a description is created and F_SETFL does not change it -- which is
+     * exactly why it would have sat here unnoticed.
+     */
+    fd_table[fd].nonblock_owned =
+        fd_alias_pending ? fd_alias_spec.nonblock_owned : probe->nonblock_owned;
     fd_table[fd].fasync_owner_type = FASYNC_OWNER_NONE;
     fd_table[fd].fasync_owner = 0;
     sock_opt_clear(&fd_table[fd]);
@@ -239,8 +469,13 @@ void fdtable_init(void)
                                 .generation = fd_next_generation++};
 
     /* The compound literals above zero can_block; recover the real value so a
-     * terminal stdin still routes reads through the interruptible wait.
+     * terminal stdin still routes reads through the interruptible wait. Same
+     * for foreign_description, which fd_init_entry derives from the type and
+     * nothing derives here: these three descriptions belong to whoever launched
+     * elfuse, and every alias of them reads the answer from this entry.
      */
+    for (int i = 0; i < 3; i++)
+        fd_table[i].foreign_description = true;
     fd_table[0].can_block = host_fd_may_block(STDIN_FILENO);
     fd_table[1].can_block = host_fd_may_block(STDOUT_FILENO);
     fd_table[2].can_block = host_fd_may_block(STDERR_FILENO);
@@ -259,16 +494,24 @@ void fdtable_init(void)
 static int fd_alloc_locked(int minfd,
                            int type,
                            int host_fd,
-                           void (*cleanup)(int))
+                           void (*cleanup)(int),
+                           const fd_host_probe_t *probe)
 {
     int fd = fd_bitmap_find_free(minfd);
     if (fd >= 0 && fd >= rlimit_nofile_cur)
         fd = -1; /* RLIMIT_NOFILE exceeded */
     if (fd < 0) {
+        /* No slot, so nothing is published and the probe's O_NONBLOCK has to
+         * come back off: the caller asked for an allocation, got EMFILE, and
+         * should not also find its descriptor changed. This runs an fcntl under
+         * fd_lock, which the probe exists to avoid, but only on the path that
+         * is failing anyway.
+         */
+        fd_probe_rollback(probe, host_fd);
         errno = EMFILE;
         return -1;
     }
-    fd_init_entry(fd, type, host_fd, cleanup);
+    fd_init_entry(fd, type, host_fd, cleanup, probe);
     return fd;
 }
 
@@ -279,8 +522,9 @@ static int fd_alloc_locked(int minfd,
  */
 int fd_alloc(int type, int host_fd, void (*cleanup)(int))
 {
+    fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
-    int fd = fd_alloc_locked(0, type, host_fd, cleanup);
+    int fd = fd_alloc_locked(0, type, host_fd, cleanup, &probe);
     pthread_mutex_unlock(&fd_lock);
     return fd;
 }
@@ -291,11 +535,13 @@ int fd_alloc_dir(int type,
                  void *dir,
                  int linux_flags)
 {
+    fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
-    int fd = fd_alloc_locked(0, type, host_fd, cleanup);
+    int fd = fd_alloc_locked(0, type, host_fd, cleanup, &probe);
     if (fd >= 0) {
         fd_table[fd].dir = dir;
-        fd_table[fd].linux_flags = linux_flags;
+        fd_table[fd].linux_flags =
+            fd_flags_with_accmode(fd_table[fd].type, linux_flags);
     }
     pthread_mutex_unlock(&fd_lock);
     return fd;
@@ -314,11 +560,13 @@ int fd_alloc_dir_from(int minfd,
                       void *dir,
                       int linux_flags)
 {
+    fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
-    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup);
+    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup, &probe);
     if (fd >= 0) {
         fd_table[fd].dir = dir;
-        fd_table[fd].linux_flags = linux_flags;
+        fd_table[fd].linux_flags =
+            fd_flags_with_accmode(fd_table[fd].type, linux_flags);
     }
     pthread_mutex_unlock(&fd_lock);
     return fd;
@@ -341,14 +589,16 @@ int fd_alloc_dir_at(int fd,
         return -1;
 
     fd_entry_t old = {.type = FD_CLOSED};
+    fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
     if (fd_table[fd].type != FD_CLOSED) {
         old = fd_table[fd];
         epoll_note_fd_closed(fd, old.ofd_id);
     }
-    fd_init_entry(fd, type, host_fd, cleanup);
+    fd_init_entry(fd, type, host_fd, cleanup, &probe);
     fd_table[fd].dir = dir;
-    fd_table[fd].linux_flags = linux_flags;
+    fd_table[fd].linux_flags =
+        fd_flags_with_accmode(fd_table[fd].type, linux_flags);
     pthread_mutex_unlock(&fd_lock);
 
     if (old.type != FD_CLOSED)
@@ -367,8 +617,9 @@ int fd_alloc_from(int minfd,
                   void (*cleanup)(int),
                   uint64_t *out_gen)
 {
+    fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
-    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup);
+    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup, &probe);
 
     /* Capture the freshly-stamped generation inside the allocating critical
      * section. Callers (dup) later revalidate it under fd_lock to prove the
@@ -379,6 +630,63 @@ int fd_alloc_from(int minfd,
         *out_gen = fd_table[fd].generation;
     pthread_mutex_unlock(&fd_lock);
     return fd;
+}
+
+/* The alias-aware entry points. Each is the plain allocator with the
+ * inheritance bracketed around it, so a caller states what it is claiming and
+ * cannot leave the claim set behind.
+ */
+int fd_alloc_alias(const fd_alias_spec_t *spec,
+                   int type,
+                   int host_fd,
+                   void (*cleanup)(int))
+{
+    fd_alias_begin(spec);
+    return fd_alias_end(fd_alloc(type, host_fd, cleanup));
+}
+
+int fd_alloc_alias_at(const fd_alias_spec_t *spec,
+                      int fd,
+                      int type,
+                      int host_fd,
+                      void (*cleanup)(int),
+                      uint64_t *out_gen)
+{
+    fd_alias_begin(spec);
+    return fd_alias_end(fd_alloc_at(fd, type, host_fd, cleanup, out_gen));
+}
+
+int fd_alloc_alias_relaxed(const fd_alias_spec_t *spec,
+                           int fixed_fd,
+                           int minfd,
+                           int type,
+                           int host_fd,
+                           void (*cleanup)(int),
+                           uint64_t *out_gen)
+{
+    fd_alias_begin(spec);
+    int fd =
+        fixed_fd >= 0
+            ? fd_alloc_at_relaxed(fixed_fd, type, host_fd, cleanup, out_gen)
+            : fd_alloc_from_relaxed(minfd, type, host_fd, cleanup, out_gen);
+    return fd_alias_end(fd);
+}
+
+int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
+                       int fixed_fd,
+                       int minfd,
+                       int type,
+                       int host_fd,
+                       void (*cleanup)(int),
+                       void *dir,
+                       int linux_flags)
+{
+    fd_alias_begin(spec);
+    int fd = fixed_fd >= 0 ? fd_alloc_dir_at(fixed_fd, type, host_fd, cleanup,
+                                             dir, linux_flags)
+                           : fd_alloc_dir_from(minfd, type, host_fd, cleanup,
+                                               dir, linux_flags);
+    return fd_alias_end(fd);
 }
 
 int fd_alloc_from_relaxed(int minfd,
@@ -393,7 +701,8 @@ int fd_alloc_from_relaxed(int minfd,
     /* Single active thread: no sibling can race the slot, so the unlocked
      * generation read is safe.
      */
-    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup);
+    fd_host_probe_t probe = fd_probe_host(type, host_fd);
+    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup, &probe);
     if (out_gen && fd >= 0)
         *out_gen = fd_table[fd].generation;
     return fd;
@@ -455,6 +764,7 @@ int fd_alloc_at(int fd,
      */
     fd_entry_t old = {.type = FD_CLOSED};
 
+    fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
     if (fd_table[fd].type != FD_CLOSED) {
         old = fd_table[fd];
@@ -465,7 +775,7 @@ int fd_alloc_at(int fd,
          */
         epoll_note_fd_closed(fd, old.ofd_id);
     }
-    fd_init_entry(fd, type, host_fd, cleanup);
+    fd_init_entry(fd, type, host_fd, cleanup, &probe);
     if (out_gen)
         *out_gen = fd_table[fd].generation;
     pthread_mutex_unlock(&fd_lock);
@@ -493,10 +803,17 @@ int fd_alloc_at_relaxed(int fd,
     if (fd_table[fd].type != FD_CLOSED)
         return fd_alloc_at(fd, type, host_fd, cleanup, out_gen);
 
+    /* After the early returns, not before: every one of them either rejects the
+     * request or hands it to a variant that probes for itself, and the probe
+     * sets O_NONBLOCK on the host fd. Probing first would run that on an fd the
+     * call is about to refuse, and run it twice on the delegating path.
+     */
+    fd_host_probe_t probe = fd_probe_host(type, host_fd);
+
     /* Single active thread: no sibling can race the slot, so the unlocked init
      * and generation read are safe.
      */
-    fd_init_entry(fd, type, host_fd, cleanup);
+    fd_init_entry(fd, type, host_fd, cleanup, &probe);
     if (out_gen)
         *out_gen = fd_table[fd].generation;
     return fd;
@@ -666,14 +983,112 @@ int fd_get_type(int guest_fd)
     return type;
 }
 
-bool fd_can_block(int guest_fd)
+fd_block_state_t fd_block_state(int guest_fd)
+{
+    fd_block_state_t st = {.type = FD_CLOSED};
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return st;
+
+    /* Same relaxed rule the allocation paths use: with one active thread no
+     * sibling can mutate the slot, so the lock buys nothing. This runs on every
+     * read and write of a fd that can block, and the whole-entry fd_snapshot it
+     * replaces copied a few hundred bytes under a global lock to read three
+     * fields.
+     */
+    bool locked = !thread_is_single_active();
+    if (locked)
+        pthread_mutex_lock(&fd_lock);
+    st = fd_block_state_of(&fd_table[guest_fd]);
+    if (locked)
+        pthread_mutex_unlock(&fd_lock);
+    return st;
+}
+
+bool fd_guest_nonblock(int guest_fd)
+{
+    /* Same field, same relaxed rule as fd_block_state: with one active thread
+     * no sibling can mutate the slot, so the lock buys nothing. This runs on
+     * every eventfd, signalfd, timerfd and inotify read, which is once per
+     * event-loop wakeup.
+     */
+    return fd_block_state(guest_fd).guest_nonblock;
+}
+
+void fd_for_each_alias_locked(int guest_fd,
+                              uint64_t generation,
+                              void (*fn)(int guest_fd, void *ctx),
+                              void *ctx)
+{
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
+        return;
+
+    /* A close+reopen in the window makes ofd_id name a description the caller
+     * never asked about, so verify the slot first and change nothing if it
+     * moved. Generation is the discriminator: a reopen can reuse the same guest
+     * fd number, host fd number and type, and only the monotonic generation
+     * tells the caller's open from a new one.
+     */
+    if (fd_table[guest_fd].type == FD_CLOSED ||
+        fd_table[guest_fd].generation != generation)
+        return;
+    uint64_t ofd_id = fd_table[guest_fd].ofd_id;
+    if (!ofd_id)
+        return;
+
+    /* Walk the allocation bitmap rather than the table: one word rules out 64
+     * slots, and the flag sweeps run per fd at event-loop setup.
+     */
+    for (int w = 0; w < FD_BITMAP_WORDS; w++) {
+        uint64_t used = ~fd_free_bitmap[w];
+        while (used) {
+            int fd = w * 64 + bit_ctz64(used);
+            used &= used - 1;
+            if (fd_table[fd].type != FD_CLOSED && fd_table[fd].ofd_id == ofd_id)
+                fn(fd, ctx);
+        }
+    }
+}
+
+typedef struct {
+    int mask, value;
+} shadow_bits_ctx_t;
+
+static void set_shadow_bits_slot(int guest_fd, void *ctx)
+{
+    const shadow_bits_ctx_t *b = ctx;
+    fd_table[guest_fd].linux_flags =
+        (fd_table[guest_fd].linux_flags & ~b->mask) | (b->value & b->mask);
+}
+
+void fd_set_shadow_flags(int guest_fd, uint64_t generation, int mask, int value)
+{
+    shadow_bits_ctx_t ctx = {.mask = mask, .value = value};
+    pthread_mutex_lock(&fd_lock);
+    fd_for_each_alias_locked(guest_fd, generation, set_shadow_bits_slot, &ctx);
+    pthread_mutex_unlock(&fd_lock);
+}
+
+bool fd_apply_guest_nonblock(int guest_fd, bool on)
 {
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
         return false;
+
+    /* One fd_lock window for the question and the answer both. Reading the slot
+     * first and sweeping afterwards took the lock twice and revalidated the
+     * generation the first read had just produced, on a path every F_SETFL and
+     * every FIONBIO runs whatever the fd's type.
+     */
+    shadow_bits_ctx_t ctx = {.mask = LINUX_O_NONBLOCK,
+                             .value = on ? LINUX_O_NONBLOCK : 0};
     pthread_mutex_lock(&fd_lock);
-    bool can_block = fd_table[guest_fd].can_block;
+    fd_entry_t *e = &fd_table[guest_fd];
+    bool shadowed = e->type != FD_CLOSED &&
+                    fd_nonblock_shadowed(e->type, e->nonblock_owned);
+    if (shadowed)
+        fd_for_each_alias_locked(guest_fd, e->generation, set_shadow_bits_slot,
+                                 &ctx);
     pthread_mutex_unlock(&fd_lock);
-    return can_block;
+    return shadowed;
 }
 
 void fd_publish_linux_flags(int guest_fd, int linux_flags)
@@ -681,7 +1096,8 @@ void fd_publish_linux_flags(int guest_fd, int linux_flags)
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
         return;
     pthread_mutex_lock(&fd_lock);
-    fd_table[guest_fd].linux_flags = linux_flags;
+    fd_table[guest_fd].linux_flags =
+        fd_flags_with_accmode(fd_table[guest_fd].type, linux_flags);
     pthread_mutex_unlock(&fd_lock);
 }
 
@@ -705,6 +1121,31 @@ void (*fd_cleanup_for_type(int type))(int)
     if (type < 0 || type >= FD_TYPE_REGISTRY_SIZE)
         return NULL;
     return fd_type_cleanup[type];
+}
+
+/* Look up a guest FD, dup its host fd, and classify the slot, all in one
+ * fd_lock window. Caller owns the returned descriptor and must close it.
+ *
+ * Returns -1 on failure, with *st_out reporting FD_CLOSED.
+ */
+int fd_to_host_dup_state(int guest_fd, fd_block_state_t *st_out)
+{
+    /* fd_snapshot_and_dup already takes the whole entry and the dup in one
+     * fd_lock window, which is the atomicity a transfer needs: the pin keeps
+     * the description alive, and the classification has to describe that same
+     * description rather than whatever takes the fd number next. Composing with
+     * it rather than repeating it also inherits its host_fd < 0 guard, which a
+     * hand-rolled copy here did not have and would have dup(-1)'d for the FUSE
+     * types that carry no host descriptor.
+     */
+    fd_entry_t snap;
+    int owned = fd_snapshot_and_dup(guest_fd, &snap);
+    if (owned < 0) {
+        *st_out = (fd_block_state_t) {.type = FD_CLOSED};
+        return -1;
+    }
+    *st_out = fd_block_state_of(&snap);
+    return owned;
 }
 
 /* Look up a guest FD and return a dup'd host fd that the caller owns. The dup

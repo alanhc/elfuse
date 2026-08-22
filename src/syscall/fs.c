@@ -84,7 +84,14 @@ static int intercepted_fd_type(const char *path, int host_fd, int linux_flags)
     int type = opened_fd_type(host_fd, linux_flags);
     if (type < 0)
         return type;
-    if (type == FD_REGULAR && path && !strcmp(path, "/dev/urandom"))
+
+    /* Both spellings, because procemu already serves them from one host device
+     * and Linux gives them one file_operations: /dev/random keeps O_ASYNC
+     * through random_fasync exactly as /dev/urandom does, and typing only one
+     * of them left the other reporting the flag cleared.
+     */
+    if (type == FD_REGULAR && path &&
+        (!strcmp(path, "/dev/urandom") || !strcmp(path, "/dev/random")))
         return FD_URANDOM;
     return type;
 }
@@ -410,12 +417,17 @@ void dir_stream_release(void *ds_ptr)
     }
 }
 
+/* spec is the description this fd inherits from, or NULL for a fresh one. Only
+ * the magic-link open passes one: it implements the open as a dup, so the host
+ * flags are shared with the source and must not be probed or changed.
+ */
 static int fd_alloc_opened_host(int host_fd,
                                 int type,
                                 int linux_flags,
                                 int min_guest_fd,
                                 void (*cleanup)(int),
-                                const char *virtual_path)
+                                const char *virtual_path,
+                                const fd_alias_spec_t *spec)
 {
     dir_stream_t *ds = NULL;
 
@@ -440,8 +452,9 @@ static int fd_alloc_opened_host(int host_fd,
 
     int guest_fd =
         min_guest_fd >= 0
-            ? fd_alloc_from_relaxed(min_guest_fd, type, host_fd, cleanup, NULL)
-            : fd_alloc_from_relaxed(0, type, host_fd, cleanup, NULL);
+            ? fd_alloc_alias_relaxed(spec, -1, min_guest_fd, type, host_fd,
+                                     cleanup, NULL)
+            : fd_alloc_alias_relaxed(spec, -1, 0, type, host_fd, cleanup, NULL);
     if (guest_fd < 0) {
         int saved_errno = errno;
         if (ds)
@@ -611,8 +624,8 @@ int64_t sys_openat_path(guest_t *g,
             close_keep_errno(host_fd);
             return linux_errno();
         }
-        int guest_fd =
-            fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL);
+        int guest_fd = fd_alloc_opened_host(host_fd, type, linux_flags, -1,
+                                            NULL, NULL, NULL);
         if (guest_fd < 0) {
             close_keep_errno(host_fd);
             return linux_errno();
@@ -651,9 +664,34 @@ int64_t sys_openat_path(guest_t *g,
             }
             int min_guest_fd =
                 (!strncmp(tx.intercept_path, "/dev/", 5)) ? -1 : 128;
-            int guest_fd = fd_alloc_opened_host(
-                intercepted, type, linux_flags, min_guest_fd,
-                fd_cleanup_for_type(type), tx.intercept_path);
+
+            /* An fd magic link (/dev/stdin, /dev/fd/N, /proc/self/fd/N) is
+             * served by dup'ing a descriptor this process already holds, so the
+             * new slot aliases an open file description that already exists.
+             * Say so, or the allocator probes it: taking O_NONBLOCK ownership
+             * of the launcher's terminal leaves it nonblocking after elfuse
+             * exits, and re-probing a description elfuse already owns would
+             * answer the same thing twice.
+             */
+            fd_entry_t alias_src;
+            fd_alias_spec_t spec = {0};
+            int alias_fd = path_fd_magiclink_guest_fd(tx.intercept_path);
+            bool aliased = alias_fd >= 0 && fd_snapshot(alias_fd, &alias_src);
+            if (aliased) {
+                /* Ownership yes, identity no. Linux gives an opened magic link
+                 * its own open file description with its own status flags, so
+                 * this must not join the source's alias set: an F_SETFL on
+                 * /proc/self/fd/0 would otherwise sweep onto fd 0. elfuse
+                 * implements the open as a dup, so the host flags really are
+                 * shared and the description really is foreign, which is
+                 * exactly what fd_alias_host_shared claims and no more.
+                 */
+                spec = fd_alias_host_shared(&alias_src);
+            }
+            int guest_fd =
+                fd_alloc_opened_host(intercepted, type, linux_flags,
+                                     min_guest_fd, fd_cleanup_for_type(type),
+                                     tx.intercept_path, aliased ? &spec : NULL);
             if (guest_fd < 0) {
                 proc_pty_forget_host_fd(intercepted);
                 close_keep_errno(intercepted);
@@ -679,8 +717,8 @@ int64_t sys_openat_path(guest_t *g,
             close_keep_errno(host_fd);
             return linux_errno();
         }
-        int guest_fd =
-            fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL);
+        int guest_fd = fd_alloc_opened_host(host_fd, type, linux_flags, -1,
+                                            NULL, NULL, NULL);
         if (guest_fd < 0) {
             close_keep_errno(host_fd);
             return linux_errno();
@@ -704,7 +742,7 @@ int64_t sys_openat_path(guest_t *g,
         return linux_errno();
     }
     int guest_fd =
-        fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL);
+        fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL, NULL);
     if (guest_fd < 0) {
         close_keep_errno(host_fd);
         return linux_errno();
@@ -941,17 +979,6 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
                                              dir_stream_t *ds,
                                              uint64_t expected_gen)
 {
-    /* LINUX_O_NONBLOCK is a file-status flag preserved by dup(2)/dup2(2).
-     * Required for FD_TIMERFD (and any other type that stores NONBLOCK in
-     * linux_flags rather than on the host fd) so a duplicated non-blocking
-     * timerfd does not silently turn blocking.
-     */
-    int preserved_flags =
-        src_snap->linux_flags &
-        (LINUX_O_ACCMODE | LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
-         LINUX_O_DIRECT | LINUX_O_LARGEFILE | LINUX_O_NONBLOCK | LINUX_O_ASYNC);
-    int final_flags = preserved_flags | linux_flags;
-
     bool installed = false;
     pthread_mutex_lock(&fd_lock);
 
@@ -963,8 +990,9 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
     if (fd_table[dst_fd].type == expected_type &&
         fd_table[dst_fd].host_fd == expected_host_fd &&
         fd_table[dst_fd].generation == expected_gen) {
-        fd_table[dst_fd].linux_flags = final_flags;
-        fd_table[dst_fd].ofd_id = src_snap->ofd_id;
+        /* linux_flags and ofd_id are not written here: the allocator installed
+         * both from the alias spec, in the window that published the slot.
+         */
         fd_table[dst_fd].fasync_owner_type = src_snap->fasync_owner_type;
         fd_table[dst_fd].fasync_owner = src_snap->fasync_owner;
         fd_table[dst_fd].seals = src_snap->seals;
@@ -972,9 +1000,14 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
                sizeof(fd_table[dst_fd].proc_path));
         if (ds)
             fd_table[dst_fd].dir = ds;
+
+        /* Read the mode back from the slot the allocator published rather than
+         * from a local copy of it, so there is one answer to what this fd's
+         * access mode is.
+         */
         bool readable_urandom =
             expected_type == FD_URANDOM &&
-            (final_flags & LINUX_O_ACCMODE) != LINUX_O_WRONLY;
+            (fd_table[dst_fd].linux_flags & LINUX_O_ACCMODE) != LINUX_O_WRONLY;
         shim_globals_mark_urandom_fd(dst_fd, readable_urandom);
         installed = true;
     }
@@ -1069,11 +1102,20 @@ static int duplicate_guest_fd(int src_fd,
     int new_type = (src_snap.type == FD_STDIO) ? FD_REGULAR : src_snap.type;
     void (*cleanup)(int) = fd_cleanup_for_type(new_type);
     uint64_t alloc_gen = 0;
-    int guest_fd =
-        fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, new_type, new_host_fd,
-                                         cleanup, &alloc_gen)
-                   : fd_alloc_from_relaxed(min_guest_fd, new_type, new_host_fd,
-                                           cleanup, &alloc_gen);
+
+    /* The new slot aliases src_snap's description, whatever type it ends up
+     * with, so the allocator inherits its status-flag answers instead of
+     * probing a description it does not own. The dup's own bits ride along with
+     * the description's, so the allocator publishes the final value inside the
+     * window that creates the slot and install_fd_alias_metadata_atomic no
+     * longer writes flags or identity at all. Two writers of one field is how a
+     * dup'd epoll lost its ofd_id.
+     */
+    fd_alias_spec_t spec = fd_alias_of(src_fd, &src_snap);
+    spec.linux_flags |= linux_flags;
+    int guest_fd = fd_alloc_alias_relaxed(
+        &spec, fixed_slot ? fixed_guest_fd : -1, min_guest_fd, new_type,
+        new_host_fd, cleanup, &alloc_gen);
     if (guest_fd < 0) {
         if (fixed_slot)
             errno = EBADF;
@@ -1424,19 +1466,19 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         pthread_mutex_unlock(&fd_lock);
         return 0;
     case 3: { /* F_GETFL */
-        if (fuse_fd)
-            return fd_snap.linux_flags;
-
-        /* Linux timerfd F_GETFL reports O_RDWR plus the writable status bits
-         * the kernel honors. Surface only those bits from the shadow rather
-         * than echoing arbitrary linux_flags bits so stray F_SETFL args cannot
-         * leak through here. O_ASYNC stays off because timerfd_fops lacks
-         * ->fasync, so generic_setfl drops it.
+        /* One rule: the host answers for the bits it is authoritative for, the
+         * shadow for the rest. fd_host_flag_mask names the first set from the
+         * type; O_NONBLOCK leaves it per fd, since ownership is not a property
+         * of the type alone.
          */
-        if (fd_type == FD_TIMERFD)
-            return LINUX_O_RDWR |
-                   (fd_snap.linux_flags &
-                    (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_NOATIME));
+        int host_mask = fd_host_flag_mask(fd_snap.type);
+        if (fd_nonblock_shadowed(fd_snap.type, fd_snap.nonblock_owned))
+            host_mask &= ~LINUX_O_NONBLOCK;
+
+        int shadow_fl = fd_snap.linux_flags & ~FD_GETFL_HIDDEN;
+        if (!host_mask)
+            return shadow_fl;
+
         host_fd_ref_t host_ref;
         if (host_fd_ref_open(fd, &host_ref) < 0)
             return -LINUX_EBADF;
@@ -1444,19 +1486,8 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         host_fd_ref_close(&host_ref);
         if (mac_fl < 0)
             return linux_errno();
-        int linux_fl = mac_to_linux_status_flags(mac_fl);
-        if (fd_snap.type == FD_REGULAR || fd_snap.type == FD_DIR ||
-            fd_snap.type == FD_PATH || fd_snap.type == FD_URANDOM)
-            linux_fl = (linux_fl & ~O_ACCMODE) | (fd_snap.linux_flags & 3);
-        linux_fl |= fd_snap.linux_flags &
-                    (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
-                     LINUX_O_DIRECT | LINUX_O_LARGEFILE);
-
-        /* O_ASYNC is tracked in the shadow (never armed on the host fd), so
-         * surface it from there. See linux_to_mac_status_flags in translate.c.
-         */
-        linux_fl |= fd_snap.linux_flags & LINUX_O_ASYNC;
-        return linux_fl;
+        return (shadow_fl & ~host_mask) |
+               (mac_to_linux_status_flags(mac_fl) & host_mask);
     }
     case 4: /* F_SETFL */
     {
@@ -1491,45 +1522,107 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             return 0;
         }
 
-        /* Timerfd: kqueue host fd rejects fcntl(F_SETFL), so mirror Linux's
-         * file-status word in the linux_flags shadow. Of Linux's writable
-         * status flags (O_APPEND, O_ASYNC, O_DIRECT, O_NOATIME, O_NONBLOCK) the
-         * timerfd kernel object honors O_APPEND, O_NONBLOCK, and O_NOATIME.
-         * O_ASYNC is silently dropped (timerfd_fops lacks ->fasync). O_DIRECT
-         * returns -EINVAL because the inode lacks FMODE_CAN_ODIRECT. Bits
-         * outside the writable set (access mode, CLOEXEC,
-         * O_PATH/DIRECTORY/NOFOLLOW/etc.) are silently ignored, matching how
-         * Linux F_SETFL drops them.
+        /* An fd elfuse emulates whole has no host description to tell. The fd
+         * behind it is elfuse's own pipe or kqueue, held at the flags the
+         * emulation needs, and a kqueue rejects fcntl(F_SETFL) outright: this
+         * used to be a hand-written timerfd branch, while signalfd, inotify,
+         * eventfd, epoll, pidfd and netlink fell through to the host call below
+         * and set flags on elfuse's own descriptor. fd_host_flag_mask says
+         * which types those are, and answers the same question F_GETFL asks it.
+         *
+         * Of Linux's writable status flags (O_APPEND, O_ASYNC, O_DIRECT,
+         * O_NOATIME, O_NONBLOCK) these anon-inode objects honor O_APPEND,
+         * O_NONBLOCK and O_NOATIME. O_DIRECT is refused because the inode lacks
+         * FMODE_CAN_ODIRECT. Bits outside the writable set (access mode,
+         * CLOEXEC, O_PATH and friends) are silently dropped, as Linux drops
+         * them.
          */
-        if (fd_type == FD_TIMERFD) {
+        if (fd_host_flag_mask(fd_snap.type) == 0) {
             const int setfl_mask =
                 LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_NOATIME;
-            pthread_mutex_lock(&fd_lock);
-            if (fd_table[fd].type != FD_TIMERFD ||
-                fd_table[fd].generation != fd_snap.generation) {
-                pthread_mutex_unlock(&fd_lock);
-                return -LINUX_EBADF;
-            }
-            if ((int) arg & LINUX_O_DIRECT) {
-                pthread_mutex_unlock(&fd_lock);
+            if ((int) arg & LINUX_O_DIRECT)
                 return -LINUX_EINVAL;
-            }
-            fd_table[fd].linux_flags =
-                (fd_table[fd].linux_flags & ~setfl_mask) |
-                ((int) arg & setfl_mask);
+
+            /* The sweep below revalidates the generation and does nothing when
+             * it moved, which would report success for a write that never
+             * happened; a closed or reopened slot owes the guest EBADF.
+             */
+            pthread_mutex_lock(&fd_lock);
+            bool live = fd_table[fd].type == fd_snap.type &&
+                        fd_table[fd].generation == fd_snap.generation;
             pthread_mutex_unlock(&fd_lock);
+            if (!live)
+                return -LINUX_EBADF;
+
+            /* Every bit here is answered from the shadow, and each one is per
+             * open file description, so the sweep has to reach every alias
+             * rather than only the name the guest passed. O_NONBLOCK needs no
+             * second pass for that: it is in setfl_mask like the rest.
+             *
+             * The sweep revalidates the generation itself, so a close+reopen
+             * between the snapshot and here changes nothing and the separate
+             * lock-and-check this replaced is gone.
+             */
+            fd_set_shadow_flags(fd, fd_snap.generation, setfl_mask, (int) arg);
+            asyncio_apply(fd, fd_snap.generation, ((int) arg & LINUX_O_ASYNC));
             return 0;
         }
+
+        /* A socket has no O_DIRECT to set: Linux answers EINVAL, since the
+         * inode has no FMODE_CAN_ODIRECT. A pipe does accept it -- that is
+         * packet mode, not a filesystem property -- so the reject is by type
+         * and not by "regular files only". Measured against qemu-aarch64: pipe
+         * rc=0 reported=1, socket rc=-1 errno=22, regular rc=0.
+         *
+         * Rejected before anything is applied, as Linux rejects it: setfl()
+         * checks O_DIRECT ahead of the flag store, so a call that fails here
+         * must not have landed the other bits it carried.
+         */
+        if (((int) arg & LINUX_O_DIRECT) && fd_snap.type == FD_SOCKET)
+            return -LINUX_EINVAL;
+
         host_fd_ref_t host_ref;
         if (host_fd_ref_open(fd, &host_ref) < 0)
             return -LINUX_EBADF;
-        int rc =
-            fcntl(host_ref.fd, F_SETFL, linux_to_mac_status_flags((int) arg));
+
+        /* An owned fd keeps O_NONBLOCK on the host whatever the guest asks; the
+         * request is recorded in the shadow below and the transfer paths read
+         * it from there.
+         */
+        int mac_fl = linux_to_mac_status_flags((int) arg);
+
+        /* The host flag is not the guest's to change on these: elfuse holds it
+         * set, either to keep the transfer non-parking or because the host fd
+         * is its own pipe behind a synthetic fd. The request is recorded in the
+         * shadow below instead.
+         */
+        if (fd_nonblock_shadowed(fd_snap.type, fd_snap.nonblock_owned))
+            mac_fl |= O_NONBLOCK;
+        int rc = fcntl(host_ref.fd, F_SETFL, mac_fl);
         if (rc < 0) {
             int64_t err = linux_errno();
             host_fd_ref_close(&host_ref);
             return err;
         }
+
+        /* The settable bits macOS has no equivalent for are answered from the
+         * shadow (fd_host_flag_mask), so F_SETFL has to write them there or
+         * F_GETFL keeps reporting whatever open() recorded. O_DIRECT and
+         * O_NOATIME are those two; O_NONBLOCK and O_ASYNC have their own paths
+         * below. Measured before this: Linux takes O_NOATIME from 0 to 1 and
+         * back, elfuse stayed at 0 throughout.
+         */
+        int shadow_setfl = (LINUX_O_DIRECT | LINUX_O_NOATIME) &
+                           ~fd_host_flag_mask(fd_snap.type);
+        if (shadow_setfl)
+            fd_set_shadow_flags(fd, fd_snap.generation, shadow_setfl,
+                                (int) arg);
+
+        /* The guest's O_NONBLOCK for an owned fd lives in the shadow, which is
+         * what the transfer paths and F_GETFL read. It reaches every dup alias
+         * because Linux keeps O_NONBLOCK on the open file description.
+         */
+        fd_apply_guest_nonblock(fd, ((int) arg & LINUX_O_NONBLOCK) != 0);
 
         /* O_ASYNC is elfuse-managed: track the armed bit and (dis)arm the SIGIO
          * watcher. asyncio_apply rescans the slot under fd_lock and uses each
@@ -2049,15 +2142,25 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
         return linux_errno();
     }
 
-    /* Apply O_NONBLOCK to host FDs if requested */
-    if (linux_flags & LINUX_O_NONBLOCK) {
-        fcntl(host_fds[0], F_SETFL, O_NONBLOCK);
-        fcntl(host_fds[1], F_SETFL, O_NONBLOCK);
-    }
+    /* The host fds are already nonblocking: fd_alloc owns O_NONBLOCK on a pipe
+     * so a transfer can report EAGAIN instead of parking a vCPU thread. Record
+     * what the guest asked for, which is what F_GETFL and the wait paths read.
+     */
+    int shadow = linux_flags & (LINUX_O_CLOEXEC | LINUX_O_NONBLOCK);
+    fd_publish_linux_flags(guest_fds[0], shadow);
+    fd_publish_linux_flags(guest_fds[1], shadow);
 
-    /* Propagate O_CLOEXEC if set in flags */
-    fd_table[guest_fds[0]].linux_flags = linux_flags & LINUX_O_CLOEXEC;
-    fd_table[guest_fds[1]].linux_flags = linux_flags & LINUX_O_CLOEXEC;
+    /* fd_alloc owns O_NONBLOCK on a pipe, so the guest's request is recorded
+     * above and the host fds are already nonblocking. If ownership was refused
+     * -- only a failing fcntl does that -- the guest's request still has to
+     * reach the host fd, since nothing else will answer for it.
+     */
+    if (linux_flags & LINUX_O_NONBLOCK) {
+        for (int i = 0; i < 2; i++) {
+            if (!fd_block_state(guest_fds[i]).nonblock_owned)
+                fd_set_nonblock(host_fds[i]);
+        }
+    }
 
     int32_t fds[2] = {guest_fds[0], guest_fds[1]};
     if (guest_write_small(g, fds_gva, fds, sizeof(fds)) < 0) {

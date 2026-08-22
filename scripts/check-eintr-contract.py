@@ -95,6 +95,18 @@ INVENTORY = {
         "drain (tty_io.c, no ERESTARTSYS), and part of the output has already "
         "drained, so a restart would wait the interval again.",
     ),
+    "syscall/io.c::copy_fd_range": (
+        "forbids",
+        "sendfile and copy_file_range read a chunk before waiting to write it; "
+        "a pipe input cannot be rewound, so a restart would re-run the call "
+        "over an input missing that chunk.",
+    ),
+    "syscall/io.c::splice_drain_chunk": (
+        "forbids",
+        "Same shape as copy_fd_range, and a pipe is the usual splice input. "
+        "This is the drain sys_splice runs per chunk; the forbid lives here "
+        "because only this loop knows how much of the chunk never left.",
+    ),
     "syscall/fuse.c::fuse_request_locked": (
         "forbids",
         "FUSE_INTERRUPT is on the wire and the request is detached, so a "
@@ -107,12 +119,78 @@ INVENTORY = {
     ),
     "syscall/io.c::io_wait_fd_or_interrupted": (
         "restartable",
-        "Reports readiness or EINTR before any transfer; the caller has not "
-        "touched the fd yet.",
+        "Reports readiness or EINTR without transferring anything itself. It "
+        "no longer follows that its callers have not: io_xfer waits again "
+        "after a partial write, and copy_fd_range and splice_drain_chunk wait "
+        "to write a chunk they have already read. Those decide for themselves "
+        "and are listed above.",
     ),
     "syscall/fs.c::open_nonblocking_writer": (
         "restartable",
         "FIFO open retry; nothing is opened until it succeeds.",
+    ),
+    "syscall/fd.c::eventfd_read": (
+        "restartable",
+        "The wait precedes the read of the counter pipe, so an interrupted "
+        "wait has not drained anything and the counter still holds what the "
+        "guest came for.",
+    ),
+    "syscall/fd.c::signalfd_read": (
+        "restartable",
+        "The wait precedes the dequeue; the pending mask is untouched when it "
+        "returns EINTR.",
+    ),
+    "syscall/fd.c::timerfd_read": (
+        "restartable",
+        "The wait precedes the zero-timeout kevent that collects the "
+        "expirations, so an interrupted wait leaves the count with the timer. "
+        "Restarting re-collects the same expirations.",
+    ),
+    "syscall/io.c::io_xfer": (
+        "restartable",
+        "EINTR reaches the guest only on the total == 0 exit. Once any byte "
+        "has moved the short count is returned instead, which is what Linux "
+        "does and what makes the restart safe: there is nothing to redo.",
+    ),
+    "syscall/net.c::net_wait_or_interrupted": (
+        "restartable",
+        "A wait, nothing more. Its callers own the question of what they had "
+        "already consumed before reaching it.",
+    ),
+    "syscall/net.c::net_recv_zero_payload_gate": (
+        "restartable",
+        "Waits for readability before any recv runs, so no datagram has been "
+        "taken off the socket.",
+    ),
+    "syscall/net.c::connect_nonblock_wait": (
+        "restartable",
+        "The SYN is already out, which is exactly why the restart needs its "
+        "precondition rather than a ban: sys_connect treats EALREADY as "
+        "in-flight always and EISCONN as in-flight only under "
+        "syscall_is_restarted(), so the retry waits the same connection out "
+        "instead of starting a second one.",
+    ),
+    "syscall/net.c::sys_sendto": (
+        "restartable",
+        "POLLOUT wait, then send. An interrupted wait has sent nothing, and a "
+        "send that moved bytes returns the count.",
+    ),
+    "syscall/net-msg.c::sys_sendmsg": (
+        "restartable",
+        "Both wait sites sit before their send in the EAGAIN retry loop, so "
+        "EINTR means nothing left the socket.",
+    ),
+    "syscall/net-msg.c::sys_sendmmsg": (
+        "restartable",
+        "Interrupting message i reports i as the count when i > 0, so the "
+        "restart never re-sends a delivered message; only an interrupt before "
+        "the first send reaches the guest as EINTR.",
+    ),
+    "syscall/netlink.c::nl_wait_readable_locked": (
+        "restartable",
+        "Waits for a reply to a request an earlier sendmsg put on the wire. "
+        "This call consumed nothing, and the restart waits for the same "
+        "reply.",
     ),
     "syscall/inotify.c::inotify_read": (
         "restartable",
@@ -180,7 +258,47 @@ INVENTORY = {
 SELF = {"syscall/syscall.c::syscall_restart_forbid"}
 
 EINTR_RE = re.compile(r"(return\s+-LINUX_EINTR|=\s*-LINUX_EINTR|errno\s*=\s*EINTR)\b")
+
+# A function can also decide the restart question without naming EINTR itself:
+# it forwards a wait helper's errno and calls syscall_restart_forbid() over the
+# top. Those are deciders by the definition above and have to be classified, or
+# the one class of caller the helper's own entry cannot describe -- the caller
+# that consumed something before the wait -- stays invisible to this gate.
+FORBID_MARKER = "syscall_restart_forbid()"
+
+# A wait routed through a shared helper reports the helper's EINTR without ever
+# naming it. That is precisely the refactor this tree keeps making -- four
+# synthetic readers moved onto io_wait_fd_or_interrupted, and each one silently
+# left this gate's view the moment it stopped writing the literal. Treat calling
+# one of these as reporting EINTR, so the classification survives the cleanup
+# that hides the constant.
+#
+# A name belongs here when it can return -LINUX_EINTR to its caller. Callers of
+# a helper listed here are still free to be 'restartable': the entry states the
+# decision, it does not presume one.
+EINTR_HELPERS = ("io_wait_fd_or_interrupted",)
+HELPER_RE = re.compile(r"\b(" + "|".join(EINTR_HELPERS) + r")\s*\(")
+
 FUNC_START_RE = re.compile(r"^(\w[\w \t\*]*?)\b(\w+)\s*\([^;]*$")
+
+
+CODE_TOKEN_RE = re.compile(r'"(?:[^"\\]|\\.)*"|/\*.*?\*/|//[^\n]*', re.S)
+
+
+def code_only(body):
+    """The body with comments and string literals blanked out.
+
+    Every marker this gate looks for is a call, and a call is code. Matching
+    the raw text instead lets a function that merely *mentions*
+    io_wait_fd_or_interrupted in a comment read as one that calls it, which is
+    a gate that answers questions about prose. Newlines are preserved so line
+    numbers in any future diagnostic still line up.
+    """
+
+    def blank(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    return CODE_TOKEN_RE.sub(blank, body)
 
 
 def functions(path):
@@ -217,11 +335,11 @@ def scan():
         rel = path.relative_to(SRC).as_posix()
         text = path.read_text(errors="ignore").split("\n")
         for name, first, last in functions(path):
-            body = "\n".join(text[first - 1 : last])
-            if not EINTR_RE.search(body):
+            body = code_only("\n".join(text[first - 1 : last]))
+            forbids = FORBID_MARKER in body
+            if not EINTR_RE.search(body) and not forbids and not HELPER_RE.search(body):
                 continue
-            key = f"{rel}::{name}"
-            found[key] = "syscall_restart_forbid()" in body
+            found[f"{rel}::{name}"] = forbids
     return found
 
 

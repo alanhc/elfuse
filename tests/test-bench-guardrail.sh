@@ -10,9 +10,12 @@
 #   clock_gettime(libc)   <=  50 ns/op    (vDSO CNTVCT fast path)
 #   read(/dev/urandom, 1) <= 400 ns/op    (shim urandom ring fast path)
 #   stat("/dev/null")     <= Nx getpid    (guest_read_path, no fast path)
+#   read(empty nonblocking pipe) <= Nx getpid   (per-transfer overhead)
+#   pipe write+read       <= Nx getpid    (transfer plus wait/wakeup)
 #
-# The first three are absolute; stat-path is a ratio. See the threshold block
-# below for why the two kinds of limit are not interchangeable.
+# The first three are absolute; every other lane is a ratio to a getpid from the
+# same run. See the threshold block below for why the two kinds of limit are not
+# interchangeable.
 #
 # The static (musl) bench is the baseline; the dynamic-glibc bench verifies that
 # glibc 2.41's vDSO probe (NT_GNU_ABI_TAG PT_NOTE) keeps clock_gettime on the
@@ -68,6 +71,82 @@ THRESH_URANDOM=400
 # not read a dynamic pass as evidence the copy helpers are clean.
 THRESH_STAT_RATIO_STATIC=105
 THRESH_STAT_RATIO_GLIBC=500
+
+# The two transfer lanes, both ratios to getpid for the same reason stat-path
+# is: they are host calls whose cost is a slope, and dividing by a lane measured
+# on the same machine moments earlier cancels the machine out.
+#
+# pipe-eagain is the detector. A read of an empty pipe the guest set nonblocking
+# reaches the fd lookup, the block-state decision and the transfer attempt, then
+# returns without touching the pipe buffer or waking anything, so it measures
+# per-transfer overhead and nothing else. Observed 52-66 across runs on a loaded
+# machine, a 25% spread, which is tight enough to gate at 85.
+#
+# The number this exists to catch: read/write on a fd that can block used to
+# probe with poll(), divert to the slow path when the probe said "not ready",
+# and re-resolve the fd there. Measured on this lane at 259-857 against 52-66
+# after that divert was removed. Anything that puts a host call or a lock
+# acquisition back into the per-transfer path lands in the same range, and the
+# guardrail had no lane that could see it: a 30-50% regression in the read/write
+# path passed this script clean while it was being written.
+#
+# pipe-roundtrip moves a byte out and back, so it covers the wait and wakeup
+# machinery pipe-eagain skips. It also inherits the scheduler noise that comes
+# with them: observed 77-176 on the same runs where pipe-eagain held a 25%
+# spread. It is a gross-regression arm, kept for the coverage and ceilinged so
+# it does not flake. Do not tighten it toward the observed median chasing small
+# regressions, and do not read a pass here as evidence the transfer path is
+# clean; that is pipe-eagain's job.
+THRESH_PIPE_EAGAIN_RATIO=85
+THRESH_PIPE_RT_RATIO=220
+
+# The same transfer with a sibling thread alive, divided by getpid from that
+# same state, so the pair isolates what a second thread costs and nothing else.
+# It is not a duplicate of pipe-eagain: with one active thread elfuse borrows
+# the host fd, and with a sibling it dups and closes it around every fd syscall
+# to keep a racing close from retiring it. That is two host syscalls a guest
+# doing real work pays on every read and write, measured at 47.8x against 58.3x
+# here, and no single-threaded lane can see it. Ceiled at 110 so the dup pair
+# has room but a third host call does not.
+THRESH_PIPE_EAGAIN_MT_RATIO=110
+
+# Bulk transfer: a megabyte written into a pipe a sibling drains, so the write
+# fills the buffer, waits, and resumes. Every other lane moves one byte, which
+# is why the ready-poll rewrite could leave bulk writes 21-31% slower with
+# nothing here to notice.
+#
+# This lane is a gross-regression arm, and the ceiling says so. It cannot catch
+# the regression that motivated it: idle it measures ~6900x, a busy host alone
+# put it at 9900x, and a 25% regression would read ~8600x -- inside the band
+# load produces on its own. Bulk throughput is dominated by pipe capacity and
+# scheduling rather than by syscall entry cost, so dividing by getpid does not
+# cancel the load the way it does for stat-path. A tighter number here would
+# fail on clean trees and be ignored, which costs more than it catches.
+#
+# What catches a 25% slope is the A/B in the TODO entry: two builds, alternating
+# passes, medians, on an idle machine. The lane's job is to make that comparison
+# possible at all by existing.
+#
+# The ceiling is 15000 against an idle figure near 6900, which is 2.17x: it
+# trips just short of a 2.2x collapse, and lets a 2x one through. It is written
+# that way because a busy host alone reached 1.4x, and the gap between the two
+# is the whole margin this lane has: a number tight enough to catch 2x would
+# fail on clean trees.
+THRESH_PIPE_BULK_RATIO=15000
+
+# Descriptor creation, with and without path resolution. fd_init_entry stats the
+# host fd and may set O_NONBLOCK on it inside the fd-table lock; pipe-create is
+# the same allocation with the path work removed, so the pair says how much of
+# the cost is resolution.
+#
+# fd-create splits by variant for the same reason stat-path does: under dynamic
+# glibc the open resolves through the sysroot, which is most of the lane. It
+# measured 999x against a first-cut 1000x ceiling, which would have flaked on
+# the next busy run rather than caught anything. pipe-create allocates without a
+# path, so one number covers both.
+THRESH_FD_CREATE_RATIO_STATIC=1000
+THRESH_FD_CREATE_RATIO_GLIBC=1700
+THRESH_PIPE_CREATE_RATIO=1000
 
 C_RED='\033[0;31m'
 C_GREEN='\033[0;32m'
@@ -176,8 +255,8 @@ check_ratio()
 
 run_one_pass()
 {
-    local variant="$1" bench="$2" stat_ratio="$3"
-    shift 3
+    local variant="$1" bench="$2" stat_ratio="$3" fd_ratio="$4"
+    shift 4
     local out
     out="$(mktemp)"
     if ! "$ELFUSE" "$@" "$bench" "$ITERS" > "$out" 2>&1; then
@@ -199,6 +278,28 @@ run_one_pass()
         "$(extract_ns "$out" read-urandom1)" "$THRESH_URANDOM"
     check_ratio "$variant" "stat-path" \
         "$(extract_ns "$out" stat-path)" "$getpid_ns" "$stat_ratio"
+    check_ratio "$variant" "pipe-eagain" \
+        "$(extract_ns "$out" pipe-eagain)" "$getpid_ns" \
+        "$THRESH_PIPE_EAGAIN_RATIO"
+    check_ratio "$variant" "pipe-roundtrip" \
+        "$(extract_ns "$out" pipe-roundtrip)" "$getpid_ns" \
+        "$THRESH_PIPE_RT_RATIO"
+    check_ratio "$variant" "fd-create" \
+        "$(extract_ns "$out" fd-create)" "$getpid_ns" "$fd_ratio"
+    check_ratio "$variant" "pipe-create" \
+        "$(extract_ns "$out" pipe-create)" "$getpid_ns" \
+        "$THRESH_PIPE_CREATE_RATIO"
+    check_ratio "$variant" "pipe-bulk" \
+        "$(extract_ns "$out" pipe-bulk)" "$getpid_ns" \
+        "$THRESH_PIPE_BULK_RATIO"
+
+    # The sibling-alive lanes divide by their own getpid, measured with that
+    # sibling running, so the ratio carries only the per-transfer difference.
+    local getpid_mt_ns
+    getpid_mt_ns="$(extract_ns "$out" getpid-mt)"
+    check_ratio "$variant" "pipe-eagain-mt" \
+        "$(extract_ns "$out" pipe-eagain-mt)" "$getpid_mt_ns" \
+        "$THRESH_PIPE_EAGAIN_MT_RATIO"
 
     rm -f "$out"
 }
@@ -254,13 +355,14 @@ echo "=== bench-guardrail (iters=$ITERS) ==="
 
 if [ "$run_static" = 1 ]; then
     echo "[static (musl)]"
-    run_and_check static "$STATIC_BENCH" "$THRESH_STAT_RATIO_STATIC"
+    run_and_check static "$STATIC_BENCH" "$THRESH_STAT_RATIO_STATIC" \
+        "$THRESH_FD_CREATE_RATIO_STATIC"
 fi
 
 if [ -x "$GLIBC_BENCH" ] && [ -d "$GLIBC_SYSROOT" ]; then
     echo "[dynamic-glibc]"
     run_and_check dyn-glibc "$GLIBC_BENCH" "$THRESH_STAT_RATIO_GLIBC" \
-        --sysroot "$GLIBC_SYSROOT"
+        "$THRESH_FD_CREATE_RATIO_GLIBC" --sysroot "$GLIBC_SYSROOT"
 else
     /usr/bin/printf "  ${C_YELLOW}SKIP${C_RESET}  dyn-glibc      cross-toolchain absent: %s\n" \
         "$GLIBC_TOOLCHAIN"

@@ -16,7 +16,9 @@
 #pragma once
 
 #include <stdint.h>
+#include <sys/uio.h>
 #include "core/guest.h"
+#include "syscall/internal.h" /* fd_block_state_t */
 
 /* I/O syscall handlers. */
 
@@ -41,6 +43,75 @@ void io_init(void);
  * by hv_vcpus_exit + the wakeup pipe.
  */
 int64_t io_wait_fd_or_interrupted(int host_fd, short events);
+
+/* Consecutive EAGAINs from a transfer the wait called ready, before io_xfer
+ * stops retrying at full speed and starts backing off.
+ *
+ * Sized to tell two things apart that look identical from here. Losing a race
+ * to a sibling is normal and self-limiting: the wait blocks again until the fd
+ * genuinely has something, so a contended pipe can lose several times in one
+ * syscall and every loss still made progress somewhere. An fd whose readiness
+ * the transfer never honours -- poll reporting POLLHUP or POLLERR that a
+ * nonblocking transfer answers with EAGAIN -- never blocks in the wait at all
+ * and reaches this in microseconds. High enough that contention almost never
+ * pays for it, low enough that the pathological case cannot hold a core.
+ */
+#define IO_XFER_SPIN_LIMIT 16
+
+/* Move iov through host_fd with the blocking semantics the guest asked for,
+ * without parking this vCPU thread in a host call.
+ *
+ * A readiness poll reserves nothing. Between the poll and the transfer a
+ * sibling thread, or a forked process sharing the open file description, can
+ * take the bytes the poll promised, and the transfer then blocks where neither
+ * hv_vcpus_exit nor the wakeup pipe reaches it; an execve teardown counts that
+ * thread as a sibling that would not leave. So the wait is interruptible and
+ * the transfer itself reports EAGAIN rather than blocking, and a steal only
+ * sends the caller back to the wait. A write keeps going until every byte has
+ * moved, which is what a blocking write(2) promises, and reports the partial
+ * count when a signal arrives with bytes already gone.
+ *
+ * Two kinds of fd fall outside the no-parking guarantee, and a caller relying
+ * on it during exec teardown has to know which. A socket transfers with
+ * MSG_DONTWAIT, which macOS ignores for AF_UNIX sends, so a send into a full
+ * buffer blocks in the kernel. Inherited stdio is a description elfuse does not
+ * own, so its transfer is a plain blocking read or write. Both are recorded in
+ * TODO.md; everything else elfuse owns O_NONBLOCK on and cannot park here.
+ *
+ * events picks the direction: POLLIN reads, POLLOUT writes. iov is scratch the
+ * caller owns, and a partial write rewrites it. Regular files, fds the guest
+ * set nonblocking, and direction mismatches transfer straight through.
+ *
+ * Returns 0 with *out set to the raw host result (errno live when it is -1), or
+ * a negative Linux errno, in which case nothing moved and iov is untouched: the
+ * wait was interrupted (EINTR), the fd is a pty master whose slaves are all
+ * gone (EIO), or the iovec lengths do not sum (EINVAL). A caller that cannot
+ * answer those itself has to hand the value back to the guest. The same
+ * transfer, classified from the state pinned with the host fd rather than
+ * looked up again.
+ *
+ * io_xfer resolves the slot itself, which is correct only while nothing can
+ * reuse the fd number underneath it. A caller that already holds a host fd took
+ * it from a slot that a sibling may since have closed and reopened as another
+ * kind of object; classifying that new object and transferring on the old
+ * descriptor is how a pinned pipe comes to be sent recv(MSG_DONTWAIT) and
+ * answers ENOTSOCK, and how a pinned socket comes to take the plain blocking
+ * read this file exists to avoid. host_fd_ref_open_state takes both together.
+ */
+int64_t io_xfer(int fd,
+                int host_fd,
+                short events,
+                struct iovec *iov,
+                int iovcnt,
+                ssize_t *out,
+                const fd_block_state_t *pinned);
+
+/* pinned is required, not optional: it is dereferenced unconditionally. Making
+ * it nullable would put this function one step from the failure that already
+ * happened once here -- an out-param written before its NULL check let clang
+ * prove the UB and compile a whole caller to a trap. Every caller pins and
+ * classifies in one window, so there is no caller that would want NULL.
+ */
 
 /* Backoff bounds for io_retry_backoff. These replace a blocking host call that
  * returned the instant the resource freed, so the ceiling is the added latency

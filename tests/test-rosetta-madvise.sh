@@ -31,9 +31,6 @@ MADV_BIN="$(pwd)/tests/fixtures/rosetta/x86_64-rosetta-madvise"
 # shellcheck source=tests/lib/report.sh
 . "$(dirname "$0")/lib/report.sh"
 
-pass=0
-fail=0
-skip=0
 total=0
 
 if [ ! -x "$ROSETTA_PATH" ]; then
