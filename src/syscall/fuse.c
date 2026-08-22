@@ -1816,6 +1816,9 @@ static int fuse_materialize_open_file_locked(fuse_session_t *session,
     if (sizeof(tmp_template) > outsz)
         return -LINUX_ENAMETOOLONG;
 
+    /* Not tmpfile_anon: execve needs a path to hand the loader, so this one
+     * keeps its name and is unlinked once the exec has taken it.
+     */
     int tmp_fd = mkstemp(tmp_template);
     if (tmp_fd < 0)
         return linux_errno();
@@ -2403,8 +2406,14 @@ int64_t fuse_dev_read(int guest_fd,
                       uint64_t buf_gva,
                       uint64_t count)
 {
+    /* Take the blocking mode with the descriptor, not from a later lookup: a
+     * sibling reusing this fd number in between would otherwise decide how this
+     * read waits on a slot that is no longer the one being read.
+     */
     host_fd_ref_t notify_ref;
-    if (host_fd_ref_open_io(guest_fd, &notify_ref) < 0)
+    fd_block_state_t dev_st;
+    uint64_t dev_gen = 0;
+    if (host_fd_ref_open_io_state(guest_fd, &notify_ref, &dev_gen, &dev_st) < 0)
         return -LINUX_EBADF;
 
     pthread_mutex_lock(&fuse_lock);
@@ -2417,9 +2426,25 @@ int64_t fuse_dev_read(int guest_fd,
     fuse_session_get_locked(session);
     pthread_mutex_unlock(&fuse_lock);
 
+    /* The state came from the descriptor; the session came from the fd number.
+     * A sibling closing and reopening guest_fd between the two makes them
+     * describe different objects, and the read would then take its blocking
+     * mode from one and its queue from the other: a nonblocking replacement
+     * waits, a blocking one gets EAGAIN. The generation was captured with the
+     * descriptor, so comparing it here proves the pair belongs together. Taken
+     * after fuse_lock is dropped, since fd_lock orders above it.
+     */
+    if (fd_block_state(guest_fd).generation != dev_gen) {
+        pthread_mutex_lock(&fuse_lock);
+        fuse_session_put_locked(session);
+        pthread_mutex_unlock(&fuse_lock);
+        host_fd_ref_close(&notify_ref);
+        return -LINUX_EBADF;
+    }
+
     pthread_mutex_lock(&session->lock);
     while (!session->closed && !session->queue_head) {
-        if (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK) {
+        if (dev_st.guest_nonblock) {
             pthread_mutex_unlock(&session->lock);
             pthread_mutex_lock(&fuse_lock);
             fuse_session_put_locked(session);
@@ -2827,12 +2852,18 @@ int fuse_dup_fd(int src_fd,
     int new_host_fd = snap.type == FD_FUSE_DEV ? dup(snap.host_fd) : -1;
     if (snap.type == FD_FUSE_DEV && new_host_fd < 0)
         return -1;
+
+    /* Allocate as an alias, so the slot is published already carrying the
+     * description's identity and flags. Minting a fresh ofd_id and patching it
+     * afterwards leaves a window in which the slot is visible under an identity
+     * no other name shares, and an alias sweep running then skips it.
+     */
     uint64_t alloc_gen = 0;
-    int guest_fd =
-        fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, snap.type, new_host_fd,
-                                         fuse_fd_cleanup, &alloc_gen)
-                   : fd_alloc_from_relaxed(min_guest_fd, snap.type, new_host_fd,
-                                           fuse_fd_cleanup, &alloc_gen);
+    fd_alias_spec_t spec = fd_alias_of(src_fd, &snap);
+    spec.linux_flags |= linux_flags;
+    int guest_fd = fd_alloc_alias_relaxed(
+        &spec, fixed_slot ? fixed_guest_fd : -1, min_guest_fd, snap.type,
+        new_host_fd, fuse_fd_cleanup, &alloc_gen);
     if (guest_fd < 0) {
         if (new_host_fd >= 0)
             close(new_host_fd);
@@ -2895,13 +2926,9 @@ int fuse_dup_fd(int src_fd,
     if (fd_table[guest_fd].type == snap.type &&
         fd_table[guest_fd].host_fd == new_host_fd &&
         fd_table[guest_fd].generation == alloc_gen) {
-        int preserved_flags =
-            snap.linux_flags &
-            (LINUX_O_ACCMODE | LINUX_O_PATH | LINUX_O_DIRECTORY |
-             LINUX_O_NOFOLLOW | LINUX_O_DIRECT | LINUX_O_LARGEFILE |
-             LINUX_O_NONBLOCK | LINUX_O_ASYNC);
-        fd_table[guest_fd].linux_flags = preserved_flags | linux_flags;
-        fd_table[guest_fd].ofd_id = snap.ofd_id;
+        /* Flags and identity came with the allocation; only the fasync owner is
+         * left for this window to carry across.
+         */
         fd_table[guest_fd].fasync_owner_type = snap.fasync_owner_type;
         fd_table[guest_fd].fasync_owner = snap.fasync_owner;
         if (fd_table[guest_fd].linux_flags & LINUX_O_ASYNC)

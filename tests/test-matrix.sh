@@ -496,6 +496,7 @@ run_summary_suite()
     fields="$(suite_summary_fields "$output")"
     if [ -n "$fields" ]; then
         local suite_pass=0 suite_fail=0 suite_skip=0 suite_total=0
+
         read -r suite_pass suite_fail suite_skip suite_total <<< "$fields"
 
         # Force decimal: a sub-suite that ever emits a zero-padded count ('08',
@@ -786,7 +787,30 @@ run_unit_tests()
     test_rc "$runner" "test-threaded-exec-worker" 0 \
         "$bindir/test-threaded-exec" worker
     test_rc "$runner" "test-exec-handoff" 0 "$bindir/test-exec-handoff"
+    test_rc "$runner" "test-pipe-steal" 0 "$bindir/test-pipe-steal"
+    test_check "$runner" "test-fcntl-flags" "0 failed" "$bindir/test-fcntl-flags"
     test_rc "$runner" "test-mprotect-mt" 0 "$bindir/test-mprotect-mt"
+    test_check "$runner" "test-dup-setfl-race" "0 failed" \
+        "$bindir/test-dup-setfl-race"
+
+    # The blocking-semantics surface elfuse emulates on top of an O_NONBLOCK it
+    # owns. Every assertion in these is Linux's own answer, which is the whole
+    # point of running them against the reference kernel as well: a test that
+    # only passes under elfuse documents a bug as a feature.
+    printf "\nBlocking semantics\n"
+    test_check "$runner" "test-eventfd-semaphore-contended" "0 failed" \
+        "$bindir/test-eventfd-semaphore-contended"
+    test_check "$runner" "test-socket-shortwrite" "0 failed" \
+        "$bindir/test-socket-shortwrite"
+    test_check "$runner" "test-socket-blockwrite-signal" "0 failed" \
+        "$bindir/test-socket-blockwrite-signal"
+    test_check "$runner" "test-socket-accept-contended" "0 failed" \
+        "$bindir/test-socket-accept-contended"
+    test_check "$runner" "test-socket-waitall" "0 failed" \
+        "$bindir/test-socket-waitall"
+    test_check "$runner" "test-synthetic-wait-signal" "0 failed" \
+        "$bindir/test-synthetic-wait-signal"
+    test_check "$runner" "test-sigpipe" "0 failed" "$bindir/test-sigpipe"
 
     printf "\nNegative tests\n"
     test_check "$runner" "test-negative" "0 failed" "$bindir/test-negative"

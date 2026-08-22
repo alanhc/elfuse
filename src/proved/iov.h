@@ -21,13 +21,14 @@
  *
  * Split into a header because io.c and net-msg.c cannot be given to Frama-C:
  * they include the macOS uio and socket headers, which the analyzer's libc does
- * not model. This header needs nothing but stdint.h, so make verify-iov proves
- * it directly.
+ * not model. This header needs only stdint.h and sys/uio.h, and the analyzer
+ * supplies its own modeled sys/uio.h, so make verify-iov proves it directly.
  */
 
 #pragma once
 
 #include <stdint.h>
+#include <sys/uio.h>
 
 /* Linux UIO_MAXIOV: the cap on iovcnt every one of these syscalls enforces. */
 #define IOV_COUNT_MAX 1024LL
@@ -84,4 +85,58 @@ static inline int iov_total_add(uint64_t total, uint64_t len, uint64_t *out)
 
     *out = total + len;
     return 1;
+}
+
+/* How many iovec entries a partial transfer of `moved` bytes has fully spent,
+ * and how far into the first survivor it landed.
+ *
+ * The caller resumes at iov + result with iovcnt - result entries, after
+ * trimming that survivor by *rem_out. Splitting the index arithmetic out from
+ * the pointer bump is what makes the useful half provable: the two facts a
+ * caller needs before touching the survivor are that the index is in range and
+ * that the remainder is strictly inside it, and both are postconditions here.
+ * The bump itself stays in io.c, since iov_base points into guest memory whose
+ * extent no contract in this tree can name.
+ *
+ * The last postcondition is what ties the remainder back to the bytes moved.
+ * Without it the contract is satisfied by a loop that never subtracts anything,
+ * since the exit condition alone already puts rem below the entry it indexes;
+ * make verify-mutants found exactly that hole by deleting the subtraction.
+ *
+ * The separation precondition is not ceremony: without it *rem_out and the
+ * array may alias, the store can change the length the second postcondition
+ * talks about, and the proof fails. Every caller passes a local.
+ */
+/*@
+  requires 0 <= iovcnt;
+  requires \valid_read(iov + (0 .. iovcnt - 1));
+  requires \valid(rem_out);
+  requires \separated(rem_out, iov + (0 .. iovcnt - 1));
+  assigns *rem_out;
+  ensures 0 <= \result <= iovcnt;
+  ensures \result < iovcnt ==> *rem_out < iov[\result].iov_len;
+  ensures *rem_out <= moved;
+  ensures \result > 0 ==> *rem_out + iov[\result - 1].iov_len <= moved;
+ */
+static inline int iov_advance_index(const struct iovec *iov,
+                                    int iovcnt,
+                                    size_t moved,
+                                    size_t *rem_out)
+{
+    int spent = 0;
+    size_t rem = moved;
+
+    /*@
+      loop invariant 0 <= spent <= iovcnt;
+      loop invariant rem <= moved;
+      loop invariant spent > 0 ==> rem + iov[spent - 1].iov_len <= moved;
+      loop assigns spent, rem;
+      loop variant iovcnt - spent;
+     */
+    while (spent < iovcnt && rem >= iov[spent].iov_len) {
+        rem -= iov[spent].iov_len;
+        spent++;
+    }
+    *rem_out = rem;
+    return spent;
 }

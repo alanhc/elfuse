@@ -639,6 +639,11 @@ static int aot_materialize_input_fd(int bin_fd, char out_path[PATH_MAX])
     if (aot_cache_path("input.XXXXXX", out_path, PATH_MAX) < 0)
         return -1;
 
+    /* Not tmpfile_anon: the translate subprocess opens this scratch file by
+     * pathname, since in_path is handed to it in argv, so it cannot be
+     * anonymous. It is unlinked once the translation is done; the file that
+     * gets renamed into the cache is the translator's output, not this one.
+     */
     int out_fd = mkstemp(out_path);
     if (out_fd < 0)
         return -1;

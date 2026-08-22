@@ -154,6 +154,163 @@ void fdtable_init(void);
  */
 int fd_alloc(int type, int host_fd, void (*cleanup)(int));
 
+/* The status bits that belong to the open file description rather than to the
+ * fd slot naming it, so a dup carries them to the alias and an alias sweep may
+ * write them to every slot sharing an ofd_id.
+ *
+ * One list because four hand-written copies of it had already drifted into two
+ * memberships, and neither carried O_APPEND or O_NOATIME -- which F_SETFL on a
+ * timerfd writes to the shadow, so a dup of one reported the flag on one name
+ * for it and not the other. The mode and the open-time bits are here for the
+ * same reason O_NONBLOCK is: dup(2) gives the alias the same description, so
+ * whatever the shadow answers for one name it has to answer for all of them.
+ */
+#define FD_DESCRIPTION_FLAGS                                                 \
+    (LINUX_O_ACCMODE | LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | \
+     LINUX_O_DIRECT | LINUX_O_LARGEFILE | LINUX_O_NONBLOCK | LINUX_O_ASYNC | \
+     LINUX_O_APPEND | LINUX_O_NOATIME)
+
+/* What a new fd slot inherits from an open file description that already
+ * exists. Every field is a separate claim, and a site has to make each one on
+ * purpose: build this with one of the constructors below rather than by
+ * initializer, so "not set" cannot quietly mean "not foreign, not owned, fresh
+ * identity" the way a partial fd_entry_t did. Four of the seven alias sites
+ * shipped a defect while it did.
+ *
+ * Both ownership fields matter. A dup of the launcher's stdin is typed
+ * FD_REGULAR, so a type test cannot see what it aliases, and taking O_NONBLOCK
+ * ownership there leaves the launching shell's terminal nonblocking after
+ * elfuse exits; carrying foreign_description keeps that fact through a dup of a
+ * dup, and through fork, which rebuilds the whole table from descriptions the
+ * parent already holds. Carrying nonblock_owned also saves the probe: an alias
+ * shares the description, so its answer cannot differ from its source's.
+ */
+typedef struct {
+    uint64_t ofd_id; /* 0: mint a fresh description identity */
+    int linux_flags; /* guest-visible flags to publish with the slot */
+    bool foreign_description;
+    bool nonblock_owned;
+
+    /* The live source to re-read under fd_lock, or -1 for a site with no
+     * in-process source. The fields above are a snapshot the caller took before
+     * the allocation, and an F_SETFL landing in between sweeps the aliases that
+     * exist at that moment -- which does not include the one being built.
+     * Publishing from the snapshot then gives the new name a shadow the rest of
+     * the description has already moved past: a dup of a blocking pipe reports
+     * blocking through F_GETFL and waits in io_xfer while every other name for
+     * it is nonblocking.
+     *
+     * src_generation is what makes the re-read safe. A close+reopen in the same
+     * window puts a different description behind the same number, and
+     * re-reading then would copy identity and flags from a file the caller
+     * never saw. When the generation has moved the snapshot is used as-is,
+     * which is the behaviour this field replaces rather than a new risk.
+     */
+    int src_guest_fd;
+    uint64_t src_generation;
+} fd_alias_spec_t;
+
+/* A full alias: same description, same identity, same status flags. dup(2),
+ * dup2, dup3, F_DUPFD and the Rosetta socket upgrade.
+ *
+ * src_guest_fd is the number the snapshot came from, so the allocator can take
+ * the description state again under the lock that publishes the new slot. Pass
+ * -1 for a source that is no longer addressable by number -- the Rosetta socket
+ * upgrade rebuilds the very slot it snapshotted, so re-reading it would find
+ * the replacement it is in the middle of installing.
+ */
+static inline fd_alias_spec_t fd_alias_of(int src_guest_fd,
+                                          const fd_entry_t *src)
+{
+    return (fd_alias_spec_t) {
+        .ofd_id = src->ofd_id,
+        .linux_flags = src->linux_flags & FD_DESCRIPTION_FLAGS,
+        .foreign_description = src->foreign_description,
+        .nonblock_owned = src->nonblock_owned,
+        .src_guest_fd = src_guest_fd,
+        .src_generation = src->generation,
+    };
+}
+
+/* The same host description, but an identity of its own: opening a magic link
+ * (/proc/self/fd/N, /dev/stdin) dups the descriptor, so the host flags are
+ * shared and must not be touched, while Linux gives the result a new open file
+ * description. Sweeping the source's aliases from it would be wrong.
+ */
+static inline fd_alias_spec_t fd_alias_host_shared(const fd_entry_t *src)
+{
+    return (fd_alias_spec_t) {
+        .src_guest_fd = -1,
+        .foreign_description = src->foreign_description,
+        .nonblock_owned = src->nonblock_owned,
+    };
+}
+
+/* The same identity, with the flags the caller has already worked out: a dup of
+ * a synthetic fd, whose host fd is elfuse's own pipe or kqueue. Not foreign
+ * (elfuse opened it) and not owned (fd_nonblock_shadowed answers from the type
+ * for those), so the alias sweeps find it and nothing else changes.
+ *
+ * Passing the flags here rather than writing them after the allocation is the
+ * point: a slot published first and patched second is observable in between
+ * with the wrong flags, which for an EFD_NONBLOCK eventfd means a sibling
+ * reading it as blocking.
+ */
+static inline fd_alias_spec_t fd_alias_identity(uint64_t ofd_id,
+                                                int linux_flags)
+{
+    return (fd_alias_spec_t) {
+        .src_guest_fd = -1, .ofd_id = ofd_id, .linux_flags = linux_flags};
+}
+
+/* Ownership facts only, for the two sites with no source slot to point at: a
+ * descriptor arriving over SCM_RIGHTS, and the fork rebuild, which remaps
+ * identities itself once every slot exists.
+ */
+static inline fd_alias_spec_t fd_alias_carried(bool foreign, bool owned)
+{
+    return (fd_alias_spec_t) {
+        .src_guest_fd = -1,
+        .foreign_description = foreign,
+        .nonblock_owned = owned,
+    };
+}
+
+/* Allocate a slot that inherits from `spec`, applying the inheritance inside
+ * the same fd_lock window that publishes the slot: a close+reopen in a gap
+ * would otherwise take the alias's identity and be swept as though it shared a
+ * description it never saw.
+ *
+ * fixed_fd >= 0 asks for that exact slot; otherwise the lowest free slot at or
+ * above minfd. The _relaxed variant skips the lock for the generation read when
+ * this is the only active thread, matching fd_alloc_from_relaxed.
+ */
+int fd_alloc_alias(const fd_alias_spec_t *spec,
+                   int type,
+                   int host_fd,
+                   void (*cleanup)(int));
+int fd_alloc_alias_at(const fd_alias_spec_t *spec,
+                      int fd,
+                      int type,
+                      int host_fd,
+                      void (*cleanup)(int),
+                      uint64_t *out_gen);
+int fd_alloc_alias_relaxed(const fd_alias_spec_t *spec,
+                           int fixed_fd,
+                           int minfd,
+                           int type,
+                           int host_fd,
+                           void (*cleanup)(int),
+                           uint64_t *out_gen);
+int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
+                       int fixed_fd,
+                       int minfd,
+                       int type,
+                       int host_fd,
+                       void (*cleanup)(int),
+                       void *dir,
+                       int linux_flags);
+
 /* Allocate the lowest available FD and publish type, host_fd, dir, and
  * linux_flags in one fd_lock critical section, so the slot never becomes
  * visible to a concurrent close/scan as type-set-but-dir-NULL. For fds (epoll)
@@ -274,11 +431,84 @@ int fd_snapshot_and_dup(int guest_fd, fd_entry_t *out);
  */
 int fd_get_type(int guest_fd);
 
-/* True when a host read/write on this guest fd may block (pipe, socket, fifo,
- * char/tty). Regular files and directories never block. Callers use this to
- * decide whether to route a blocking I/O through the interruptible wait path.
+/* The fields a transfer needs to decide how to run, read in one go. type is
+ * FD_CLOSED when the slot is closed or out of range. guest_nonblock is what the
+ * guest asked for, which on an owned fd is the only place it is recorded. seals
+ * rides along so a write path can reject a sealed memfd from the state it
+ * pinned, rather than from a second lookup that may describe another file.
  */
-bool fd_can_block(int guest_fd);
+typedef struct {
+    int type;
+    uint64_t generation;
+    unsigned seals;
+    bool can_block;
+    bool nonblock_owned;
+    bool guest_nonblock;
+} fd_block_state_t;
+
+fd_block_state_t fd_block_state(int guest_fd);
+
+/* Set or clear the guest's O_NONBLOCK shadow on every slot sharing guest_fd's
+ * open file description, anchored on guest_fd's generation so a close+reopen in
+ * the window changes nothing. O_NONBLOCK is a per-description flag on Linux, so
+ * a dup alias has to observe what the original asked for. On an fd whose
+ * O_NONBLOCK elfuse owns (see fd_init_entry) the host flag can no longer carry
+ * that, since elfuse holds it set, which is why the shadow has to be walked by
+ * hand. Call fn for every fd sharing guest_fd's open file description,
+ * including guest_fd itself, or not at all when the slot moved under the caller
+ * (a close+reopen that reused the number). The caller must hold fd_lock, and fn
+ * runs under it: the sweeps this serves mutate per-description state, and
+ * dropping the lock between finding an alias and touching it would let a
+ * sibling close retire the fd in between.
+ *
+ * Per-description state has no home of its own in this tree. O_NONBLOCK,
+ * O_ASYNC and the SIGIO owner all live per fd entry and are kept in step by
+ * sweeping the aliases, and this is the one place that knows how.
+ *
+ * The callers hold fd_lock; the sweep does not take it. Every writer of
+ * per-description state goes through here, so the lock covers the whole sweep
+ * rather than each slot in turn.
+ */
+void fd_for_each_alias_locked(int guest_fd,
+                              uint64_t generation,
+                              void (*fn)(int guest_fd, void *ctx),
+                              void *ctx);
+
+/* Apply the bits of value selected by mask to the guest-visible status flags of
+ * every fd sharing guest_fd's open file description.
+ *
+ * Every bit answered from the shadow belongs to the description, not to the
+ * slot, so a change through one alias has to reach the rest: F_GETFL on a dup
+ * of a timerfd reported stale O_APPEND and O_NOATIME while only O_NONBLOCK was
+ * being swept.
+ */
+void fd_set_shadow_flags(int guest_fd,
+                         uint64_t generation,
+                         int mask,
+                         int value);
+
+/* The guest's O_NONBLOCK for a fd whose host description is elfuse's own: a
+ * synthetic fd is backed by a pipe or a kqueue held nonblocking so the
+ * emulation can drive the waiting itself, so the host flag says nothing about
+ * what the guest asked for and the shadow is the only record.
+ *
+ * Every synthetic reader answers from here: eventfd, signalfd, timerfd, inotify
+ * and netlink. When one of them kept its own copy of the flag instead, a guest
+ * that set O_NONBLOCK with fcntl after creating the fd had it reported back
+ * correctly and then blocked forever on an empty read.
+ *
+ * Takes fd_lock, so callers must not already hold a lock that orders after it
+ * (sfd_lock=5a, inotify_lock); read the flag before taking those.
+ */
+bool fd_guest_nonblock(int guest_fd);
+
+/* Route a guest O_NONBLOCK request (F_SETFL, ioctl FIONBIO) to the shadow when
+ * elfuse owns the host flag on this fd.
+ *
+ * Returns false when it does not, and the caller should apply the request to
+ * the host fd itself.
+ */
+bool fd_apply_guest_nonblock(int guest_fd, bool on);
 
 /* Publish linux_flags for a guest fd under fd_lock. Use after fd_alloc when the
  * creating syscall needs to set linux_flags atomically with respect to a
@@ -318,12 +548,90 @@ static inline bool fd_type_is_synthetic(int type)
            type == FD_EPOLL;
 }
 
+/* The status bits the host description is authoritative for. Everything outside
+ * this mask is answered from the shadow, which is the inversion of how F_GETFL
+ * used to read: it asked the host and then overrode the answer bit by bit,
+ * eight special cases deep, taking the access mode from the shadow in two
+ * separate places for two disjoint type sets.
+ *
+ * Zero means the host has nothing to say, which is the honest answer for a type
+ * elfuse emulates whole: the fd behind it is elfuse's own pipe or kqueue, so
+ * F_GETFL cannot ask it what the guest opened and F_SETFL must not tell it.
+ * That second half matters -- a kqueue rejects fcntl(F_SETFL), which is why
+ * timerfd already had a hand-written branch to skip the host call while
+ * signalfd and inotify fell through to it.
+ *
+ * O_NONBLOCK is not decided here because it is not a property of the type
+ * alone: fd_nonblock_shadowed answers it per fd, and F_GETFL clears the bit
+ * from this mask when it does.
+ */
+static inline int fd_host_flag_mask(int type)
+{
+    /* An fd elfuse serves out of its own descriptor: nothing to ask. */
+    if (fd_type_is_synthetic(type) || type == FD_FUSE_DEV ||
+        type == FD_FUSE_FILE || type == FD_FUSE_DIR)
+        return 0;
+
+    /* Bits the host description never carries for anyone: elfuse tracks O_ASYNC
+     * itself (it is never armed on the host fd), and the open-time bits are
+     * Linux spellings macOS has no equivalent for.
+     */
+    int mask =
+        ~(LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
+          LINUX_O_LARGEFILE | LINUX_O_ASYNC | LINUX_O_NOATIME);
+
+    /* And the access mode, for the types elfuse opens on the host with a mode
+     * of its own choosing: an O_PATH or directory fd is opened read-only
+     * whatever the guest asked for. A pipe, socket or inherited stdio really
+     * was opened the way the guest sees it, so the host answers for those.
+     */
+    switch (type) {
+    case FD_REGULAR:
+    case FD_DIR:
+    case FD_PATH:
+    case FD_URANDOM:
+        mask &= ~LINUX_O_ACCMODE;
+        break;
+    default:
+        break;
+    }
+    return mask;
+}
+
+/* Bits the shadow holds that F_GETFL must never report: CLOEXEC is a descriptor
+ * flag, answered by F_GETFD, and Linux does not surface it here.
+ */
+#define FD_GETFL_HIDDEN (LINUX_O_CLOEXEC)
+
+
+/* True when fd_entry_t.linux_flags, not the host description, is where this
+ * fd's O_NONBLOCK lives. Two ways to get there: elfuse owns the host flag so a
+ * transfer can report EAGAIN instead of parking a vCPU (fd_init_entry), or the
+ * host fd is elfuse's own pipe or kqueue and the guest is not talking to it at
+ * all, in which case the host flag has to stay as the emulation needs it.
+ *
+ * Everything that answers or records the flag agrees through this: F_GETFL,
+ * F_SETFL, ioctl FIONBIO, the transfer paths, and the synthetic readers.
+ */
+static inline bool fd_nonblock_shadowed(int type, bool nonblock_owned)
+{
+    return nonblock_owned || fd_type_is_synthetic(type);
+}
+
 /* Look up a guest FD and return a dup'd host fd owned by the caller.
  * Thread-safe: dup is performed under fd_lock.
  *
  * Returns -1 on failure. Caller MUST close() the returned fd when done.
  */
 int fd_to_host_dup(int guest_fd);
+
+/* The same dup, with the slot's transfer classification taken in the same
+ * fd_lock window. A caller that pins a host fd and then asks what kind of fd it
+ * was has a gap: the pin keeps the description alive, but the guest fd number
+ * can be reused for another kind of object in between, and the answer then
+ * describes something the caller is not holding.
+ */
+int fd_to_host_dup_state(int guest_fd, fd_block_state_t *st_out);
 
 /* Mark an FD slot as closed (set type = FD_CLOSED and update bitmap). Does NOT
  * close the host FD or free type-specific resources (DIR*, epoll instance);
@@ -457,6 +765,35 @@ static inline int host_fd_ref_open(guest_fd_t guest_fd, host_fd_ref_t *ref)
     return 0;
 }
 
+/* Pin the host fd and classify the slot together, so a transfer acts on the
+ * object it is holding rather than on whatever took that fd number afterwards.
+ * With one active thread there is no mutator and the two relaxed reads are
+ * already consistent; with siblings alive both come from one fd_lock window.
+ */
+static inline int host_fd_ref_open_state(guest_fd_t guest_fd,
+                                         host_fd_ref_t *ref,
+                                         fd_block_state_t *st_out)
+{
+    ref->fd = -1;
+    ref->owned = false;
+
+    if (thread_is_single_active()) {
+        int host_fd = fd_to_host(guest_fd);
+        if (host_fd < 0)
+            return -1;
+        *st_out = fd_block_state(guest_fd);
+        ref->fd = host_fd;
+        return 0;
+    }
+
+    int host_fd = fd_to_host_dup_state(guest_fd, st_out);
+    if (host_fd < 0)
+        return -1;
+    ref->fd = host_fd;
+    ref->owned = true;
+    return 0;
+}
+
 static inline void host_fd_ref_close(host_fd_ref_t *ref)
 {
     /* Preserve errno across close(2). Callers commonly invoke this on the
@@ -482,28 +819,20 @@ static inline int host_dirfd_ref_open(guest_fd_t dirfd, host_fd_ref_t *ref)
     return host_fd_ref_open(dirfd, ref);
 }
 
-/* Open a host fd reference, rejecting O_PATH (FD_PATH) entries with -EBADF. Use
- * this for syscalls that operate on the underlying file -- read/write, lseek,
- * ftruncate, fsync/fdatasync, flock, fsetxattr/fremovexattr, ioctl, etc. Linux
- * returns EBADF on those calls when the fd was opened O_PATH; the host fd here
- * is a plain O_RDONLY descriptor, so without this gate the host call would
- * silently succeed and diverge from Linux semantics.
- *
- * Calls that are explicitly allowed on O_PATH (fstat, fstatfs, fchdir, close,
- * dup, fcntl get/set CLOEXEC, *at() dirfd) keep using host_{fd,dirfd}_ref_open
- * helpers above.
+/* The transfer classification carried by an entry already in hand. Callers that
+ * snapshot and dup in one window get their state from here rather than looking
+ * the slot up again, which is what makes the two describe the same object.
  */
-static inline int64_t host_fd_ref_open_io(guest_fd_t guest_fd,
-                                          host_fd_ref_t *ref)
+static inline fd_block_state_t fd_block_state_of(const fd_entry_t *e)
 {
-    fd_entry_t snap;
-    if (!fd_snapshot(guest_fd, &snap))
-        return -LINUX_EBADF;
-    if (snap.type == FD_PATH)
-        return -LINUX_EBADF;
-    if (host_fd_ref_open(guest_fd, ref) < 0)
-        return -LINUX_EBADF;
-    return 0;
+    return (fd_block_state_t) {
+        .type = e->type,
+        .generation = e->generation,
+        .seals = e->seals,
+        .can_block = e->can_block,
+        .nonblock_owned = e->nonblock_owned,
+        .guest_nonblock = (e->linux_flags & LINUX_O_NONBLOCK) != 0,
+    };
 }
 
 /* host_fd_ref_open_io() that also reports the fd generation the reference was
@@ -520,15 +849,30 @@ static inline int64_t host_fd_ref_open_io(guest_fd_t guest_fd,
  *
  * *out_gen is 0 on failure.
  *
+ * st_out, when given, receives the transfer classification taken in that same
+ * window, which is what lets a transfer act on the object it is holding rather
+ * than on whatever took the fd number afterwards. Both out-params are optional.
+ *
  * Returns 0 on success, -LINUX_EBADF otherwise.
  */
-static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
-                                              host_fd_ref_t *ref,
-                                              uint64_t *out_gen)
+static inline int64_t host_fd_ref_open_io_state(guest_fd_t guest_fd,
+                                                host_fd_ref_t *ref,
+                                                uint64_t *out_gen,
+                                                fd_block_state_t *st_out)
 {
     ref->fd = -1;
     ref->owned = false;
-    *out_gen = 0;
+    if (st_out)
+        *st_out = (fd_block_state_t) {.type = FD_CLOSED};
+
+    /* Both out-params are optional. Writing through out_gen unconditionally is
+     * a null dereference for a caller that wants only the classification, and
+     * the compiler is entitled to assume that cannot happen: clang proved the
+     * UB and compiled the whole of fuse_dev_read to a single brk #1, so every
+     * FUSE read trapped before doing anything.
+     */
+    if (out_gen)
+        *out_gen = 0;
 
     fd_entry_t snap;
     if (thread_is_single_active()) {
@@ -538,8 +882,11 @@ static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
         if (!fd_snapshot(guest_fd, &snap) || snap.type == FD_PATH ||
             snap.host_fd < 0)
             return -LINUX_EBADF;
+        if (st_out)
+            *st_out = fd_block_state_of(&snap);
         ref->fd = snap.host_fd;
-        *out_gen = snap.generation;
+        if (out_gen)
+            *out_gen = snap.generation;
         return 0;
     }
 
@@ -552,10 +899,44 @@ static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
         errno = saved_errno;
         return -LINUX_EBADF;
     }
+    if (st_out)
+        *st_out = fd_block_state_of(&snap);
     ref->fd = host_fd;
     ref->owned = true;
-    *out_gen = snap.generation;
+    if (out_gen)
+        *out_gen = snap.generation;
     return 0;
+}
+
+/* Open a host fd reference, rejecting O_PATH (FD_PATH) entries with -EBADF. Use
+ * this for syscalls that operate on the underlying file -- read/write, lseek,
+ * ftruncate, fsync/fdatasync, flock, fsetxattr/fremovexattr, ioctl, etc. Linux
+ * returns EBADF on those calls when the fd was opened O_PATH; the host fd here
+ * is a plain O_RDONLY descriptor, so without this gate the host call would
+ * silently succeed and diverge from Linux semantics.
+ *
+ * Calls that are explicitly allowed on O_PATH (fstat, fstatfs, fchdir, close,
+ * dup, fcntl get/set CLOEXEC, *at() dirfd) keep using host_{fd,dirfd}_ref_open
+ * helpers above.
+ */
+static inline int64_t host_fd_ref_open_io(guest_fd_t guest_fd,
+                                          host_fd_ref_t *ref)
+{
+    /* Hand-rolling the FD_PATH check here would take fd_lock twice and reject
+     * on a snapshot the pin does not have to agree with. One window, one
+     * decision; the caller just does not want what it classified.
+     */
+    return host_fd_ref_open_io_state(guest_fd, ref, NULL, NULL);
+}
+
+/* The generation-only spelling, for callers that do not run a transfer with the
+ * descriptor they pin.
+ */
+static inline int64_t host_fd_ref_open_io_gen(guest_fd_t guest_fd,
+                                              host_fd_ref_t *ref,
+                                              uint64_t *out_gen)
+{
+    return host_fd_ref_open_io_state(guest_fd, ref, out_gen, NULL);
 }
 
 /* A guest timeout at or above this many seconds means "wait indefinitely", and

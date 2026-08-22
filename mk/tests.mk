@@ -107,16 +107,28 @@ endef
 # spurious TIMEOUT. TEST_TIMEOUT is only overridden if the caller has not
 # already set one.
 
+# No "clean" prerequisite. These lanes used to depend on it, which removed the
+# whole build tree including the 186 cross-compiled guest binaries -- built with
+# CROSS_TEST_CFLAGS, and so untouched by anything EXTRA_CFLAGS says. The FLAVOR
+# stamp in mk/common.mk was added later to solve the same problem exactly:
+# it removes the *.o and *.d that a CFLAGS change actually invalidates, and
+# leaves the rest. Measured on this tree, the clean cost 186 needless
+# cross-compiles per sanitizer run, most of the lane's wall time.
+#
+# What still protects the link is the stamp, not the clean: the sub-make below
+# re-reads common.mk with the sanitizer CFLAGS, sees a different flavor, and
+# drops every host object before anything is compiled or linked.
+
 ## Run the sanitizer subset with AddressSanitizer (ASAN)
-check-asan: clean
+check-asan:
 	ASAN_OPTIONS="abort_on_error=1:detect_leaks=0" TEST_TIMEOUT="$${TEST_TIMEOUT:-30}" $(MAKE) EXTRA_CFLAGS="-fsanitize=address -fno-omit-frame-pointer" check-sanitizer
 
 ## Run the sanitizer subset with UndefinedBehaviorSanitizer (UBSAN)
-check-ubsan: clean
+check-ubsan:
 	UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" TEST_TIMEOUT="$${TEST_TIMEOUT:-30}" $(MAKE) EXTRA_CFLAGS="-fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer" check-sanitizer
 
 ## Run the sanitizer subset with ThreadSanitizer (TSAN)
-check-tsan: clean
+check-tsan:
 	TSAN_OPTIONS="halt_on_error=1" TEST_TIMEOUT="$${TEST_TIMEOUT:-60}" $(MAKE) EXTRA_CFLAGS="-fsanitize=thread -fno-omit-frame-pointer" check-sanitizer
 
 # Manifest sections that exercise elfuse-internal concurrency, memory, fork,
@@ -180,7 +192,7 @@ endef
 CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-tlbi-encoder-host test-fork-ipc-protocol-host \
         test-vcpu-run-hooks-host test-identity-override-host \
-        test-teardown-live-vcpu-host test-casefold-host \
+        test-teardown-live-vcpu-host test-stdio-nonblock-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host)
@@ -201,6 +213,7 @@ $(call run-host-unit,test-absock-names-host,absock derived-name unit test)
 $(call run-host-unit,test-dynamic-array-host,dynamic array unit test)
 $(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
+$(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)

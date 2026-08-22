@@ -63,6 +63,7 @@ test-shim-urandom-wrap
 [section] I/O subsystem tests
 test-eventfd
 test-eventfd-dup
+test-eventfd-semaphore-contended
 test-signalfd
 test-signalfd-hardening
 test-epoll
@@ -79,6 +80,13 @@ test-pty
 test-ioctl-fioasync
 test-getdents-refcount
 test-dev-shm-paths
+test-fcntl-flags
+test-socket-shortwrite
+test-socket-blockwrite-signal
+test-socket-accept-contended
+test-socket-waitall
+test-synthetic-wait-signal
+test-sigpipe
 
 [section] Threading tests
 test-thread                    # diff=skip
@@ -144,6 +152,8 @@ test-robust-futex
 
 [section] FD table race tests
 test-fd-race
+test-dup-setfl-race
+test-pipe-steal
 
 [section] Multithreaded fork tests
 test-mt-fork

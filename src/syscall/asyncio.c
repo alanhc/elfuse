@@ -19,9 +19,12 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <sys/event.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "utils.h"
+
+#include "proved/asyncudata.h"
 
 #include "runtime/thread.h"
 #include "syscall/linux-wire.h"
@@ -69,24 +72,28 @@ static bool async_owner_is_local(int owner_type, int owner)
     }
 }
 
-/* kqueue udata packs the guest fd (low 16 bits) plus the fd slot generation at
- * arm time (upper 48 bits). The generation guards against ABA: if the slot was
- * closed and reused between arm and a stale event firing, the generation no
- * longer matches and the event is dropped, so a SIGIO cannot land on a later,
- * unrelated occupant of the same guest fd number. FD_TABLE_SIZE is 1024 (fits
- * 16 bits) and the generation counter is monotonic, so 48 bits will not wrap.
+/* kqueue udata carries the guest fd and the fd slot generation at arm time. The
+ * generation guards against ABA: if the slot was closed and reused between arm
+ * and a stale event firing, the generation no longer matches and the event is
+ * dropped, so a SIGIO cannot land on a later, unrelated occupant of the same
+ * guest fd number.
+ *
+ * The packing itself is proved in proved/asyncudata.h -- that whatever goes in
+ * comes back out is the whole of the guard, and it used to rest on a comment
+ * asserting that 1024 fds fit 16 bits and that 48 bits of generation will not
+ * wrap. make verify-asyncudata now discharges both, and that the multiply
+ * cannot overflow.
  */
 static void *async_pack(int guest_fd, uint64_t generation)
 {
-    return (void *) (uintptr_t) (((generation & 0xFFFFFFFFFFFFULL) << 16) |
-                                 (uint32_t) (guest_fd & 0xFFFF));
+    return (void *) (uintptr_t) async_udata_pack(guest_fd, generation);
 }
 
 static void async_unpack(void *udata, int *guest_fd, uint64_t *generation)
 {
     uint64_t v = (uint64_t) (uintptr_t) udata;
-    *guest_fd = (int) (v & 0xFFFF);
-    *generation = (v >> 16) & 0xFFFFFFFFFFFFULL;
+    *guest_fd = async_udata_fd(v);
+    *generation = async_udata_gen(v);
 }
 
 static void async_deliver(void *udata, int signum)
@@ -98,7 +105,7 @@ static void async_deliver(void *udata, int signum)
     fd_entry_t snap;
     if (!fd_snapshot(guest_fd, &snap))
         return; /* slot closed since the knote fired */
-    if ((snap.generation & 0xFFFFFFFFFFFFULL) != generation)
+    if (snap.generation % ASYNC_UDATA_GEN_SPAN != generation)
         return; /* slot reused (ABA): this event belongs to the prior open */
     if (signum != LINUX_SIGURG && !(snap.linux_flags & LINUX_O_ASYNC))
         return; /* disarmed between fire and here (EV_CLEAR raced a disarm) */
@@ -214,6 +221,87 @@ static void async_reeval_slot_locked(int i)
         asyncio_disarm(fd_table[i].host_fd);
 }
 
+typedef struct {
+    int32_t owner_type, owner;
+} owner_set_ctx_t;
+
+/* Both sweeps below run under fd_lock inside fd_for_each_alias_locked, and both
+ * re-evaluate the slot's kevent registration after the change: arming inside
+ * the lock is what closes the close+reuse race, since a sibling cannot retire
+ * and reopen a host fd number while the scan holds it.
+ */
+static void owner_set_slot(int guest_fd, void *ctx)
+{
+    const owner_set_ctx_t *o = ctx;
+    fd_table[guest_fd].fasync_owner_type = o->owner_type;
+    fd_table[guest_fd].fasync_owner = o->owner;
+    async_reeval_slot_locked(guest_fd);
+}
+
+/* True when F_SETFL(O_ASYNC) sticks, so F_GETFL reports it afterwards.
+ *
+ * Linux does not carry FASYNC in SETFL_MASK: setfl() lands the bit only by
+ * calling file_operations->fasync, so an object whose fops lack one keeps
+ * O_ASYNC clear however often the guest sets it. The set was measured against
+ * qemu-aarch64, not read off the kernel source, which reads as though the bit
+ * sticks everywhere:
+ *
+ *   keeps it: pipe, fifo, socket, netlink, inotify, tty, /dev/urandom
+ *   drops it: timerfd, eventfd, signalfd, epoll, pidfd, regular file,
+ *             directory, /dev/null, /dev/zero
+ *
+ * The type alone cannot answer for FD_REGULAR and FD_STDIO, which may be a
+ * fifo, a socket, a tty, another character device or a plain file, so those two
+ * ask the host object what it is. can_block was the first answer here and was
+ * wrong in both directions: it takes in every character device, which put
+ * O_ASYNC on /dev/null, and it says nothing about /dev/urandom, which Linux
+ * does let the flag stick on (random_fasync). This runs on F_SETFL of O_ASYNC
+ * and nowhere else.
+ */
+static bool fd_keeps_fasync(int type, int host_fd)
+{
+    switch (type) {
+    case FD_PIPE:
+    case FD_SOCKET:
+    case FD_NETLINK:
+    case FD_INOTIFY:
+    case FD_FUSE_DEV:
+    case FD_URANDOM:
+        return true;
+    case FD_REGULAR:
+    case FD_STDIO:
+        break;
+    default:
+        return false;
+    }
+
+    struct stat st;
+    if (host_fd < 0 || fstat(host_fd, &st) != 0)
+        return false;
+    if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))
+        return true;
+    if (S_ISCHR(st.st_mode))
+        return isatty(host_fd) == 1;
+    return false;
+}
+
+static void async_flag_slot(int guest_fd, void *ctx)
+{
+    /* Setting the bit is conditional, clearing it never is: Linux lands FASYNC
+     * only through file_operations->fasync, so on an object without one the
+     * flag stays clear and F_GETFL keeps reporting 0. elfuse used to record the
+     * request for every type, which made a timerfd, an eventfd and a plain file
+     * all claim O_ASYNC they would never deliver.
+     */
+    bool on = *(bool *) ctx && fd_keeps_fasync(fd_table[guest_fd].type,
+                                               fd_table[guest_fd].host_fd);
+    if (on)
+        fd_table[guest_fd].linux_flags |= LINUX_O_ASYNC;
+    else
+        fd_table[guest_fd].linux_flags &= ~LINUX_O_ASYNC;
+    async_reeval_slot_locked(guest_fd);
+}
+
 void fasync_owner_set(int guest_fd,
                       uint64_t expect_gen,
                       int owner_type,
@@ -230,24 +318,9 @@ void fasync_owner_set(int guest_fd,
      * registration does not block, and the watcher thread never holds fd_lock
      * while parked in kevent(), so there is no deadlock.
      */
+    owner_set_ctx_t ctx = {.owner_type = owner_type, .owner = owner};
     pthread_mutex_lock(&fd_lock);
-    uint64_t ofd_id = 0;
-    if (fd_table[guest_fd].type != FD_CLOSED &&
-        fd_table[guest_fd].generation == expect_gen)
-        ofd_id = fd_table[guest_fd].ofd_id;
-    if (ofd_id) {
-        /* An O(FD_TABLE_SIZE) scan reaches every alias sharing this
-         * open-file-description. Cold path (F_SETOWN only); an ofd_id to fd
-         * index is the upgrade if it ever shows up in a profile.
-         */
-        for (int i = 0; i < FD_TABLE_SIZE; i++) {
-            if (fd_table[i].type == FD_CLOSED || fd_table[i].ofd_id != ofd_id)
-                continue;
-            fd_table[i].fasync_owner_type = owner_type;
-            fd_table[i].fasync_owner = owner;
-            async_reeval_slot_locked(i);
-        }
-    }
+    fd_for_each_alias_locked(guest_fd, expect_gen, owner_set_slot, &ctx);
     pthread_mutex_unlock(&fd_lock);
 }
 
@@ -281,24 +354,6 @@ void asyncio_apply(int guest_fd, uint64_t expect_gen, bool on)
      * fasync_owner_set for the deadlock argument.
      */
     pthread_mutex_lock(&fd_lock);
-    uint64_t ofd_id = 0;
-    if (fd_table[guest_fd].type != FD_CLOSED &&
-        fd_table[guest_fd].generation == expect_gen)
-        ofd_id = fd_table[guest_fd].ofd_id;
-    if (ofd_id) {
-        /* An O(FD_TABLE_SIZE) scan reaches every alias sharing this
-         * open-file-description. Cold path (O_ASYNC toggles only); an ofd_id to
-         * fd index is the upgrade if it ever shows up in a profile.
-         */
-        for (int i = 0; i < FD_TABLE_SIZE; i++) {
-            if (fd_table[i].type == FD_CLOSED || fd_table[i].ofd_id != ofd_id)
-                continue;
-            if (on)
-                fd_table[i].linux_flags |= LINUX_O_ASYNC;
-            else
-                fd_table[i].linux_flags &= ~LINUX_O_ASYNC;
-            async_reeval_slot_locked(i);
-        }
-    }
+    fd_for_each_alias_locked(guest_fd, expect_gen, async_flag_slot, &on);
     pthread_mutex_unlock(&fd_lock);
 }

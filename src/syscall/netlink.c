@@ -831,16 +831,13 @@ int64_t netlink_sendmsg(int guest_fd, guest_t *g, uint64_t msg_gva, int flags)
  *
  * On success returns 0 with nl_lock still held and ns valid. On EAGAIN, EINTR,
  * EIO, or if the socket was closed underneath the poll, releases nl_lock and
- * returns the negative Linux errno. flags carries MSG_DONTWAIT; pass 0 for
- * read(2), which only honors O_NONBLOCK.
+ * returns the negative Linux errno.
  */
 static int64_t nl_wait_readable_locked(netlink_state_t *ns,
                                        int guest_fd,
-                                       int flags)
+                                       bool nonblock)
 {
     while (ns->buf_pos >= ns->buf_len) {
-        bool nonblock = (flags & LINUX_MSG_DONTWAIT) ||
-                        (fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK);
         if (nonblock) {
             pthread_mutex_unlock(&nl_lock);
             return -LINUX_EAGAIN;
@@ -938,8 +935,8 @@ static void nl_write_kernel_src(guest_t *g,
  * of them hands out a message split across two calls.
  *
  * Returns the byte count, or a negative Linux errno. Takes nl_lock and releases
- * it before returning. flags carries MSG_DONTWAIT; pass 0 for read(2), which
- * only honors O_NONBLOCK.
+ * it before returning. nonblock is sampled before nl_lock so this leaf lock
+ * does not nest fd_lock.
  */
 static int64_t netlink_recv_iov(int guest_fd,
                                 guest_t *g,
@@ -947,6 +944,7 @@ static int64_t netlink_recv_iov(int guest_fd,
                                 int iovcnt,
                                 int flags)
 {
+    bool nonblock = (flags & LINUX_MSG_DONTWAIT) || fd_guest_nonblock(guest_fd);
     pthread_mutex_lock(&nl_lock);
     netlink_state_t *ns = nl_find(guest_fd);
     if (!ns) {
@@ -968,7 +966,7 @@ static int64_t netlink_recv_iov(int guest_fd,
         return 0;
     }
 
-    int64_t werr = nl_wait_readable_locked(ns, guest_fd, flags);
+    int64_t werr = nl_wait_readable_locked(ns, guest_fd, nonblock);
     if (werr < 0)
         return werr;
 

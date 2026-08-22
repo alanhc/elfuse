@@ -4,12 +4,23 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Minimal bench that measures the four labels the guardrail script checks:
+ * Minimal bench that measures the eleven labels the guardrail script checks,
+ * all of which it extracts by name and holds to a ceiling:
  *
  *   getpid          (raw SVC; shim identity fast path)
  *   clock_gettime   (vDSO trampoline; see -DGUARD_USE_LIBC_CG below)
  *   read-urandom1   (raw read; shim urandom ring fast path)
  *   stat-path       (full SVC round trip through guest_read_path)
+ *   pipe-roundtrip  (write + read on a pipe; the read/write transfer path)
+ *   pipe-eagain     (read of an empty nonblocking pipe; per-transfer cost)
+ *   fd-create       (open + close; fd_init_entry including its path work)
+ *   pipe-create     (pipe + close; the same allocation without a path)
+ *   pipe-bulk       (a megabyte into a pipe a sibling drains)
+ *   getpid-mt       (the identity path with a sibling thread alive)
+ *   pipe-eagain-mt  (the transfer path with a sibling thread alive)
+ *
+ * The last three run after the single-threaded cases, so nothing above pays for
+ * a second thread existing.
  *
  * Built twice from this single source:
  *   build/bench-hot-guard       -- static glibc. Compiled without
@@ -40,7 +51,9 @@
  */
 
 #include <elf.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,6 +159,23 @@ static uint64_t monotonic_ns(clock_gettime_fn cg)
     return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
 }
 
+/* A lane that cannot be set up must not simply vanish from the output. The
+ * guardrail treats an absent label as a deterministic MISS and does not retry
+ * it, so a transient malloc or thread failure would read exactly like a
+ * regression. Say which lane and why, and exit non-zero so the run is a setup
+ * failure rather than a measurement.
+ *
+ * The error comes in as an argument because pthread_create reports through its
+ * return value and is not required to touch errno; musl does not, so reading
+ * errno here would print whatever the last unrelated call left behind.
+ */
+static void bench_setup_failed(const char *lane, const char *what, int err)
+{
+    fprintf(stderr, "bench-hot-guard: %s unavailable: %s failed: %s\n", lane,
+            what, strerror(err));
+    exit(2);
+}
+
 static long bench_getpid(void *ctx)
 {
     (void) ctx;
@@ -176,6 +206,132 @@ static long bench_read_urandom1(void *ctx)
     int fd = *(int *) ctx;
     unsigned char byte;
     return read(fd, &byte, 1);
+}
+
+/* The transfer lane: one byte out and the same byte back through a pipe, so
+ * each iteration is two guest read/write syscalls over a fd that can block,
+ * with the data always ready.
+ *
+ * This is the path every guest doing real work spends its time on, and until
+ * this lane existed nothing here measured it: the other four are served by the
+ * shim, the vDSO, or the path helpers, and a 30-50% regression in the
+ * read/write transfer path passed the guardrail clean. It regresses as a slope
+ * (a host call or a lock acquisition added per transfer), which is why it is
+ * checked as a ratio to getpid like stat-path rather than absolutely.
+ */
+typedef struct {
+    int rd, wr;
+} pipe_ctx_t;
+
+/* The same transfer path with the data movement and the wakeup taken out: a
+ * read of an empty pipe the guest itself set nonblocking. It reaches the fd
+ * lookup, the block-state decision and the transfer attempt, and returns EAGAIN
+ * without touching the pipe buffer or waking anybody, so it measures
+ * per-transfer overhead with far less scheduling noise than the round trip.
+ */
+static long bench_pipe_eagain(void *ctx)
+{
+    pipe_ctx_t *p = ctx;
+    char c;
+    return read(p->rd, &c, 1);
+}
+
+static long bench_pipe_roundtrip(void *ctx)
+{
+    pipe_ctx_t *p = ctx;
+    char c = 'x';
+    if (write(p->wr, &c, 1) != 1)
+        return -1;
+    return read(p->rd, &c, 1);
+}
+
+/* The bulk lane: a large write into a pipe a sibling thread is draining, so the
+ * write fills the buffer, waits, and resumes. That wait-and-resume loop is what
+ * a single-byte transfer never reaches, and it is where the ready-poll rewrite
+ * left a regression the other lanes could not see: measured 21-31% slower than
+ * the parent commit, filed as a P2 with no lane to hold it. This is that lane.
+ *
+ * Reported as ns/op over a fixed transfer size, so a slope in the retry loop
+ * shows up directly rather than through a ratio.
+ */
+#define BULK_BYTES (1u << 20)
+
+typedef struct {
+    int rd, wr;
+    unsigned char *buf;
+} bulk_ctx_t;
+
+static void *bulk_drain(void *arg)
+{
+    bulk_ctx_t *b = arg;
+    unsigned char sink[65536];
+    for (;;) {
+        ssize_t n = read(b->rd, sink, sizeof(sink));
+        if (n <= 0)
+            break;
+    }
+    return NULL;
+}
+
+static long bench_pipe_bulk(void *ctx)
+{
+    bulk_ctx_t *b = ctx;
+    size_t sent = 0;
+    while (sent < BULK_BYTES) {
+        ssize_t n = write(b->wr, b->buf + sent, BULK_BYTES - sent);
+        if (n <= 0)
+            return -1;
+        sent += (size_t) n;
+    }
+    return (long) sent;
+}
+
+/* The same per-transfer op as pipe-eagain, with a sibling thread alive.
+ *
+ * elfuse takes fd_lock on the fd-table reads it can skip when only one thread
+ * is running (thread_is_single_active), so every lane above measures the
+ * lock-free path exclusively. A guest doing real work has more than one thread,
+ * and a lock added to the transfer path would be invisible here without this.
+ */
+static void *idle_sibling(void *arg)
+{
+    volatile int *stop = arg;
+    while (!*stop) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+/* fd creation with the path work taken out: pipe() makes two descriptors from
+ * nothing, so what is left is the table allocation itself. Both slots run
+ * fd_init_entry, which decides O_NONBLOCK ownership with two fcntls inside the
+ * fd-table lock; the open-based lane below cannot see that cost under the path
+ * resolution it also pays.
+ */
+static long bench_pipe_create(void *ctx)
+{
+    (void) ctx;
+    int p[2];
+    if (pipe(p) != 0)
+        return -1;
+    close(p[0]);
+    close(p[1]);
+    return 0;
+}
+
+/* The fd-creation lane: open and close the same path, so each iteration runs a
+ * full fd_init_entry, which stats the host fd and may set O_NONBLOCK on it,
+ * both inside the fd-table lock. Nothing else here allocates a descriptor.
+ */
+static long bench_fd_create(void *ctx)
+{
+    (void) ctx;
+    int fd = open("/dev/null", O_RDWR);
+    if (fd < 0)
+        return -1;
+    close(fd);
+    return 0;
 }
 
 /* The path-resolving lane. Every syscall that takes a path pays guest_read_path
@@ -248,18 +404,95 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        perror("pipe");
+        close(urandomfd);
+        return 1;
+    }
+
+    int eagain_fd[2];
+    if (pipe(eagain_fd) != 0) {
+        perror("pipe");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(urandomfd);
+        return 1;
+    }
+    fcntl(eagain_fd[0], F_SETFL, fcntl(eagain_fd[0], F_GETFL) | O_NONBLOCK);
+    pipe_ctx_t eagain_ctx = {.rd = eagain_fd[0], .wr = eagain_fd[1]};
+
     cg_ctx_t cg_ctx = {.fn = vdso_cg};
     struct stat stat_buf;
+    pipe_ctx_t pipe_ctx = {.rd = pipefd[0], .wr = pipefd[1]};
     const bench_case_t cases[] = {
         {"getpid", bench_getpid, NULL},
         {"clock_gettime", bench_clock_gettime, &cg_ctx},
         {"read-urandom1", bench_read_urandom1, &urandomfd},
         {"stat-path", bench_stat_path, &stat_buf},
+        {"pipe-roundtrip", bench_pipe_roundtrip, &pipe_ctx},
+        {"pipe-eagain", bench_pipe_eagain, &eagain_ctx},
+        {"fd-create", bench_fd_create, NULL},
+        {"pipe-create", bench_pipe_create, NULL},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         run_case(vdso_cg, &cases[i], iters);
 
+    /* The bulk lane needs a reader on the other end, and the sibling lane needs
+     * a thread that is merely alive. Both run after the single-threaded cases
+     * so nothing above pays for a second thread existing.
+     */
+    int bulk_fd[2];
+    unsigned char *bulk_buf = malloc(BULK_BYTES);
+    if (bulk_buf && pipe(bulk_fd) == 0) {
+        memset(bulk_buf, 0x5a, BULK_BYTES);
+        bulk_ctx_t bulk_ctx = {
+            .rd = bulk_fd[0], .wr = bulk_fd[1], .buf = bulk_buf};
+        pthread_t drain;
+        int rc_drain = pthread_create(&drain, NULL, bulk_drain, &bulk_ctx);
+        if (rc_drain == 0) {
+            /* A megabyte per op, so far fewer iterations than the syscall
+             * lanes; the guardrail divides by its own count.
+             */
+            unsigned long bulk_iters = iters / 200 ? iters / 200 : 1;
+            bench_case_t bulk = {"pipe-bulk", bench_pipe_bulk, &bulk_ctx};
+            run_case(vdso_cg, &bulk, bulk_iters);
+            close(bulk_fd[1]);
+            pthread_join(drain, NULL);
+            close(bulk_fd[0]);
+        } else {
+            bench_setup_failed("pipe-bulk", "pthread_create", rc_drain);
+            close(bulk_fd[0]);
+            close(bulk_fd[1]);
+        }
+    } else {
+        bench_setup_failed("pipe-bulk", bulk_buf ? "pipe" : "malloc", errno);
+    }
+    free(bulk_buf);
+
+    volatile int stop = 0;
+    pthread_t sibling;
+    int rc_sibling =
+        pthread_create(&sibling, NULL, idle_sibling, (void *) &stop);
+    if (rc_sibling == 0) {
+        bench_case_t mt[] = {
+            {"getpid-mt", bench_getpid, NULL},
+            {"pipe-eagain-mt", bench_pipe_eagain, &eagain_ctx},
+        };
+        for (size_t i = 0; i < sizeof(mt) / sizeof(mt[0]); i++)
+            run_case(vdso_cg, &mt[i], iters);
+        stop = 1;
+        pthread_join(sibling, NULL);
+    } else {
+        bench_setup_failed("getpid-mt/pipe-eagain-mt", "pthread_create",
+                           rc_sibling);
+    }
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    close(eagain_fd[0]);
+    close(eagain_fd[1]);
     close(urandomfd);
     return 0;
 }

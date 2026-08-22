@@ -1864,18 +1864,23 @@ static int64_t sc_memfd_create(guest_t *g,
     if (guest_read_small(g, x0, &first, sizeof(first)) < 0)
         return -LINUX_EFAULT;
 
-    char template[] = "/tmp/elfuse-memfd-XXXXXX";
-    int fd = mkstemp(template);
+    int fd = tmpfile_anon("memfd");
     if (fd < 0)
         return linux_errno();
-    unlink(template);
     int gfd = fd_alloc(FD_REGULAR, fd, NULL);
     if (gfd < 0) {
         close(fd);
         return linux_errno();
     }
-    if (flags & LINUX_MFD_CLOEXEC)
-        fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
+
+    /* Linux opens a memfd O_RDWR (shmem_file_setup then get_unused_fd_flags),
+     * and F_GETFL answers a regular file's access mode from the shadow because
+     * O_PATH and directory fds have no macOS equivalent. The type table cannot
+     * speak for this one: a memfd is FD_REGULAR like any other file.
+     */
+    fd_publish_linux_flags(
+        gfd,
+        LINUX_O_RDWR | ((flags & LINUX_MFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0));
     fd_table[gfd].seals =
         (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
     return gfd;
@@ -2602,17 +2607,6 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
                 tp != FD_SOCKET)
                 goto slow_path;
 
-            /* Same racy-but-benign read as tp above, and no worse than the
-             * shipped tp-based divert: a concurrent close+reopen (only possible
-             * with a live sibling thread; a single active thread has no
-             * mutator) that flips this slot to a blocking fd could skip the
-             * divert for one call. The guest is already reading an fd it is
-             * concurrently reopening, so the pinned fd it gets is undefined
-             * regardless; the slow path carries the identical window. Not worth
-             * a lock on the hot regular-file read.
-             */
-            bool can_block = fd_table[fd].can_block;
-
             /* Proc-backed fds may need synthetic read/write handling (for
              * example, oom_* rereads recompute content on each read and proc
              * dirfds steer relative *at() resolution). Keep them on the slow
@@ -2621,12 +2615,25 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             if (fd_table[fd].proc_path[0] != '\0')
                 goto slow_path;
 
+            /* Pin the descriptor and classify it together: io_xfer would
+             * otherwise look the slot up again, and a sibling reusing this fd
+             * number in between makes the two describe different objects.
+             */
             host_fd_ref_t host_ref;
-            if (host_fd_ref_open(fd, &host_ref) != 0)
+            fd_block_state_t fast_st;
+            if (host_fd_ref_open_state(fd, &host_ref, &fast_st) != 0)
                 goto slow_path;
 
-            /* Check seals after dup; the fd is still valid */
-            if (nr == SYS_write && (fd_table[fd].seals & LINUX_F_SEAL_WRITE)) {
+            /* Both of the decisions below come from fast_st, the state taken
+             * with the descriptor, and not from a second look at the table. The
+             * pre-filter above can afford its racy read because a wrong answer
+             * only costs a diversion to the slow path; these two cannot. A
+             * can_block read that disagrees with the pinned fd picks the wrong
+             * transfer form for it, which is the parked-vCPU failure this path
+             * is built to avoid, and a seals read that disagrees enforces the
+             * seal of whatever occupied the slot a moment ago.
+             */
+            if (nr == SYS_write && (fast_st.seals & LINUX_F_SEAL_WRITE)) {
                 host_fd_ref_close(&host_ref);
                 goto slow_path;
             }
@@ -2647,30 +2654,30 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
                 goto slow_path;
             }
 
-            /* A blocking read/write on a pipe, socket, fifo, or char device
-             * would park this vCPU thread in an uninterruptible host call where
-             * the preempt thread's hv_vcpus_exit cannot reach it. Probe
-             * non-blocking: read waits for POLLIN, write for POLLOUT; if the fd
-             * would block, divert to the slow path where sys_read/sys_write
-             * wait interruptibly (poll + wakeup pipe). Regular files never
-             * block (can_block is false) and stay on the fast path.
+            /* Readiness is not a reservation: a sibling thread or a forked
+             * process on the same open file description can take the bytes
+             * before this thread gets to them, and a transfer that then blocks
+             * parks this vCPU where hv_vcpus_exit and the wakeup pipe cannot
+             * reach it. io_xfer runs the transfer without that risk, waiting
+             * interruptibly when it has to, and reports a negative only for the
+             * cases the slow path has to answer: an interrupted wait, and a
+             * read on a pty master whose slaves are gone.
+             *
+             * Regular files never block (can_block is false) and go straight to
+             * the host call.
              */
-            if (can_block) {
+            ssize_t ret;
+            if (fast_st.can_block) {
                 short ev = (nr == SYS_read) ? POLLIN : POLLOUT;
-                struct pollfd pfd = {.fd = host_ref.fd, .events = ev};
-
-                /* Divert on not-ready (0) or probe error (< 0, e.g. EINTR): a
-                 * blocking call here cannot be preempted, so let the
-                 * interruptible slow path handle both.
-                 */
-                if (poll(&pfd, 1, 0) <= 0) {
+                struct iovec iov = {.iov_base = buf, .iov_len = count};
+                if (io_xfer(fd, host_ref.fd, ev, &iov, 1, &ret, &fast_st) < 0) {
                     host_fd_ref_close(&host_ref);
                     goto slow_path;
                 }
+            } else {
+                ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)
+                                       : write(host_ref.fd, buf, count);
             }
-
-            ssize_t ret = (nr == SYS_read) ? read(host_ref.fd, buf, count)
-                                           : write(host_ref.fd, buf, count);
             if (ret >= 0) {
                 host_fd_ref_close(&host_ref);
                 result = ret;

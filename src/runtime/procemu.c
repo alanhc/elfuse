@@ -664,11 +664,9 @@ const char *proc_get_shm_dir(void)
  */
 static int proc_synthetic_fd(const void *data, size_t len)
 {
-    char template[] = "/tmp/elfuse-proc-XXXXXX";
-    int fd = mkstemp(template);
+    int fd = tmpfile_anon("proc");
     if (fd < 0)
         return -1;
-    unlink(template); /* Delete on close; fd keeps it alive */
 
     const uint8_t *p = data;
     size_t remaining = len;

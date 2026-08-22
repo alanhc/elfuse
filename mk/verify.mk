@@ -272,12 +272,20 @@ VERIFY_DIRENT_CLAIM := for ANY name length a host or FUSE directory can present
 VERIFY_DIRENT_UNPROVED := the readdir walk and the name translation stay test-covered
 
 VERIFY_IOV_SRC  := src/proved/iov.h
-VERIFY_IOV_FCTS := iov_count_ok iov_total_add
-VERIFY_IOV_MIN_GOALS ?= 17
+VERIFY_IOV_FCTS := iov_count_ok iov_total_add iov_advance_index
+VERIFY_IOV_MIN_GOALS ?= 40
 VERIFY_IOV_MODEL := typed
 VERIFY_IOV_SCAN := src/proved/iov.h
 VERIFY_IOV_CLAIM := for ANY iovec array a guest can write
 VERIFY_IOV_UNPROVED := the per-entry guest_ptr bounds stay test-covered
+
+VERIFY_ASYNCUDATA_SRC  := src/proved/asyncudata.h
+VERIFY_ASYNCUDATA_FCTS := async_udata_fd async_udata_gen async_udata_pack
+VERIFY_ASYNCUDATA_MIN_GOALS ?= 15
+VERIFY_ASYNCUDATA_MODEL := typed
+VERIFY_ASYNCUDATA_SCAN := src/proved/asyncudata.h
+VERIFY_ASYNCUDATA_CLAIM := for ANY guest fd and slot generation the watcher can arm
+VERIFY_ASYNCUDATA_UNPROVED := the kevent registration and the delivery-side owner checks stay test-covered
 
 VERIFY_FDSET_SRC  := src/proved/fdset.h
 VERIFY_FDSET_FCTS := fdset_words fdset_fd_index fdset_slot
@@ -336,7 +344,11 @@ commafy = $(subst $(verify_space),$(verify_comma),$(strip $(1)))
 # target name is enough and stays readable; a new target using a letter not
 # listed here shows up immediately as a literal upper-case character in the
 # rule name rather than silently misbehaving.
-lc = $(subst A,a,$(subst B,b,$(subst C,c,$(subst D,d,$(subst E,e,$(subst F,f,$(subst G,g,$(subst H,h,$(subst I,i,$(subst K,k,$(subst L,l,$(subst M,m,$(subst N,n,$(subst O,o,$(subst P,p,$(subst Q,q,$(subst R,r,$(subst S,s,$(subst T,t,$(subst U,u,$(subst V,v,$(subst W,w,$(subst X,x,$(1))))))))))))))))))))))))
+# Lowercase a target name. Spelled out per letter because make has no case
+# function; J, Y and Z were missing from this chain, so a proof target whose
+# name contained one produced a rule nobody could invoke -- silently, since the
+# .PHONY list and the rule name were wrong in the same way. Keep all 26.
+lc = $(subst A,a,$(subst B,b,$(subst C,c,$(subst D,d,$(subst E,e,$(subst F,f,$(subst G,g,$(subst H,h,$(subst I,i,$(subst J,j,$(subst K,k,$(subst L,l,$(subst M,m,$(subst N,n,$(subst O,o,$(subst P,p,$(subst Q,q,$(subst R,r,$(subst S,s,$(subst T,t,$(subst U,u,$(subst V,v,$(subst W,w,$(subst X,x,$(subst Y,y,$(subst Z,z,$(1)))))))))))))))))))))))))))
 
 # The proof targets, derived rather than listed. Make knows every variable it
 # has read, so the set of VERIFY_<T>_SRC assignments above IS the target list;

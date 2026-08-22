@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -294,6 +295,82 @@ static inline int fd_set_cloexec(int fd)
 static inline int fd_set_nonblock(int fd)
 {
     return fd_update_status_flag(fd, O_NONBLOCK, true);
+}
+
+/* Create a temp file that exists only as long as the returned fd: mkstemp under
+ * /tmp with an elfuse-<what>- prefix, unlinked before it is handed back.
+ *
+ * The unlink is the point. Four places wanted this shape and each spelled out
+ * the create-then-unlink pair, which is a file left on disk the first time
+ * somebody adds an early return between the two. Callers that keep the name
+ * (the Rosetta AOT cache staging its output for a rename, and the FUSE exec
+ * materializer, which unlinks after the exec) genuinely differ and stay as they
+ * are; a flag to suppress the unlink here would just move their decision
+ * somewhere it reads as an afterthought.
+ *
+ * Returns the fd, or -1 with errno set. The path is never reported because
+ * nothing can reach it: that is what makes it anonymous.
+ */
+static inline int tmpfile_anon(const char *what)
+{
+    char path[64];
+    int n = snprintf(path, sizeof(path), "/tmp/elfuse-%s-XXXXXX", what);
+    if (n < 0 || (size_t) n >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    int fd = mkstemp(path);
+    if (fd < 0)
+        return -1;
+
+    /* The name has to go, or the fd is not anonymous and the caller has no way
+     * to remove a path it never sees. Retry EINTR, and fail the call rather
+     * than hand back a descriptor with a name still attached.
+     */
+    int rc;
+    do {
+        rc = unlink(path);
+    } while (rc < 0 && errno == EINTR);
+
+    /* Any failure other than ENOENT leaves a named file behind that the caller
+     * cannot see to remove, so the call fails rather than hand back a
+     * descriptor that is not anonymous. Retrying would not help: the error is a
+     * property of the path or the directory, not a transient of this call, and
+     * EINTR is already handled above.
+     */
+    if (rc < 0 && errno != ENOENT) {
+        int unlink_errno = errno;
+        close(fd);
+        errno = unlink_errno;
+        return -1;
+    }
+
+    /* Neither answer the unlink can give is proof the file is anonymous, so ask
+     * the descriptor. A success is not proof: another process with this uid can
+     * hard-link the entry between mkstemp and here, and then the unlink removes
+     * the name it was given while the descriptor stays linked under the other
+     * one. An ENOENT is not proof either: the same race with rename leaves the
+     * unlink missing entirely. The link count is the fact that matters in both,
+     * so it is checked in both.
+     */
+    struct stat anon;
+    if (fstat(fd, &anon) != 0) {
+        /* Its own errno, not EEXIST. Folding the two together reported a
+         * spurious EEXIST out of memfd_create for anything fstat could fail
+         * with.
+         */
+        int fstat_errno = errno;
+        close(fd);
+        errno = fstat_errno;
+        return -1;
+    }
+    if (anon.st_nlink != 0) {
+        close(fd);
+        errno = EEXIST;
+        return -1;
+    }
+    return fd;
 }
 
 /* Carry overflow/underflow between tv_nsec and tv_sec so the result is a
