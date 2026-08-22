@@ -18,6 +18,13 @@
 #   2. A label in both lists at once. The test is then skipped under every
 #      runner the matrix has, so it never executes anywhere while still looking
 #      registered.
+#   3. A tests/manifest.txt binary that no test_* call registers at all. Same
+#      cost, arrived at from the other side: "make check" runs it, the matrix
+#      never does, and the reference kernel therefore never adjudicates it. Six
+#      tests reached that state before this check existed, four of them added
+#      in the same branch that claimed they encoded Linux behaviour. Only the
+#      matrix can substantiate such a claim, so a test that skips it is a claim
+#      nobody checked.
 #
 # The pass counts themselves are not checked here. test-matrix.sh already holds
 # each lane to its EXPECTED_BASELINES floor at runtime, which is a stronger
@@ -47,8 +54,60 @@ registered_labels()
         | sed -E 's/.*"\$runner" +"([^"]+)"$/\1/' | sort -u
 }
 
+# Manifest binaries the matrix deliberately does not run. Each asserts an
+# elfuse-internal implementation detail with no counterpart on a real kernel, so
+# the reference lane has nothing to say about it. The matrix's own comment above
+# its suite list is the long form; this is the machine-readable copy.
+MATRIX_EXEMPT="
+test-oom-proc
+test-shim-identity
+test-shim-identity-attention
+test-shim-verbose-trace
+test-shim-data-el1
+test-shim-urandom-smp
+test-shim-urandom-toctou
+test-shim-urandom-wrap
+test-shim-cred-race
+test-mremap-infra
+test-mremap-fork-tracking
+test-dev-shm-paths
+"
+
+# The binary name from each manifest line: the first field, with any trailing
+# arguments and any "#" marker dropped.
+#
+# Matching the whole line instead missed 17 of the 84 entries, because a
+# manifest line carries arguments (test-argc a b c) and markers (test-thread #
+# diff=skip) beside the name. Those were exactly the entries a coverage guard
+# most wants to see, and it reported success while checking two thirds of the
+# list.
+manifest_tests()
+{
+    local manifest
+    manifest="$(dirname "$0")/../tests/manifest.txt"
+    if [ ! -r "$manifest" ]; then
+        echo "Error: cannot read $manifest; the coverage check needs it" >&2
+        return 1
+    fi
+    sed -E 's/#.*//' "$manifest" | awk '{print $1}' \
+        | grep -E '^test-[A-Za-z0-9._-]+$' | sort -u
+}
+
 ret=0
 registered="$(registered_labels)"
+
+manifest_list="$(manifest_tests)" || exit 1
+
+while IFS= read -r test; do
+    [ -n "$test" ] || continue
+    printf '%s\n' "$MATRIX_EXEMPT" | grep -qxF "$test" && continue
+    if ! printf '%s\n' "$registered" | grep -qxF "$test"; then
+        echo "Error: tests/manifest.txt has '$test', which the matrix never runs." >&2
+        echo "       Add a test_* call for it, or name it in MATRIX_EXEMPT here" >&2
+        echo "       with the reason the reference kernel cannot adjudicate it." >&2
+        ret=1
+    fi
+done <<< "$manifest_list"
 
 for list in QEMU_SKIP ELFUSE_SKIP; do
     while IFS= read -r label; do
