@@ -30,9 +30,6 @@ ENV_CAT="${4:-}"
 . "$(dirname "$0")/lib/report.sh"
 
 # Counters are per-script; see tests/lib/report.sh.
-pass=0
-fail=0
-skip=0
 
 # check <reject|accept> <desc> <stderr-substring or ''> <flags...>
 check()

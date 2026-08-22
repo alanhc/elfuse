@@ -40,9 +40,6 @@ SHORTDIR=/tmp/elfuse-rfm
 # shellcheck source=tests/lib/report.sh
 . "$(dirname "$0")/lib/report.sh"
 
-pass=0
-fail=0
-skip=0
 total=0
 
 # Expect a non-zero exit AND a stderr fragment match. Args: <label>
