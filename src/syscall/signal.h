@@ -126,15 +126,22 @@ typedef struct {
 #define LINUX_SEGV_MAPERR 1 /* Address not mapped to object */
 #define LINUX_SEGV_ACCERR 2 /* Invalid permissions for mapped object */
 
-/* Linux sigcontext (aarch64). From arch/arm64/include/uapi/asm/sigcontext.h */
+/* Linux sigcontext (aarch64). From arch/arm64/include/uapi/asm/sigcontext.h
+ * Size of the sigcontext extension area, matching Linux. Named rather than
+ * spelled inline because build_sigcontext_reserved's contract is stated against
+ * it: the running offset that walks the record chain is only provably in bounds
+ * against a bound the prover can see.
+ */
+#define SIGCONTEXT_RESERVED_BYTES 4096
+
 typedef struct {
     uint64_t fault_address;
     uint64_t regs[31]; /* X0-X30 */
     uint64_t sp;       /* SP_EL0 */
     uint64_t pc;       /* ELR_EL1 at time of signal */
     uint64_t pstate;   /* SPSR_EL1 at time of signal */
-    /* Extension space for FPSIMD, ESR, SVE contexts (4096 bytes) */
-    uint8_t __reserved[4096] __attribute__((aligned(16)));
+    /* Extension space for FPSIMD, ESR, SVE contexts */
+    uint8_t __reserved[SIGCONTEXT_RESERVED_BYTES] __attribute__((aligned(16)));
 } linux_sigcontext_t;
 
 /* Linux stack_t and sigaltstack constants. */

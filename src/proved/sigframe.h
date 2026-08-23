@@ -91,3 +91,35 @@ static inline int sigframe_base(uint64_t sp,
     *base = candidate;
     return 1;
 }
+
+/* Layout of the FPSIMD record inside sigcontext.__reserved: an 8-byte framing
+ * header, FPSR and FPCR, then V0-V31 at 16 bytes each. The record is the first
+ * in the chain, so these offsets are relative to both the record and the
+ * reserved area.
+ */
+#define SIGFRAME_FPSIMD_VREG_BASE 16U
+#define SIGFRAME_FPSIMD_VREG_BYTES 16U
+#define SIGFRAME_FPSIMD_VREG_COUNT 32U
+#define SIGFRAME_FPSIMD_BYTES    \
+    (SIGFRAME_FPSIMD_VREG_BASE + \
+     SIGFRAME_FPSIMD_VREG_COUNT * SIGFRAME_FPSIMD_VREG_BYTES)
+
+/* Byte offset of vector register n within the FPSIMD record.
+ *
+ * Split out of the store loop in signal.c so the bound is proved once here
+ * rather than re-derived by the prover at every iteration, which is where a
+ * whole-loop proof of that function times out. The postcondition is what the
+ * caller needs: the 16 bytes at the returned offset land inside the record.
+ */
+/*@
+  requires n < SIGFRAME_FPSIMD_VREG_COUNT;
+  assigns \nothing;
+  ensures \result == SIGFRAME_FPSIMD_VREG_BASE +
+                     n * SIGFRAME_FPSIMD_VREG_BYTES;
+  ensures \result >= SIGFRAME_FPSIMD_VREG_BASE;
+  ensures \result + SIGFRAME_FPSIMD_VREG_BYTES <= SIGFRAME_FPSIMD_BYTES;
+ */
+static inline uint32_t sigframe_fpsimd_vreg_offset(uint32_t n)
+{
+    return SIGFRAME_FPSIMD_VREG_BASE + n * SIGFRAME_FPSIMD_VREG_BYTES;
+}

@@ -256,12 +256,29 @@ VERIFY_NETLINKWALK_UNPROVED := the reply builders, the socket I/O, and whether \
 their callers honor these preconditions stay test-covered
 
 VERIFY_SIGFRAME_SRC  := src/proved/sigframe.h
-VERIFY_SIGFRAME_FCTS := sigframe_base
-VERIFY_SIGFRAME_MIN_GOALS ?= 15
+VERIFY_SIGFRAME_FCTS := sigframe_base sigframe_fpsimd_vreg_offset
+VERIFY_SIGFRAME_MIN_GOALS ?= 20
 VERIFY_SIGFRAME_MODEL := typed
 VERIFY_SIGFRAME_SCAN := src/proved/sigframe.h
-VERIFY_SIGFRAME_CLAIM := for ANY interrupted stack pointer and frame size
-VERIFY_SIGFRAME_UNPROVED := the frame field layout is not covered at all yet
+VERIFY_SIGFRAME_CLAIM := for ANY interrupted stack pointer and frame size, \
+and ANY vector register index
+VERIFY_SIGFRAME_UNPROVED := the 32-store FPSIMD loop that consumes the offset \
+stays test-covered, and so do the magic and size values
+
+# A whole-function proof of build_sigcontext_reserved in src/syscall/signal.c
+# was tried and is not here. It reaches 67 of 71 with the Bytes model, and the
+# four that stay open are Z3 timeouts on the store loop's frame condition, not
+# counterexamples: they survive a 180-second per-goal timeout and a frame
+# narrowed from the whole 4096-byte reserved area to the 552 bytes the chain
+# writes. Splitting the offset arithmetic into sigframe_fpsimd_vreg_offset above
+# is what that attempt bought, and the loop that consumes it stays test-covered.
+# The ACSL on the function itself is left in place: it is correct, it states the
+# frame, and it is what a stronger model would need to start from.
+#
+# What the attempt did settle is that signal.c parses at all, which it did not
+# before: its one _Atomic(T *) is now spelled as the qualifier form, and the two
+# Darwin headers it reaches for have stubs (frama-c-stubs/mach, frama-c-stubs/
+# sys/ucontext.h). That is a prerequisite for any later proof in this file.
 
 VERIFY_DIRENT_SRC  := src/proved/dirent.h
 VERIFY_DIRENT_FCTS := dirent_reclen dirent_record_bounds
