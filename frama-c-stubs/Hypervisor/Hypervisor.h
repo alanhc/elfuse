@@ -120,14 +120,34 @@ typedef struct {
 hv_return_t hv_vcpu_destroy(hv_vcpu_t vcpu);
 hv_return_t hv_vcpu_run(hv_vcpu_t vcpu);
 hv_return_t hv_vcpus_exit(hv_vcpu_t *vcpus, unsigned int vcpu_count);
+
+/* Contracts on the register accessors, not just declarations. Without an
+ * assigns clause WP must assume the call writes anywhere, which defeats the
+ * assigns clause of every caller it appears in. The frame is what the API
+ * documents: the call fills the out-parameter and touches nothing else the
+ * caller can name. HVF's vCPU state is not in the C memory model, so there is
+ * nothing else to state.
+ */
+/*@
+  requires \valid(value);
+  assigns *value;
+ */
 hv_return_t hv_vcpu_get_reg(hv_vcpu_t vcpu, hv_reg_t reg, uint64_t *value);
 hv_return_t hv_vcpu_set_reg(hv_vcpu_t vcpu, hv_reg_t reg, uint64_t value);
+/*@
+  requires \valid(value);
+  assigns *value;
+ */
 hv_return_t hv_vcpu_get_sys_reg(hv_vcpu_t vcpu,
                                 hv_sys_reg_t reg,
                                 uint64_t *value);
 hv_return_t hv_vcpu_set_sys_reg(hv_vcpu_t vcpu,
                                 hv_sys_reg_t reg,
                                 uint64_t value);
+/*@
+  requires \valid(value);
+  assigns *value;
+ */
 hv_return_t hv_vcpu_get_simd_fp_reg(hv_vcpu_t vcpu,
                                     hv_simd_fp_reg_t reg,
                                     hv_simd_fp_uchar16_t *value);

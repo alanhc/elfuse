@@ -2135,8 +2135,7 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
     guest_fds[1] = fd_alloc(FD_PIPE, host_fds[1], NULL);
     if (guest_fds[1] < 0) {
         int saved_errno = errno;
-        fd_mark_closed(guest_fds[0]);
-        close(host_fds[0]);
+        fd_retire_published(guest_fds[0], host_fds[0]);
         close(host_fds[1]);
         errno = saved_errno;
         return linux_errno();
@@ -2164,10 +2163,8 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
 
     int32_t fds[2] = {guest_fds[0], guest_fds[1]};
     if (guest_write_small(g, fds_gva, fds, sizeof(fds)) < 0) {
-        fd_mark_closed(guest_fds[0]);
-        fd_mark_closed(guest_fds[1]);
-        close(host_fds[0]);
-        close(host_fds[1]);
+        fd_retire_published(guest_fds[0], host_fds[0]);
+        fd_retire_published(guest_fds[1], host_fds[1]);
         return -LINUX_EFAULT;
     }
 
@@ -2977,13 +2974,13 @@ int64_t sys_fchmodat(guest_t *g,
 
     /* An fd magic link names the descriptor's file, and Linux resolves it
      * inside the syscall. Act on the descriptor so nothing can redirect the
-     * chmod between resolution and use; see path_fd_magiclink_dup().
+     * chmod between resolution and use; see path_fd_magiclink_open().
      */
     if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW)) {
-        int magic_fd = path_fd_magiclink_dup(path);
-        if (magic_fd >= 0) {
-            int mrc = fchmod(magic_fd, mode);
-            close_keep_errno(magic_fd);
+        host_fd_ref_t magic;
+        if (path_fd_magiclink_open(path, &magic) == 0) {
+            int mrc = fchmod(magic.fd, mode);
+            host_fd_ref_close(&magic);
             return mrc < 0 ? linux_errno() : 0;
         }
     }
@@ -3156,16 +3153,16 @@ int64_t sys_fchownat(guest_t *g,
      * descriptor, not on a pathname resolved from it a moment earlier.
      */
     if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW)) {
-        int magic_fd = path_fd_magiclink_dup(path);
-        if (magic_fd >= 0) {
-            int host_rc = fchown(magic_fd, owner, group);
+        host_fd_ref_t magic;
+        if (path_fd_magiclink_open(path, &magic) == 0) {
+            int host_rc = fchown(magic.fd, owner, group);
             int saved_errno = errno;
             struct stat host_st;
             const struct stat *st_ptr =
-                fstat(magic_fd, &host_st) == 0 ? &host_st : NULL;
+                fstat(magic.fd, &host_st) == 0 ? &host_st : NULL;
             errno = saved_errno;
             int64_t out = chown_result(host_rc, st_ptr, owner, group);
-            close_keep_errno(magic_fd);
+            host_fd_ref_close(&magic);
             return out;
         }
     }
@@ -3317,10 +3314,10 @@ int64_t sys_utimensat(guest_t *g,
          * the descriptor, not on a pathname resolved from it a moment earlier.
          */
         if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW)) {
-            int magic_fd = path_fd_magiclink_dup(path);
-            if (magic_fd >= 0) {
-                int mrc = futimens(magic_fd, times_gva ? ts : NULL);
-                close_keep_errno(magic_fd);
+            host_fd_ref_t magic;
+            if (path_fd_magiclink_open(path, &magic) == 0) {
+                int mrc = futimens(magic.fd, times_gva ? ts : NULL);
+                host_fd_ref_close(&magic);
                 host_fd_ref_close(&dir_ref);
                 return mrc < 0 ? linux_errno() : 0;
             }

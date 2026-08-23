@@ -444,8 +444,7 @@ int64_t sys_socketpair(guest_t *g,
     }
     int gfd1 = fd_alloc(FD_SOCKET, fds[1], absock_unregister_fd);
     if (gfd1 < 0) {
-        fd_mark_closed(gfd0);
-        close(fds[0]);
+        fd_retire_published(gfd0, fds[0]);
         close(fds[1]);
         return -LINUX_EMFILE;
     }
@@ -458,10 +457,8 @@ int64_t sys_socketpair(guest_t *g,
 
     int32_t guest_fds[2] = {gfd0, gfd1};
     if (guest_write_small(g, sv_gva, guest_fds, sizeof(guest_fds)) < 0) {
-        fd_mark_closed(gfd0);
-        close(fds[0]);
-        fd_mark_closed(gfd1);
-        close(fds[1]);
+        fd_retire_published(gfd0, fds[0]);
+        fd_retire_published(gfd1, fds[1]);
         return -LINUX_EFAULT;
     }
 
@@ -554,7 +551,7 @@ static int64_t do_accept(guest_t *g,
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -LINUX_EBADF;
 
-    host_fd_ref_t host_ref = {.fd = -1, .owned = false};
+    host_fd_ref_t host_ref = HOST_FD_REF_INIT;
     uint64_t listener_generation = 0;
     int listener_passcred_fallback = 0;
     int listener_type = FD_CLOSED;
@@ -570,11 +567,11 @@ static int64_t do_accept(guest_t *g,
                                 &listener_passcred_fallback);
     } else {
         fd_entry_t listener_snap = {.type = FD_CLOSED};
-        int host_fd = fd_snapshot_and_dup(fd, &listener_snap);
+        int host_fd =
+            fd_host_ref_acquire(fd, &listener_snap, &host_ref.lifetime);
         if (host_fd < 0)
-            return -LINUX_EBADF;
+            return linux_errno();
         host_ref.fd = host_fd;
-        host_ref.owned = true;
         sock_st = fd_block_state_of(&listener_snap);
         listener_type = listener_snap.type;
         listener_generation = listener_snap.generation;
@@ -645,15 +642,13 @@ static int64_t do_accept(guest_t *g,
      */
     if (addr_gva) {
         if (!addrlen_gva) {
-            close(new_fd);
-            fd_mark_closed(gfd);
+            fd_retire_published(gfd, new_fd);
             return -LINUX_EFAULT;
         }
         uint32_t guest_addrlen;
         if (guest_read_small(g, addrlen_gva, &guest_addrlen,
                              sizeof(guest_addrlen)) < 0) {
-            close(new_fd);
-            fd_mark_closed(gfd);
+            fd_retire_published(gfd, new_fd);
             return -LINUX_EFAULT;
         }
         uint8_t linux_sa[128];
@@ -669,8 +664,7 @@ static int64_t do_accept(guest_t *g,
             if (guest_write_small(g, addr_gva, linux_sa, write_len) < 0 ||
                 guest_write_small(g, addrlen_gva, &actual_len,
                                   sizeof(actual_len)) < 0) {
-                close(new_fd);
-                fd_mark_closed(gfd);
+                fd_retire_published(gfd, new_fd);
                 return -LINUX_EFAULT;
             }
         }

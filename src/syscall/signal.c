@@ -426,7 +426,7 @@ static inline bool *thread_saved_valid_ptr(void)
  * a stale value or fail to see a fresh registration. The release-acquire pair
  * seals the window.
  */
-static _Atomic(guest_t *) attention_guest;
+static guest_t *_Atomic attention_guest;
 
 void signal_init(void)
 {
@@ -1893,6 +1893,22 @@ int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva)
 #define ESR_MAGIC 0x45535201U
 #define ESR_CONTEXT_SIZE 16 /* { __u32 magic, size; __u64 esr; } */
 
+/* Worst case the chain below writes: both records plus the terminator. The
+ * assert is what keeps the contract on build_sigcontext_reserved honest if a
+ * record grows or a third one is added.
+ */
+#define SIGCONTEXT_CHAIN_MAX_BYTES (FPSIMD_CONTEXT_SIZE + ESR_CONTEXT_SIZE + 8)
+
+_Static_assert(SIGCONTEXT_CHAIN_MAX_BYTES <= SIGCONTEXT_RESERVED_BYTES,
+               "sigcontext record chain must fit the reserved area");
+
+/* The proved offset bound in src/proved/sigframe.h derives the record size
+ * independently. Both spell 528 today and nothing else ties them, so a change
+ * to either would leave the proof describing a record that no longer exists.
+ */
+_Static_assert(FPSIMD_CONTEXT_SIZE == SIGFRAME_FPSIMD_BYTES,
+               "proved FPSIMD record size must match the one written here");
+
 /* Build the extended context chain in the __reserved area. Linux kernel
  * (arch/arm64/kernel/signal.c) builds:
  *   1. FPSIMD context (always present)
@@ -1900,6 +1916,13 @@ int64_t signal_sigaltstack(guest_t *g, uint64_t ss_gva, uint64_t old_ss_gva)
  *   3. Terminator (magic=0, size=0)
  * The @esr parameter is the raw ESR_EL1 value; if non-zero, the ESR context
  * block is included.
+ *
+ * The contract states the buffer the caller owes, which is what lets the
+ * running offset be proved in bounds rather than merely read as obviously so.
+ */
+/*@
+  requires \valid(reserved + (0 .. SIGCONTEXT_CHAIN_MAX_BYTES - 1));
+  assigns reserved[0 .. SIGCONTEXT_CHAIN_MAX_BYTES - 1];
  */
 static void build_sigcontext_reserved(uint8_t *reserved,
                                       uint64_t esr,
@@ -1923,10 +1946,22 @@ static void build_sigcontext_reserved(uint8_t *reserved,
     memcpy(reserved + off + 8, &fpsr32, 4);
     memcpy(reserved + off + 12, &fpcr32, 4);
 
-    /* Save V0-V31 (128-bit each, at offset 16) */
-    for (int i = 0; i < 32; i++) {
-        hv_simd_fp_uchar16_t vreg = vcpu_get_simd(vcpu, (unsigned) i);
-        memcpy(reserved + off + 16 + (size_t) i * 16, &vreg, 16);
+    /* Save V0-V31 (128-bit each, at offset 16) off is still zero here: FPSIMD
+     * is the first record in the chain, and the invariant says so rather than
+     * leaving the prover to guess, which is what bounds the 32 stores below
+     * inside the reserved area.
+     */
+    hv_simd_fp_uchar16_t vreg;
+    /*@
+      loop invariant 0 <= i <= SIGFRAME_FPSIMD_VREG_COUNT;
+      loop invariant off == 0;
+      loop assigns i, vreg, reserved[0 .. SIGCONTEXT_CHAIN_MAX_BYTES - 1];
+      loop variant SIGFRAME_FPSIMD_VREG_COUNT - i;
+     */
+    for (uint32_t i = 0; i < SIGFRAME_FPSIMD_VREG_COUNT; i++) {
+        vreg = vcpu_get_simd(vcpu, i);
+        memcpy(reserved + off + sigframe_fpsimd_vreg_offset(i), &vreg,
+               SIGFRAME_FPSIMD_VREG_BYTES);
     }
     off += FPSIMD_CONTEXT_SIZE;
 

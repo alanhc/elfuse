@@ -629,9 +629,8 @@ int64_t sys_inotify_init1(int flags)
     int slot = inotify_slot_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&inotify_lock);
-        fd_mark_closed(gfd);
+        fd_retire_published(gfd, pipefd[0]);
         close(kq);
-        close(pipefd[0]);
         close(pipefd[1]);
         return -LINUX_ENOMEM;
     }

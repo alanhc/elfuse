@@ -2797,21 +2797,23 @@ int proc_intercept_open(const guest_t *g,
             return -1;
         }
 
-        /* fd_to_host_dup atomically duplicates under fd_lock so a concurrent
-         * close+reopen on another vCPU cannot redirect the lseek to an
-         * unrelated host fd that took the freed slot. The probe pollutes errno
-         * with ESPIPE on non-seekable fds (sockets, pipes), so save and restore
-         * around the call to keep the caller's view clean.
+        /* Pin under fd_lock so a concurrent close+reopen on another vCPU cannot
+         * redirect the lseek to an unrelated host fd that took the freed slot.
+         * A dup would answer that too, but retiring it would drop the guest's
+         * record locks on the file (fcntl(2)), and reading /proc/self/fdinfo
+         * must not unlock anything. The probe pollutes errno with ESPIPE on
+         * non-seekable fds (sockets, pipes), so save and restore around the
+         * call to keep the caller's view clean.
          */
         off_t pos = 0;
-        int dup_fd = fd_to_host_dup(n);
-        if (dup_fd >= 0) {
+        host_fd_ref_t probe_ref;
+        if (host_fd_ref_open(n, &probe_ref) == 0) {
             int saved_errno = errno;
-            off_t probe = lseek(dup_fd, 0, SEEK_CUR);
+            off_t probe = lseek(probe_ref.fd, 0, SEEK_CUR);
             if (probe >= 0)
                 pos = probe;
             errno = saved_errno;
-            close(dup_fd);
+            host_fd_ref_close(&probe_ref);
         }
 
         char extra[160];

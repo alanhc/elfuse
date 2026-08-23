@@ -505,6 +505,22 @@ MUTATIONS = [
         "    *base = candidate;",
         "    *base = floor - floor % SIGFRAME_ALIGN;",
     ),
+    (
+        "sigframe",
+        "src/proved/sigframe.h",
+        "sigframe_fpsimd_vreg_offset",
+        "shift every vector register one slot up (V31 writes past the record)",
+        "    return SIGFRAME_FPSIMD_VREG_BASE + n * SIGFRAME_FPSIMD_VREG_BYTES;",
+        "    return SIGFRAME_FPSIMD_VREG_BASE + (n + 1) * SIGFRAME_FPSIMD_VREG_BYTES;",
+    ),
+    (
+        "sigframe",
+        "src/proved/sigframe.h",
+        "sigframe_fpsimd_vreg_offset",
+        "drop the header base (V0 lands on FPSR and FPCR)",
+        "    return SIGFRAME_FPSIMD_VREG_BASE + n * SIGFRAME_FPSIMD_VREG_BYTES;",
+        "    return n * SIGFRAME_FPSIMD_VREG_BYTES;",
+    ),
     # ---- verify-elf --------------------------------------------------------
     (
         "elf",

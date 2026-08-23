@@ -10,6 +10,7 @@
  * access through fd_lock.
  */
 
+#include <assert.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -41,6 +42,12 @@ pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
 fd_entry_t fd_table[FD_TABLE_SIZE];
 static uint64_t fd_next_generation = 1;
 static uint64_t fd_next_ofd_id = 1;
+
+struct fd_lifetime {
+    _Atomic unsigned int refs;
+    int host_fd;
+    int type;
+};
 
 /* RLIMIT_NOFILE tracking. Guest-side soft limit for RLIMIT_NOFILE. fd_alloc
  * checks this. Default matches typical Linux default (1024). Updated by
@@ -268,6 +275,7 @@ static inline void fd_init_entry(int fd,
     fd_bitmap_set_used(fd);
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
+    fd_table[fd].lifetime = NULL;
 
     /* Take the description state again, here, from the live source. The spec
      * carries a snapshot the caller made before this lock was held, and an
@@ -827,9 +835,10 @@ int fd_alloc_at_relaxed(int fd,
  * another thread could fd_alloc() this slot, populate it with a new
  * host_fd/dir, and then the current stale writes would corrupt the new entry.
  */
-void fd_mark_closed_unlocked(int fd)
+fd_lifetime_t *fd_mark_closed_unlocked(int fd)
 {
     uint64_t closing_ofd_id = fd_table[fd].ofd_id;
+    fd_lifetime_t *detached = fd_table[fd].lifetime;
 
     /* Clear before publishing FD_CLOSED/free. The EL1 urandom read fast path
      * intentionally avoids fd_lock, so it must not observe a stale urandom bit
@@ -838,6 +847,7 @@ void fd_mark_closed_unlocked(int fd)
     shim_globals_mark_urandom_fd(fd, false);
     fd_table[fd].type = FD_CLOSED;
     fd_table[fd].host_fd = -1;
+    fd_table[fd].lifetime = NULL;
     fd_table[fd].ofd_id = 0;
     fd_table[fd].dir = NULL;
     fd_table[fd].proc_path[0] = '\0';
@@ -854,13 +864,15 @@ void fd_mark_closed_unlocked(int fd)
      * single-threaded on the relaxed path).
      */
     epoll_note_fd_closed(fd, closing_ofd_id);
+    return detached;
 }
 
-void fd_mark_closed(int fd)
+fd_lifetime_t *fd_mark_closed(int fd)
 {
     pthread_mutex_lock(&fd_lock);
-    fd_mark_closed_unlocked(fd);
+    fd_lifetime_t *detached = fd_mark_closed_unlocked(fd);
     pthread_mutex_unlock(&fd_lock);
+    return detached;
 }
 
 /* Snapshot fd_table[fd] into *out and optionally close it. Caller must hold
@@ -911,8 +923,15 @@ bool fd_close_regular_relaxed(int fd, int *host_fd_out)
     if (!thread_is_single_active())
         return false;
 
+    /* Refuse a slot carrying a lifetime. The caller closes *host_fd_out raw and
+     * never touches the refcount, so admitting one here would strand the slot's
+     * reference and leak the object. The thread_is_single_active() gate above
+     * does not subsume this: the lifetime is created on the multi-threaded
+     * acquire path and outlives the return to a single active thread.
+     */
     fd_entry_t *entry = &fd_table[fd];
-    if (entry->type != FD_REGULAR || entry->dir || entry->cleanup)
+    if (entry->type != FD_REGULAR || entry->dir || entry->cleanup ||
+        entry->lifetime)
         return false;
 
     *host_fd_out = entry->host_fd;
@@ -933,6 +952,177 @@ int fd_to_host(int guest_fd)
     if (fd_table[guest_fd].type == FD_CLOSED)
         return -1;
     return fd_table[guest_fd].host_fd;
+}
+
+/* Take one reference on fd's lifetime with fd_lock held, creating it if this is
+ * the slot's first borrower. The single place a lifetime is ever born.
+ *
+ * spare, when it points at a non-NULL allocation, is one the caller made
+ * outside the lock; this consumes it and clears the caller's pointer, or leaves
+ * it untouched when the slot already carries a lifetime. A caller passing NULL
+ * allocates here instead, with the table lock held, which is only acceptable
+ * away from the per-syscall path: see fd_host_ref_acquire for why that one
+ * preallocates.
+ *
+ * Returns NULL when the slot is closed, carries no host descriptor, or the
+ * allocation fails. A caller that has already established the first two under
+ * this same lock hold can read NULL as out of memory.
+ */
+static fd_lifetime_t *fd_lifetime_pin_spare(int fd, fd_lifetime_t **spare)
+{
+    if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
+        return NULL;
+    if (fd_table[fd].type == FD_CLOSED || fd_table[fd].host_fd < 0)
+        return NULL;
+
+    fd_lifetime_t *lifetime = fd_table[fd].lifetime;
+    if (!lifetime) {
+        if (spare && *spare) {
+            lifetime = *spare;
+            *spare = NULL;
+        } else {
+            lifetime = malloc(sizeof(*lifetime));
+            if (!lifetime)
+                return NULL;
+        }
+        atomic_init(&lifetime->refs, 1);
+        lifetime->host_fd = fd_table[fd].host_fd;
+        lifetime->type = fd_table[fd].type;
+        fd_table[fd].lifetime = lifetime;
+    }
+    atomic_fetch_add(&lifetime->refs, 1);
+    return lifetime;
+}
+
+int fd_host_ref_acquire(int guest_fd,
+                        fd_entry_t *out,
+                        fd_lifetime_t **lifetime_out)
+{
+    *lifetime_out = NULL;
+    if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE)) {
+        errno = EBADF;
+        return -1;
+    }
+
+    /* Two passes at most. The first runs with no spare and succeeds outright
+     * for any fd that already carries a lifetime, which after its first borrow
+     * is every fd; only a first borrow drops the lock to allocate and comes
+     * back. Allocating up front instead would be simpler, but it would make
+     * every multi-threaded fd call pay a malloc/free pair, and sys_ppoll pays
+     * it per polled descriptor.
+     *
+     * The allocation stays outside the lock either way. Inside, it would nest
+     * the allocator's own lock under the order-3 table lock, which
+     * check-lock-order.py cannot see because it only knows file-scope
+     * pthread_mutex_t, and every first touch of an fd would pay a possible
+     * allocator stall with the whole table held.
+     */
+    fd_lifetime_t *spare = NULL;
+    for (;;) {
+        pthread_mutex_lock(&fd_lock);
+        if (!fd_snapshot_locked(guest_fd, out, false) || out->host_fd < 0) {
+            pthread_mutex_unlock(&fd_lock);
+            free(spare);
+            errno = EBADF;
+            return -1;
+        }
+
+        /* Committing needs either an existing lifetime to share or a spare to
+         * install. Without one, fall out and allocate. A slot that acquired a
+         * lifetime while the lock was down takes the first branch on the retry
+         * and the spare goes back to the allocator untouched.
+         */
+        if (out->lifetime || spare) {
+            fd_lifetime_t *lifetime = fd_lifetime_pin_spare(guest_fd, &spare);
+            if (!lifetime) {
+                /* Unreachable: the slot checks above passed under this same
+                 * lock hold, and this branch never allocates. Handled rather
+                 * than asserted so a future change cannot hand back a host fd
+                 * with a NULL lifetime, which reads as a successful pin.
+                 */
+                pthread_mutex_unlock(&fd_lock);
+                free(spare);
+                errno = ENOMEM;
+                return -1;
+            }
+            out->lifetime = lifetime;
+            *lifetime_out = lifetime;
+            int host_fd = out->host_fd;
+            pthread_mutex_unlock(&fd_lock);
+            free(spare);
+            return host_fd;
+        }
+        pthread_mutex_unlock(&fd_lock);
+
+        spare = malloc(sizeof(*spare));
+        if (!spare) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+}
+
+void fd_lifetime_release(fd_lifetime_t *lifetime)
+{
+    unsigned int prev = atomic_fetch_sub(&lifetime->refs, 1);
+
+    /* An unbalanced release wraps refs and the object silently never frees,
+     * which surfaces later as an fd leak with no trace of its origin. Catch it
+     * where it happens instead.
+     */
+    assert(prev != 0);
+    if (prev != 1)
+        return;
+    if (lifetime->type != FD_STDIO)
+        close(lifetime->host_fd);
+    free(lifetime);
+}
+
+fd_lifetime_t *fd_lifetime_pin_locked(int fd)
+{
+    return fd_lifetime_pin_spare(fd, NULL);
+}
+
+/* Retire a slot the caller published in fd_table, closing the host fd it owns.
+ *
+ * Prefer this over fd_mark_closed plus a raw close on the host fd: once a slot
+ * is published a sibling can pin it, and a raw close then pulls the descriptor
+ * out from under that sibling while stranding the slot's own reference. The
+ * close is deferred to the last release when a pin exists.
+ *
+ * A slot that no longer holds host_fd is left entirely alone, descriptor
+ * included. Reaching that means a sibling already closed this guest fd, and
+ * that close retired the descriptor on its way out, so closing it here would be
+ * a second close of a number the host may since have handed to someone else.
+ *
+ * host_fd narrows which slot this retires but does not identify it: if the
+ * sibling's replacement happens to reuse the same number, the check passes and
+ * this retires the replacement. Distinguishing that needs the allocation
+ * generation, which the plain fd_alloc does not hand back. The residue is a
+ * guest operating on an fd number it was never given, which linux-wire.h
+ * already calls a guest-level bug.
+ */
+void fd_retire_published(int fd, int host_fd)
+{
+    if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
+        if (host_fd >= 0)
+            close(host_fd);
+        return;
+    }
+
+    /* A synthetic slot can carry no host descriptor at all (the FUSE file and
+     * directory types); retiring one still has to clear the slot.
+     */
+    pthread_mutex_lock(&fd_lock);
+    bool still_ours =
+        fd_table[fd].type != FD_CLOSED && fd_table[fd].host_fd == host_fd;
+    fd_lifetime_t *lifetime = still_ours ? fd_mark_closed_unlocked(fd) : NULL;
+    pthread_mutex_unlock(&fd_lock);
+
+    if (lifetime)
+        fd_lifetime_release(lifetime);
+    else if (still_ours && host_fd >= 0)
+        close(host_fd);
 }
 
 /* Snapshot an fd entry under fd_lock.
@@ -1123,31 +1313,6 @@ void (*fd_cleanup_for_type(int type))(int)
     return fd_type_cleanup[type];
 }
 
-/* Look up a guest FD, dup its host fd, and classify the slot, all in one
- * fd_lock window. Caller owns the returned descriptor and must close it.
- *
- * Returns -1 on failure, with *st_out reporting FD_CLOSED.
- */
-int fd_to_host_dup_state(int guest_fd, fd_block_state_t *st_out)
-{
-    /* fd_snapshot_and_dup already takes the whole entry and the dup in one
-     * fd_lock window, which is the atomicity a transfer needs: the pin keeps
-     * the description alive, and the classification has to describe that same
-     * description rather than whatever takes the fd number next. Composing with
-     * it rather than repeating it also inherits its host_fd < 0 guard, which a
-     * hand-rolled copy here did not have and would have dup(-1)'d for the FUSE
-     * types that carry no host descriptor.
-     */
-    fd_entry_t snap;
-    int owned = fd_snapshot_and_dup(guest_fd, &snap);
-    if (owned < 0) {
-        *st_out = (fd_block_state_t) {.type = FD_CLOSED};
-        return -1;
-    }
-    *st_out = fd_block_state_of(&snap);
-    return owned;
-}
-
 /* Look up a guest FD and return a dup'd host fd that the caller owns. The dup
  * is performed under fd_lock so that close() on another thread cannot
  * invalidate the host fd between lookup and dup. Caller must close the returned
@@ -1209,7 +1374,8 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
          snap->fasync_owner_type != FASYNC_OWNER_NONE))
         asyncio_disarm(snap->host_fd);
 
-    /* Keep stdin/stdout/stderr open on the host */
-    if (snap->type != FD_STDIO)
+    if (snap->lifetime)
+        fd_lifetime_release(snap->lifetime);
+    else if (snap->type != FD_STDIO)
         close(snap->host_fd);
 }

@@ -312,6 +312,13 @@ $(BUILD_DIR)/test-eventfd-semaphore-contended: \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-fd-pin-lock keeps a sibling thread live so the fd syscalls under test
+# take the multi-threaded pin path rather than the single-active fast path.
+$(BUILD_DIR)/test-fd-pin-lock: \
+		tests/test-fd-pin-lock.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-socket-accept-contended parks two threads on one listener.
 $(BUILD_DIR)/test-socket-accept-contended: \
 		tests/test-socket-accept-contended.c | $(BUILD_DIR)

@@ -471,8 +471,7 @@ int64_t netlink_socket(int protocol, int type)
 
     netlink_state_t *ns = nl_alloc(gfd);
     if (!ns) {
-        fd_mark_closed(gfd);
-        close(pipefd[0]);
+        fd_retire_published(gfd, pipefd[0]);
         close(pipefd[1]);
         return -LINUX_ENOMEM;
     }

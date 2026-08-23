@@ -1523,7 +1523,7 @@ int fuse_proc_open(int linux_flags)
     if (fuse_bind_dev_fd_locked(guest_fd, slot) < 0) {
         fuse_session_put_locked(slot);
         pthread_mutex_unlock(&fuse_lock);
-        fd_mark_closed(guest_fd);
+        fd_retire_published(guest_fd, notify_pipe[0]);
         errno = EMFILE;
         return -1;
     }
@@ -2413,8 +2413,10 @@ int64_t fuse_dev_read(int guest_fd,
     host_fd_ref_t notify_ref;
     fd_block_state_t dev_st;
     uint64_t dev_gen = 0;
-    if (host_fd_ref_open_io_state(guest_fd, &notify_ref, &dev_gen, &dev_st) < 0)
-        return -LINUX_EBADF;
+    int64_t err =
+        host_fd_ref_open_io_state(guest_fd, &notify_ref, &dev_gen, &dev_st);
+    if (err < 0)
+        return err;
 
     pthread_mutex_lock(&fuse_lock);
     fuse_session_t *session = fuse_session_by_fd_locked(guest_fd);
@@ -2877,7 +2879,7 @@ int fuse_dup_fd(int src_fd,
         fuse_session_t *session = fuse_session_by_fd_locked(src_fd);
         if (!session) {
             pthread_mutex_unlock(&fuse_lock);
-            fd_mark_closed(guest_fd);
+            fd_retire_published(guest_fd, new_host_fd);
             errno = EBADF;
             return -1;
         }
@@ -2885,7 +2887,7 @@ int fuse_dup_fd(int src_fd,
         if (fuse_bind_dev_fd_locked(guest_fd, session) < 0) {
             fuse_session_put_locked(session);
             pthread_mutex_unlock(&fuse_lock);
-            fd_mark_closed(guest_fd);
+            fd_retire_published(guest_fd, new_host_fd);
             errno = EMFILE;
             return -1;
         }

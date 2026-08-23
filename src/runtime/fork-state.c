@@ -284,7 +284,7 @@ int fork_ipc_send_fd_table(int ipc_sock)
 {
     ipc_fd_entry_t fd_entries[FD_TABLE_SIZE];
     int host_fds_to_send[FD_TABLE_SIZE];
-    bool host_fds_duped[FD_TABLE_SIZE];
+    fd_lifetime_t *host_fd_pins[FD_TABLE_SIZE];
     uint32_t num_fds = 0;
 
     pthread_mutex_lock(&fd_lock);
@@ -302,17 +302,22 @@ int fork_ipc_send_fd_table(int ipc_sock)
         if (fd_type_is_synthetic(t))
             continue;
 
-        int host_fd;
-        bool was_duped = false;
+        /* Pin rather than dup. SCM_RIGHTS does not consume the sender's
+         * descriptor, so the dup only ever existed to keep the host fd valid
+         * across the window between dropping fd_lock and sendmsg, where a
+         * sibling's close could free the number for the next open to claim. The
+         * pin covers that window without a second descriptor, and without the
+         * close that retired it: closing any descriptor for a file drops the
+         * whole process's POSIX record locks on it (fcntl(2)), so the dup
+         * silently dropped every lock the guest held every time it forked.
+         */
+        fd_lifetime_t *pin = NULL;
         if (t != FD_STDIO) {
-            int duped = dup(fd_table[i].host_fd);
-            if (duped < 0)
+            pin = fd_lifetime_pin_locked(i);
+            if (!pin)
                 continue;
-            host_fd = duped;
-            was_duped = true;
-        } else {
-            host_fd = fd_table[i].host_fd;
         }
+        int host_fd = fd_table[i].host_fd;
 
         fd_entries[num_fds].guest_fd = i;
         fd_entries[num_fds].type = fd_table[i].type;
@@ -327,7 +332,7 @@ int fork_ipc_send_fd_table(int ipc_sock)
         memcpy(fd_entries[num_fds].proc_path, fd_table[i].proc_path,
                sizeof(fd_entries[num_fds].proc_path));
         host_fds_to_send[num_fds] = host_fd;
-        host_fds_duped[num_fds] = was_duped;
+        host_fd_pins[num_fds] = pin;
         num_fds++;
     }
     pthread_mutex_unlock(&fd_lock);
@@ -345,15 +350,23 @@ int fork_ipc_send_fd_table(int ipc_sock)
         }
     }
 
+    /* Release only. The pin leaves a lifetime installed on every non-stdio slot
+     * for the rest of the process, which refuses fd_close_regular_relaxed for
+     * all of them, and tearing them back down here was tried and reverted: it
+     * is not a leak, since the slot frees the object at close, and the close it
+     * slows down does not measurably slow down. Median over three runs of 200
+     * fds held across a fork, closed after: 1.04x an unpinned close without the
+     * teardown, 1.02x with, against run-to-run noise of about 10%.
+     */
     for (uint32_t fi = 0; fi < num_fds; fi++)
-        if (host_fds_duped[fi])
-            close(host_fds_to_send[fi]);
+        if (host_fd_pins[fi])
+            fd_lifetime_release(host_fd_pins[fi]);
     return 0;
 
 fail:
     for (uint32_t fi = 0; fi < num_fds; fi++)
-        if (host_fds_duped[fi])
-            close(host_fds_to_send[fi]);
+        if (host_fd_pins[fi])
+            fd_lifetime_release(host_fd_pins[fi]);
     return -1;
 }
 
@@ -504,16 +517,14 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
                 if (dir_fd < 0) {
                     log_error("fork-child: dup failed for DIR gfd %d: %s", gfd,
                               strerror(errno));
-                    close(host_fds[i]);
-                    fd_mark_closed(gfd);
+                    fd_retire_published(gfd, host_fds[i]);
                     continue;
                 }
                 DIR *dir = fdopendir(dir_fd);
                 if (!dir) {
                     close(dir_fd);
                     log_error("fork-child: fdopendir failed for gfd %d", gfd);
-                    close(host_fds[i]);
-                    fd_mark_closed(gfd);
+                    fd_retire_published(gfd, host_fds[i]);
                     continue;
                 }
                 void *ds = dir_stream_create(dir);
@@ -521,8 +532,7 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
                     closedir(dir);
                     log_error("fork-child: dir_stream_create failed for gfd %d",
                               gfd);
-                    close(host_fds[i]);
-                    fd_mark_closed(gfd);
+                    fd_retire_published(gfd, host_fds[i]);
                     continue;
                 }
                 fd_table[gfd].dir = ds;

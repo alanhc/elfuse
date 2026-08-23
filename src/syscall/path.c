@@ -290,28 +290,59 @@ int path_fd_magiclink_guest_fd(const char *path)
     return parse_fd_magiclink(path);
 }
 
-int path_fd_magiclink_dup(const char *path)
+/* Whether an f*() call on the slot's host fd acts on the file the magic link
+ * names. A FUSE or synthetic fd is served by an emulation layer rather than by
+ * the host file behind it, so those keep the path form and the intercepts that
+ * go with it.
+ */
+static inline bool magiclink_type_acts_on_host_fd(int type)
 {
+    return type == FD_REGULAR || type == FD_DIR || type == FD_PATH ||
+           type == FD_STDIO;
+}
+
+int path_fd_magiclink_open(const char *path, host_fd_ref_t *ref)
+{
+    ref->fd = -1;
+    ref->lifetime = NULL;
+
     int fd = parse_fd_magiclink(path);
     if (fd < 0)
         return -1;
 
-    /* Only descriptors whose host fd is the object itself. A FUSE or synthetic
-     * fd is served by an emulation layer rather than by the host file behind
-     * it, so an f*() call would act on the wrong thing; those keep the path
-     * form and the intercepts that go with it.
+    /* Pin rather than dup. A sibling vCPU closing this slot would otherwise
+     * leave the number free for the next open to claim, which is the only
+     * reason a second descriptor was ever taken here; the pin covers it without
+     * one. It also has to be a pin rather than a dup because the caller acts on
+     * a file the guest may hold record locks on, and retiring a dup would drop
+     * every one of them (fcntl(2)): a guest chmod of its own /proc/self/fd/N
+     * would silently unlock the file.
+     *
+     * The classification below and the pin have to come out of the same fd_lock
+     * hold. Taking them separately leaves a window where a sibling closes the
+     * slot and the next open claims the number, and the caller then acts on the
+     * replacement while the type it was admitted on describes the object that
+     * is gone.
      */
     fd_entry_t snap;
-    if (!fd_snapshot(fd, &snap))
-        return -1;
-    if (snap.type != FD_REGULAR && snap.type != FD_DIR &&
-        snap.type != FD_PATH && snap.type != FD_STDIO)
-        return -1;
+    if (thread_is_single_active()) {
+        if (!fd_snapshot(fd, &snap) || snap.host_fd < 0)
+            return -1;
+        if (!magiclink_type_acts_on_host_fd(snap.type))
+            return -1;
+        ref->fd = snap.host_fd;
+        return 0;
+    }
 
-    /* dup under fd_lock: a sibling vCPU closing this slot would otherwise leave
-     * the number free for the next open to claim.
-     */
-    return fd_to_host_dup(fd);
+    int host_fd = fd_host_ref_acquire(fd, &snap, &ref->lifetime);
+    if (host_fd < 0)
+        return -1;
+    if (!magiclink_type_acts_on_host_fd(snap.type)) {
+        host_fd_ref_close(ref);
+        return -1;
+    }
+    ref->fd = host_fd;
+    return 0;
 }
 
 /* Resolve an absolute fd magic link to the host path its descriptor is open on.
@@ -320,8 +351,8 @@ int path_fd_magiclink_dup(const char *path)
  * descriptor has no host path (a pipe, socket, or anonymous fd, where F_GETPATH
  * fails and the caller's own /proc intercepts remain the right answer).
  *
- * Callers that can act on a descriptor should prefer path_fd_magiclink_dup(): a
- * pathname taken here and used later is a TOCTOU, since a rename or an
+ * Callers that can act on a descriptor should prefer path_fd_magiclink_open():
+ * a pathname taken here and used later is a TOCTOU, since a rename or an
  * unlink-and-recreate in between leaves it naming a different inode, where
  * Linux resolves the link inside the syscall and cannot be redirected.
  */
@@ -329,13 +360,13 @@ static int resolve_fd_magiclink_host_path(const char *path,
                                           char *out,
                                           size_t outsz)
 {
-    int host_fd = path_fd_magiclink_dup(path);
-    if (host_fd < 0)
+    host_fd_ref_t ref;
+    if (path_fd_magiclink_open(path, &ref) < 0)
         return 0;
 
     char resolved[MAXPATHLEN];
-    int rc = fcntl(host_fd, F_GETPATH, resolved);
-    close(host_fd);
+    int rc = fcntl(ref.fd, F_GETPATH, resolved);
+    host_fd_ref_close(&ref);
     if (rc < 0)
         return 0;
 
@@ -728,6 +759,11 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
     bool clamp = false;
     size_t depth = 0;
 
+    /* Function-scoped because base_fd borrows dir_ref.fd for the whole walk:
+     * the pin has to outlive every use of the descriptor it keeps open.
+     */
+    host_fd_ref_t dir_ref = HOST_FD_REF_INIT;
+
     if (path[0] == '/') {
         /* The resolver splices an intermediate link into its target, so its
          * output cannot reveal the link to the component walk below. Ask the
@@ -779,19 +815,24 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
             clamp = true;
         }
 
-        host_fd_ref_t dir_ref;
         if (host_dirfd_ref_open(dirfd, &dir_ref) < 0) {
             errno = EBADF;
             return -1;
         }
         if (dir_ref.fd == AT_FDCWD) {
             base_fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-            if (base_fd < 0)
+            if (base_fd < 0) {
+                host_fd_ref_close(&dir_ref);
                 return -1;
+            }
             owned_base_fd = true;
         } else {
+            /* Borrowed, not owned: dir_ref holds the pin and the close at out:
+             * drops it. Claiming ownership here would close the table's own
+             * host fd, which every other alias of this description still uses.
+             */
             base_fd = dir_ref.fd;
-            owned_base_fd = dir_ref.owned;
+            owned_base_fd = false;
         }
     }
 
@@ -915,6 +956,7 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
 out:
     if (owned_current_fd && current_fd >= 0)
         close(current_fd);
+    host_fd_ref_close(&dir_ref);
     return rc;
 }
 

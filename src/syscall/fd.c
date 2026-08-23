@@ -208,8 +208,7 @@ int64_t sys_timerfd_create(int clockid, int flags)
     int slot = timerfd_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
-        fd_mark_closed(gfd);
-        close(kq);
+        fd_retire_published(gfd, kq);
         return -LINUX_ENOMEM;
     }
 
@@ -656,9 +655,8 @@ int64_t sys_eventfd2(unsigned int initval, int flags)
     int slot = eventfd_slot_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
-        fd_mark_closed(gfd);
+        fd_retire_published(gfd, pipefd[0]);
         close(state_rd);
-        close(pipefd[0]);
         close(pipefd[1]);
         return -LINUX_ENOMEM;
     }
@@ -1133,8 +1131,7 @@ int64_t sys_signalfd4(guest_t *g,
     int slot = signalfd_slot_alloc();
     if (slot < 0) {
         pthread_mutex_unlock(&sfd_lock);
-        fd_mark_closed(gfd);
-        close(pipefd[0]);
+        fd_retire_published(gfd, pipefd[0]);
         close(pipefd[1]);
         return -LINUX_ENOMEM;
     }
