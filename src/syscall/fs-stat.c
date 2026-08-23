@@ -221,7 +221,7 @@ static int64_t stat_at_path(guest_t *g,
     }
 
     int64_t rc = 0;
-    host_fd_ref_t dir_ref = {.fd = -1, .owned = false};
+    host_fd_ref_t dir_ref = HOST_FD_REF_INIT;
     if ((flags & LINUX_AT_EMPTY_PATH) && pathp[0] == '\0') {
         /* Linux: AT_EMPTY_PATH with dirfd == AT_FDCWD operates on the current
          * working directory.
@@ -234,13 +234,17 @@ static int64_t stat_at_path(guest_t *g,
                 goto done;
             }
         } else {
+            /* Pin, not dup: fstatat needs the descriptor to stay valid, not to
+             * be private, and retiring a dup would drop the guest's record
+             * locks on the file (fcntl(2)).
+             */
             fd_entry_t snap;
-            dir_ref.fd = fd_snapshot_and_dup(dirfd, &snap);
-            dir_ref.owned = true;
-            if (dir_ref.fd < 0) {
-                rc = -LINUX_EBADF;
+            if (fd_host_ref_acquire(dirfd, &snap, &dir_ref.lifetime) < 0) {
+                /* EBADF or ENOMEM; the helper distinguishes them. */
+                rc = linux_errno();
                 goto done;
             }
+            dir_ref.fd = snap.host_fd;
             if (snap.type == FD_PATH && snap.proc_path[0] != '\0') {
                 int intercepted = proc_intercept_stat(snap.proc_path, mac_st);
                 if (intercepted == 0)

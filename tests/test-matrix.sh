@@ -736,6 +736,7 @@ run_unit_tests()
     test_check "$runner" "test-poll" "0 failed" "$bindir/test-poll"
     test_rc "$runner" "test-flock" 0 "$bindir/test-flock"
     test_rc "$runner" "test-ofd-lock" 0 "$bindir/test-ofd-lock"
+    test_rc "$runner" "test-fd-pin-lock" 0 "$bindir/test-fd-pin-lock"
     test_rc "$runner" "test-times" 0 "$bindir/test-times"
     test_rc "$runner" "test-syscall-smoke" 0 "$bindir/test-syscall-smoke"
     test_rc "$runner" "test-process-vm" 0 "$bindir/test-process-vm"

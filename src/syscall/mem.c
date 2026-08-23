@@ -905,7 +905,7 @@ static int64_t sys_mmap_high_va(guest_t *g,
         return -LINUX_ENOMEM;
 
     bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
-    host_fd_ref_t backing_ref = {.fd = -1, .owned = false};
+    host_fd_ref_t backing_ref = HOST_FD_REF_INIT;
     int host_backing_fd = -1;
     int track_backing_fd = -1;
     bool close_host_backing_fd = false;
@@ -2673,7 +2673,7 @@ int64_t sys_mmap(guest_t *g,
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
     bool is_prot_none = (prot == LINUX_PROT_NONE);
     bool is_noreserve = is_anon && (flags & LINUX_MAP_NORESERVE) != 0;
-    host_fd_ref_t backing_ref = {.fd = -1, .owned = 0};
+    host_fd_ref_t backing_ref = HOST_FD_REF_INIT;
     int host_backing_fd = -1, track_backing_fd = -1;
 
     /* Tracks whether hvf_apply_file_overlay has installed a host

@@ -154,6 +154,7 @@ test-robust-futex
 test-fd-race
 test-dup-setfl-race
 test-pipe-steal
+test-fd-pin-lock
 
 [section] Multithreaded fork tests
 test-mt-fork

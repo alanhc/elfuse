@@ -100,8 +100,7 @@ static void recvmsg_cleanup_scm_rights(const int *scm_gfds,
                                        int scm_nfds)
 {
     for (int i = 0; i < scm_nfds; i++) {
-        fd_mark_closed(scm_gfds[i]);
-        close(scm_hfds[i]);
+        fd_retire_published(scm_gfds[i], scm_hfds[i]);
     }
 }
 

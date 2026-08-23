@@ -555,7 +555,19 @@ typedef struct {
      */
     _Atomic int type; /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
     int host_fd;      /* Underlying macOS file descriptor */
-    uint64_t ofd_id;  /* Shared by dup aliases of one open file description */
+
+    /* Refcount pinning host_fd open across a concurrent syscall, created on
+     * first borrow and NULL until then. This slot holds one reference and each
+     * in-flight borrower holds another; the last release closes host_fd. Not an
+     * ABI field: elfuse-internal, and declared here only because the fd table
+     * entry is.
+     *
+     * fd_mark_closed_unlocked detaches this pointer without releasing it, so
+     * the slot's reference travels in the snapshot the caller took first and is
+     * released by fd_cleanup_entry. See fd_host_ref_acquire in internal.h.
+     */
+    struct fd_lifetime *lifetime;
+    uint64_t ofd_id; /* Shared by dup aliases of one open file description */
     uint64_t generation; /* Bumped each time this guest fd slot is reused. Lets
                           * long-lived references (e.g. epoll registrations)
                           * detect a close+reopen ABA where the slot now holds a

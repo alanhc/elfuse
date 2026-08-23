@@ -283,7 +283,7 @@ int path_openat2_check_fd_xdev(int guest_fd, int start_class);
 int path_parse_proc_name(const char *name);
 
 /* The guest descriptor an absolute fd magic link names, or -1 when the path is
- * not that shape. Unlike path_fd_magiclink_dup this hands back the guest fd
+ * not that shape. Unlike path_fd_magiclink_open this hands back the guest fd
  * number itself, for callers that need the table entry rather than the object:
  * opening one of these paths produces a second name for a description the
  * process already holds, so the new slot has to inherit that entry's answers
@@ -291,10 +291,15 @@ int path_parse_proc_name(const char *name);
  */
 int path_fd_magiclink_guest_fd(const char *path);
 
-/* An owned dup of the descriptor an absolute fd magic link names
- * ("/proc/self/fd/<n>", the own-pid spelling, "/dev/fd/<n>", "/dev/std*"), or
- * -1 when the path is not that shape or its descriptor is not backed by a plain
- * host object. The caller closes it.
+/* Fill *ref with a reference to the descriptor an absolute fd magic link names
+ * ("/proc/self/fd/<n>", the own-pid spelling, "/dev/fd/<n>", "/dev/std*").
+ *
+ * Returns 0, or -1 when the path is not that shape or its descriptor is not
+ * backed by a plain host object. On success the caller must hand *ref to
+ * host_fd_ref_close and must not close ref->fd itself: this is the guest's own
+ * descriptor, borrowed, not a private duplicate. Closing it directly would shut
+ * the guest's fd, and on a file the guest has locked it would drop every record
+ * lock the process holds on it.
  *
  * Metadata syscalls should act on this rather than on the translated pathname.
  * Linux resolves the magic link inside the syscall, so nothing can redirect it;
@@ -302,4 +307,4 @@ int path_fd_magiclink_guest_fd(const char *path);
  * different inode if the file is renamed, or unlinked and recreated, in
  * between.
  */
-int path_fd_magiclink_dup(const char *path);
+int path_fd_magiclink_open(const char *path, host_fd_ref_t *ref);

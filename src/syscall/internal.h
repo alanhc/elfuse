@@ -625,24 +625,74 @@ static inline bool fd_nonblock_shadowed(int type, bool nonblock_owned)
  */
 int fd_to_host_dup(int guest_fd);
 
-/* The same dup, with the slot's transfer classification taken in the same
- * fd_lock window. A caller that pins a host fd and then asks what kind of fd it
- * was has a gap: the pin keeps the description alive, but the guest fd number
- * can be reused for another kind of object in between, and the answer then
- * describes something the caller is not holding.
+/* Refcount that keeps a host fd open across a concurrent syscall. Defined in
+ * fdtable.c; opaque to every caller.
  */
-int fd_to_host_dup_state(int guest_fd, fd_block_state_t *st_out);
+typedef struct fd_lifetime fd_lifetime_t;
 
-/* Mark an FD slot as closed (set type = FD_CLOSED and update bitmap). Does NOT
- * close the host FD or free type-specific resources (DIR*, epoll instance);
- * caller must do that first.
+/* Pin the host fd of a live slot and snapshot the entry, in one fd_lock window.
+ * The pin keeps the host descriptor open for the duration of a host call even
+ * if a sibling closes the guest fd, which is what the per-call dup used to buy;
+ * unlike the dup it does not consume a host descriptor, and it leaves POSIX
+ * record locks alone (closing any descriptor for an inode drops the process's
+ * locks on it, so the old dup released an F_SETLK the moment it went away).
+ *
+ * The snapshot describes the same description the pin holds: the guest fd
+ * number can be reused for another kind of object as soon as fd_lock is
+ * dropped, so a classification taken afterwards would describe something the
+ * caller is not holding.
+ *
+ * Returns the host fd, or -1 with errno set to EBADF (no such live slot) or
+ * ENOMEM. The caller must pass *lifetime_out to fd_lifetime_release exactly
+ * once; the slot holds its own separate reference.
  */
-void fd_mark_closed(int fd);
+int fd_host_ref_acquire(int guest_fd,
+                        fd_entry_t *out,
+                        fd_lifetime_t **lifetime_out);
+
+/* Pin a live slot with fd_lock already held.
+ *
+ * Returns NULL when the slot is closed, carries no host descriptor, or the
+ * allocation fails. For a caller already walking the table under the lock;
+ * allocates inside it, so fork-scale callers only.
+ */
+fd_lifetime_t *fd_lifetime_pin_locked(int fd);
+
+/* Drop one reference. The last release closes the host fd (except for FD_STDIO,
+ * which elfuse did not open) and frees the object.
+ */
+void fd_lifetime_release(fd_lifetime_t *lifetime);
+
+/* Mark an FD slot as closed (set type = FD_CLOSED and update bitmap) and detach
+ * its lifetime. Does NOT close the host FD or free type-specific resources
+ * (DIR*, epoll instance); caller must do that first.
+ *
+ * Detaching is not releasing. The returned lifetime carries the slot's own
+ * reference and the caller now owns it: either hand it to fd_lifetime_release,
+ * or ignore the return only because a snapshot taken before this call still
+ * carries the same pointer and will reach fd_cleanup_entry. A caller that does
+ * neither strands the reference and the host fd never closes.
+ *
+ * A caller that just wants to retire a published slot and close its host fd
+ * should call fd_retire_published instead of open-coding either shape.
+ */
+fd_lifetime_t *fd_mark_closed(int fd);
 
 /* Same as fd_mark_closed but requires fd_lock to be already held. Used by
  * sys_execve CLOEXEC loop which holds fd_lock for the entire scan.
  */
-void fd_mark_closed_unlocked(int fd);
+fd_lifetime_t *fd_mark_closed_unlocked(int fd);
+
+/* Retire a slot the caller published in fd_table and close the host fd it owns,
+ * deferring the close to the last in-flight borrower when one holds a pin. The
+ * rollback path for a syscall that published a slot and then failed.
+ *
+ * A slot that no longer holds host_fd is left entirely alone, its descriptor
+ * included: reaching that means a sibling already closed this guest fd and that
+ * close retired the descriptor. See the definition for what the check does and
+ * does not prove.
+ */
+void fd_retire_published(int fd, int host_fd);
 
 /* Atomically snapshot an fd entry and mark it closed.
  *
@@ -733,21 +783,31 @@ int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot);
  */
 void fd_set_rlimit_nofile(int cur);
 
-/* Borrowed-or-owned host fd reference.
+/* Borrowed-or-pinned host fd reference.
  *
  * Single-threaded guests borrow the raw host fd directly (no dup, no close).
- * Multi-threaded guests dup under fd_lock to prevent TOCTOU races with
- * concurrent close() from CLONE_THREAD siblings.
+ * Multi-threaded guests pin the slot's host fd until the syscall completes.
  */
 typedef struct {
     host_fd_t fd;
-    bool owned;
+    fd_lifetime_t *lifetime;
 } host_fd_ref_t;
+
+/* An empty ref, safe to hand to host_fd_ref_close without ever opening it.
+ *
+ * Naming fd is enough: a designated initializer zeroes every member it does not
+ * name, so lifetime comes out NULL. Spell it this way rather than listing them,
+ * which is how one initializer came to say ".owned = 0" and three others to
+ * omit a member added later.
+ */
+#define HOST_FD_REF_INIT ((host_fd_ref_t) {.fd = -1})
+
+static inline fd_block_state_t fd_block_state_of(const fd_entry_t *e);
 
 static inline int host_fd_ref_open(guest_fd_t guest_fd, host_fd_ref_t *ref)
 {
     ref->fd = -1;
-    ref->owned = false;
+    ref->lifetime = NULL;
 
     if (thread_is_single_active()) {
         int host_fd = fd_to_host(guest_fd);
@@ -757,11 +817,11 @@ static inline int host_fd_ref_open(guest_fd_t guest_fd, host_fd_ref_t *ref)
         return 0;
     }
 
-    int host_fd = fd_to_host_dup(guest_fd);
+    fd_entry_t snap;
+    int host_fd = fd_host_ref_acquire(guest_fd, &snap, &ref->lifetime);
     if (host_fd < 0)
         return -1;
     ref->fd = host_fd;
-    ref->owned = true;
     return 0;
 }
 
@@ -775,7 +835,13 @@ static inline int host_fd_ref_open_state(guest_fd_t guest_fd,
                                          fd_block_state_t *st_out)
 {
     ref->fd = -1;
-    ref->owned = false;
+    ref->lifetime = NULL;
+
+    /* Settle the classification before anything can fail. Every failure exit
+     * below has to leave one behind, or a caller that reads it after a refused
+     * open reads whatever was on its stack.
+     */
+    *st_out = (fd_block_state_t) {.type = FD_CLOSED};
 
     if (thread_is_single_active()) {
         int host_fd = fd_to_host(guest_fd);
@@ -786,11 +852,12 @@ static inline int host_fd_ref_open_state(guest_fd_t guest_fd,
         return 0;
     }
 
-    int host_fd = fd_to_host_dup_state(guest_fd, st_out);
+    fd_entry_t snap;
+    int host_fd = fd_host_ref_acquire(guest_fd, &snap, &ref->lifetime);
     if (host_fd < 0)
         return -1;
+    *st_out = fd_block_state_of(&snap);
     ref->fd = host_fd;
-    ref->owned = true;
     return 0;
 }
 
@@ -801,10 +868,10 @@ static inline void host_fd_ref_close(host_fd_ref_t *ref)
      * failure; a non-zero close error must not clobber that value.
      */
     int saved_errno = errno;
-    if (ref->owned && ref->fd >= 0)
-        close(ref->fd);
+    if (ref->lifetime)
+        fd_lifetime_release(ref->lifetime);
     ref->fd = -1;
-    ref->owned = false;
+    ref->lifetime = NULL;
     errno = saved_errno;
 }
 
@@ -813,7 +880,7 @@ static inline int host_dirfd_ref_open(guest_fd_t dirfd, host_fd_ref_t *ref)
 {
     if (dirfd == LINUX_AT_FDCWD) {
         ref->fd = AT_FDCWD;
-        ref->owned = false;
+        ref->lifetime = NULL;
         return 0;
     }
     return host_fd_ref_open(dirfd, ref);
@@ -853,7 +920,7 @@ static inline fd_block_state_t fd_block_state_of(const fd_entry_t *e)
  * window, which is what lets a transfer act on the object it is holding rather
  * than on whatever took the fd number afterwards. Both out-params are optional.
  *
- * Returns 0 on success, -LINUX_EBADF otherwise.
+ * Returns 0 on success or a negative Linux errno.
  */
 static inline int64_t host_fd_ref_open_io_state(guest_fd_t guest_fd,
                                                 host_fd_ref_t *ref,
@@ -861,7 +928,7 @@ static inline int64_t host_fd_ref_open_io_state(guest_fd_t guest_fd,
                                                 fd_block_state_t *st_out)
 {
     ref->fd = -1;
-    ref->owned = false;
+    ref->lifetime = NULL;
     if (st_out)
         *st_out = (fd_block_state_t) {.type = FD_CLOSED};
 
@@ -890,19 +957,21 @@ static inline int64_t host_fd_ref_open_io_state(guest_fd_t guest_fd,
         return 0;
     }
 
-    int host_fd = fd_snapshot_and_dup(guest_fd, &snap);
+    /* linux_errno rather than a flat EBADF: fd_host_ref_acquire distinguishes a
+     * slot that is not open from an allocation it could not make, and a guest
+     * under memory pressure must not be told its descriptor is invalid.
+     */
+    int host_fd = fd_host_ref_acquire(guest_fd, &snap, &ref->lifetime);
     if (host_fd < 0)
-        return -LINUX_EBADF;
+        return linux_errno();
     if (snap.type == FD_PATH) {
-        int saved_errno = errno;
-        close(host_fd);
-        errno = saved_errno;
+        fd_lifetime_release(ref->lifetime);
+        ref->lifetime = NULL;
         return -LINUX_EBADF;
     }
     if (st_out)
         *st_out = fd_block_state_of(&snap);
     ref->fd = host_fd;
-    ref->owned = true;
     if (out_gen)
         *out_gen = snap.generation;
     return 0;

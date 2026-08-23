@@ -220,7 +220,7 @@ int64_t sys_ppoll(guest_t *g,
     uint32_t unpollable_count = 0;
     bool unpollable_checked = false;
     for (uint32_t i = 0; i < nfds; i++) {
-        host_refs[i] = (host_fd_ref_t) {.fd = -1, .owned = false};
+        host_refs[i] = HOST_FD_REF_INIT;
         unpollable[i] = (poll_unpollable_t) {.fd = -1};
         int guest_fd = guest_fds[i].fd;
         int host_fd = -1;
@@ -688,7 +688,7 @@ int64_t sys_pselect6(guest_t *g,
                     continue;
                 }
                 int i = (int) fd_index;
-                host_fd_ref_t ref = {.fd = -1, .owned = false};
+                host_fd_ref_t ref = HOST_FD_REF_INIT;
                 if (host_fd_ref_open_io(i, &ref) < 0)
                     goto pselect_badf;
                 int host_fd = ref.fd;
