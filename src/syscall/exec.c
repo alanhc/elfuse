@@ -960,6 +960,237 @@ int64_t exec_run_handoff(hv_vcpu_t vcpu, guest_t *g, bool verbose)
     return rc == SYSCALL_EXEC_HAPPENED ? SYSCALL_EXEC_HAPPENED : 0;
 }
 
+/* Where segment i of a loaded image lands in the guest, given the base the
+ * image was mapped at. The page-table region list and the /proc/self/maps list
+ * are both derived from these, which is the only reason the two agree; each
+ * used to recompute the arithmetic itself, twice over for the executable and
+ * the interpreter.
+ */
+static inline uint64_t exec_seg_start(const elf_info_t *info,
+                                      int i,
+                                      uint64_t base)
+{
+    return info->segments[i].gpa + base;
+}
+
+static inline uint64_t exec_seg_end(const elf_info_t *info,
+                                    int i,
+                                    uint64_t base)
+{
+    return info->segments[i].gpa + info->segments[i].memsz + base;
+}
+
+/* What the post-PNR rebuild needs from the pre-PNR resolution, gathered in one
+ * place because two phases already take the whole set and the phases still
+ * inlined in sys_execve take most of it. Every member is settled before
+ * guest_reset and read-only afterwards.
+ */
+typedef struct {
+    unsigned int shim_size;
+    const elf_info_t *elf_info;
+    uint64_t elf_load_base;
+    const exec_interp_t *interp;
+    uint64_t interp_base;
+    const char *path; /* Guest-visible name, for /proc/self/maps */
+} exec_image_t;
+
+/* Describe the replacement image's address space and install its page tables.
+ *
+ * Runs past the point of no return, so every failure here is fatal rather than
+ * an errno: the old image is already gone and there is nothing to return to.
+ * That is also why the bounds check before each append is a goto to one fatal
+ * exit instead of an error path.
+ *
+ * Also publishes the two mmap watermarks (g->mmap_rx_end, g->mmap_end) that the
+ * fresh regions establish.
+ *
+ * Returns the new TTBR0.
+ */
+static uint64_t exec_install_address_space(guest_t *g, const exec_image_t *img)
+{
+    const unsigned int shim_size = img->shim_size;
+    const elf_info_t *elf_info = img->elf_info;
+    const uint64_t elf_load_base = img->elf_load_base;
+    const exec_interp_t *interp = img->interp;
+    const uint64_t interp_base = img->interp_base;
+
+    /* Worst case: 7 fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX,
+     * mmap RW) plus up to ELF_MAX_SEGMENTS for both the executable and the
+     * interpreter. Sized comfortably to keep the bounds-check loops simple
+     * after the point of no return.
+     */
+#define MAX_REGIONS (8 + 2 * ELF_MAX_SEGMENTS)
+    mem_region_t regions[MAX_REGIONS];
+    int nregions = 0;
+
+    /* Fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX, mmap RW): 7
+     * entries. Bounds-check before each to prevent array overflow. After the
+     * point of no return, overflow is fatal (exit).
+     */
+
+    /* Keep the shim executable-only; HVF faults on merged RWX mappings. */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] = (mem_region_t) {.gpa_start = g->shim_base,
+                                          .gpa_end = g->shim_base + shim_size,
+                                          .perms = MEM_PERM_RX};
+
+    /* EL1 exception handlers use this block for stack and scratch state.
+     * EL1-only so EL0 cannot read or store directly to the identity cache,
+     * urandom ring, or attention word that the shim fast paths consult. Matches
+     * bootstrap.c; if this regresses to plain RW, execve quietly defeats the
+     * protection on every new image.
+     */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] =
+        (mem_region_t) {.gpa_start = g->shim_data_base,
+                        .gpa_end = g->shim_data_base + BLOCK_2MIB,
+                        .perms = MEM_PERM_RW_EL1_ONLY};
+
+    /* The vDSO sits in the same 2MiB block as the shim. The page-table builder
+     * splits the block into 4KiB L3 pages when its regions don't fully cover
+     * it, so the vDSO must appear here to keep the trampoline page valid and RX
+     * after rebuild.
+     */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] = (mem_region_t) {.gpa_start = VDSO_BASE,
+                                          .gpa_end = VDSO_BASE + VDSO_SIZE,
+                                          .perms = MEM_PERM_RX};
+
+    /* Translate ELF p_flags into guest page permissions, for the executable and
+     * then the interpreter shifted by its own base. Silent drops would leave a
+     * loaded segment unmapped, so treat overflow as fatal (this is already past
+     * the point of no return).
+     */
+    const elf_info_t *lists[] = {elf_info, &interp->info};
+    const uint64_t bases[] = {elf_load_base, interp_base};
+    for (size_t l = 0; l < ARRAY_SIZE(lists); l++) {
+        for (int i = 0; i < lists[l]->num_segments; i++) {
+            if (nregions >= MAX_REGIONS)
+                goto too_many_regions;
+            regions[nregions++] = (mem_region_t) {
+                .gpa_start = exec_seg_start(lists[l], i, bases[l]),
+                .gpa_end = exec_seg_end(lists[l], i, bases[l]),
+                .perms = elf_pf_to_prot(lists[l]->segments[i].flags)};
+        }
+    }
+
+    /* brk region (RW). Pre-mapped up to MMAP_RX_BASE. */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] = (mem_region_t) {.gpa_start = g->brk_base,
+                                          .gpa_end = MMAP_RX_BASE,
+                                          .perms = MEM_PERM_RW};
+
+    /* The dynamic stack bounds were recomputed above from the new brk. */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] = (mem_region_t) {.gpa_start = g->stack_base,
+                                          .gpa_end = g->stack_top,
+                                          .perms = MEM_PERM_RW};
+
+    /* PROT_EXEC mmap allocations start in a separate RX area to preserve W^X
+     * with 2MiB page-table blocks.
+     */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] = (mem_region_t) {.gpa_start = MMAP_RX_BASE,
+                                          .gpa_end = MMAP_RX_INITIAL_END,
+                                          .perms = MEM_PERM_RX};
+    g->mmap_rx_end = MMAP_RX_INITIAL_END;
+
+    /* Non-executable mmap allocations start high to match Linux address-space
+     * layout and avoid low executable/heap regions.
+     */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] = (mem_region_t) {.gpa_start = MMAP_BASE,
+                                          .gpa_end = MMAP_INITIAL_END,
+                                          .perms = MEM_PERM_RW};
+    g->mmap_end = MMAP_INITIAL_END;
+
+    uint64_t ttbr0 = guest_build_page_tables(g, regions, nregions);
+    if (!ttbr0) {
+        log_fatal(
+            "execve failed after point of no return: "
+            "failed to build page tables");
+        exit(128);
+    }
+    return ttbr0;
+
+too_many_regions:
+    log_fatal(
+        "execve failed after point of no return: "
+        "too many memory regions (max %d)",
+        MAX_REGIONS);
+    exit(128);
+}
+
+/* Republish the guest's /proc/self/maps view for the replacement image.
+ *
+ * Runs alongside exec_install_address_space and describes the same address
+ * space, one layer up: that call installs the hardware mapping, this one names
+ * it for the guest. The two lists must agree, so a region added to one belongs
+ * in the other.
+ *
+ * Also punches the two holes that carry no mapping at all: the stack guard page
+ * and the NULL page, whose PTEs are invalidated rather than described.
+ */
+static void exec_publish_maps(guest_t *g, const exec_image_t *img)
+{
+    const unsigned int shim_size = img->shim_size;
+    const elf_info_t *elf_info = img->elf_info;
+    const uint64_t elf_load_base = img->elf_load_base;
+    const exec_interp_t *interp = img->interp;
+    const uint64_t interp_base = img->interp_base;
+    const char *path = img->path;
+
+    /* Rebuild /proc/self/maps metadata in parallel with the new page tables. */
+    guest_region_add(g, g->shim_base, g->shim_base + shim_size,
+                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
+                     "[shim]");
+
+    /* Report PROT_NONE for [shim-data] to match the EL1-only mapping (see
+     * matching bootstrap.c registration). EL0 dereferences fault, so user
+     * tooling reading /proc/self/maps should see the same access state.
+     */
+    guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
+                     LINUX_PROT_NONE, LINUX_MAP_PRIVATE, 0, "[shim-data]");
+
+    /* Same two lists, same order, same spans as exec_install_address_space.
+     * interp->display_path was resolved before guest_reset, so naming the
+     * interpreter here needs no filesystem lookup past the point of no return.
+     */
+    const elf_info_t *lists[] = {elf_info, &interp->info};
+    const uint64_t bases[] = {elf_load_base, interp_base};
+    const char *names[] = {path, interp->display_path};
+    for (size_t l = 0; l < ARRAY_SIZE(lists); l++) {
+        for (int i = 0; i < lists[l]->num_segments; i++) {
+            guest_region_add(g, exec_seg_start(lists[l], i, bases[l]),
+                             exec_seg_end(lists[l], i, bases[l]),
+                             elf_pf_to_prot(lists[l]->segments[i].flags),
+                             LINUX_MAP_PRIVATE, lists[l]->segments[i].offset,
+                             names[l]);
+        }
+    }
+
+    /* Leave the lowest stack page unmapped so downward overflow faults before
+     * corrupting adjacent mappings.
+     */
+    guest_invalidate_ptes(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE);
+    guest_region_add(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE,
+                     LINUX_PROT_NONE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                     0, "[stack-guard]");
+    guest_region_add(g, g->stack_base + STACK_GUARD_SIZE, g->stack_top,
+                     LINUX_PROT_READ | LINUX_PROT_WRITE,
+                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[stack]");
+
+    /* Preserve Linux-style NULL dereference faults after exec. */
+    guest_invalidate_ptes(g, 0, 0x1000);
+}
+
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_execve(hv_vcpu_t vcpu,
                    guest_t *g,
@@ -1737,166 +1968,15 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     g->stack_top = stack_top;
     g->stack_base = stack_top - STACK_SIZE;
 
-    /* Worst case: 7 fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX,
-     * mmap RW) plus up to ELF_MAX_SEGMENTS for both the executable and the
-     * interpreter. Sized comfortably to keep the bounds-check loops simple
-     * after the point of no return.
-     */
-#define MAX_REGIONS (8 + 2 * ELF_MAX_SEGMENTS)
-    mem_region_t regions[MAX_REGIONS];
-    int nregions = 0;
+    const exec_image_t image = {.shim_size = shim_size,
+                                .elf_info = &elf_info,
+                                .elf_load_base = elf_load_base,
+                                .interp = &interp,
+                                .interp_base = interp_base,
+                                .path = path};
+    uint64_t ttbr0 = exec_install_address_space(g, &image);
 
-    /* Fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX, mmap RW): 7
-     * entries. Bounds-check before each to prevent array overflow. After the
-     * point of no return, overflow is fatal (exit).
-     */
-
-    /* Keep the shim executable-only; HVF faults on merged RWX mappings. */
-    if (nregions >= MAX_REGIONS)
-        goto too_many_regions;
-    regions[nregions++] = (mem_region_t) {.gpa_start = g->shim_base,
-                                          .gpa_end = g->shim_base + shim_size,
-                                          .perms = MEM_PERM_RX};
-
-    /* EL1 exception handlers use this block for stack and scratch state.
-     * EL1-only so EL0 cannot read or store directly to the identity cache,
-     * urandom ring, or attention word that the shim fast paths consult. Matches
-     * bootstrap.c; if this regresses to plain RW, execve quietly defeats the
-     * protection on every new image.
-     */
-    if (nregions >= MAX_REGIONS)
-        goto too_many_regions;
-    regions[nregions++] =
-        (mem_region_t) {.gpa_start = g->shim_data_base,
-                        .gpa_end = g->shim_data_base + BLOCK_2MIB,
-                        .perms = MEM_PERM_RW_EL1_ONLY};
-
-    /* The vDSO sits in the same 2MiB block as the shim. The page-table builder
-     * splits the block into 4KiB L3 pages when its regions don't fully cover
-     * it, so the vDSO must appear here to keep the trampoline page valid and RX
-     * after rebuild.
-     */
-    if (nregions >= MAX_REGIONS)
-        goto too_many_regions;
-    regions[nregions++] = (mem_region_t) {.gpa_start = VDSO_BASE,
-                                          .gpa_end = VDSO_BASE + VDSO_SIZE,
-                                          .perms = MEM_PERM_RX};
-
-    /* Translate ELF p_flags into guest page permissions. Silent drops would
-     * leave the loaded segment unmapped, so treat overflow as fatal (the caller
-     * is already past the point of no return).
-     */
-    for (int i = 0; i < elf_info.num_segments; i++) {
-        if (nregions >= MAX_REGIONS)
-            goto too_many_regions;
-        regions[nregions++] = (mem_region_t) {
-            .gpa_start = elf_info.segments[i].gpa + elf_load_base,
-            .gpa_end = elf_info.segments[i].gpa + elf_info.segments[i].memsz +
-                       elf_load_base,
-            .perms = elf_pf_to_prot(elf_info.segments[i].flags)};
-    }
-
-    /* Interpreter segments use the same permission translation, shifted by
-     * interp_base. Same fatal-overflow rule as the executable's segments.
-     */
-    for (int i = 0; i < interp.info.num_segments; i++) {
-        if (nregions >= MAX_REGIONS)
-            goto too_many_regions;
-        regions[nregions++] = (mem_region_t) {
-            .gpa_start = interp.info.segments[i].gpa + interp_base,
-            .gpa_end = interp.info.segments[i].gpa +
-                       interp.info.segments[i].memsz + interp_base,
-            .perms = elf_pf_to_prot(interp.info.segments[i].flags)};
-    }
-
-    /* brk region (RW). Pre-mapped up to MMAP_RX_BASE. */
-    if (nregions >= MAX_REGIONS)
-        goto too_many_regions;
-    regions[nregions++] = (mem_region_t) {.gpa_start = g->brk_base,
-                                          .gpa_end = MMAP_RX_BASE,
-                                          .perms = MEM_PERM_RW};
-
-    /* The dynamic stack bounds were recomputed above from the new brk. */
-    if (nregions >= MAX_REGIONS)
-        goto too_many_regions;
-    regions[nregions++] = (mem_region_t) {.gpa_start = g->stack_base,
-                                          .gpa_end = g->stack_top,
-                                          .perms = MEM_PERM_RW};
-
-    /* PROT_EXEC mmap allocations start in a separate RX area to preserve W^X
-     * with 2MiB page-table blocks.
-     */
-    if (nregions >= MAX_REGIONS)
-        goto too_many_regions;
-    regions[nregions++] = (mem_region_t) {.gpa_start = MMAP_RX_BASE,
-                                          .gpa_end = MMAP_RX_INITIAL_END,
-                                          .perms = MEM_PERM_RX};
-    g->mmap_rx_end = MMAP_RX_INITIAL_END;
-
-    /* Non-executable mmap allocations start high to match Linux address-space
-     * layout and avoid low executable/heap regions.
-     */
-    if (nregions >= MAX_REGIONS)
-        goto too_many_regions;
-    regions[nregions++] = (mem_region_t) {.gpa_start = MMAP_BASE,
-                                          .gpa_end = MMAP_INITIAL_END,
-                                          .perms = MEM_PERM_RW};
-    g->mmap_end = MMAP_INITIAL_END;
-
-    uint64_t ttbr0 = guest_build_page_tables(g, regions, nregions);
-    if (!ttbr0) {
-        log_fatal(
-            "execve failed after point of no return: "
-            "failed to build page tables");
-        exit(128);
-    }
-
-    /* Rebuild /proc/self/maps metadata in parallel with the new page tables. */
-    guest_region_add(g, g->shim_base, g->shim_base + shim_size,
-                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
-                     "[shim]");
-
-    /* Report PROT_NONE for [shim-data] to match the EL1-only mapping (see
-     * matching bootstrap.c registration). EL0 dereferences fault, so user
-     * tooling reading /proc/self/maps should see the same access state.
-     */
-    guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
-                     LINUX_PROT_NONE, LINUX_MAP_PRIVATE, 0, "[shim-data]");
-    for (int i = 0; i < elf_info.num_segments; i++) {
-        guest_region_add(g, elf_info.segments[i].gpa + elf_load_base,
-                         elf_info.segments[i].gpa + elf_info.segments[i].memsz +
-                             elf_load_base,
-                         elf_pf_to_prot(elf_info.segments[i].flags),
-                         LINUX_MAP_PRIVATE, elf_info.segments[i].offset, path);
-    }
-
-    /* interp.resolved was computed before guest_reset so no filesystem lookup
-     * is needed after the point of no return.
-     */
-    if (interp.info.num_segments > 0) {
-        for (int i = 0; i < interp.info.num_segments; i++) {
-            guest_region_add(g, interp.info.segments[i].gpa + interp_base,
-                             interp.info.segments[i].gpa +
-                                 interp.info.segments[i].memsz + interp_base,
-                             elf_pf_to_prot(interp.info.segments[i].flags),
-                             LINUX_MAP_PRIVATE, interp.info.segments[i].offset,
-                             interp.display_path);
-        }
-    }
-
-    /* Leave the lowest stack page unmapped so downward overflow faults before
-     * corrupting adjacent mappings.
-     */
-    guest_invalidate_ptes(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE);
-    guest_region_add(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE,
-                     LINUX_PROT_NONE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
-                     0, "[stack-guard]");
-    guest_region_add(g, g->stack_base + STACK_GUARD_SIZE, g->stack_top,
-                     LINUX_PROT_READ | LINUX_PROT_WRITE,
-                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[stack]");
-
-    /* Preserve Linux-style NULL dereference faults after exec. */
-    guest_invalidate_ptes(g, 0, 0x1000);
+    exec_publish_maps(g, &image);
 
     /* Build argc/argv/envp/auxv for the replacement image. */
     const char **argv_const = (const char **) argv;
@@ -1992,11 +2072,4 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                         path_host_temp, interp_host_buf, interp_host_temp);
 
     return SYSCALL_EXEC_HAPPENED;
-
-too_many_regions:
-    log_fatal(
-        "execve failed after point of no return: "
-        "too many memory regions (max %d)",
-        MAX_REGIONS);
-    exit(128);
 }
