@@ -23,7 +23,7 @@
 #include "syscall/fuse.h"
 #include "proved/pathdepth.h"
 
-#include "syscall/internal.h" /* fd_to_host_dup */
+#include "syscall/internal.h" /* host_dirfd_ref_open */
 #include "syscall/path.h"
 #include "syscall/proc.h"
 

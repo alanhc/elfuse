@@ -1388,15 +1388,12 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     /* Validate the target fd and read its persistent host fd in a single
      * fd_lock snapshot, so the kqueue knote ident is taken from the same entry
      * that was validated. A kqueue knote is keyed by the fd number and the
-     * kernel drops it the moment that fd is closed, so the ident must be the
-     * persistent host fd from the fd table -- not the dup that
-     * host_fd_ref_open() hands multi-threaded callers, which
-     * host_fd_ref_close() closes when the syscall returns (silently tearing the
-     * registration down). Snapshotting (rather than host_fd_ref_open() + a
-     * separate fd_to_host()) keeps the validate and the ident read atomic under
-     * one fd_lock. The snapshot's generation then guards the cross-call ABA
-     * below. Result mapping uses udata (the guest fd), so the ident only needs
-     * to stay open and refer to the same open file description.
+     * kernel drops it the moment that fd is closed, so the ident has to be the
+     * fd table's own host fd. Snapshotting, rather than host_fd_ref_open() plus
+     * a separate fd_to_host(), keeps the validate and the ident read atomic
+     * under one fd_lock. The snapshot's generation then guards the cross-call
+     * ABA below. Result mapping uses udata (the guest fd), so the ident only
+     * needs to stay open and refer to the same open file description.
      */
     fd_entry_t target_snap;
     if (!fd_snapshot(fd, &target_snap)) {

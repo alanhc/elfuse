@@ -1624,8 +1624,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
 
         /* O_ASYNC is elfuse-managed: track the armed bit and (dis)arm the SIGIO
          * watcher. asyncio_apply rescans the slot under fd_lock and uses each
-         * alias's real backing fd, not host_ref.fd (a per-syscall dup for
-         * multi-threaded callers).
+         * alias's real backing fd rather than the one this call pinned.
          */
         asyncio_apply(fd, fd_snap.generation, ((int) arg & LINUX_O_ASYNC));
         host_fd_ref_close(&host_ref);

@@ -2563,10 +2563,9 @@ int64_t sys_process_vm_writev(guest_t *g,
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
 {
     /* FIOCLEX/FIONCLEX are the ioctl form of fcntl(F_SETFD): they set/clear the
-     * guest close-on-exec flag, which lives in fd_table linux_flags (not the
-     * host fd's FD_CLOEXEC, which is per-descriptor and would be lost on the
-     * dup that host_fd_ref hands multi-threaded callers, so mirror the F_SETFD
-     * path in sys_fcntl). They need no host fd, so dispatch them before
+     * guest close-on-exec flag, which lives in fd_table linux_flags because
+     * that is where F_GETFD answers from, so mirror the F_SETFD path in
+     * sys_fcntl. They need no host fd, so dispatch them before
      * host_fd_ref_open_io(): that helper rejects O_PATH (FD_PATH) fds with
      * EBADF, but Linux allows these ioctls -- like fcntl(F_SETFD) -- on O_PATH
      * descriptors. Validate the slot and mutate the flag in a single fd_lock
@@ -3084,9 +3083,9 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         /* Get the slave pty number associated with a /dev/ptmx master fd. Pass
          * the guest fd: proc_pty_master_adopt snapshots the canonical (host_fd,
          * generation) under fd_lock, performs the slave open on a private dup,
-         * then re-validates the slot before publishing the keepalive. Passing
-         * the per-syscall host_fd_ref dup or a raw host fd would race with
-         * sibling close+reuse.
+         * then re-validates the slot before publishing the keepalive. A bare
+         * host fd carries no generation, so it could not be revalidated against
+         * a sibling close+reuse.
          */
         uint32_t val = proc_pty_master_adopt(fd);
         if (val == UINT32_MAX) {
@@ -3171,7 +3170,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
          * does: the slave handed out here counts toward the master's hangup
          * accounting, and that table is keyed by pts number. Pass the guest fd
          * so the adopt validates against the canonical (host_fd, generation)
-         * rather than this call's host_fd_ref dup.
+         * rather than a bare descriptor with no generation to check.
          */
         uint32_t pts_num = proc_pty_master_adopt(fd);
         char slave[64];
@@ -3214,8 +3213,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             proc_pty_note_guest_slave(host_slave_fd, pts_num);
 
         /* Track CLOEXEC + accmode in the guest table so exec honors them; the
-         * host fd's own FD_CLOEXEC is per-descriptor and would be lost on the
-         * dup that host_fd_ref hands multi-threaded callers.
+         * guest table is where F_GETFD answers from.
          */
         fd_publish_linux_flags(guest_fd, linux_flags);
         return guest_fd;

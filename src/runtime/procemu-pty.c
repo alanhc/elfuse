@@ -1263,9 +1263,10 @@ static bool pty_slot_hung_up_locked(int slot)
 
 bool proc_pty_master_hung_up(int guest_fd, uint64_t expect_generation)
 {
-    /* Keyed on the guest fd rather than a host one: callers reach the master
-     * through host_fd_ref, which hands out a dup, and the keepalive table is
-     * keyed by the canonical host fd that dup does not share.
+    /* Keyed on the guest fd rather than a host one: the caller brings a
+     * generation to check, and only the guest fd leads back to the table entry
+     * carrying it. A host fd number alone cannot tell a live master from one a
+     * sibling closed and an unrelated open recycled.
      */
     fd_entry_t snap;
     if (!fd_snapshot(guest_fd, &snap))

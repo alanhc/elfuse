@@ -2562,8 +2562,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
      * it.
      *
      * Single-threaded guests can use the raw host fd directly because there is
-     * no concurrent close() race. Multi-threaded guests still dup the fd under
-     * fd_lock to prevent TOCTOU races with CLONE_THREAD siblings.
+     * no concurrent close() race. Multi-threaded guests pin it under fd_lock
+     * instead, which holds it valid against a CLONE_THREAD sibling's close.
      */
     int nr = (int) x8;
     const syscall_entry_t *entry = NULL;
@@ -2606,8 +2606,8 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
 
             /* Pre-filter: only fast-path fd types that map 1:1 to host
              * read/write. This read is racy but benign; if the type changed,
-             * fd_to_host_dup will either fail or the slow path handles it
-             * correctly on fallthrough.
+             * host_fd_ref_open_state will either fail or the slow path handles
+             * it correctly on fallthrough.
              */
             int tp = fd_table[fd].type;
             if (tp != FD_REGULAR && tp != FD_STDIO && tp != FD_PIPE &&
