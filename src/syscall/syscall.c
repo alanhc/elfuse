@@ -1594,8 +1594,13 @@ static int64_t sc_flock(guest_t *g,
     (void) verbose;
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_io((int) x0, &host_ref);
-    if (err < 0)
-        return err;
+    if (err < 0) {
+        /* ENOMEM is not in flock(2)'s errno set. Linux answers a lock it has no
+         * room to record with ENOLCK, so spell the shortage the way a guest
+         * checking flock's documented values can read it.
+         */
+        return err == -LINUX_ENOMEM ? -LINUX_ENOLCK : err;
+    }
 
     /* A blocking flock parks the vCPU thread where no teardown wake reaches it,
      * so poll LOCK_NB instead. An explicit LOCK_NB, and LOCK_UN which never
