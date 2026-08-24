@@ -225,8 +225,19 @@ int64_t sys_ppoll(guest_t *g,
         int guest_fd = guest_fds[i].fd;
         int host_fd = -1;
         if (guest_fd >= 0) {
-            if (host_fd_ref_open_io_gen(guest_fd, &host_refs[i],
-                                        &guest_gen[i]) < 0) {
+            int64_t rc =
+                host_fd_ref_open_io_gen(guest_fd, &host_refs[i], &guest_gen[i]);
+            if (rc == -LINUX_ENOMEM) {
+                /* The pin could not be allocated. POLLNVAL here would name a
+                 * descriptor that is still open, and the usual reaction to
+                 * POLLNVAL is to close it, so a guest under memory pressure
+                 * would tear down its own working fds. Fail the whole wait with
+                 * the errno Linux uses when it cannot build the tables for one.
+                 */
+                host_fd_refs_close(host_refs, i);
+                return -LINUX_ENOMEM;
+            }
+            if (rc < 0) {
                 need_pollnval[i] = true;
                 invalid_count++;
             } else {
@@ -710,7 +721,10 @@ int64_t sys_pselect6(guest_t *g,
                 }
                 int i = (int) fd_index;
                 host_fd_ref_t ref = HOST_FD_REF_INIT;
-                if (host_fd_ref_open_io(i, &ref) < 0)
+                int64_t rc = host_fd_ref_open_io(i, &ref);
+                if (rc == -LINUX_ENOMEM)
+                    goto pselect_nomem;
+                if (rc < 0)
                     goto pselect_badf;
                 int host_fd = ref.fd;
                 reqs[req_count].host_fd = host_fd;
@@ -971,6 +985,9 @@ pselect_inval:
     goto pselect_cleanup;
 pselect_badf:
     err = -LINUX_EBADF;
+    goto pselect_cleanup;
+pselect_nomem:
+    err = -LINUX_ENOMEM;
 pselect_cleanup:
     for (int i = 0; i < req_count; i++)
         host_fd_ref_close(&reqs[i].ref);
@@ -1355,8 +1372,9 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         return -LINUX_EINVAL;
 
     host_fd_ref_t epoll_ref;
-    if (host_fd_ref_open(epfd, &epoll_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(epfd, &epoll_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     /* Pin the instance so a concurrent close(epfd) cannot free it under us. */
     epoll_instance_t *inst = epoll_instance_acquire(epfd);
@@ -1637,8 +1655,9 @@ int64_t sys_epoll_pwait(guest_t *g,
                         uint64_t sigmask_gva)
 {
     host_fd_ref_t epoll_ref;
-    if (host_fd_ref_open(epfd, &epoll_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(epfd, &epoll_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     if (maxevents <= 0) {
         host_fd_ref_close(&epoll_ref);

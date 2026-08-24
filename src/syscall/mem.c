@@ -1079,10 +1079,11 @@ static int64_t sys_mmap_high_va(guest_t *g,
             }
             close_host_backing_fd = true;
         } else {
-            if (host_fd_ref_open(fd, &backing_ref) < 0) {
+            int64_t ref_err = host_fd_ref_open(fd, &backing_ref);
+            if (ref_err < 0) {
                 if (replaced_remove_fd >= 0)
                     close(replaced_remove_fd);
-                return -LINUX_EBADF;
+                return ref_err;
             }
             host_backing_fd = backing_ref.fd;
         }
@@ -2869,9 +2870,10 @@ int64_t sys_mmap(guest_t *g,
         }
 
         if (!is_anon) {
-            if (host_fd_ref_open(fd, &fresh.backing_ref) < 0) {
+            int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
+            if (ref_err < 0) {
                 mmap_fresh_dispose(&fresh);
-                return -LINUX_EBADF;
+                return ref_err;
             }
             host_backing_fd = fresh.backing_ref.fd;
         }
@@ -3095,9 +3097,10 @@ int64_t sys_mmap(guest_t *g,
          * Closes on every failure path within the non-fixed branch.
          */
         if (!is_anon) {
-            if (host_fd_ref_open(fd, &fresh.backing_ref) < 0) {
+            int64_t ref_err = host_fd_ref_open(fd, &fresh.backing_ref);
+            if (ref_err < 0) {
                 mmap_fresh_dispose(&fresh);
-                return -LINUX_EBADF;
+                return ref_err;
             }
             host_backing_fd = fresh.backing_ref.fd;
         }

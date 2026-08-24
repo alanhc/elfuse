@@ -560,8 +560,9 @@ int path_translate_at(guest_fd_t dirfd,
         host_fd_ref_t ref;
         casefold_verdict_t verdict;
 
-        if (host_dirfd_ref_open(dirfd, &ref) < 0) {
-            errno = EBADF;
+        int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+        if (ref_err < 0) {
+            errno = (ref_err == -LINUX_ENOMEM) ? ENOMEM : EBADF;
             return -1;
         }
         verdict = casefold_resolve_at(ref.fd, "", tx->guest_path, follow_final,
@@ -815,8 +816,9 @@ int sys_path_has_symlink(guest_fd_t dirfd, const char *path)
             clamp = true;
         }
 
-        if (host_dirfd_ref_open(dirfd, &dir_ref) < 0) {
-            errno = EBADF;
+        int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+        if (ref_err < 0) {
+            errno = (ref_err == -LINUX_ENOMEM) ? ENOMEM : EBADF;
             return -1;
         }
         if (dir_ref.fd == AT_FDCWD) {
@@ -1241,8 +1243,9 @@ static int path_openat2_dirfd_host_path(guest_fd_t dirfd,
     }
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0) {
-        errno = EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0) {
+        errno = (ref_err == -LINUX_ENOMEM) ? ENOMEM : EBADF;
         return -1;
     }
     int rc = fcntl(dir_ref.fd, F_GETPATH, out);
@@ -1562,8 +1565,9 @@ static int dirfd_symlink_chain_reaches_absolute_target(guest_fd_t dirfd,
                                                        const char *path)
 {
     host_fd_ref_t ref;
-    if (host_dirfd_ref_open(dirfd, &ref) < 0) {
-        errno = EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+    if (ref_err < 0) {
+        errno = (ref_err == -LINUX_ENOMEM) ? ENOMEM : EBADF;
         return -1;
     }
 
@@ -1842,8 +1846,9 @@ static int open_guest_walk_root_fd(guest_fd_t dirfd,
     }
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0) {
-        errno = EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0) {
+        errno = (ref_err == -LINUX_ENOMEM) ? ENOMEM : EBADF;
         return -1;
     }
 

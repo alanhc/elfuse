@@ -149,8 +149,9 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
 
     host_fd_ref_t host_ref;
     fd_block_state_t sock_st;
-    if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &sock_st);
+    if (ref_err < 0)
+        return ref_err;
 
     linux_msghdr_t lmsg;
     if (guest_read_small(g, msg_gva, &lmsg, sizeof(lmsg)) < 0) {
@@ -468,8 +469,9 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 
     host_fd_ref_t host_ref;
     fd_block_state_t sock_st;
-    if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &sock_st);
+    if (ref_err < 0)
+        return ref_err;
 
     linux_msghdr_t lmsg;
     if (guest_read_small(g, msg_gva, &lmsg, sizeof(lmsg)) < 0) {
@@ -1061,8 +1063,9 @@ int64_t sys_sendmmsg(guest_t *g,
         host_fd_ref_t host_ref;
 
         fd_block_state_t sock_st;
-        if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &sock_st);
+        if (ref_err < 0)
+            return ref_err;
         if (guest_read_small(g, msg_gva, &lmsg, sizeof(lmsg)) < 0) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
@@ -1160,8 +1163,9 @@ int64_t sys_recvmmsg(guest_t *g,
         host_fd_ref_t host_ref;
 
         fd_block_state_t sock_st;
-        if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &sock_st);
+        if (ref_err < 0)
+            return ref_err;
         if (guest_read_small(g, msg_gva, &lmsg, sizeof(lmsg)) < 0) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
@@ -1285,8 +1289,9 @@ int64_t sys_recvmmsg(guest_t *g,
         linux_timespec_t ts;
         if (guest_read_small(g, timeout_gva, &ts, sizeof(ts)) == 0) {
             host_fd_ref_t host_ref;
-            if (host_fd_ref_open(fd, &host_ref) < 0)
-                return -LINUX_EBADF;
+            int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+            if (ref_err < 0)
+                return ref_err;
             if (ts.tv_sec < 0 || !RANGE_CHECK(ts.tv_nsec, 0, 1000000000LL)) {
                 host_fd_ref_close(&host_ref);
                 return -LINUX_EINVAL;

@@ -1594,8 +1594,13 @@ static int64_t sc_flock(guest_t *g,
     (void) verbose;
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_io((int) x0, &host_ref);
-    if (err < 0)
-        return err;
+    if (err < 0) {
+        /* ENOMEM is not in flock(2)'s errno set. Linux answers a lock it has no
+         * room to record with ENOLCK, so spell the shortage the way a guest
+         * checking flock's documented values can read it.
+         */
+        return err == -LINUX_ENOMEM ? -LINUX_ENOLCK : err;
+    }
 
     /* A blocking flock parks the vCPU thread where no teardown wake reaches it,
      * so poll LOCK_NB instead. An explicit LOCK_NB, and LOCK_UN which never
@@ -2213,8 +2218,9 @@ static int64_t sc_execveat(guest_t *g,
         /* path_gva is already x1, use directly */
     } else if (flags & LINUX_AT_EMPTY_PATH) {
         host_fd_ref_t dir_ref;
-        if (host_fd_ref_open(dirfd, &dir_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open(dirfd, &dir_ref);
+        if (ref_err < 0)
+            return ref_err;
         if (fcntl(dir_ref.fd, F_GETPATH, resolved) < 0) {
             host_fd_ref_close(&dir_ref);
             return -LINUX_ENOENT;
@@ -2239,8 +2245,9 @@ static int64_t sc_execveat(guest_t *g,
         if (tx.fuse_path || tx.proc_resolved != 0)
             return -LINUX_ENOSYS;
         host_fd_ref_t dir_ref;
-        if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+        if (ref_err < 0)
+            return ref_err;
 
         /* O_CLOEXEC: the descriptor is closed a few lines below, but a
          * concurrent execve on another vCPU thread inside that window would

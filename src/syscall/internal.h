@@ -804,7 +804,13 @@ typedef struct {
 
 static inline fd_block_state_t fd_block_state_of(const fd_entry_t *e);
 
-static inline int host_fd_ref_open(guest_fd_t guest_fd, host_fd_ref_t *ref)
+/* Returns 0, or a negative Linux errno the caller propagates unchanged. A slot
+ * that is closed or out of range is -LINUX_EBADF; an open slot the pin could
+ * not be allocated for is -LINUX_ENOMEM, so a caller can tell a bad descriptor
+ * from a host that is out of memory. O_PATH entries are accepted here; the
+ * calls that Linux rejects on one use host_fd_ref_open_io() instead.
+ */
+static inline int64_t host_fd_ref_open(guest_fd_t guest_fd, host_fd_ref_t *ref)
 {
     ref->fd = -1;
     ref->lifetime = NULL;
@@ -812,7 +818,7 @@ static inline int host_fd_ref_open(guest_fd_t guest_fd, host_fd_ref_t *ref)
     if (thread_is_single_active()) {
         int host_fd = fd_to_host(guest_fd);
         if (host_fd < 0)
-            return -1;
+            return -LINUX_EBADF;
         ref->fd = host_fd;
         return 0;
     }
@@ -820,7 +826,7 @@ static inline int host_fd_ref_open(guest_fd_t guest_fd, host_fd_ref_t *ref)
     fd_entry_t snap;
     int host_fd = fd_host_ref_acquire(guest_fd, &snap, &ref->lifetime);
     if (host_fd < 0)
-        return -1;
+        return linux_errno();
     ref->fd = host_fd;
     return 0;
 }
@@ -830,9 +836,9 @@ static inline int host_fd_ref_open(guest_fd_t guest_fd, host_fd_ref_t *ref)
  * With one active thread there is no mutator and the two relaxed reads are
  * already consistent; with siblings alive both come from one fd_lock window.
  */
-static inline int host_fd_ref_open_state(guest_fd_t guest_fd,
-                                         host_fd_ref_t *ref,
-                                         fd_block_state_t *st_out)
+static inline int64_t host_fd_ref_open_state(guest_fd_t guest_fd,
+                                             host_fd_ref_t *ref,
+                                             fd_block_state_t *st_out)
 {
     ref->fd = -1;
     ref->lifetime = NULL;
@@ -846,7 +852,7 @@ static inline int host_fd_ref_open_state(guest_fd_t guest_fd,
     if (thread_is_single_active()) {
         int host_fd = fd_to_host(guest_fd);
         if (host_fd < 0)
-            return -1;
+            return -LINUX_EBADF;
         *st_out = fd_block_state(guest_fd);
         ref->fd = host_fd;
         return 0;
@@ -855,7 +861,7 @@ static inline int host_fd_ref_open_state(guest_fd_t guest_fd,
     fd_entry_t snap;
     int host_fd = fd_host_ref_acquire(guest_fd, &snap, &ref->lifetime);
     if (host_fd < 0)
-        return -1;
+        return linux_errno();
     *st_out = fd_block_state_of(&snap);
     ref->fd = host_fd;
     return 0;
@@ -876,7 +882,7 @@ static inline void host_fd_ref_close(host_fd_ref_t *ref)
 }
 
 /* Open a dirfd reference, treating LINUX_AT_FDCWD as AT_FDCWD. */
-static inline int host_dirfd_ref_open(guest_fd_t dirfd, host_fd_ref_t *ref)
+static inline int64_t host_dirfd_ref_open(guest_fd_t dirfd, host_fd_ref_t *ref)
 {
     if (dirfd == LINUX_AT_FDCWD) {
         ref->fd = AT_FDCWD;
