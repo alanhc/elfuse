@@ -576,7 +576,7 @@ int main(int argc, char **argv)
      * the process title (PostgreSQL/nginx argv-clobber technique).
      */
     elf_path = strdup(argv[arg_start]);
-    bool have_sysroot = (sysroot != NULL || create_sysroot != NULL);
+    bool have_sysroot = (sysroot || create_sysroot);
     const char *sysroot_src = create_sysroot ? create_sysroot : sysroot;
     if (have_sysroot) {
         sysroot_path = calloc(LINUX_PATH_MAX, 1);

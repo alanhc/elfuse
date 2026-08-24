@@ -12,6 +12,7 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -145,7 +146,7 @@ void thread_register_main(hv_vcpu_t vcpu,
     pthread_mutex_lock(&thread_lock);
 
     thread_entry_t *t = &thread_table[0];
-    t->guest_tid = tid;
+    __atomic_store_n(&t->guest_tid, tid, __ATOMIC_RELAXED);
     t->vcpu = vcpu;
     t->vcpu_valid = true;
     t->vexit = vexit;
@@ -172,6 +173,52 @@ void thread_register_main(hv_vcpu_t vcpu,
 
     /* Set TLS pointer for the main thread */
     current_thread = t;
+}
+
+/* Where thread_slot_clear starts its memset: just past the one word inside
+ * tpending that a lock-free scan reads.
+ */
+#define THREAD_SLOT_CLEAR_START           \
+    (offsetof(thread_entry_t, tpending) + \
+     sizeof(((thread_entry_t *) 0)->tpending.pending))
+
+/* Each lock-free-scanned field has to sit wholly below that point, or the
+ * memset would plain-write something a scan can be loading. Assert the property
+ * each field actually needs rather than a chain of orderings, so inserting a
+ * field in the middle of the group cannot quietly weaken it.
+ */
+#define THREAD_SLOT_KEPT(field)                   \
+    (offsetof(thread_entry_t, field) +            \
+         sizeof(((thread_entry_t *) 0)->field) <= \
+     THREAD_SLOT_CLEAR_START)
+
+_Static_assert(THREAD_SLOT_KEPT(active), "active is cleared by the memset");
+_Static_assert(THREAD_SLOT_KEPT(blocked), "blocked is cleared by the memset");
+_Static_assert(THREAD_SLOT_KEPT(guest_tid),
+               "guest_tid is cleared by the memset");
+_Static_assert(THREAD_SLOT_KEPT(tpending.pending),
+               "tpending.pending is cleared by the memset");
+
+/* Clear a slot that thread_alloc is about to hand to a new thread.
+ *
+ * A whole-struct memset cannot be used. Three scans walk the table lock-free
+ * and each loads active and then a payload field with no lock in between, so
+ * one of them can still be reading this slot after it went inactive and while
+ * the recycle runs. Plain-writing any field they read is a data race, so the
+ * four they touch are stored atomically and the memset skips them.
+ */
+static void thread_slot_clear(thread_entry_t *t)
+{
+    __atomic_store_n(&t->active, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->blocked, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->guest_tid, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->tpending.pending, 0, __ATOMIC_RELAXED);
+
+    /* Everything past the scanned bitmask is lock-private: the rest of
+     * tpending, then the whole tail. One span covers both, padding included.
+     */
+    memset((unsigned char *) t + THREAD_SLOT_CLEAR_START, 0,
+           sizeof(*t) - THREAD_SLOT_CLEAR_START);
 }
 
 thread_entry_t *thread_alloc(int64_t tid,
@@ -223,11 +270,11 @@ rescan:
          * what is now a different logical thread.
          */
         uint64_t next_generation = t->generation + 1;
-        memset(t, 0, sizeof(*t));
+        thread_slot_clear(t);
         t->generation = next_generation;
         t->sp_el1_slot = -1; /* No SP_EL1 yet; thread_alloc_sp_el1 fills this */
         t->in_syscall = -1;  /* Not in one; syscall_dispatch fills this */
-        t->guest_tid = tid;
+        __atomic_store_n(&t->guest_tid, tid, __ATOMIC_RELAXED);
         if (stack_start < stack_end) {
             t->stack_map_start = stack_start;
             t->stack_map_end = stack_end;
@@ -404,11 +451,11 @@ uint64_t thread_pending_union(void)
      */
     uint64_t u = 0;
     THREAD_FOR_EACH_ACTIVE_RELAXED (t)
-        u |= t->tpending.pending;
+        u |= __atomic_load_n(&t->tpending.pending, __ATOMIC_RELAXED);
     return u;
 }
 
-int thread_tid_alive(int64_t tid)
+bool thread_tid_alive(int64_t tid)
 {
     /* Lock-free scan: active transitions 1->0 exactly once (in
      * thread_deactivate under thread_lock), and guest_tid is set at allocation
@@ -417,9 +464,9 @@ int thread_tid_alive(int64_t tid)
      * on the next poll iteration (100ms later).
      */
     THREAD_FOR_EACH_ACTIVE_RELAXED (t)
-        if (t->guest_tid == tid)
-            return 1;
-    return 0;
+        if (__atomic_load_n(&t->guest_tid, __ATOMIC_RELAXED) == tid)
+            return true;
+    return false;
 }
 
 int thread_active_count(void)
@@ -741,20 +788,22 @@ void thread_interrupt_all(void)
     pthread_mutex_unlock(&thread_lock);
 }
 
-int thread_signal_deliverable(uint64_t sigbit)
+bool thread_signal_deliverable(uint64_t sigbit)
 {
-    /* Lock-free scan: each thread's blocked field is written under sig_lock
-     * (lock order 4), but the code reads it without locking here. A stale read
-     * is benign: worst case is a harmless spurious interrupt after reading
-     * blocked=0 concurrently with a transition to blocked=1, or a delayed
-     * delivery corrected by the next signal_pending() check.
+    /* Lock-free scan: a thread's blocked field is written under sig_lock (lock
+     * order 4) by its owner, and once by the parent that clones it before the
+     * child's pthread exists. This reads it without either lock, so every
+     * writer publishes with an atomic store. A stale read is benign: worst case
+     * is a harmless spurious interrupt after reading blocked=0 concurrently
+     * with a transition to blocked=1, or a delayed delivery corrected by the
+     * next signal_pending() check.
      */
     THREAD_FOR_EACH_ACTIVE_RELAXED (t) {
-        uint64_t mask = __atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE);
+        uint64_t mask = thread_blocked_load(t);
         if (sigbit & ~mask)
-            return 1;
+            return true;
     }
-    return 0;
+    return false;
 }
 
 /* Fork quiesce. */
@@ -864,12 +913,12 @@ void thread_resume_siblings(void)
     pthread_mutex_unlock(&thread_lock);
 }
 
-int thread_fork_barrier_check(void)
+bool thread_fork_barrier_check(void)
 {
     pthread_mutex_lock(&thread_lock);
     if (!fork_quiesce_active) {
         pthread_mutex_unlock(&thread_lock);
-        return 0;
+        return false;
     }
 
     /* Only a thread that thread_quiesce_siblings counted contributes to the
@@ -917,7 +966,7 @@ int thread_fork_barrier_check(void)
     }
 
     pthread_mutex_unlock(&thread_lock);
-    return 1;
+    return true;
 }
 
 void thread_wake_leader_for_work(void)

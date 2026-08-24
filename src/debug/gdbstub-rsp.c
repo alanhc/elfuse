@@ -44,15 +44,15 @@ int gdb_hex_encode(char *dst, const uint8_t *src, size_t len)
   ensures \result != 0 ==> *out == 16 * hex_val((unsigned char) hi) +
                                     hex_val((unsigned char) lo);
  */
-static int gdb_hex_pair(char hi, char lo, uint8_t *out)
+static bool gdb_hex_pair(char hi, char lo, uint8_t *out)
 {
     int h = hex_nibble((unsigned char) hi);
     if (h < 0)
-        return 0;
+        return false;
 
     int l = hex_nibble((unsigned char) lo);
     if (l < 0)
-        return 0;
+        return false;
 
     /* Unsigned arithmetic, and "* 16 +" rather than "<< 4 |": a signed left
      * shift that overflows is undefined, and the prover reasons about the
@@ -60,7 +60,7 @@ static int gdb_hex_pair(char hi, char lo, uint8_t *out)
      * establish that the two operands do not share bits.
      */
     *out = (uint8_t) ((unsigned int) h * 16u + (unsigned int) l);
-    return 1;
+    return true;
 }
 
 /* Decode len bytes from 2*len hex digits.

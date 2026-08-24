@@ -1698,7 +1698,7 @@ getsockopt_translated:
         int value = 0;
         socklen_t mac_optlen = sizeof(value);
         uint32_t actual_len, write_len;
-        int used_cache = net_socket_cached_int_get(fd, level, optname, &value);
+        bool used_cache = net_socket_cached_int_get(fd, level, optname, &value);
 
         if (!used_cache) {
             if (getsockopt(host_ref.fd, mac_level, mac_optname, &value,

@@ -35,7 +35,37 @@
  * signal API without an include cycle.
  */
 typedef struct thread_entry {
-    int64_t guest_tid;           /* Linux TID (unique per thread) */
+    /* Read without thread_lock. Three scans walk the table lock-free
+     * (thread_pending_union, thread_tid_alive, thread_signal_deliverable): each
+     * loads active, then one of blocked, guest_tid, or tpending.pending, with
+     * nothing in between. A scanner that saw active as 1 just before this slot
+     * went inactive can still be loading one of those when thread_alloc
+     * recycles the slot, so none of them may be plain-written there. They are
+     * grouped here, cleared with atomic stores, and deliberately excluded from
+     * the memset that clears the rest. Keep them ahead of the rest of the
+     * struct; thread.c asserts that each one sits below where its memset
+     * starts.
+     */
+    int active;        /* Non-zero while thread is running. Stays int (not bool)
+                        * because lock-free paths in thread.c use __atomic_load_n
+                        * on it; the 32-bit width keeps the access pattern
+                        * predictable across architectures.
+                        */
+    uint64_t blocked;  /* Per-thread signal mask (POSIX requires each thread to
+                        * have its own). Initialized to the parent's mask on
+                        * clone, modified via rt_sigprocmask.
+                        */
+    int64_t guest_tid; /* Linux TID (unique per thread) */
+
+    /* Thread-directed pending signals (Linux task->pending). tgkill/tkill and
+     * pthread_kill queue here so only this thread consumes them. Written and
+     * read under the signal module's sig_lock; do not touch without it. Only
+     * the leading pending bitmask is scanned lock-free, so the recycle clear
+     * stores that one atomically and memsets the rest of this struct.
+     */
+    signal_pending_t tpending;
+
+    /* First fully lock-private field. thread_alloc memsets from here on. */
     hv_vcpu_t vcpu;              /* HVF vCPU handle for this thread */
     bool vcpu_valid;             /* Handle has been published and not destroyed.
                                   * hv_vcpu_t value 0 is valid, so the handle
@@ -60,11 +90,6 @@ typedef struct thread_entry {
                                   * shim data block is now at high IPA and only
                                   * known via guest_t.
                                   */
-    int active;                  /* Non-zero while thread is running.
-                                  * Stays int (not bool) because lock-free paths in thread.c
-                                  * use __atomic_load_n on this field; the 32-bit width keeps
-                                  * the access pattern predictable across architectures.
-                                  */
     uint64_t generation; /* Bumped by thread_alloc each time this slot is
                           * reused. Lets a caller holding a t pointer detect
                           * that its slot was recycled to a different logical
@@ -82,18 +107,12 @@ typedef struct thread_entry {
                           * the entry: pthread_join/pthread_detach on an
                           * already-detached thread is undefined.
                           */
-    /* Per-thread signal mask (POSIX requires each thread to have its own).
-     * Initialized to the parent's mask on clone, modified via rt_sigprocmask.
+    /* Per-thread signal mask lives at the top of the struct; see the lock-free
+     * group there. saved_blocked is touched only under sig_lock by the owning
+     * thread, so it stays here with the rest of the signal state.
      */
-    uint64_t blocked;       /* Signal mask for this thread */
     uint64_t saved_blocked; /* Original mask saved by sigsuspend */
     bool saved_blocked_valid;
-
-    /* Thread-directed pending signals (Linux task->pending). tgkill/tkill and
-     * pthread_kill queue here so only this thread consumes them. Written and
-     * read under the signal module's sig_lock; do not touch without it.
-     */
-    signal_pending_t tpending;
 
     /* Per-thread alternate signal stack (Linux sigaltstack is per-thread).
      * Fields mirror linux_stack_t layout for easy copy.
@@ -195,6 +214,22 @@ typedef struct thread_entry {
     int deferred_stack_unmap_busy;
 } thread_entry_t;
 
+/* The one definition of how the lock-free-scanned signal mask is accessed.
+ * Writers are the owning thread under sig_lock, plus the parent that clones a
+ * child before its pthread exists; readers are the lock-free scans. Going
+ * through these keeps the memory order in one place, so a new writer cannot
+ * plain-store the field by omission.
+ */
+static inline void thread_blocked_store(thread_entry_t *t, uint64_t mask)
+{
+    __atomic_store_n(&t->blocked, mask, __ATOMIC_RELEASE);
+}
+
+static inline uint64_t thread_blocked_load(const thread_entry_t *t)
+{
+    return __atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE);
+}
+
 typedef struct {
     thread_entry_t *thread;
     int64_t guest_tid;
@@ -271,12 +306,12 @@ thread_entry_t *thread_find(int64_t tid);
 thread_entry_t *thread_find_locked(int64_t tid);
 
 /* Lock-free check: is there an active thread with this TID?
- * Returns 1 if found, 0 if not. Safe to call without holding any lock (used
- * from futex_lock_pi to avoid lock order inversion with bucket locks). May
- * return a stale true if the thread is being deactivated concurrently; callers
- * must tolerate this.
+ * Returns true if found. Safe to call without holding any lock (used from
+ * futex_lock_pi to avoid lock order inversion with bucket locks). May return a
+ * stale true if the thread is being deactivated concurrently; callers must
+ * tolerate this.
  */
-int thread_tid_alive(int64_t tid);
+bool thread_tid_alive(int64_t tid);
 
 /* Count currently active threads. */
 int thread_active_count(void);
@@ -381,7 +416,7 @@ void thread_wake_exit_waiters(void);
  * corrected by rt_sigprocmask re-checking pending signals after unblock. Does
  * NOT acquire thread_lock.
  */
-int thread_signal_deliverable(uint64_t sigbit);
+bool thread_signal_deliverable(uint64_t sigbit);
 
 /* Fork quiesce helpers. */
 
@@ -403,10 +438,10 @@ void thread_resume_siblings(void);
 
 /* Check if a fork quiesce is in progress. Called from the vCPU run loop's
  * HV_EXIT_REASON_CANCELED handler. If active, increments the quiesced counter,
- * blocks until the fork completes, then returns 1.
- * Returns 0 if no quiesce is active.
+ * blocks until the fork completes, then returns true.
+ * Returns false if no quiesce is active.
  */
-int thread_fork_barrier_check(void);
+bool thread_fork_barrier_check(void);
 
 /* Hand a counted sibling's slot back to an armed fork barrier when it exits or
  * fails bring-up before reaching thread_fork_barrier_check. Caller must hold

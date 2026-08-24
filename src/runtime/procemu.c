@@ -56,7 +56,6 @@
 #include <libproc.h>
 #include <mach/mach.h>
 
-#include "string-builder.h"
 #include "utils.h"
 
 #include "proved/slice.h"
@@ -1737,7 +1736,7 @@ static int proc_build_maps_entries(const guest_t *g,
         size_t count = maps_entries_count(&entries);
         maps_entry_t *last =
             count > 0 ? maps_entries_at(&entries, count - 1) : NULL;
-        if (last != NULL && last->end == start && last->prot == r->prot &&
+        if (last && last->end == start && last->prot == r->prot &&
             last->flags == r->flags && last->offset == r->offset &&
             last->inherited_at_fork == r->inherited_at_fork &&
             !strcmp(last->name, r->name)) {
@@ -1861,7 +1860,8 @@ static int proc_open_self_maps(const guest_t *g)
         char line[256];
         int line_len = proc_format_maps_header(e, line, sizeof(line));
         if (line_len < 0 ||
-            string_builder_appendf(&builder, "%.*s\n", line_len, line) < 0)
+            string_builder_append_n(&builder, line, (size_t) line_len) < 0 ||
+            string_builder_append_n(&builder, "\n", 1) < 0)
             goto out;
     }
 

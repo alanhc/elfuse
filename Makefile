@@ -19,8 +19,6 @@ include mk/config.mk
 # Source files.
 SRCS := \
     main.c \
-    dynamic-array.c \
-    string-builder.c \
     core/guest.c \
     core/elf.c \
     core/stack.c \
@@ -254,19 +252,17 @@ $(BUILD_DIR)/test-absock-names-host: $(BUILD_DIR)/test-absock-names-host.o \
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 ## Build the string builder host unit test (native macOS binary)
-# This is a pure-C unit test; link the string builder and generic container
-# implementations directly and skip the Hypervisor framework and codesign.
+# Header-only now, so the test needs no object but its own; skip the
+# Hypervisor framework and codesign.
 $(BUILD_DIR)/test-string-builder-host: \
-		$(BUILD_DIR)/test-string-builder-host.o \
-		$(BUILD_DIR)/string-builder.o \
-		$(BUILD_DIR)/dynamic-array.o | $(BUILD_DIR)
+		$(BUILD_DIR)/test-string-builder-host.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
 ## Build the generic dynamic-array host unit test (native macOS binary)
+# Header-only container; the test compiles it in through utils.h.
 $(BUILD_DIR)/test-dynamic-array-host: \
-		$(BUILD_DIR)/test-dynamic-array-host.o \
-		$(BUILD_DIR)/dynamic-array.o | $(BUILD_DIR)
+		$(BUILD_DIR)/test-dynamic-array-host.o | $(BUILD_DIR)
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 

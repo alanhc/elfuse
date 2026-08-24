@@ -226,7 +226,7 @@ static guest_t *singleton_g;
 
 void shim_globals_set_singleton(guest_t *g)
 {
-    if (g != NULL && singleton_g != NULL && singleton_g != g) {
+    if (g && singleton_g && singleton_g != g) {
         log_error(
             "shim_globals: singleton already registered to %p, "
             "refusing to re-register with %p",

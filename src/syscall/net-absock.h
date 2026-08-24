@@ -47,9 +47,9 @@ int absock_bind_prepare(const uint8_t *linux_sa,
                         int *out_len);
 void absock_bind_commit(int idx);
 void absock_bind_rollback(int idx);
-int absock_reverse_lookup(const char *fs_path,
-                          uint8_t *out_name,
-                          uint32_t *out_len);
+bool absock_reverse_lookup(const char *fs_path,
+                           uint8_t *out_name,
+                           uint32_t *out_len);
 
 /* Naming helpers, non-static only as a unit-test seam: no real volume can be
  * made to produce the collisions tests/test-absock-names-host.c proves

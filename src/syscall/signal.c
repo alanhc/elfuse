@@ -334,14 +334,14 @@ static void signal_rt_enqueue_locked(signal_pending_t *p,
     p->rt_queue[idx]++;
 }
 
-static int signal_rt_dequeue_locked(signal_pending_t *p,
-                                    int signum,
-                                    signal_rt_info_t *out)
+static bool signal_rt_dequeue_locked(signal_pending_t *p,
+                                     int signum,
+                                     signal_rt_info_t *out)
 {
     int idx = signum - LINUX_SIGRTMIN;
     if (p->rt_queue[idx] <= 0) {
         p->pending &= ~sig_bit(signum);
-        return 0;
+        return false;
     }
 
     if (out)
@@ -352,7 +352,7 @@ static int signal_rt_dequeue_locked(signal_pending_t *p,
         p->pending &= ~sig_bit(signum);
         p->rt_head[idx] = 0;
     }
-    return 1;
+    return true;
 }
 
 /* Route a signal into a specific pending set (shared or a thread's private). */
@@ -451,7 +451,7 @@ void signal_init(void)
 void signal_set_shim_globals_guest(guest_t *g)
 {
     guest_t *cur = atomic_load_explicit(&attention_guest, memory_order_acquire);
-    if (g != NULL && cur != NULL && cur != g) {
+    if (g && cur && cur != g) {
         log_error(
             "signal: shim-globals guest already registered to %p, "
             "refusing to re-register with %p",
@@ -625,7 +625,7 @@ static bool signal_queue_thread_common(int64_t tid,
     if (t) {
         signal_enqueue_locked(&t->tpending, signum, info);
         refresh_pending_hint_locked();
-        blocked = __atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE);
+        blocked = thread_blocked_load(t);
         found = true;
     }
     pthread_mutex_unlock(thread_get_lock());
@@ -845,7 +845,7 @@ void signal_set_state(const signal_state_t *state)
      * POSIX: fork preserves blocked mask, altstack, and on_altstack.
      */
     if (current_thread) {
-        current_thread->blocked = state->blocked;
+        thread_blocked_store(current_thread, state->blocked);
         current_thread->altstack_sp = state->altstack.ss_sp;
         current_thread->altstack_flags = state->altstack.ss_flags;
         current_thread->altstack_size = state->altstack.ss_size;
@@ -1176,19 +1176,19 @@ void signal_get_itimer(struct timeval *value, struct timeval *interval)
  *
  * Returns 0 if not expired.
  */
-static int check_one_timer(guest_itimer_t *timer, const struct timeval *now)
+static bool check_one_timer(guest_itimer_t *timer, const struct timeval *now)
 {
     if (!timer->active)
-        return 0;
+        return false;
     if (timeval_cmp(now, &timer->expiry) < 0)
-        return 0;
+        return false;
 
     if (timer->interval.tv_sec != 0 || timer->interval.tv_usec != 0) {
         timer->expiry = timeval_add(&timer->expiry, &timer->interval);
     } else {
         __atomic_store_n(&timer->active, 0, __ATOMIC_RELEASE);
     }
-    return 1; /* expired */
+    return true; /* expired */
 }
 
 /* cpu_timers selects whether ITIMER_VIRTUAL and ITIMER_PROF are advanced along
@@ -2268,12 +2268,20 @@ static int deliver_signal_locked(hv_vcpu_t vcpu,
         hv_vcpu_set_reg(vcpu, HV_REG_X2, ucontext_addr);
     }
 
-    /* 5. Update blocked mask during handler execution */
+    /* 5. Update blocked mask during handler execution. Sibling threads scan
+     * this field atomically in thread_signal_deliverable, so a sequence of
+     * plain read-modify-writes races with that scan. Compute the mask locally
+     * and publish it once. No compare-and-swap: the only writers are the owning
+     * thread and, before its pthread exists, the parent that cloned it, so the
+     * two can never overlap.
+     */
+    uint64_t new_blocked = __atomic_load_n(blocked, __ATOMIC_RELAXED);
     if (!(act->sa_flags & LINUX_SA_NODEFER))
-        *blocked |= sig_bit(signum);
-    *blocked |= act->sa_mask;
+        new_blocked |= sig_bit(signum);
+    new_blocked |= act->sa_mask;
     /* Never block SIGKILL/SIGSTOP */
-    *blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
+    new_blocked &= ~(sig_bit(LINUX_SIGKILL) | sig_bit(LINUX_SIGSTOP));
+    __atomic_store_n(blocked, new_blocked, __ATOMIC_RELEASE);
 
     /* 6. Track per-thread altstack usage */
     if (use_altstack && thr)
@@ -2437,7 +2445,15 @@ int signal_deliver_fault(hv_vcpu_t vcpu, guest_t *g, int signum, int *exit_code)
         if (act->sa_handler == LINUX_SIG_IGN || (*blocked & sig_bit(signum))) {
             act->sa_handler = LINUX_SIG_DFL;
             act->sa_flags &= ~LINUX_SA_SIGINFO;
-            *blocked &= ~sig_bit(signum);
+
+            /* Published in one release store for the same reason
+             * deliver_signal_locked does: siblings load this field lock-free
+             * (signal_queue_thread_common, thread_signal_deliverable), so a
+             * plain read-modify-write here races that scan.
+             */
+            uint64_t cleared =
+                __atomic_load_n(blocked, __ATOMIC_RELAXED) & ~sig_bit(signum);
+            __atomic_store_n(blocked, cleared, __ATOMIC_RELEASE);
         }
     }
 

@@ -914,8 +914,9 @@ int64_t exec_run_handoff(hv_vcpu_t vcpu, guest_t *g, bool verbose)
 
     /* Adopt the requester's mask, which is what the new image inherits on
      * Linux. Through the signal module rather than by storing to the field:
-     * every other writer holds sig_lock (order 4), and
-     * thread_signal_deliverable reads it lock-free against them.
+     * writers hold sig_lock (order 4) apart from the two clone sites, which
+     * write a child's mask before its pthread exists, and
+     * thread_signal_deliverable reads it lock-free against all of them.
      */
     saved_mask = signal_save_blocked();
     signal_set_blocked(adopt_mask);

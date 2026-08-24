@@ -610,7 +610,7 @@ MUTATIONS = [
         "src/debug/gdbstub-rsp.c",
         "gdb_hex_pair",
         "drop the low-nibble validation",
-        "    int l = hex_nibble((unsigned char) lo);\n    if (l < 0)\n        return 0;\n",
+        "    int l = hex_nibble((unsigned char) lo);\n    if (l < 0)\n        return false;\n",
         "    int l = hex_nibble((unsigned char) lo);\n",
     ),
     (
@@ -644,7 +644,7 @@ MUTATIONS = [
         "src/core/elf.c",
         "elf_add_no_wrap",
         "drop the overflow guard (the sum wraps and is reported as valid)",
-        "    if (a > UINT64_MAX - b)\n        return 0;\n",
+        "    if (a > UINT64_MAX - b)\n        return false;\n",
         "",
     ),
     (
@@ -652,15 +652,15 @@ MUTATIONS = [
         "src/core/elf.c",
         "elf_phdr_gpa_in_segment",
         "drop the fits-the-segment guard (the table runs past p_filesz)",
-        "    if (rel > p_filesz || p_filesz - rel < total)\n        return 0;",
-        "    if (rel > p_filesz)\n        return 0;",
+        "    if (rel > p_filesz || p_filesz - rel < total)\n        return false;",
+        "    if (rel > p_filesz)\n        return false;",
     ),
     (
         "elf",
         "src/core/elf.c",
         "elf_phdr_gpa_in_segment",
         "drop the below-segment guard (the relative offset underflows)",
-        "    if (phoff < p_offset)\n        return 0;\n",
+        "    if (phoff < p_offset)\n        return false;\n",
         "",
     ),
     (
@@ -676,7 +676,7 @@ MUTATIONS = [
         "src/core/elf.c",
         "elf_phdr_table_bytes",
         "drop the table ceiling (phnum * phentsize is unbounded)",
-        "    if (bytes > ELF_PHDR_TABLE_MAX)\n        return 0;\n",
+        "    if (bytes > ELF_PHDR_TABLE_MAX)\n        return false;\n",
         "",
     ),
     (

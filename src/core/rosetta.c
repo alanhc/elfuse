@@ -757,8 +757,8 @@ static ssize_t rosettad_recv_fd(int sock, void *buf, size_t buflen, int *out_fd)
      * hold; a trailing cmsg means more than the one expected fd. nfd == 1
      * short-circuits before CMSG_NXTHDR so a NULL cmsg is never dereferenced.
      */
-    bool accept = nfd == 1 && !(msg.msg_flags & MSG_CTRUNC) &&
-                  CMSG_NXTHDR(&msg, cmsg) == NULL;
+    bool accept =
+        nfd == 1 && !(msg.msg_flags & MSG_CTRUNC) && !CMSG_NXTHDR(&msg, cmsg);
     if (!accept) {
         for (size_t i = 0; i < nfd; i++)
             close(fds[i]);
