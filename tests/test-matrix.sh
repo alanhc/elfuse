@@ -858,6 +858,9 @@ run_unit_tests()
     printf "\nCross-fork MAP_SHARED coherence\n"
     test_rc "$runner" "test-cross-fork-mapshared" 0 "$bindir/test-cross-fork-mapshared"
 
+    printf "\nMAP_SHARED across execve\n"
+    test_rc "$runner" "test-exec-shared-mmap" 0 "$bindir/test-exec-shared-mmap"
+
     printf "\nmadvise MADV_DONTNEED\n"
     test_rc "$runner" "test-madvise" 0 "$bindir/test-madvise"
 
