@@ -14,7 +14,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include "core/guest.h"

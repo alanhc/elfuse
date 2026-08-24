@@ -364,7 +364,7 @@ static bool resolve_fd_magiclink_host_path(const char *path,
     if (path_fd_magiclink_open(path, &ref) < 0)
         return false;
 
-    char resolved[MAXPATHLEN];
+    char resolved[PATH_MAX];
     int rc = fcntl(ref.fd, F_GETPATH, resolved);
     host_fd_ref_close(&ref);
     if (rc < 0)

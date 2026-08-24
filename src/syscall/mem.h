@@ -98,3 +98,18 @@ int mmap_fork_restore_overlays(guest_t *g,
                                const bool *parent_active,
                                const uint64_t *parent_ovl_start,
                                const uint64_t *parent_ovl_end);
+
+/* Undo every live MAP_SHARED host overlay before execve resets the address
+ * space. guest_reset zeroes each tracked region by writing through its host VA,
+ * and an overlay still installed there is the backing file's own page cache, so
+ * those zeroes reach the file: a guest that mmaps a file MAP_SHARED and execs
+ * truncates its contents to zero on the host. Removing the overlay first
+ * restores plain slab backing, which is also what the new image needs, since an
+ * overlay left in place would hand it a host file at that VA.
+ *
+ * Caller holds mmap_lock.
+ *
+ * Returns 0, or -errno with the overlays that could not be torn down still
+ * marked active; the caller must not reset guest memory after a failure.
+ */
+int mmap_exec_drop_overlays(guest_t *g);

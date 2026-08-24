@@ -43,6 +43,7 @@
 #include "syscall/wakeup-pipe.h" /* wakeup_pipe_signal */
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
+#include "syscall/mem.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
@@ -1835,6 +1836,23 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         g->is_rosetta = true;
         proc_set_rosetta_active(true);
     }
+
+    /* Before the memset, not after: guest_reset writes through each region's
+     * host VA, which for an overlaid region is the backing file's page cache.
+     * Dropping the overlays first sends those zeroes to the slab instead, and
+     * leaves the new image with anonymous backing at that VA rather than a host
+     * file. Fatal on failure for the same reason the whole region past the
+     * point of no return is: the alternative is zeroing a user's file.
+     */
+    int overlay_err = mmap_exec_drop_overlays(g);
+    if (overlay_err < 0) {
+        log_fatal(
+            "execve failed after point of no return: "
+            "MAP_SHARED overlay teardown failed: %d",
+            overlay_err);
+        exit(128);
+    }
+
     guest_reset(g);
 
     /* The replacement image must not inherit process-wide shutdown requests

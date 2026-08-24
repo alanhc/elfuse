@@ -2520,6 +2520,17 @@ static int cleanup_overlays_in_range(guest_t *g, uint64_t start, uint64_t end)
     return err;
 }
 
+int mmap_exec_drop_overlays(guest_t *g)
+{
+    /* The whole primary window: an overlay only ever binds a host VA inside it
+     * (hvf_apply_file_overlay resolves through host_base + ipa), so a high-VA
+     * region carries none and the walk stops at the first one anyway. Both
+     * boundaries fall outside the region array, so the splits are no-ops and
+     * this cannot fail for want of a region slot.
+     */
+    return cleanup_overlays_in_range(g, 0, g->guest_size);
+}
+
 /* Memory syscalls (tightly coupled to guest.h). */
 
 static bool heap_tail_can_extend(const guest_region_t *tail,
