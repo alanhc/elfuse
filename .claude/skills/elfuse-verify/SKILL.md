@@ -213,6 +213,24 @@ make check-tsan            # data races, worth it for anything multi-vCPU
 make infer-uninit          # uninitialized reads
 ```
 
+## What done means
+
+Green is a claim about named commands, so report it as one: which lanes ran,
+what each said, and which ones did not run. Three failure modes to avoid, all
+of which have shipped before:
+
+- A lane that could not run is named along with the risk that leaves. It is
+  never rounded up into the passing set.
+- A count, a latency, or a coverage figure is recomputed before it is quoted,
+  including from this file. A number carried forward from a document reads as
+  measured and is not.
+- A proof is done when `make verify` and `make verify-mutants` say so from the
+  Makefile. MCP goals discharging is progress, not a verdict.
+
+Establish the baseline before a multi-command session rather than after: this
+tree is not green everywhere, and without the before-picture there is no way
+to separate breakage you caused from breakage you inherited.
+
 ## Authoritative sources
 
 This skill is a working summary. These are tracked and survive a fresh clone,
