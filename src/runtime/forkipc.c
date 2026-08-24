@@ -755,7 +755,7 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
 
     /* Inherit parent's signal mask (POSIX: clone inherits blocked mask) */
     if (current_thread)
-        t->blocked = current_thread->blocked;
+        thread_blocked_store(t, current_thread->blocked);
 
     /* Allocate per-thread EL1 stack (records both sp and slot in t). */
     uint64_t child_sp_el1 = thread_alloc_sp_el1(g, t);
@@ -1184,7 +1184,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
 
     /* Inherit parent's signal mask */
     if (current_thread)
-        t->blocked = current_thread->blocked;
+        thread_blocked_store(t, current_thread->blocked);
 
     /* Allocate per-thread EL1 stack (records both sp and slot in t). */
     uint64_t child_sp_el1 = thread_alloc_sp_el1(g, t);
@@ -1463,7 +1463,7 @@ static int fork_snapshot_shm_via_clonefile(int src_fd)
      * concurrent process could DoS the fast path via EEXIST.
      */
     char tmpdir[] = "/tmp/elfuse-fork-XXXXXX";
-    if (mkdtemp(tmpdir) == NULL)
+    if (!mkdtemp(tmpdir))
         return -1;
     char clone_path[64];
     snprintf(clone_path, sizeof(clone_path), "%s/snap", tmpdir);

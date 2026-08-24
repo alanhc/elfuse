@@ -617,7 +617,7 @@ static fuse_mount_t *fuse_alloc_mount_locked(void)
         }
     }
     for (int i = 0; i < FUSE_MAX_MOUNTS; i++) {
-        if (fuse_mounts[i].used && fuse_mounts[i].session == NULL) {
+        if (fuse_mounts[i].used && !fuse_mounts[i].session) {
             fuse_uninstall_mount_locked(&fuse_mounts[i]);
             memset(&fuse_mounts[i], 0, sizeof(fuse_mounts[i]));
             fuse_mounts[i].used = true;
@@ -881,7 +881,7 @@ static int fuse_queue_request_locked(fuse_session_t *session,
     if (payload_len)
         memcpy(req->frame + sizeof(*hdr), payload, payload_len);
 
-    bool was_empty = session->queue_head == NULL;
+    bool was_empty = !session->queue_head;
     if (session->queue_tail)
         session->queue_tail->next = req;
     else
@@ -1625,7 +1625,7 @@ int64_t sys_mount(guest_t *g,
         return -LINUX_EBADF;
     }
     for (int i = 0; i < FUSE_MAX_MOUNTS; i++) {
-        if (fuse_mounts[i].used && fuse_mounts[i].session != NULL &&
+        if (fuse_mounts[i].used && fuse_mounts[i].session &&
             !strcmp(fuse_mounts[i].path, target_canon)) {
             /* Live mount at this path already; reject as EBUSY. A tombstoned
              * slot at the same path is reclaimed below.
@@ -1640,7 +1640,7 @@ int64_t sys_mount(guest_t *g,
      */
     fuse_mount_t *mount = NULL;
     for (int i = 0; i < FUSE_MAX_MOUNTS; i++) {
-        if (fuse_mounts[i].used && fuse_mounts[i].session == NULL &&
+        if (fuse_mounts[i].used && !fuse_mounts[i].session &&
             !strcmp(fuse_mounts[i].path, target_canon)) {
             fuse_uninstall_mount_locked(&fuse_mounts[i]);
             memset(&fuse_mounts[i], 0, sizeof(fuse_mounts[i]));
@@ -1745,7 +1745,7 @@ static int fuse_path_lookup(const char *path,
     pthread_mutex_lock(&session->lock);
     pthread_mutex_unlock(&fuse_lock);
 
-    bool keep_lookup = retain_final_lookup && session_out != NULL;
+    bool keep_lookup = retain_final_lookup && session_out;
     int rc = fuse_walk_path_locked(session, relpath, keep_lookup, nodeid_out,
                                    attr_out);
     pthread_mutex_unlock(&session->lock);

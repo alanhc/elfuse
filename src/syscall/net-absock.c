@@ -253,9 +253,9 @@ void absock_unregister_fd(int guest_fd)
     pthread_mutex_unlock(&absock_lock);
 }
 
-int absock_reverse_lookup(const char *fs_path,
-                          uint8_t *out_name,
-                          uint32_t *out_len)
+bool absock_reverse_lookup(const char *fs_path,
+                           uint8_t *out_name,
+                           uint32_t *out_len)
 {
     pthread_mutex_lock(&absock_lock);
     for (int i = 0; i < ABSOCK_MAX_ENTRIES; i++) {
@@ -264,11 +264,11 @@ int absock_reverse_lookup(const char *fs_path,
             *out_len = absock_table[i].name_len;
             memcpy(out_name, absock_table[i].name, absock_table[i].name_len);
             pthread_mutex_unlock(&absock_lock);
-            return 1;
+            return true;
         }
     }
     pthread_mutex_unlock(&absock_lock);
-    return 0;
+    return false;
 }
 
 int absock_is_abstract_unix(const uint8_t *linux_sa, uint32_t addrlen)

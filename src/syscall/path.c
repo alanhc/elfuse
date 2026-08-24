@@ -356,25 +356,25 @@ int path_fd_magiclink_open(const char *path, host_fd_ref_t *ref)
  * unlink-and-recreate in between leaves it naming a different inode, where
  * Linux resolves the link inside the syscall and cannot be redirected.
  */
-static int resolve_fd_magiclink_host_path(const char *path,
-                                          char *out,
-                                          size_t outsz)
+static bool resolve_fd_magiclink_host_path(const char *path,
+                                           char *out,
+                                           size_t outsz)
 {
     host_fd_ref_t ref;
     if (path_fd_magiclink_open(path, &ref) < 0)
-        return 0;
+        return false;
 
     char resolved[MAXPATHLEN];
     int rc = fcntl(ref.fd, F_GETPATH, resolved);
     host_fd_ref_close(&ref);
     if (rc < 0)
-        return 0;
+        return false;
 
     size_t len = strlen(resolved);
     if (len >= outsz)
-        return 0;
+        return false;
     memcpy(out, resolved, len + 1);
-    return 1;
+    return true;
 }
 
 int path_translate_at(guest_fd_t dirfd,
@@ -1128,7 +1128,7 @@ int resolve_proc_at_path(guest_fd_t dirfd,
     return resolve_proc_cwd_path(path, out, outsz);
 }
 
-int path_openat2_stays_beneath(const char *path, bool clamp_at_root)
+bool path_openat2_stays_beneath(const char *path, bool clamp_at_root)
 {
     int depth = 0;
     const char *p = path;
@@ -1149,7 +1149,7 @@ int path_openat2_stays_beneath(const char *path, bool clamp_at_root)
         if (len == 2 && start[0] == '.' && start[1] == '.') {
             if (depth == 0) {
                 if (!clamp_at_root)
-                    return 0;
+                    return false;
             } else {
                 depth--;
             }
@@ -1158,7 +1158,7 @@ int path_openat2_stays_beneath(const char *path, bool clamp_at_root)
         depth++;
     }
 
-    return 1;
+    return true;
 }
 
 int path_openat2_normalize_in_root(const char *path, char *out, size_t outsz)
@@ -1682,7 +1682,7 @@ static int path_check_relative_sysroot_containment(guest_fd_t dirfd,
      * such a path at "/", the host kernel would keep climbing, and only the
      * absolute spelling the resolver returns below reconciles the two.
      */
-    bool climbed = path_openat2_stays_beneath(abs_path, false) == 0;
+    bool climbed = !path_openat2_stays_beneath(abs_path, false);
 
     char host_buf[LINUX_PATH_MAX];
     const char *checked;

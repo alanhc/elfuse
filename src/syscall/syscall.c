@@ -2386,51 +2386,51 @@ static const syscall_entry_t syscall_table[SC_TABLE_SIZE] = {
 
 /* Main dispatch. */
 
-static int fast_scalar_syscall_result(int nr, uint64_t x0, int64_t *result)
+static bool fast_scalar_syscall_result(int nr, uint64_t x0, int64_t *result)
 {
     switch (nr) {
     case SYS_getpid:
         *result = proc_get_pid();
-        return 1;
+        return true;
     case SYS_getppid:
         *result = proc_get_ppid();
-        return 1;
+        return true;
     case SYS_gettid:
         *result = current_thread ? current_thread->guest_tid : proc_get_pid();
-        return 1;
+        return true;
     case SYS_getpgid:
         *result = ((int) x0 == 0 || (int) x0 == (int) proc_get_pid())
                       ? proc_get_pgid()
                       : -LINUX_ESRCH;
-        return 1;
+        return true;
     case SYS_getuid:
         *result = (int64_t) proc_get_uid();
-        return 1;
+        return true;
     case SYS_geteuid:
         *result = (int64_t) proc_get_euid();
-        return 1;
+        return true;
     case SYS_getgid:
         *result = (int64_t) proc_get_gid();
-        return 1;
+        return true;
     case SYS_getegid:
         *result = (int64_t) proc_get_egid();
-        return 1;
+        return true;
     case SYS_fadvise64:
     case SYS_mlock:
     case SYS_munlock:
         *result = 0;
-        return 1;
+        return true;
     case SYS_capset:
         *result = -LINUX_EPERM;
-        return 1;
+        return true;
     case SYS_io_destroy:
         *result = -LINUX_EINVAL;
-        return 1;
+        return true;
     case SYS_sethostname:
         *result = -LINUX_EPERM;
-        return 1;
+        return true;
     default:
-        return 0;
+        return false;
     }
 }
 

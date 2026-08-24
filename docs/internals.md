@@ -117,8 +117,9 @@ Key files:
 
 ## Generic Dynamic Containers
 
-`src/dynamic-array.h` and `src/dynamic-array.c` provide the raw
-`dynamic_array_t` used by the procfs VMA snapshot and the string builder. Capacity
+`src/utils.h` provides the raw `dynamic_array_t` used by the procfs VMA
+snapshot and the string builder. It is header-only: every operation is a
+`static inline`, so there is no container object to link. Capacity
 is measured in element slots, while `count` is the number of logical elements.
 The allocation is one contiguous block of `capacity * element_size` bytes;
 both the count addition and the multiplication are checked before a growth.
@@ -132,14 +133,16 @@ does not manage pointers or other resources held by an element. `destroy`
 frees the contiguous block and restores the zero state. A facade can therefore
 be declared as `{0}` and initialized lazily on its first operation.
 
-`string_builder_t` is a thin facade over a generated `char` container. The
-container count is the C-string length and excludes the terminator; its
-capacity accessor reports bytes including the trailing NUL slot. Reserve and
-append account for that slot, and every successful mutation restores
-`data[count] == '\0'`. `string_builder_append` accepts a C string and uses its
-first NUL as the end of the input. Formatted appends retain the existing
-two-pass `vsnprintf` behavior and commit only the prefix through the first NUL,
-matching standard C string semantics.
+`string_builder_t` wraps a raw `dynamic_array_t` of `char`. The count is the
+C-string length and excludes the terminator, so every path that grows the
+builder reserves one byte beyond the payload and restores `data[count] ==
+'\0'`. The surviving surface is `init`, `destroy`, `length`, `data_const`,
+`append_n`, and `appendf`; the plain-text `append`, `reserve`, and the capacity accessor went
+with the header-only conversion because nothing outside the tests used them.
+`appendf` renders into a scratch buffer before touching storage, which is what
+makes a format string or argument aliasing the builder's own data safe, and it
+commits only the prefix through the first NUL, matching standard C string
+semantics.
 
 ## Hypervisor.framework Constraints
 

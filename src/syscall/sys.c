@@ -644,27 +644,27 @@ static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
     return lim;
 }
 
-static int rlimit_cache_get(int resource, linux_rlimit64_t *lim)
+static bool rlimit_cache_get(int resource, linux_rlimit64_t *lim)
 {
     if (!RANGE_CHECK(resource, 0, RLIMIT_CACHE_SIZE) || !lim)
-        return 0;
+        return false;
 
     if (thread_is_single_active()) {
         if (cached_linux_rlimit_valid[resource]) {
             *lim = cached_linux_rlimits[resource];
-            return 1;
+            return true;
         }
-        return 0;
+        return false;
     }
 
     pthread_mutex_lock(&rlimit_lock);
     if (cached_linux_rlimit_valid[resource]) {
         *lim = cached_linux_rlimits[resource];
         pthread_mutex_unlock(&rlimit_lock);
-        return 1;
+        return true;
     }
     pthread_mutex_unlock(&rlimit_lock);
-    return 0;
+    return false;
 }
 
 static void rlimit_cache_set(int resource, linux_rlimit64_t lim)

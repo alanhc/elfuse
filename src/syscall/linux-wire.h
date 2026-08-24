@@ -603,15 +603,15 @@ typedef struct {
 } fd_entry_t;
 
 /* Inline socket option cache accessors. */
-static inline int sock_opt_get(const fd_entry_t *e, int idx, int *value)
+static inline bool sock_opt_get(const fd_entry_t *e, int idx, int *value)
 {
     if ((unsigned) idx >= SOCK_OPT_COUNT)
-        return 0;
+        return false;
     if (e->sock.valid & (1u << idx)) {
         *value = e->sock.val[idx];
-        return 1;
+        return true;
     }
-    return 0;
+    return false;
 }
 
 static inline void sock_opt_set(fd_entry_t *e, int idx, int value)

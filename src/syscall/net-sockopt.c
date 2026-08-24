@@ -26,10 +26,10 @@ static void net_socket_cache_set_many_zero(int guest_fd,
         net_socket_cache_set_index(guest_fd, indices[i], 0);
 }
 
-int net_socket_fd_is_valid(int guest_fd)
+bool net_socket_fd_is_valid(int guest_fd)
 {
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE))
-        return 0;
+        return false;
 
     if (thread_is_single_active())
         return fd_table[guest_fd].type == FD_SOCKET;
@@ -40,15 +40,15 @@ int net_socket_fd_is_valid(int guest_fd)
     return valid;
 }
 
-static int net_sock_cache_get(int guest_fd, int idx, int *value)
+static bool net_sock_cache_get(int guest_fd, int idx, int *value)
 {
     if (!RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE) || !value)
-        return 0;
+        return false;
 
     if (thread_is_single_active()) {
         if (fd_table[guest_fd].type == FD_SOCKET)
             return sock_opt_get(&fd_table[guest_fd], idx, value);
-        return 0;
+        return false;
     }
 
     pthread_mutex_lock(&fd_lock);
@@ -149,14 +149,14 @@ static int net_sock_opt_index_for(int level, int optname)
     return -1;
 }
 
-int net_socket_cached_int_get(int guest_fd, int level, int optname, int *value)
+bool net_socket_cached_int_get(int guest_fd, int level, int optname, int *value)
 {
     if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR)
-        return 0;
+        return false;
 
     int idx = net_sock_opt_index_for(level, optname);
     if (idx < 0)
-        return 0;
+        return false;
     return net_sock_cache_get(guest_fd, idx, value);
 }
 
@@ -212,24 +212,24 @@ int64_t recv_eof_or_errno(int host_fd, int guest_fd)
     return fold ? 0 : linux_errno();
 }
 
-int net_socket_cached_int_get_if_generation(int guest_fd,
-                                            uint64_t generation,
-                                            int level,
-                                            int optname,
-                                            int *value)
+bool net_socket_cached_int_get_if_generation(int guest_fd,
+                                             uint64_t generation,
+                                             int level,
+                                             int optname,
+                                             int *value)
 {
     if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR)
-        return 0;
+        return false;
 
     int idx = net_sock_opt_index_for(level, optname);
     if (idx < 0 || !RANGE_CHECK(guest_fd, 0, FD_TABLE_SIZE) || !value)
-        return 0;
+        return false;
 
     if (thread_is_single_active()) {
         fd_entry_t *entry = &fd_table[guest_fd];
         if (entry->type == FD_SOCKET && entry->generation == generation)
             return sock_opt_get(entry, idx, value);
-        return 0;
+        return false;
     }
 
     pthread_mutex_lock(&fd_lock);

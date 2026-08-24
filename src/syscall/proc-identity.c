@@ -277,7 +277,7 @@ bool proc_pid_alive(int pid)
 {
     if (pid == 0 || pid == (int) guest_pid)
         return true;
-    return thread_tid_alive((int64_t) pid) != 0;
+    return thread_tid_alive((int64_t) pid);
 }
 
 int64_t proc_sys_setpriority(int which, int who, int prio)

@@ -54,13 +54,13 @@
   assigns *sum;
   ensures \result != 0 ==> *sum == a + b;
  */
-static int elf_add_no_wrap(uint64_t a, uint64_t b, uint64_t *sum)
+static bool elf_add_no_wrap(uint64_t a, uint64_t b, uint64_t *sum)
 {
     if (a > UINT64_MAX - b)
-        return 0;
+        return false;
 
     *sum = a + b;
-    return 1;
+    return true;
 }
 
 /* Size of the program header table in bytes, or 0 when the header geometry is
@@ -74,19 +74,19 @@ static int elf_add_no_wrap(uint64_t a, uint64_t b, uint64_t *sum)
   ensures \result != 0 ==> phentsize >= sizeof(elf64_phdr_t);
   ensures \result != 0 ==> 0 < *total <= ELF_PHDR_TABLE_MAX;
  */
-static int elf_phdr_table_bytes(uint16_t phnum,
-                                uint16_t phentsize,
-                                size_t *total)
+static bool elf_phdr_table_bytes(uint16_t phnum,
+                                 uint16_t phentsize,
+                                 size_t *total)
 {
     if (phnum == 0 || phentsize < sizeof(elf64_phdr_t))
-        return 0;
+        return false;
 
     size_t bytes = (size_t) phnum * phentsize;
     if (bytes > ELF_PHDR_TABLE_MAX)
-        return 0;
+        return false;
 
     *total = bytes;
-    return 1;
+    return true;
 }
 
 /* Copy program header idx out of a buffer of buflen bytes.
@@ -111,22 +111,22 @@ static int elf_phdr_table_bytes(uint16_t phnum,
   ensures \result != 0 ==>
             (size_t) idx * phentsize + sizeof(elf64_phdr_t) <= buflen;
  */
-static int elf_phdr_fetch(const uint8_t *buf,
-                          size_t buflen,
-                          uint16_t idx,
-                          uint16_t phentsize,
-                          elf64_phdr_t *out)
+static bool elf_phdr_fetch(const uint8_t *buf,
+                           size_t buflen,
+                           uint16_t idx,
+                           uint16_t phentsize,
+                           elf64_phdr_t *out)
 {
     size_t off = (size_t) idx * phentsize;
     if (off > buflen || buflen - off < sizeof(*out))
-        return 0;
+        return false;
 
     /* memcpy rather than an aliased struct pointer: e_phentsize is attacker
      * controlled and need not be a multiple of the program header alignment, so
      * buf + off is not guaranteed to be suitably aligned.
      */
     memcpy(out, buf + off, sizeof(*out));
-    return 1;
+    return true;
 }
 
 /* Guest VA of the program header table, given one PT_LOAD's file range.
@@ -151,19 +151,19 @@ static int elf_phdr_fetch(const uint8_t *buf,
   ensures \result != 0 ==> phoff + total <= p_offset + p_filesz;
   ensures \result != 0 ==> *gpa_out == p_vaddr + (phoff - p_offset);
  */
-static int elf_phdr_gpa_in_segment(uint64_t phoff,
-                                   size_t total,
-                                   uint64_t p_offset,
-                                   uint64_t p_filesz,
-                                   uint64_t p_vaddr,
-                                   uint64_t *gpa_out)
+static bool elf_phdr_gpa_in_segment(uint64_t phoff,
+                                    size_t total,
+                                    uint64_t p_offset,
+                                    uint64_t p_filesz,
+                                    uint64_t p_vaddr,
+                                    uint64_t *gpa_out)
 {
     if (phoff < p_offset)
-        return 0;
+        return false;
 
     uint64_t rel = phoff - p_offset;
     if (rel > p_filesz || p_filesz - rel < total)
-        return 0;
+        return false;
 
     return elf_add_no_wrap(p_vaddr, rel, gpa_out);
 }
@@ -184,14 +184,14 @@ static int elf_phdr_gpa_in_segment(uint64_t phoff,
   ensures \result != 0 ==> memsz <= *zero_len_out;
   ensures \result != 0 ==> filesz <= *zero_len_out;
  */
-static int elf_segment_extent(uint64_t vaddr,
-                              uint64_t va_base,
-                              uint64_t target_base,
-                              uint64_t filesz,
-                              uint64_t memsz,
-                              uint64_t guest_size,
-                              uint64_t *gpa_out,
-                              uint64_t *zero_len_out)
+static bool elf_segment_extent(uint64_t vaddr,
+                               uint64_t va_base,
+                               uint64_t target_base,
+                               uint64_t filesz,
+                               uint64_t memsz,
+                               uint64_t guest_size,
+                               uint64_t *gpa_out,
+                               uint64_t *zero_len_out)
 {
     /* Relocation is expressed as a window, not a pre-wrapped base: the segment
      * at vaddr sits at target_base + (vaddr - va_base).
@@ -204,21 +204,21 @@ static int elf_segment_extent(uint64_t vaddr,
      * overflowing into it.
      */
     if (vaddr < va_base)
-        return 0;
+        return false;
 
     uint64_t gpa;
     if (!elf_add_no_wrap(target_base, vaddr - va_base, &gpa))
-        return 0;
+        return false;
 
     /* A segment cannot contain more initialized file data than its in-memory
      * extent.
      */
     if (filesz > memsz)
-        return 0;
+        return false;
 
     /* Keep the mapped segment inside the configured IPA-sized guest slab. */
     if (memsz > guest_size || gpa > guest_size - memsz)
-        return 0;
+        return false;
 
     /* The loader zeros up to the next page boundary AFTER the segment ends, so
      * the extent is PAGE_ALIGN_UP(gpa + memsz) rather than gpa +
@@ -237,7 +237,7 @@ static int elf_segment_extent(uint64_t vaddr,
 
     *gpa_out = gpa;
     *zero_len_out = aligned - gpa;
-    return 1;
+    return true;
 }
 
 /* Read a PT_INTERP segment's dynamic linker path into info->interp_path.

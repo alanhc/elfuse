@@ -52,7 +52,13 @@ int passes = 0, fails = 0;
 #define BATCH 24
 
 static int pipe_rd, pipe_wr;
-static atomic_int stop, pause_req, paused;
+
+/* pause_ack counts both edges of each request. Main waits for the flipper to
+ * observe the release before requesting the next pause, so one wait cannot
+ * absorb two rounds.
+ */
+static atomic_int stop, pause_req;
+static atomic_uint pause_ack;
 static int stale_round = -1, stale_alias = -1, stale_src = -1;
 
 static void *flipper(void *arg)
@@ -60,17 +66,18 @@ static void *flipper(void *arg)
     (void) arg;
     while (!atomic_load(&stop)) {
         if (atomic_load(&pause_req)) {
-            atomic_store(&paused, 1);
+            /* Publish the ack only once per request, after the last write. */
+            atomic_fetch_add(&pause_ack, 1u);
             while (atomic_load(&pause_req) && !atomic_load(&stop))
                 sched_yield();
-            atomic_store(&paused, 0);
+            atomic_fetch_add(&pause_ack, 1u);
             continue;
         }
         int fl = fcntl(pipe_wr, F_GETFL);
         if (fl >= 0)
             (void) fcntl(pipe_wr, F_SETFL, fl ^ O_NONBLOCK);
     }
-    atomic_store(&paused, 1);
+    atomic_fetch_add(&pause_ack, 1u);
     return NULL;
 }
 
@@ -107,8 +114,9 @@ int main(void)
          * write the flag, so any name that still disagrees kept a value the
          * description has moved past.
          */
+        unsigned want = atomic_load(&pause_ack) + 1u;
         atomic_store(&pause_req, 1);
-        while (!atomic_load(&paused))
+        while (atomic_load(&pause_ack) < want && !atomic_load(&stop))
             sched_yield();
 
         int src = fcntl(pipe_wr, F_GETFL);
@@ -123,6 +131,9 @@ int main(void)
         }
 
         atomic_store(&pause_req, 0);
+        want++;
+        while (atomic_load(&pause_ack) < want && !atomic_load(&stop))
+            sched_yield();
         for (int i = 0; i < n; i++)
             close(dups[i]);
         dups_taken += n;
