@@ -43,3 +43,76 @@
 #ifndef ETOOMANYREFS
 #define ETOOMANYREFS 59
 #endif
+
+/* limits.h: longest single path component. POSIX rather than Darwin-specific,
+ * but Frama-C's limits.h omits it, and path.c sizes a component buffer with it.
+ * 255, as Darwin's sys/syslimits.h says.
+ */
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
+
+/* termios.h: echo control characters as ^X. In the BSD set Darwin carries and
+ * the modeled libc does not; io.c translates it in both directions between the
+ * guest and host termios lflag words, so it is one arm of a switch whose other
+ * arms are real values.
+ */
+#ifndef ECHOCTL
+#define ECHOCTL 0x00000040
+#endif
+
+/* termios.h: the BSD local-mode bits Darwin carries and the modeled libc stops
+ * short of. io.c translates the lflag word in both directions between the guest
+ * and the host, so each of these is one arm of a mask whose other arms are real
+ * values; a collision would fold two guest flags onto one host flag.
+ */
+#ifndef ECHOKE
+#define ECHOKE 0x00000001
+#endif
+#ifndef ECHOPRT
+#define ECHOPRT 0x00000020
+#endif
+#ifndef EXTPROC
+#define EXTPROC 0x00000800
+#endif
+#ifndef FLUSHO
+#define FLUSHO 0x00800000
+#endif
+#ifndef PENDIN
+#define PENDIN 0x20000000
+#endif
+
+/* sys/ioctl.h: modem control lines, for TIOCMGET and TIOCMSET. The same
+ * argument applies: io.c maps the guest's bits onto these.
+ */
+#ifndef TIOCM_DTR
+#define TIOCM_DTR 0x0002
+#endif
+#ifndef TIOCM_RTS
+#define TIOCM_RTS 0x0004
+#endif
+
+/* fcntl.h: deallocate a byte range, Darwin's answer to Linux
+ * FALLOC_FL_PUNCH_HOLE. io.c takes this fast path in sys_fallocate, so both the
+ * command number and the argument struct have to be here: the modeled libc has
+ * neither, and without the struct the local declaration is an incomplete type
+ * rather than an unresolved name. Layout and field order match Darwin's
+ * sys/fcntl.h, since io.c fills it by designated initializer.
+ */
+#ifndef F_PUNCHHOLE
+#define F_PUNCHHOLE 99
+struct fpunchhole {
+    unsigned int fp_flags;
+    unsigned int reserved;
+    off_t fp_offset;
+    off_t fp_length;
+};
+#endif
+
+/* netinet/in.h: set the IP don't-fragment bit. Darwin's nearest answer to Linux
+ * IP_MTU_DISCOVER, which is what net.c is translating when it reaches for this;
+ * the guest's PMTUDISC_DO and PMTUDISC_PROBE both land here.
+ */
+#ifndef IP_DONTFRAG
+#define IP_DONTFRAG 28
+#endif
