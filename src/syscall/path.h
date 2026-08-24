@@ -58,6 +58,18 @@ static inline host_fd_t path_translation_dirfd(const path_translation_t *tx,
     return tx->is_dev_shm ? AT_FDCWD : ref->fd;
 }
 
+/* A FUSE-backed path has no host file behind it, so a path op that cannot be
+ * served over the FUSE transport answers ENOSYS.
+ *
+ * Returns INT64_MIN when the translation is not FUSE-backed, which is the
+ * caller's cue to carry on.
+ */
+static inline int64_t reject_unsupported_fuse_path_op(
+    const path_translation_t *tx)
+{
+    return tx && tx->fuse_path ? -LINUX_ENOSYS : INT64_MIN;
+}
+
 /* Force AT_SYMLINK_NOFOLLOW on the *at metadata calls for a shm redirect. One
  * choke point for the never-follow invariant; see dev_shm_resolve_path().
  */

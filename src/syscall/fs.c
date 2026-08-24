@@ -519,11 +519,6 @@ static int64_t read_translated_path(guest_t *g,
     return 0;
 }
 
-static int64_t reject_unsupported_fuse_path_op(const path_translation_t *tx)
-{
-    return tx && tx->fuse_path ? -LINUX_ENOSYS : INT64_MIN;
-}
-
 /* open/close. */
 
 

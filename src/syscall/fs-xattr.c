@@ -54,6 +54,30 @@ static int64_t xattr_alloc_buf(uint64_t size, void **buf)
     return *buf ? 0 : -LINUX_ENOMEM;
 }
 
+/* Resolve a path-based xattr call and derive the macOS options flag.
+ *
+ * One choke point for two facts each entry point below would otherwise carry
+ * for itself: a FUSE-backed path has no xattrs, and a shm redirect is never
+ * followed whatever the caller asked. See dev_shm_resolve_path() in procemu.c
+ * for the invariant, and path_translation_at_flags() for its *at form.
+ *
+ * Returns the macOS options flag with tx filled, or a negative Linux errno. The
+ * flag is 0 or XATTR_NOFOLLOW, so the sign separates the two.
+ */
+static int xattr_resolve_path(const char *path,
+                              int nofollow,
+                              path_translation_t *tx)
+{
+    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
+                          tx) < 0)
+        return linux_errno();
+    int64_t fuse_rc = reject_unsupported_fuse_path_op(tx);
+    if (fuse_rc != INT64_MIN)
+        return (int) fuse_rc;
+
+    return (nofollow || tx->is_dev_shm) ? XATTR_NOFOLLOW : 0;
+}
+
 static int64_t xattr_copy_out_result(guest_t *g,
                                      uint64_t dst_gva,
                                      void *buf,
@@ -80,13 +104,9 @@ int64_t sys_getxattr(guest_t *g,
         return -LINUX_EFAULT;
 
     path_translation_t tx;
-    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
-                          &tx) < 0)
-        return linux_errno();
-    if (tx.fuse_path)
-        return -LINUX_ENOSYS;
-
-    int opts = (nofollow || tx.is_dev_shm) ? XATTR_NOFOLLOW : 0;
+    int opts = xattr_resolve_path(path, nofollow, &tx);
+    if (opts < 0)
+        return opts;
 
     if (size == 0) {
         ssize_t ret = getxattr(tx.host_path, name, NULL, 0, 0, opts);
@@ -119,14 +139,13 @@ int64_t sys_setxattr(guest_t *g,
         return -LINUX_EFAULT;
 
     path_translation_t tx;
-    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
-                          &tx) < 0)
-        return linux_errno();
-    if (tx.fuse_path)
-        return -LINUX_ENOSYS;
+    int opts = xattr_resolve_path(path, nofollow, &tx);
+    if (opts < 0)
+        return opts;
+    int64_t err;
 
     void *buf;
-    int64_t err = xattr_alloc_buf(size, &buf);
+    err = xattr_alloc_buf(size, &buf);
     if (err < 0)
         return err;
     if (size > 0 && guest_read(g, value_gva, buf, (size_t) size) < 0) {
@@ -134,7 +153,6 @@ int64_t sys_setxattr(guest_t *g,
         return -LINUX_EFAULT;
     }
 
-    int opts = (nofollow || tx.is_dev_shm) ? XATTR_NOFOLLOW : 0;
     err = xattr_translate_flags(flags, &opts);
     if (err < 0) {
         free(buf);
@@ -157,13 +175,9 @@ int64_t sys_listxattr(guest_t *g,
         return -LINUX_EFAULT;
 
     path_translation_t tx;
-    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
-                          &tx) < 0)
-        return linux_errno();
-    if (tx.fuse_path)
-        return -LINUX_ENOSYS;
-
-    int opts = (nofollow || tx.is_dev_shm) ? XATTR_NOFOLLOW : 0;
+    int opts = xattr_resolve_path(path, nofollow, &tx);
+    if (opts < 0)
+        return opts;
 
     if (size == 0) {
         ssize_t ret = listxattr(tx.host_path, NULL, 0, opts);
@@ -193,13 +207,9 @@ int64_t sys_removexattr(guest_t *g,
         return -LINUX_EFAULT;
 
     path_translation_t tx;
-    if (path_translate_at(LINUX_AT_FDCWD, path, path_tr_nofollow(nofollow),
-                          &tx) < 0)
-        return linux_errno();
-    if (tx.fuse_path)
-        return -LINUX_ENOSYS;
-
-    int opts = (nofollow || tx.is_dev_shm) ? XATTR_NOFOLLOW : 0;
+    int opts = xattr_resolve_path(path, nofollow, &tx);
+    if (opts < 0)
+        return opts;
     int ret = removexattr(tx.host_path, name, opts);
     return ret < 0 ? linux_errno() : 0;
 }
