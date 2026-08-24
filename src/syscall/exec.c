@@ -1191,6 +1191,68 @@ static void exec_publish_maps(guest_t *g, const exec_image_t *img)
     guest_invalidate_ptes(g, 0, 0x1000);
 }
 
+/* The EL0 address space an image is entered on. The three travel together
+ * because a TTBR without its TCR is not a translation regime.
+ */
+typedef struct {
+    uint64_t ttbr0;
+    uint64_t ttbr1;
+    uint64_t tcr;
+} exec_addr_space_t;
+
+/* Program EL0 for the image just loaded, then re-enter through the shim.
+ *
+ * Every register the new program starts on is written here rather than restored
+ * from the syscall frame the shim saved on entry. No X8=2 drop-frame marker
+ * appears because there is no frame to drop: the MMU-off _start re-entry never
+ * pops one, and sys_execve returns SYSCALL_EXEC_HAPPENED so the dispatch
+ * epilogue does not run. The marker belongs to the paths that ERET out of the
+ * saved frame, which is signal delivery and rt_sigreturn.
+ *
+ * The caller has passed the point of no return, so a failed write is fatal
+ * rather than an errno: resuming on half-staged translation or return state is
+ * worse than stopping. exec_stage_mmu_off_reentry below already reasons that
+ * way, and these writes are the same commitment.
+ */
+static void exec_enter_new_image(hv_vcpu_t vcpu,
+                                 guest_t *g,
+                                 uint64_t entry_point,
+                                 uint64_t sp,
+                                 const exec_addr_space_t *as)
+{
+    uint64_t entry_ipa = guest_ipa(g, entry_point), sp_ipa = guest_ipa(g, sp);
+
+    /* Switch EL0 translation to the rebuilt page tables. */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, as->ttbr0));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, as->tcr));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, as->ttbr1));
+
+    /* The shim will ERET to this address after syscall dispatch returns. */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, entry_ipa));
+
+    /* SP_EL0 points at the freshly built Linux initial stack. */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, sp_ipa));
+
+    /* SPSR_EL1: EL0t, AArch64 */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0x0));
+
+    /* Reset TPIDR_EL0 (thread-local storage base). The previous program's TLS
+     * pointer must not leak into the new program because glibc's ld-linux uses
+     * TLS very early (GL() macro accesses static TLS), and a stale TPIDR_EL0
+     * causes it to read garbage for its internal state (link_map l_relocated
+     * flags, scope lists, etc.), breaking relocation.
+     */
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, 0));
+
+    /* Drop all register contents from the old image and re-enter through the
+     * shim's MMU-off _start protocol (TLBI before any translated fetch).
+     */
+    exec_stage_mmu_off_reentry(vcpu, g);
+    tlbi_request_clear();
+
+    exec_sync_vcpu_regs(vcpu);
+}
+
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_execve(hv_vcpu_t vcpu,
                    guest_t *g,
@@ -1861,23 +1923,16 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base,
                               shim_size);
 
-        uint64_t entry_ipa = guest_ipa(g, r_entry);
-        uint64_t sp_ipa = guest_ipa(g, r_sp);
-
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, r_ttbr0);
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, TCR_EL1_VALUE_KBUF);
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, g->ttbr1);
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, entry_ipa);
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, sp_ipa);
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0x0);
-        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, 0);
-        exec_stage_mmu_off_reentry(vcpu, g);
-        tlbi_request_clear();
-
-        exec_sync_vcpu_regs(vcpu);
+        /* The kbuf alias lives under TTBR1, so the translator enters on a
+         * different regime than a native image does. Everything else about
+         * entering an image is the same, hence the shared helper.
+         */
+        const exec_addr_space_t as = {r_ttbr0, g->ttbr1, TCR_EL1_VALUE_KBUF};
+        exec_enter_new_image(vcpu, g, r_entry, r_sp, &as);
 
         log_debug("execve: rosetta target %s, entry=0x%llx sp=0x%llx", path,
-                  (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
+                  (unsigned long long) guest_ipa(g, r_entry),
+                  (unsigned long long) guest_ipa(g, r_sp));
         free(temp_str);
         if (exec_fd >= 0) {
             close(exec_fd);
@@ -2025,41 +2080,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         proc_set_auxv(auxv.words, auxv.nwords * sizeof(auxv.words[0]));
     }
 
-    /* Replace the saved syscall-return state with the new program entry. */
-    uint64_t entry_ipa = guest_ipa(g, entry_point), sp_ipa = guest_ipa(g, sp);
-
-    /* Switch EL0 translation to the rebuilt page tables. */
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, ttbr0);
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, TCR_EL1_VALUE);
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, 0);
-
-    /* The shim will ERET to this address after syscall dispatch returns. */
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, entry_ipa);
-
-    /* SP_EL0 points at the freshly built Linux initial stack. */
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, sp_ipa);
-
-    /* SPSR_EL1: EL0t, AArch64 */
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0x0);
-
-    /* Reset TPIDR_EL0 (thread-local storage base). The previous program's TLS
-     * pointer must not leak into the new program because glibc's ld-linux uses
-     * TLS very early (GL() macro accesses static TLS), and a stale TPIDR_EL0
-     * causes it to read garbage for its internal state (link_map l_relocated
-     * flags, scope lists, etc.), breaking relocation.
-     */
-    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, 0);
-
-    /* Drop all register contents from the old image and re-enter through the
-     * shim's MMU-off _start protocol (TLBI before any translated fetch).
-     */
-    exec_stage_mmu_off_reentry(vcpu, g);
-    tlbi_request_clear();
-
-    exec_sync_vcpu_regs(vcpu);
-
+    const exec_addr_space_t as = {ttbr0, 0, TCR_EL1_VALUE};
+    exec_enter_new_image(vcpu, g, entry_point, sp, &as);
     log_debug("execve: loaded %s, entry=0x%llx sp=0x%llx", path_host,
-              (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
+              (unsigned long long) guest_ipa(g, entry_point),
+              (unsigned long long) guest_ipa(g, sp));
 
     free(temp_str);
     if (exec_fd >= 0)
