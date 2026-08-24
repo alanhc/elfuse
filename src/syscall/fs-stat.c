@@ -260,8 +260,9 @@ static int64_t stat_at_path(guest_t *g,
             }
         }
     } else {
-        if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+        if (ref_err < 0)
+            return ref_err;
 
         int intercepted = PROC_NOT_INTERCEPTED;
         if (path_might_use_stat_intercept(tx.intercept_path)) {
@@ -319,9 +320,10 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
     }
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0) {
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0) {
         log_debug("fstat(%d): invalid guest fd", fd);
-        return -LINUX_EBADF;
+        return ref_err;
     }
     if (fstat(host_ref.fd, &mac_st) < 0) {
         log_debug("fstat(%d->%d): host fstat failed errno=%d", fd, host_ref.fd,
@@ -577,8 +579,9 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
     }
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     struct statfs mac_st;
     if (fstatfs(host_ref.fd, &mac_st) < 0) {

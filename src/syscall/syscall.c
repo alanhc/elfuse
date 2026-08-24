@@ -2213,8 +2213,9 @@ static int64_t sc_execveat(guest_t *g,
         /* path_gva is already x1, use directly */
     } else if (flags & LINUX_AT_EMPTY_PATH) {
         host_fd_ref_t dir_ref;
-        if (host_fd_ref_open(dirfd, &dir_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open(dirfd, &dir_ref);
+        if (ref_err < 0)
+            return ref_err;
         if (fcntl(dir_ref.fd, F_GETPATH, resolved) < 0) {
             host_fd_ref_close(&dir_ref);
             return -LINUX_ENOENT;
@@ -2239,8 +2240,9 @@ static int64_t sc_execveat(guest_t *g,
         if (tx.fuse_path || tx.proc_resolved != 0)
             return -LINUX_ENOSYS;
         host_fd_ref_t dir_ref;
-        if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+        if (ref_err < 0)
+            return ref_err;
 
         /* O_CLOEXEC: the descriptor is closed a few lines below, but a
          * concurrent execve on another vCPU thread inside that window would

@@ -1322,8 +1322,9 @@ static int64_t host_fd_ref_open_checked(int guest_fd,
                                         fd_block_state_t *st_out)
 {
     fd_block_state_t st;
-    if (host_fd_ref_open_state(guest_fd, ref, &st) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open_state(guest_fd, ref, &st);
+    if (ref_err < 0)
+        return ref_err;
 
     if (st.type == FD_PATH || (st.seals & LINUX_F_SEAL_WRITE)) {
         int64_t err = (st.type == FD_PATH) ? -LINUX_EBADF : -LINUX_EPERM;
@@ -1886,8 +1887,9 @@ static int64_t vec_zero_iovcnt(int fd, bool op_is_write, bool positional)
         return 0;
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     int64_t ret = 0;
     if (positional && lseek(host_ref.fd, 0, SEEK_CUR) < 0 && errno == ESPIPE)

@@ -722,8 +722,9 @@ int64_t sys_openat_path(guest_t *g,
     }
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     int host_fd =
         open_nonblocking_writer(dir_ref.fd, tx.host_path, flags, mode);
@@ -1475,8 +1476,9 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             return shadow_fl;
 
         host_fd_ref_t host_ref;
-        if (host_fd_ref_open(fd, &host_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        if (ref_err < 0)
+            return ref_err;
         int mac_fl = fcntl(host_ref.fd, F_GETFL);
         host_fd_ref_close(&host_ref);
         if (mac_fl < 0)
@@ -1577,8 +1579,9 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             return -LINUX_EINVAL;
 
         host_fd_ref_t host_ref;
-        if (host_fd_ref_open(fd, &host_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        if (ref_err < 0)
+            return ref_err;
 
         /* An owned fd keeps O_NONBLOCK on the host whatever the guest asks; the
          * request is recorded in the shadow below and the transfer paths read
@@ -1632,8 +1635,9 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     case 6:   /* F_SETLK */
     case 7: { /* F_SETLKW */
         host_fd_ref_t host_ref;
-        if (host_fd_ref_open(fd, &host_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        if (ref_err < 0)
+            return ref_err;
         int mac_cmd = (cmd == 5) ? F_GETLK : (cmd == 6) ? F_SETLK : F_SETLKW;
         int64_t rc = fcntl_flock_wait(g, &host_ref, arg, mac_cmd, cmd == 5,
                                       false, cmd == 7);
@@ -1645,8 +1649,9 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     case 37:   /* F_OFD_SETLK */
     case 38: { /* F_OFD_SETLKW */
         host_fd_ref_t host_ref;
-        if (host_fd_ref_open(fd, &host_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        if (ref_err < 0)
+            return ref_err;
         int mac_cmd = (cmd == 36)   ? F_OFD_GETLK
                       : (cmd == 37) ? F_OFD_SETLK
                                     : F_OFD_SETLKW;
@@ -1762,8 +1767,9 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         return fd_table[fd].seals;
     case LINUX_F_ADD_SEALS: {
         host_fd_ref_t host_ref;
-        if (host_fd_ref_open(fd, &host_ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+        if (ref_err < 0)
+            return ref_err;
         int cur = fd_table[fd].seals;
         /* Cannot add seals if F_SEAL_SEAL is already set */
         if (cur & LINUX_F_SEAL_SEAL) {
@@ -2059,8 +2065,9 @@ int64_t sys_fchdir(int fd)
         return fuse_rc;
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     char proc_virt[64];
     const char *proc_virtual = proc_virtual_dir_path(
@@ -2217,8 +2224,9 @@ int64_t sys_readlinkat(guest_t *g,
         return -LINUX_ENOSYS;
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     /* Apply sysroot redirect for absolute paths */
     ssize_t len = readlinkat(path_translation_dirfd(&tx, &dir_ref),
@@ -2253,8 +2261,9 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
         return rc;
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     /* path_translate_at rewrites /dev/shm/<name> to the absolute backing path,
      * so shm_unlink works; path_translation_dirfd drops the guest dirfd there.
@@ -2296,8 +2305,9 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode)
         return rc;
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     if (mkdirat(path_translation_dirfd(&tx, &dir_ref), tx.host_path,
                 (mode_t) mode) < 0) {
@@ -2348,11 +2358,13 @@ int64_t sys_renameat2(guest_t *g,
         return -LINUX_ENOSYS;
 
     host_fd_ref_t olddir_ref, newdir_ref;
-    if (host_dirfd_ref_open(olddirfd, &olddir_ref) < 0)
-        return -LINUX_EBADF;
-    if (host_dirfd_ref_open(newdirfd, &newdir_ref) < 0) {
+    int64_t ref_err = host_dirfd_ref_open(olddirfd, &olddir_ref);
+    if (ref_err < 0)
+        return ref_err;
+    ref_err = host_dirfd_ref_open(newdirfd, &newdir_ref);
+    if (ref_err < 0) {
         host_fd_ref_close(&olddir_ref);
-        return -LINUX_EBADF;
+        return ref_err;
     }
     host_fd_t old_host_dirfd = path_translation_dirfd(&old_tx, &olddir_ref);
     host_fd_t new_host_dirfd = path_translation_dirfd(&new_tx, &newdir_ref);
@@ -2451,8 +2463,9 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva, int mode, int dev)
         return rc;
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     /* FIFO via mkfifoat and regular files via openat are supported; device
      * nodes need root
@@ -2608,8 +2621,9 @@ int64_t sys_symlinkat(guest_t *g,
         return rc;
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     /* An absolute target is stored verbatim, but the host kernel resolves it
      * against the real host root -- not --sysroot -- whenever anything follows
@@ -2675,11 +2689,13 @@ int64_t sys_linkat(guest_t *g,
         return -LINUX_ENOSYS;
 
     host_fd_ref_t olddir_ref, newdir_ref;
-    if (host_dirfd_ref_open(olddirfd, &olddir_ref) < 0)
-        return -LINUX_EBADF;
-    if (host_dirfd_ref_open(newdirfd, &newdir_ref) < 0) {
+    int64_t ref_err = host_dirfd_ref_open(olddirfd, &olddir_ref);
+    if (ref_err < 0)
+        return ref_err;
+    ref_err = host_dirfd_ref_open(newdirfd, &newdir_ref);
+    if (ref_err < 0) {
         host_fd_ref_close(&olddir_ref);
-        return -LINUX_EBADF;
+        return ref_err;
     }
     host_fd_t old_host_dirfd = path_translation_dirfd(&old_tx, &olddir_ref);
     host_fd_t new_host_dirfd = path_translation_dirfd(&new_tx, &newdir_ref);
@@ -2787,8 +2803,9 @@ int64_t sys_faccessat(guest_t *g,
     }
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     /* Check intercepted stat paths first since macOS has no /proc filesystem
      * and the sysfs CPU tree is synthetic. Access must reflect the synthetic
@@ -2832,8 +2849,9 @@ int64_t sys_ftruncate(int fd, int64_t length)
         return -LINUX_EPERM;
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     if (seals & (LINUX_F_SEAL_SHRINK | LINUX_F_SEAL_GROW)) {
         struct stat st;
@@ -2904,8 +2922,9 @@ int64_t sys_fchmod(int fd, uint32_t mode)
     if (fd_snapshot(fd, &snap) && snap.type == FD_PATH)
         return -LINUX_EBADF;
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
     if (fchmod(host_ref.fd, mode) < 0) {
         host_fd_ref_close(&host_ref);
         return linux_errno();
@@ -2957,8 +2976,9 @@ int64_t sys_fchmodat(guest_t *g,
             return -LINUX_EPERM;
 
         host_fd_ref_t ref;
-        if (host_dirfd_ref_open(dirfd, &ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+        if (ref_err < 0)
+            return ref_err;
         if (fchmod(ref.fd, mode) < 0) {
             host_fd_ref_close(&ref);
             return linux_errno();
@@ -3004,8 +3024,9 @@ int64_t sys_fchmodat(guest_t *g,
         return 0;
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     int mac_flags = path_translation_at_flags(&tx, translate_at_flags(flags));
     if (fchmodat(path_translation_dirfd(&tx, &dir_ref), tx.host_path, mode,
@@ -3130,8 +3151,9 @@ int64_t sys_fchownat(guest_t *g,
             return -LINUX_EPERM;
 
         host_fd_ref_t ref;
-        if (host_dirfd_ref_open(dirfd, &ref) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_dirfd_ref_open(dirfd, &ref);
+        if (ref_err < 0)
+            return ref_err;
 
         int host_rc = fchown(ref.fd, owner, group);
         int saved_errno = errno;
@@ -3194,8 +3216,9 @@ int64_t sys_fchownat(guest_t *g,
     }
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     int mac_flags = path_translation_at_flags(&tx, translate_at_flags(flags));
     host_fd_t host_dirfd = path_translation_dirfd(&tx, &dir_ref);
@@ -3236,8 +3259,9 @@ int64_t sys_fchown(int fd, uint32_t owner, uint32_t group)
     if (fd_snapshot(fd, &snap) && snap.type == FD_PATH)
         return -LINUX_EBADF;
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     int host_rc = fchown(host_ref.fd, owner, group);
     int saved_errno = errno;
@@ -3287,8 +3311,9 @@ int64_t sys_utimensat(guest_t *g,
         return -LINUX_EINVAL;
 
     host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     /* If path is NULL (path_gva == 0), operate on the dirfd itself */
     const char *path_arg = NULL;

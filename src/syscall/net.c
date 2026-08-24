@@ -527,8 +527,9 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
         return netlink_bind(fd, g, addr_gva, addrlen);
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     uint8_t linux_sa[128];
     if (addrlen > sizeof(linux_sa)) {
@@ -583,8 +584,9 @@ int64_t sys_bind(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
 int64_t sys_listen(int fd, int backlog)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     if (listen(host_ref.fd, backlog) < 0) {
         host_fd_ref_close(&host_ref);
@@ -613,8 +615,9 @@ static int64_t do_accept(guest_t *g,
     fd_block_state_t sock_st = {.type = FD_CLOSED};
 
     if (thread_is_single_active()) {
-        if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
-            return -LINUX_EBADF;
+        int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &sock_st);
+        if (ref_err < 0)
+            return ref_err;
         listener_type = fd_table[fd].type;
         listener_generation = fd_table[fd].generation;
         if (listener_type == FD_SOCKET)
@@ -748,8 +751,9 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
 {
     host_fd_ref_t host_ref;
     fd_block_state_t sock_st;
-    if (host_fd_ref_open_state(fd, &host_ref, &sock_st) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &sock_st);
+    if (ref_err < 0)
+        return ref_err;
 
     uint8_t linux_sa[128];
     if (addrlen > sizeof(linux_sa)) {
@@ -940,8 +944,9 @@ int64_t sys_getsockname(guest_t *g,
         return netlink_getsockname(fd, g, addr_gva, addrlen_gva);
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     struct sockaddr_storage mac_sa;
     socklen_t mac_len = sizeof(mac_sa);
@@ -996,8 +1001,9 @@ int64_t sys_getpeername(guest_t *g,
                         uint64_t addrlen_gva)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     struct sockaddr_storage mac_sa;
     socklen_t mac_len = sizeof(mac_sa);
@@ -1031,8 +1037,9 @@ int64_t sys_sendto(guest_t *g,
 
     host_fd_ref_t host_ref;
     fd_block_state_t send_st;
-    if (host_fd_ref_open_state(fd, &host_ref, &send_st) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &send_st);
+    if (ref_err < 0)
+        return ref_err;
 
     uint64_t avail = 0;
     void *buf =
@@ -1164,8 +1171,9 @@ int64_t sys_recvfrom(guest_t *g,
 
     host_fd_ref_t host_ref;
     fd_block_state_t recv_st;
-    if (host_fd_ref_open_state(fd, &host_ref, &recv_st) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open_state(fd, &host_ref, &recv_st);
+    if (ref_err < 0)
+        return ref_err;
 
     uint64_t avail = 0;
     void *buf =
@@ -1481,8 +1489,9 @@ int64_t sys_setsockopt(guest_t *g,
     }
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     int mac_level = level, mac_optname = optname;
 
@@ -1647,8 +1656,9 @@ int64_t sys_getsockopt(guest_t *g,
     }
 
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     int mac_level = level, mac_optname = optname;
     int small_int_opt = socket_opt_uses_small_int(level, optname);
@@ -1771,8 +1781,9 @@ getsockopt_translated:
 int64_t sys_shutdown(int fd, int how)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     /* Shutdown constants are identical on Linux and macOS */
     if (shutdown(host_ref.fd, how) < 0) {

@@ -221,8 +221,9 @@ int64_t sys_fgetxattr(guest_t *g,
                       uint64_t size)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     char name[LINUX_XATTR_NAME_MAX + 1];
     if (guest_read_str(g, name_gva, name, sizeof(name)) < 0) {
@@ -302,8 +303,9 @@ int64_t sys_fsetxattr(guest_t *g,
 int64_t sys_flistxattr(guest_t *g, int fd, uint64_t list_gva, uint64_t size)
 {
     host_fd_ref_t host_ref;
-    if (host_fd_ref_open(fd, &host_ref) < 0)
-        return -LINUX_EBADF;
+    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
+    if (ref_err < 0)
+        return ref_err;
 
     if (size == 0) {
         ssize_t ret = flistxattr(host_ref.fd, NULL, 0, 0);
