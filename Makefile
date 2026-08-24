@@ -336,6 +336,12 @@ $(BUILD_DIR)/test-dup-setfl-race: tests/test-dup-setfl-race.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-uevent-socket races two threads through socket(AF_NETLINK) and parks a
+# blocking receive until a second thread pokes the rtnetlink fd.
+$(BUILD_DIR)/test-uevent-socket: tests/test-uevent-socket.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-pthread needs -lpthread
 $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

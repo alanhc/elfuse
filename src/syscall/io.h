@@ -44,6 +44,18 @@ void io_init(void);
  */
 int64_t io_wait_fd_or_interrupted(int host_fd, short events);
 
+/* Same wait, bounded by a caller's deadline. timeout_ms < 0 is the untimed wait
+ * above; 0 or more caps the whole wait, not each of its interrupt-recheck
+ * slices, so a bounded caller cannot be stretched by them.
+ *
+ * Returns 0 when ready, 1 when the timeout expired first, -LINUX_EINTR when
+ * interrupted, or a negative Linux errno on poll failure. Only the SO_RCVTIMEO
+ * receive path needs the bound; everything else takes the untimed spelling.
+ */
+int64_t io_wait_fd_timed_or_interrupted(int host_fd,
+                                        short events,
+                                        int timeout_ms);
+
 /* Consecutive EAGAINs from a transfer the wait called ready, before io_xfer
  * stops retrying at full speed and starts backing off.
  *

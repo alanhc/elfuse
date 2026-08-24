@@ -434,6 +434,70 @@ Socket syscalls are translated in `src/syscall/net.c` and friends:
 - `SOL_SOCKET` option numbers (`SO_TYPE`, `SO_SNDBUF`, `SO_RCVBUF`, …)
   differ between platforms and are remapped per option.
 
+Netlink sockets are emulated in `src/syscall/netlink.c`: `NETLINK_ROUTE`
+answers the `RTM_GETLINK` / `RTM_GETADDR` dumps `getifaddrs` issues, and
+`NETLINK_KOBJECT_UEVENT` sockets are accepted as silent sockets -- no uevent
+is ever synthesized, so the fd never becomes readable, which is exactly a
+real Linux kernel with no hotplug activity -- because libusb-style hotplug
+monitors must open, bind, and set `SO_PASSCRED` on one before they will
+initialize at all.
+
+`socket()` validates its type argument the way `__sock_create()` and
+`netlink_create()` do, in that order: an unknown bit outside
+`SOCK_NONBLOCK|SOCK_CLOEXEC` is `EINVAL`, and a base type other than
+`SOCK_RAW` or `SOCK_DGRAM` is `ESOCKTNOSUPPORT` -- before the protocol
+number is looked at, so `socket(AF_NETLINK, SOCK_STREAM, 99)` reports the
+type error and not the family one.
+
+`SOL_SOCKET` options on a netlink fd follow `sk_setsockopt` /
+`sk_getsockopt` rather than being accepted and forgotten: whatever can be
+set can be read back, `SO_RCVBUF` and `SO_SNDBUF` clamp-double-floor at the
+two different `SOCK_MIN_*` floors, `SO_RCVTIMEO` really does bound a
+blocking receive, and the options Linux refuses (`SO_SNDLOWAT`, a
+privileged `SO_DEBUG`, a non-inet `SO_REUSEPORT`, a short `SO_LINGER` or
+timeout `optlen`) are refused with the same errno.
+
+`SO_RCVTIMEO` and `SO_SNDTIMEO` are stored as `sk_rcvtimeo` /
+`sk_sndtimeo` are: a jiffy count with `HZ` pinned at 1000, which gives
+`sock_set_timeout()`'s three states rather than two. `{0, 0}` and any
+`tv_sec` past `MAX_SCHEDULE_TIMEOUT/HZ - 1` mean wait forever; a negative
+`tv_sec` means do not wait at all, so a blocking receive under it reports
+`EAGAIN` at once; anything else is that many milliseconds, rounded up from
+a sub-jiffy `tv_usec`. Both of the first two read back as `{0, 0}`, exactly
+as `sock_get_timeout()` reports them, so only a receive can tell them
+apart. The deadline such a timeout produces is added to the clock with
+saturation, since the largest one Linux accepts is within seconds of
+overflowing a 64-bit millisecond count.
+
+An interrupted receive with a finite timeout forbids the SVC restart only
+when the interruption is one the guest can see. `io_wait_fd_timed_or_-
+interrupted()` also reports `EINTR` for the dispatcher's own execve
+handoff, which no signal accompanies; forbidding there turned a sibling's
+`execve` into an `EINTR` on a `recvmsg`. The restarted call instead resumes
+the deadline the interrupted attempt was using, which is what Linux's
+`restart_block` carries.
+
+`SOL_NETLINK` is emulated under the same contract `bind()` gives -- the
+membership and the flags are recorded, and no multicast traffic is ever
+synthesized to deliver on them. `NETLINK_ADD_MEMBERSHIP` /
+`NETLINK_DROP_MEMBERSHIP` range-check the group and return 0;
+`NETLINK_LIST_MEMBERSHIPS` reads the resulting bitmap back;
+`NETLINK_PKTINFO`, `NETLINK_BROADCAST_ERROR`, `NETLINK_NO_ENOBUFS`,
+`NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and `NETLINK_GET_STRICT_CHK` set and
+read back as flags (a libnl or libmnl monitor sets several of these on the
+way up and treats a refusal as a broken socket); `NETLINK_LISTEN_ALL_NSID`
+wants `CAP_NET_ADMIN` and reports `EPERM`; the removed mmap ring options
+and anything else report `ENOPROTOOPT`.
+
+Netlink socket state is keyed by guest fd number, and a guest fd number
+outlives its socket: `fd_cleanup_entry()` runs the netlink teardown after
+the number is already back in the fd table's free pool, so a concurrent
+`socket()` can be handed it while the previous slot is still live. Slots
+therefore carry an allocation generation -- lookups answer with the newest
+slot for a number and teardown retires the oldest -- which pairs each
+teardown with the socket that asked for it whatever order the threads
+arrive in.
+
 ### Stack Alignment
 
 The Linux initial stack must have `SP` 16-byte aligned and pointing directly

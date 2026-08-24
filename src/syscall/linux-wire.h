@@ -64,6 +64,7 @@ typedef struct {
 #define LINUX_EFBIG 27
 #define LINUX_ENOSPC 28
 #define LINUX_ESPIPE 29
+#define LINUX_EDOM 33
 #define LINUX_ERANGE 34
 #define LINUX_EDEADLK 35
 #define LINUX_ENAMETOOLONG 36

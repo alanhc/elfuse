@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <termios.h>
+#include <time.h>
 
 #include "utils.h"
 
@@ -248,9 +249,32 @@ int64_t io_retry_backoff(unsigned *backoff_us)
     return 0;
 }
 
+/* Milliseconds on CLOCK_MONOTONIC, for the bounded wait's deadline. */
+static int64_t io_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 int64_t io_wait_fd_or_interrupted(int host_fd, short events)
 {
+    return io_wait_fd_timed_or_interrupted(host_fd, events, -1);
+}
+
+int64_t io_wait_fd_timed_or_interrupted(int host_fd,
+                                        short events,
+                                        int timeout_ms)
+{
     int wake_fd = wakeup_pipe_read_fd();
+
+    /* An absolute deadline rather than a countdown: the 200 ms slices below
+     * exist to re-check interrupt conditions, and charging each one against a
+     * fixed instant keeps a bounded wait bounded no matter how many of them
+     * run. A countdown reset per slice would never expire.
+     */
+    bool bounded = timeout_ms >= 0;
+    int64_t deadline_ms = bounded ? io_now_ms() + timeout_ms : 0;
 
     /* poll() ignores entries with a negative fd, so a missing wakeup pipe just
      * drops the second slot.
@@ -313,7 +337,16 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
          * drain the byte meant to wake this one. The 200 ms recheck guarantees
          * every waiter re-evaluates its own interrupt conditions.
          */
-        int ret = poll(fds, 2, leader_only ? 0 : 200);
+        int slice = leader_only ? 0 : 200;
+        if (bounded && !leader_only) {
+            int64_t left = deadline_ms - io_now_ms();
+            if (left <= 0)
+                return 1;
+            if (left < slice)
+                slice = (int) left;
+        }
+
+        int ret = poll(fds, 2, slice);
         if (ret < 0)
             return linux_errno();
 
@@ -324,6 +357,8 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
 
         if (leader_only)
             return -LINUX_EINTR;
+        if (bounded && deadline_ms - io_now_ms() <= 0)
+            return 1;
     }
 }
 

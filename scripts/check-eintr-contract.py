@@ -125,6 +125,14 @@ INVENTORY = {
         "to write a chunk they have already read. Those decide for themselves "
         "and are listed above.",
     ),
+    "syscall/io.c::io_wait_fd_timed_or_interrupted": (
+        "restartable",
+        "The bounded spelling of the wait above, and restartable for the same "
+        "reason: it transfers nothing. The deadline is the caller's, not its "
+        "own, so the caller that supplied one -- today only the SO_RCVTIMEO "
+        "receive in nl_wait_readable_locked -- is the one that must forbid "
+        "the restart.",
+    ),
     "syscall/fs.c::open_nonblocking_writer": (
         "restartable",
         "FIFO open retry; nothing is opened until it succeeds.",
@@ -269,10 +277,18 @@ INVENTORY = {
         "before the backoff waits.",
     ),
     "syscall/netlink.c::nl_wait_readable_locked": (
-        "restartable",
-        "Waits for a reply to a request an earlier sendmsg put on the wire. "
-        "This call consumed nothing, and the restart waits for the same "
-        "reply.",
+        "forbids",
+        "Conditionally, and that condition is sock_intr_errno()'s: a receive "
+        "with no SO_RCVTIMEO consumed nothing and stays restartable (Linux "
+        "reports ERESTARTSYS there), but one with a finite timeout has spent "
+        "part of it, and a restart would hand the guest the whole timeout a "
+        "second time, so that branch forbids like every other spent deadline "
+        "in this table. Narrowed once more to the guest-visible half of the "
+        "EINTR: the dispatcher's leader-only execve handoff also reports "
+        "EINTR here, carries no signal, and is restarted by design, so the "
+        "forbid is gated on !thread_stop_is_leader_work_only() and the "
+        "restarted attempt resumes the deadline rather than taking a fresh "
+        "one -- restart_block's job.",
     ),
     "syscall/inotify.c::inotify_read": (
         "restartable",
@@ -366,6 +382,7 @@ FORBID_MARKER = "syscall_restart_forbid()"
 # decision, it does not presume one.
 EINTR_HELPERS = (
     "io_wait_fd_or_interrupted",
+    "io_wait_fd_timed_or_interrupted",
     "net_wait_or_interrupted",
     "net_recv_zero_payload_gate",
     "connect_nonblock_wait",
