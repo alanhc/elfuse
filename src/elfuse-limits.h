@@ -13,11 +13,12 @@
 /* Maximum number of guest-visible file descriptors. */
 #define FD_TABLE_SIZE 1024
 
-/* Host descriptors kept available for elfuse's internal operations. Blocking
- * I/O may hold two duplicated descriptors per guest thread (for example,
- * copy_file_range()), while another bounded slice covers runtime pipes, fork
- * IPC, debugger sockets, and sysroot/FUSE plumbing. Operations whose descriptor
- * use grows with their input set, such as ppoll(), require separate accounting.
+/* Host descriptors kept available for elfuse's internal operations: runtime
+ * pipes, fork IPC, debugger sockets, and sysroot/FUSE plumbing. A syscall's own
+ * reference to a guest descriptor is not part of that budget, because
+ * host_fd_ref_open borrows or pins the fd table's descriptor rather than
+ * duplicating it, so the reserve does not scale with thread count or with the
+ * length of a call's fd set.
  */
 #define HOST_FD_RESERVE 256
 
