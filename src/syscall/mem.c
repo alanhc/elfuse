@@ -2660,6 +2660,57 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
     return (int64_t) guest_ipa(g, g->brk_current);
 }
 
+/* Everything a fresh sys_mmap owns while it is in flight: the caller's backing
+ * fd reference, the tracker's private dup of it, the before-images of the
+ * regions it replaces, and the reserved removal descriptor.
+ */
+typedef struct {
+    int track_backing_fd;
+    int replaced_remove_fd;
+    region_snapshot_t *replaced_snaps;
+    int replaced_nsnaps;
+    host_fd_ref_t backing_ref;
+} mmap_fresh_t;
+
+static void mmap_fresh_init(mmap_fresh_t *fresh)
+{
+    fresh->track_backing_fd = -1;
+    fresh->replaced_remove_fd = -1;
+    fresh->replaced_snaps = NULL;
+    fresh->replaced_nsnaps = 0;
+    host_fd_ref_t empty = HOST_FD_REF_INIT;
+    fresh->backing_ref = empty;
+}
+
+/* Release whatever the mapping still owns, in any state.
+ *
+ * Every primitive here is idempotent and clears what it releases, and an
+ * unacquired descriptor is -1, so one call is correct at any point in the
+ * sequence and a later exit cannot leak by forgetting one.
+ *
+ * Restoring the replaced overlays is deliberately not here, for the reason the
+ * region-array rollback is not in mremap_move_dispose: it is only correct once
+ * the overlays have been removed, so it stays at the exits that know which side
+ * of that they are on.
+ *
+ * The bracket around errno is load-bearing rather than defensive:
+ * close_region_snapshots reaches a raw close, and callers translate the failure
+ * that brought them here after releasing.
+ */
+static void mmap_fresh_dispose(mmap_fresh_t *fresh)
+{
+    int saved_errno = errno;
+    if (fresh->track_backing_fd >= 0)
+        (void) close(fresh->track_backing_fd);
+    fresh->track_backing_fd = -1;
+    if (fresh->replaced_remove_fd >= 0)
+        (void) close(fresh->replaced_remove_fd);
+    fresh->replaced_remove_fd = -1;
+    dispose_region_snapshots(&fresh->replaced_snaps, &fresh->replaced_nsnaps);
+    host_fd_ref_close(&fresh->backing_ref);
+    errno = saved_errno;
+}
+
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,
@@ -2673,8 +2724,9 @@ int64_t sys_mmap(guest_t *g,
     bool needs_exec = (prot & LINUX_PROT_EXEC) != 0;
     bool is_prot_none = (prot == LINUX_PROT_NONE);
     bool is_noreserve = is_anon && (flags & LINUX_MAP_NORESERVE) != 0;
-    host_fd_ref_t backing_ref = HOST_FD_REF_INIT;
-    int host_backing_fd = -1, track_backing_fd = -1;
+    mmap_fresh_t fresh;
+    mmap_fresh_init(&fresh);
+    int host_backing_fd = -1;
 
     /* Tracks whether hvf_apply_file_overlay has installed a host
      * MAP_FIXED|MAP_SHARED mapping that the failure paths must undo if later
@@ -2699,10 +2751,7 @@ int64_t sys_mmap(guest_t *g,
      * actually consumes it; non-FIXED mmaps never touch this pointer. Always
      * free()'d (free(NULL) is a no-op) before return.
      */
-    region_snapshot_t *replaced_snaps = NULL;
-    int replaced_nsnaps = 0;
     bool replaced_regions_removed = false;
-    int replaced_remove_fd = -1;
     int track_flags =
         ((flags & LINUX_MAP_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE);
     if (is_anon)
@@ -2820,45 +2869,41 @@ int64_t sys_mmap(guest_t *g,
         }
 
         if (!is_anon) {
-            if (host_fd_ref_open(fd, &backing_ref) < 0)
+            if (host_fd_ref_open(fd, &fresh.backing_ref) < 0) {
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_EBADF;
-            host_backing_fd = backing_ref.fd;
+            }
+            host_backing_fd = fresh.backing_ref.fd;
         }
 
         remove_range_t replaced = {result_off, result_off + length};
         if (!region_has_capacity_after_removes(g, &replaced, 1, 1)) {
-            host_fd_ref_close(&backing_ref);
+            mmap_fresh_dispose(&fresh);
             return -LINUX_ENOMEM;
         }
         if (guest_region_remove_prepare(g, result_off, result_off + length,
-                                        &replaced_remove_fd) < 0) {
-            host_fd_ref_close(&backing_ref);
+                                        &fresh.replaced_remove_fd) < 0) {
+            mmap_fresh_dispose(&fresh);
             return -LINUX_ENOMEM;
         }
-        replaced_snaps = malloc(GUEST_MAX_REGIONS * sizeof(*replaced_snaps));
-        if (!replaced_snaps) {
-            if (replaced_remove_fd >= 0)
-                close(replaced_remove_fd);
-            host_fd_ref_close(&backing_ref);
+        fresh.replaced_snaps =
+            malloc(GUEST_MAX_REGIONS * sizeof(*fresh.replaced_snaps));
+        if (!fresh.replaced_snaps) {
+            mmap_fresh_dispose(&fresh);
             return -LINUX_ENOMEM;
         }
-        replaced_nsnaps =
+        fresh.replaced_nsnaps =
             capture_region_snapshots(g, result_off, result_off + length,
-                                     replaced_snaps, GUEST_MAX_REGIONS);
-        if (replaced_nsnaps < 0) {
-            if (replaced_remove_fd >= 0)
-                close(replaced_remove_fd);
-            free(replaced_snaps);
-            host_fd_ref_close(&backing_ref);
-            return replaced_nsnaps;
+                                     fresh.replaced_snaps, GUEST_MAX_REGIONS);
+        if (fresh.replaced_nsnaps < 0) {
+            int64_t capture_err = fresh.replaced_nsnaps;
+            mmap_fresh_dispose(&fresh);
+            return capture_err;
         }
         if (!is_anon) {
-            track_backing_fd = dup(host_backing_fd);
-            if (track_backing_fd < 0) {
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
-                host_fd_ref_close(&backing_ref);
+            fresh.track_backing_fd = dup(host_backing_fd);
+            if (fresh.track_backing_fd < 0) {
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_ENOMEM;
             }
             if (!is_prot_none) {
@@ -2868,11 +2913,7 @@ int64_t sys_mmap(guest_t *g,
                     nr = pread(host_backing_fd, &probe, sizeof(probe), offset);
                 } while (nr < 0 && errno == EINTR);
                 if (nr < 0) {
-                    close(track_backing_fd);
-                    if (replaced_remove_fd >= 0)
-                        close(replaced_remove_fd);
-                    dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
-                    host_fd_ref_close(&backing_ref);
+                    mmap_fresh_dispose(&fresh);
                     return linux_errno();
                 }
             }
@@ -2901,27 +2942,17 @@ int64_t sys_mmap(guest_t *g,
             int cleanup_err =
                 cleanup_overlays_in_range(g, result_off, result_off + length);
             if (cleanup_err < 0) {
-                (void) restore_snapshot_overlays_in_place(g, replaced_snaps,
-                                                          replaced_nsnaps);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
-                host_fd_ref_close(&backing_ref);
+                (void) restore_snapshot_overlays_in_place(
+                    g, fresh.replaced_snaps, fresh.replaced_nsnaps);
+                mmap_fresh_dispose(&fresh);
                 return cleanup_err;
             }
 
             if (guest_extend_page_tables(g, ext_start, ext_end, page_perms) <
                 0) {
-                (void) restore_snapshot_overlays_in_place(g, replaced_snaps,
-                                                          replaced_nsnaps);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
-                host_fd_ref_close(&backing_ref);
+                (void) restore_snapshot_overlays_in_place(
+                    g, fresh.replaced_snaps, fresh.replaced_nsnaps);
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_ENOMEM;
             }
 
@@ -2929,8 +2960,8 @@ int64_t sys_mmap(guest_t *g,
              * succeeds.
              */
             guest_region_remove_reserved(g, result_off, result_off + length,
-                                         replaced_remove_fd);
-            replaced_remove_fd = -1;
+                                         fresh.replaced_remove_fd);
+            fresh.replaced_remove_fd = -1;
             replaced_regions_removed = true;
 
             /* Fine-tune permissions for the exact range. Handles L3 splitting
@@ -2959,21 +2990,14 @@ int64_t sys_mmap(guest_t *g,
                                            host_backing_fd, (off_t) offset);
                 if (oerr < 0) {
                     int restore_err = restore_region_snapshots(
-                        g, replaced_snaps, replaced_nsnaps);
+                        g, fresh.replaced_snaps, fresh.replaced_nsnaps);
                     if (restore_err == 0)
                         restore_err = restore_snapshot_page_tables(
-                            g, result_off, result_off + length, replaced_snaps,
-                            replaced_nsnaps);
-                    if (track_backing_fd >= 0)
-                        close(track_backing_fd);
-                    if (restore_err < 0) {
-                        dispose_region_snapshots(&replaced_snaps,
-                                                 &replaced_nsnaps);
-                        host_fd_ref_close(&backing_ref);
+                            g, result_off, result_off + length,
+                            fresh.replaced_snaps, fresh.replaced_nsnaps);
+                    mmap_fresh_dispose(&fresh);
+                    if (restore_err < 0)
                         return restore_err;
-                    }
-                    dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
-                    host_fd_ref_close(&backing_ref);
                     return oerr;
                 }
                 overlay_installed = true;
@@ -3011,21 +3035,14 @@ int64_t sys_mmap(guest_t *g,
                 }
                 if (read_io_err) {
                     int restore_err = restore_region_snapshots(
-                        g, replaced_snaps, replaced_nsnaps);
+                        g, fresh.replaced_snaps, fresh.replaced_nsnaps);
                     if (restore_err == 0)
                         restore_err = restore_snapshot_page_tables(
-                            g, result_off, result_off + length, replaced_snaps,
-                            replaced_nsnaps);
-                    if (track_backing_fd >= 0)
-                        close(track_backing_fd);
-                    if (restore_err < 0) {
-                        dispose_region_snapshots(&replaced_snaps,
-                                                 &replaced_nsnaps);
-                        host_fd_ref_close(&backing_ref);
+                            g, result_off, result_off + length,
+                            fresh.replaced_snaps, fresh.replaced_nsnaps);
+                    mmap_fresh_dispose(&fresh);
+                    if (restore_err < 0)
                         return restore_err;
-                    }
-                    dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
-                    host_fd_ref_close(&backing_ref);
                     errno = saved_errno;
                     return linux_errno();
                 }
@@ -3037,21 +3054,16 @@ int64_t sys_mmap(guest_t *g,
             int cleanup_err =
                 cleanup_overlays_in_range(g, result_off, result_off + length);
             if (cleanup_err < 0) {
-                (void) restore_snapshot_overlays_in_place(g, replaced_snaps,
-                                                          replaced_nsnaps);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                if (replaced_remove_fd >= 0)
-                    close(replaced_remove_fd);
-                dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
-                host_fd_ref_close(&backing_ref);
+                (void) restore_snapshot_overlays_in_place(
+                    g, fresh.replaced_snaps, fresh.replaced_nsnaps);
+                mmap_fresh_dispose(&fresh);
                 return cleanup_err;
             }
 
             /* Remove any existing region coverage in the fixed range. */
             guest_region_remove_reserved(g, result_off, result_off + length,
-                                         replaced_remove_fd);
-            replaced_remove_fd = -1;
+                                         fresh.replaced_remove_fd);
+            fresh.replaced_remove_fd = -1;
             replaced_regions_removed = true;
 
             /* PROT_NONE with MAP_FIXED: invalidate existing page table entries
@@ -3083,9 +3095,11 @@ int64_t sys_mmap(guest_t *g,
          * Closes on every failure path within the non-fixed branch.
          */
         if (!is_anon) {
-            if (host_fd_ref_open(fd, &backing_ref) < 0)
+            if (host_fd_ref_open(fd, &fresh.backing_ref) < 0) {
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_EBADF;
-            host_backing_fd = backing_ref.fd;
+            }
+            host_backing_fd = fresh.backing_ref.fd;
         }
 
         /* Prefer stage-2 2 MiB block boundaries for non-fixed MAP_SHARED
@@ -3127,7 +3141,7 @@ int64_t sys_mmap(guest_t *g,
                     (unsigned long long) length,
                     (unsigned long long) g->mmap_limit, g->ipa_bits,
                     (unsigned long long) (g->guest_size >> 30));
-                host_fd_ref_close(&backing_ref);
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_ENOMEM;
             }
             /* High-water mark for fork IPC state transfer */
@@ -3188,7 +3202,7 @@ int64_t sys_mmap(guest_t *g,
                     (unsigned long long) length,
                     (unsigned long long) g->mmap_limit, g->ipa_bits,
                     (unsigned long long) (g->guest_size >> 30));
-                host_fd_ref_close(&backing_ref);
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_ENOMEM;
             }
             /* High-water mark for fork IPC state transfer */
@@ -3197,13 +3211,13 @@ int64_t sys_mmap(guest_t *g,
                 g->mmap_next = rw_hwm;
         }
         if (!region_has_capacity_after_removes(g, NULL, 0, 1)) {
-            host_fd_ref_close(&backing_ref);
+            mmap_fresh_dispose(&fresh);
             return -LINUX_ENOMEM;
         }
         if (!is_anon) {
-            track_backing_fd = dup(host_backing_fd);
-            if (track_backing_fd < 0) {
-                host_fd_ref_close(&backing_ref);
+            fresh.track_backing_fd = dup(host_backing_fd);
+            if (fresh.track_backing_fd < 0) {
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_ENOMEM;
             }
         }
@@ -3232,9 +3246,7 @@ int64_t sys_mmap(guest_t *g,
                 ext_end = g->mmap_limit;
             if (guest_extend_page_tables(g, ext_start, ext_end, MEM_PERM_RX) <
                 0) {
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                host_fd_ref_close(&backing_ref);
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_ENOMEM;
             }
 
@@ -3260,9 +3272,7 @@ int64_t sys_mmap(guest_t *g,
                 ext_perms |= MEM_PERM_X;
             if (guest_extend_page_tables(g, ext_start, ext_end, ext_perms) <
                 0) {
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                host_fd_ref_close(&backing_ref);
+                mmap_fresh_dispose(&fresh);
                 return -LINUX_ENOMEM;
             }
 
@@ -3322,9 +3332,7 @@ int64_t sys_mmap(guest_t *g,
                 g, result_off, length, false, 0, 0, saved_mmap_next,
                 saved_mmap_end, saved_mmap_rx_next, saved_mmap_rx_end,
                 saved_rw_gap_hint, saved_rx_gap_hint);
-            if (track_backing_fd >= 0)
-                close(track_backing_fd);
-            host_fd_ref_close(&backing_ref);
+            mmap_fresh_dispose(&fresh);
             if (rollback_err < 0)
                 return rollback_err;
             return -LINUX_EACCES;
@@ -3349,9 +3357,7 @@ int64_t sys_mmap(guest_t *g,
                     g, result_off, length, false, 0, 0, saved_mmap_next,
                     saved_mmap_end, saved_mmap_rx_next, saved_mmap_rx_end,
                     saved_rw_gap_hint, saved_rx_gap_hint);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                host_fd_ref_close(&backing_ref);
+                mmap_fresh_dispose(&fresh);
                 if (rollback_err < 0)
                     return rollback_err;
                 return oerr;
@@ -3391,9 +3397,7 @@ int64_t sys_mmap(guest_t *g,
                     g, result_off, length, false, 0, 0, saved_mmap_next,
                     saved_mmap_end, saved_mmap_rx_next, saved_mmap_rx_end,
                     saved_rw_gap_hint, saved_rx_gap_hint);
-                if (track_backing_fd >= 0)
-                    close(track_backing_fd);
-                host_fd_ref_close(&backing_ref);
+                mmap_fresh_dispose(&fresh);
                 if (rollback_err < 0)
                     return rollback_err;
                 errno = saved_errno;
@@ -3404,10 +3408,17 @@ int64_t sys_mmap(guest_t *g,
 
     /* Record the new region. guest_region_add_ex derives shared from the
      * LINUX_MAP_SHARED bit in track_flags for msync write-back.
+     *
+     * The tracker consumes the dup on success or failure, so the local drops
+     * its claim before the call rather than after: every exit below releases
+     * through mmap_fresh_dispose, and a claim left standing here would hand it
+     * a descriptor that is already gone.
      */
+    int owned_backing_fd = fresh.track_backing_fd;
+    fresh.track_backing_fd = -1;
     if (guest_region_add_ex_owned(g, result_off, result_off + length, prot,
                                   track_flags, is_anon ? 0 : (uint64_t) offset,
-                                  NULL, track_backing_fd, false, 0) < 0) {
+                                  NULL, owned_backing_fd, false, 0) < 0) {
         /* Region table was full: undo any host overlay we just installed so the
          * file is not left mmap'd at host_base+ipa with no tracking. Without
          * this, a later operation in that range would memset zeros directly
@@ -3417,12 +3428,12 @@ int64_t sys_mmap(guest_t *g,
         if (replaced_regions_removed) {
             if (overlay_installed)
                 hvf_remove_file_overlay(g, overlay_ipa, overlay_len);
-            rollback_err =
-                restore_region_snapshots(g, replaced_snaps, replaced_nsnaps);
+            rollback_err = restore_region_snapshots(g, fresh.replaced_snaps,
+                                                    fresh.replaced_nsnaps);
             if (rollback_err == 0)
                 rollback_err = restore_snapshot_page_tables(
-                    g, result_off, result_off + length, replaced_snaps,
-                    replaced_nsnaps);
+                    g, result_off, result_off + length, fresh.replaced_snaps,
+                    fresh.replaced_nsnaps);
         } else {
             rollback_err = rollback_fresh_mmap_allocation(
                 g, result_off, length, overlay_installed, overlay_ipa,
@@ -3430,8 +3441,7 @@ int64_t sys_mmap(guest_t *g,
                 saved_mmap_rx_next, saved_mmap_rx_end, saved_rw_gap_hint,
                 saved_rx_gap_hint);
         }
-        dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
-        host_fd_ref_close(&backing_ref);
+        mmap_fresh_dispose(&fresh);
         if (rollback_err < 0)
             return rollback_err;
         return -LINUX_ENOMEM;
@@ -3467,8 +3477,7 @@ int64_t sys_mmap(guest_t *g,
         !overlay_fd_writable(host_backing_fd))
         mark_region_backing_ro(g, result_off, result_off + length);
 
-    host_fd_ref_close(&backing_ref);
-    dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
+    mmap_fresh_dispose(&fresh);
 
     /* Return IPA-based address to guest */
     return (int64_t) guest_ipa(g, result_off);
