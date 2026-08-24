@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/event.h>
+#include <sys/stat.h>
 #include <poll.h>
 
 #include "utils.h"
@@ -1365,6 +1366,42 @@ int64_t sys_epoll_create1(int flags)
     return gfd;
 }
 
+/* Whether the kqueue accepts any knote on this fd, which tells a refused write
+ * filter apart from a target kqueue rejects outright. The probe knote is added
+ * disabled on purpose: sys_epoll_pwait blocks on this same kqueue without
+ * inst->lock, and an enabled probe on a ready target would hand that wait an
+ * event whose NULL udata reads back as guest fd 0. The target carries no other
+ * registration here, so the paired delete takes nothing else with it.
+ */
+static bool epoll_target_pollable(int kq, int host_fd)
+{
+    struct kevent probe;
+    EV_SET(&probe, host_fd, EVFILT_READ, EV_ADD | EV_DISABLE, 0, 0, NULL);
+    if (kevent(kq, &probe, 1, NULL, 0, NULL) < 0)
+        return false;
+    EV_SET(&probe, host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    kevent(kq, &probe, 1, NULL, 0, NULL);
+    return true;
+}
+
+/* Whether Linux would take this target at all. A plain file has no poll method
+ * and kqueue does not mind, so that refusal originates here; fstat answers it
+ * rather than the fd type, since FD_REGULAR also covers a fifo or a tty opened
+ * by path. An open that resolved a path through an intercept answers from
+ * path_poll_capable instead, because fstat would be describing elfuse's staging
+ * file: /proc/self/mountinfo and /sys/devices/system/cpu/online are ordinary
+ * host files here and pollable on Linux, while /proc/self/stat and /etc/passwd
+ * are the same kind of host file and are not.
+ */
+static bool epoll_target_supported(int kq, const fd_entry_t *snap)
+{
+    struct stat st;
+    if (!snap->path_poll_capable && fstat(snap->host_fd, &st) == 0 &&
+        S_ISREG(st.st_mode))
+        return false;
+    return epoll_target_pollable(kq, snap->host_fd);
+}
+
 int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 {
     /* The event is copied before anything else, because that is where the
@@ -1458,9 +1495,15 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     }
 
     if (op == LINUX_EPOLL_CTL_DEL) {
-        /* Linux returns ENOENT when removing an unregistered fd */
+        /* Linux returns ENOENT when removing an unregistered fd, but it tests
+         * the target's poll support before it looks at the operation, so a
+         * target it would never have accepted answers EPERM here too. Only the
+         * unregistered path pays for the check.
+         */
         if (!reg->active) {
-            ret = -LINUX_ENOENT;
+            ret = epoll_target_supported(epoll_ref.fd, &target_snap)
+                      ? -LINUX_ENOENT
+                      : -LINUX_EPERM;
             goto out_locked;
         }
 
@@ -1488,6 +1531,21 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         goto out_locked;
     }
 
+    /* The plain-file half of epoll_target_supported, inline so an ADD does not
+     * pay for the kqueue probe: the registration below already asks kqueue the
+     * rest of the question. It sits ahead of the EEXIST and ENOENT checks
+     * because do_epoll_ctl tests the target's poll support before it looks up
+     * the registration, so EPERM outranks both.
+     */
+    if (!target_snap.path_poll_capable) {
+        struct stat target_st;
+        if (fstat(target_host_fd, &target_st) == 0 &&
+            S_ISREG(target_st.st_mode)) {
+            ret = -LINUX_EPERM;
+            goto out_locked;
+        }
+    }
+
     /* Linux semantics: ADD fails with EEXIST if already registered; MOD fails
      * with ENOENT if not registered. oneshot_armed registrations (EPOLLONESHOT
      * fired, waiting for re-arm) are still valid for MOD.
@@ -1497,7 +1555,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         goto out_locked;
     }
     if (op == LINUX_EPOLL_CTL_MOD && !reg->active && !reg->oneshot_armed) {
-        ret = -LINUX_ENOENT;
+        ret = epoll_target_supported(epoll_ref.fd, &target_snap) ? -LINUX_ENOENT
+                                                                 : -LINUX_EPERM;
         goto out_locked;
     }
 
@@ -1565,9 +1624,40 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         nchanges++;
     }
 
-    if (nchanges > 0) {
-        if (kevent(epoll_ref.fd, changes, nchanges, NULL, 0, NULL) < 0) {
+    /* A mask naming no readiness filter registers nothing, so the loop below
+     * never asks kqueue whether the target takes a knote at all. Linux tests
+     * poll support before it reads the event, and answers EPERM for a directory
+     * or a character device whatever the mask says, so ask here.
+     */
+    if (nchanges == 0 && !epoll_target_pollable(epoll_ref.fd, target_host_fd)) {
+        ret = -LINUX_EPERM;
+        goto out_locked;
+    }
+
+    /* Linux decides EPERM from the target alone, never from the requested
+     * events: epoll_ctl(2) accepts EPOLLOUT on a timerfd or on a nested epoll
+     * fd, neither of which ever reports itself writable. Both are kqueues here,
+     * and kqueue refuses EVFILT_WRITE on a kqueue with EINVAL, so register one
+     * filter per call and drop a refused write filter instead of failing the
+     * whole ADD. A batched call would also stop at the first failed change and
+     * leave the survivor registered. EINVAL on the read filter, or on a write
+     * filter whose target takes no knote at all, is the EPERM case.
+     */
+    bool read_registered = false;
+    for (int i = 0; i < nchanges; i++) {
+        if (kevent(epoll_ref.fd, &changes[i], 1, NULL, 0, NULL) == 0) {
+            if (changes[i].filter == EVFILT_READ)
+                read_registered = true;
+            continue;
+        }
+        if (errno != EINVAL) {
             ret = linux_errno();
+            goto out_locked;
+        }
+        if (changes[i].filter == EVFILT_READ ||
+            !(read_registered ||
+              epoll_target_pollable(epoll_ref.fd, target_host_fd))) {
+            ret = -LINUX_EPERM;
             goto out_locked;
         }
     }

@@ -141,6 +141,14 @@ static inline int path_component_copy(char *dst,
 
 bool path_might_use_open_intercept(const char *path);
 bool path_might_use_stat_intercept(const char *path);
+
+/* Whether Linux gives the file behind this intercepted path a poll method.
+ * epoll_ctl asks it because fstat describes elfuse's staging file rather than
+ * the file the guest named. Enumerates the same surface as
+ * path_might_use_open_intercept and belongs next to it: an intercept added to
+ * one without the other is a target answered from the wrong object.
+ */
+bool path_intercept_poll_capable(const char *path);
 int path_check_intercept_access(const struct stat *st, int mode, int flags);
 
 /* Resolve a guest path against dirfd into every spelling a syscall handler

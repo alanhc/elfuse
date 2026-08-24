@@ -307,6 +307,7 @@ static inline void fd_init_entry(int fd,
                 (src->linux_flags & FD_DESCRIPTION_FLAGS);
             fd_alias_spec.foreign_description = src->foreign_description;
             fd_alias_spec.nonblock_owned = src->nonblock_owned;
+            fd_alias_spec.path_poll_capable = src->path_poll_capable;
         }
     }
 
@@ -339,6 +340,14 @@ static inline void fd_init_entry(int fd,
         fd_table[fd].linux_flags = accmode < 0 ? 0 : accmode;
     fd_table[fd].dir = NULL;
     fd_table[fd].proc_path[0] = '\0';
+
+    /* An alias shares the description, so it shares the answer: a dup of an
+     * intercepted open is the same file by another name, and epoll_ctl on the
+     * two names has to agree. Only an open that resolved a path decides this
+     * from scratch, which is why fd_alloc_opened_host leaves an alias alone.
+     */
+    fd_table[fd].path_poll_capable =
+        fd_alias_pending && fd_alias_spec.path_poll_capable;
     fd_table[fd].seals = 0;
 
     /* Whether a host read/write can block, so the fast-path and slow-path
@@ -851,6 +860,7 @@ fd_lifetime_t *fd_mark_closed_unlocked(int fd)
     fd_table[fd].ofd_id = 0;
     fd_table[fd].dir = NULL;
     fd_table[fd].proc_path[0] = '\0';
+    fd_table[fd].path_poll_capable = false;
     fd_table[fd].linux_flags = 0;
     fd_table[fd].seals = 0;
     fd_table[fd].fasync_owner_type = FASYNC_OWNER_NONE;

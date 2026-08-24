@@ -754,6 +754,8 @@ run_unit_tests()
     test_check "$runner" "test-epoll-dup" "0 failed" "$bindir/test-epoll-dup"
     test_check "$runner" "test-epoll-refcount" "0 failed" \
         "$bindir/test-epoll-refcount"
+    test_check "$runner" "test-epoll-unsupported" "0 failed" \
+        "$bindir/test-epoll-unsupported"
     test_check "$runner" "test-timerfd" "0 failed" "$bindir/test-timerfd"
     test_rc "$runner" "test-eventfd-dup" 0 "$bindir/test-eventfd-dup"
     test_rc "$runner" "test-epoll-mt" 0 "$bindir/test-epoll-mt"

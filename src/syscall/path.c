@@ -72,6 +72,75 @@ bool path_might_use_open_intercept(const char *path)
     return false;
 }
 
+/* The part of a guest /proc path that follows the process directory, or NULL
+ * when the path names no process directory at all: "/proc/self/stat" and
+ * "/proc/41/stat" both yield "stat", "/proc/self" yields "", and
+ * "/proc/meminfo" yields NULL.
+ */
+static const char *proc_pid_dir_suffix(const char *path)
+{
+    if (strncmp(path, "/proc/", 6) != 0)
+        return NULL;
+
+    const char *p = path + 6;
+    if (!strncmp(p, "self", 4) && (p[4] == '\0' || p[4] == '/')) {
+        p += 4;
+    } else if (!strncmp(p, "thread-self", 11) &&
+               (p[11] == '\0' || p[11] == '/')) {
+        p += 11;
+    } else {
+        const char *d = p;
+        while (*d >= '0' && *d <= '9')
+            d++;
+        if (d == p || (*d != '\0' && *d != '/'))
+            return NULL;
+        p = d;
+    }
+    return *p == '/' ? p + 1 : p;
+}
+
+/* Whether Linux gives the file behind this intercepted guest path a poll
+ * method, which is the only thing epoll_ctl reads EPERM off. fstat cannot
+ * answer it: elfuse serves several intercepted trees from ordinary host files,
+ * so the host object describes elfuse's staging rather than the file the guest
+ * named, and the path is what still knows.
+ *
+ * The answer per family was measured against Linux 6.12 rather than reasoned
+ * from the file's contents, because the two do not track each other: a
+ * per-process procfs file is opened through proc_single_file_operations, which
+ * carries no poll, while every proc_create entry gets proc_reg_poll whether or
+ * not it has anything to report. /proc/<pid>/mounts and mountinfo are the
+ * exception that makes the split visible -- they go through mounts_operations
+ * so a guest can wait for the mount table to change, while mountstats next to
+ * them does not and is refused. The /proc/<pid>/net subtree is the other
+ * exception, measured on Linux rather than reached here: elfuse serves
+ * /proc/net but not yet the per-process spelling of it, so that arm is
+ * unreachable today and is present so it does not become wrong the day it is.
+ */
+bool path_intercept_poll_capable(const char *path)
+{
+    if (!path || path[0] != '/')
+        return false;
+
+    const char *pid_rel = proc_pid_dir_suffix(path);
+    if (pid_rel)
+        return !strcmp(pid_rel, "mounts") || !strcmp(pid_rel, "mountinfo") ||
+               !strncmp(pid_rel, "net/", 4);
+
+    /* sysfs attributes are pollable through kernfs, and /etc/mtab is a symlink
+     * onto the mount table. What is left of the intercept surface --
+     * /etc/passwd and /etc/group, the utmp files, /dev and the FUSE mounts --
+     * is a plain file, a character device or a fifo, all of which the host
+     * object describes correctly, so the caller's fstat and kqueue probe answer
+     * for them.
+     */
+    if (!strncmp(path, "/proc/", 6))
+        return true;
+    if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
+        return true;
+    return !strcmp(path, "/etc/mtab");
+}
+
 bool path_might_use_stat_intercept(const char *path)
 {
     if (!path || path[0] != '/')
