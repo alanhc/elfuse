@@ -50,8 +50,9 @@ permissions:
 
 jobs:
   # clang-tidy via `make lint`. Runs in parallel with build/scan jobs.
-  # Advisory: .clang-tidy sets WarningsAsErrors='', so findings are logged
-  # for review but do not gate the job.
+  # Mostly advisory: findings are logged for review. The exception is
+  # readability-function-size, which .clang-tidy names in WarningsAsErrors,
+  # so a function crossing the 400-line ceiling fails this job.
   tidy-macos:
     name: clang-tidy (macOS Apple Silicon)
     runs-on: macos-15

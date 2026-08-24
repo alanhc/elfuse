@@ -562,6 +562,42 @@ static int pselect_fallback_pass(pselect_fallback_t *fb,
     return ret;
 }
 
+/* The three fd_set bitmasks of one pselect6 call, in guest word form.
+ *
+ * A NULL pointer is a set the caller did not pass, so the words behind it are
+ * never read or written back. The buffers are sized by the proved
+ * FDSET_MAX_WORDS bound, which is why a caller may index them with any word
+ * fdset_words admitted.
+ */
+typedef struct {
+    uint64_t rbuf[FDSET_MAX_WORDS];
+    uint64_t wbuf[FDSET_MAX_WORDS];
+    uint64_t ebuf[FDSET_MAX_WORDS];
+    uint64_t *r;
+    uint64_t *w;
+    uint64_t *e;
+} pselect_bits_t;
+
+static void pselect_bits_init(pselect_bits_t *b,
+                              uint64_t readfds_gva,
+                              uint64_t writefds_gva,
+                              uint64_t exceptfds_gva)
+{
+    b->r = b->w = b->e = NULL;
+    if (readfds_gva) {
+        memset(b->rbuf, 0, sizeof(b->rbuf));
+        b->r = b->rbuf;
+    }
+    if (writefds_gva) {
+        memset(b->wbuf, 0, sizeof(b->wbuf));
+        b->w = b->wbuf;
+    }
+    if (exceptfds_gva) {
+        memset(b->ebuf, 0, sizeof(b->ebuf));
+        b->e = b->ebuf;
+    }
+}
+
 int64_t sys_pselect6(guest_t *g,
                      int nfds,
                      uint64_t readfds_gva,
@@ -624,39 +660,24 @@ int64_t sys_pselect6(guest_t *g,
      * cannot exceed what these three buffers hold.
      */
     if (readfds_gva || writefds_gva || exceptfds_gva) {
-        uint64_t rbits_buf[FDSET_MAX_WORDS], wbits_buf[FDSET_MAX_WORDS];
-        uint64_t ebits_buf[FDSET_MAX_WORDS];
-        uint64_t *rbits = NULL;
-        uint64_t *wbits = NULL;
-        uint64_t *ebits = NULL;
+        pselect_bits_t bits;
+        pselect_bits_init(&bits, readfds_gva, writefds_gva, exceptfds_gva);
         int req_cap = 0;
         size_t bitmask_bytes = (size_t) nfds_words * 8;
-        if (readfds_gva) {
-            memset(rbits_buf, 0, sizeof(rbits_buf));
-            rbits = rbits_buf;
-        }
-        if (writefds_gva) {
-            memset(wbits_buf, 0, sizeof(wbits_buf));
-            wbits = wbits_buf;
-        }
-        if (exceptfds_gva) {
-            memset(ebits_buf, 0, sizeof(ebits_buf));
-            ebits = ebits_buf;
-        }
         if (readfds_gva &&
-            guest_read_small(g, readfds_gva, rbits, bitmask_bytes) < 0)
+            guest_read_small(g, readfds_gva, bits.r, bitmask_bytes) < 0)
             return -LINUX_EFAULT;
         if (writefds_gva &&
-            guest_read_small(g, writefds_gva, wbits, bitmask_bytes) < 0)
+            guest_read_small(g, writefds_gva, bits.w, bitmask_bytes) < 0)
             return -LINUX_EFAULT;
         if (exceptfds_gva &&
-            guest_read_small(g, exceptfds_gva, ebits, bitmask_bytes) < 0)
+            guest_read_small(g, exceptfds_gva, bits.e, bitmask_bytes) < 0)
             return -LINUX_EFAULT;
 
         for (int word = 0; word < nfds_words; word++) {
-            uint64_t requested = (rbits ? rbits[word] : 0) |
-                                 (wbits ? wbits[word] : 0) |
-                                 (ebits ? ebits[word] : 0);
+            uint64_t requested = (bits.r ? bits.r[word] : 0) |
+                                 (bits.w ? bits.w[word] : 0) |
+                                 (bits.e ? bits.e[word] : 0);
             req_cap += bit_popcount64(requested);
         }
         if (req_cap > (int) (ARRAY_SIZE(reqs_stack))) {
@@ -669,9 +690,9 @@ int64_t sys_pselect6(guest_t *g,
         }
 
         for (int word = 0; word < nfds_words; word++) {
-            uint64_t requested = (rbits ? rbits[word] : 0) |
-                                 (wbits ? wbits[word] : 0) |
-                                 (ebits ? ebits[word] : 0);
+            uint64_t requested = (bits.r ? bits.r[word] : 0) |
+                                 (bits.w ? bits.w[word] : 0) |
+                                 (bits.e ? bits.e[word] : 0);
             while (requested) {
                 int bit_index = bit_ctz64(requested);
                 uint64_t fd_index;
@@ -697,11 +718,11 @@ int64_t sys_pselect6(guest_t *g,
                 reqs[req_count].bit_index = (uint8_t) bit_index;
                 reqs[req_count].events = 0;
                 reqs[req_count].revents = 0;
-                if (rbits && (rbits[word] & bit))
+                if (bits.r && (bits.r[word] & bit))
                     reqs[req_count].events |= POLLIN;
-                if (wbits && (wbits[word] & bit))
+                if (bits.w && (bits.w[word] & bit))
                     reqs[req_count].events |= POLLOUT;
-                if (ebits && (ebits[word] & bit))
+                if (bits.e && (bits.e[word] & bit))
                     reqs[req_count].events |= POLLPRI;
                 reqs[req_count].ref = ref;
                 unp[req_count] = (poll_unpollable_t) {.fd = -1};
@@ -709,11 +730,11 @@ int64_t sys_pselect6(guest_t *g,
                 if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
                     if (host_fd > max_host_fd)
                         max_host_fd = host_fd;
-                    if (rbits && (rbits[word] & bit))
+                    if (bits.r && (bits.r[word] & bit))
                         FD_SET(host_fd, read_setp);
-                    if (wbits && (wbits[word] & bit))
+                    if (bits.w && (bits.w[word] & bit))
                         FD_SET(host_fd, write_setp);
-                    if (ebits && (ebits[word] & bit))
+                    if (bits.e && (bits.e[word] & bit))
                         FD_SET(host_fd, except_setp);
                 }
                 requested &= requested - 1;
@@ -887,23 +908,8 @@ pselect_retry:
 
     /* Write back result fd_sets (zero then set bits for matching fds) */
     if (readfds_gva || writefds_gva || exceptfds_gva) {
-        uint64_t rbits_buf[FDSET_MAX_WORDS], wbits_buf[FDSET_MAX_WORDS];
-        uint64_t ebits_buf[FDSET_MAX_WORDS];
-        uint64_t *rbits = NULL;
-        uint64_t *wbits = NULL;
-        uint64_t *ebits = NULL;
-        if (readfds_gva) {
-            memset(rbits_buf, 0, sizeof(rbits_buf));
-            rbits = rbits_buf;
-        }
-        if (writefds_gva) {
-            memset(wbits_buf, 0, sizeof(wbits_buf));
-            wbits = wbits_buf;
-        }
-        if (exceptfds_gva) {
-            memset(ebits_buf, 0, sizeof(ebits_buf));
-            ebits = ebits_buf;
-        }
+        pselect_bits_t bits;
+        pselect_bits_init(&bits, readfds_gva, writefds_gva, exceptfds_gva);
         int ready_bits = 0;
         for (int i = 0; i < req_count; i++) {
             int host_fd = reqs[i].host_fd, word = reqs[i].word;
@@ -914,25 +920,25 @@ pselect_retry:
                  */
                 short revents =
                     unp[i].fd >= 0 ? unp[i].revents : reqs[i].revents;
-                if (rbits && (revents & (POLLIN | POLLHUP | POLLERR))) {
-                    rbits[word] |= bit;
+                if (bits.r && (revents & (POLLIN | POLLHUP | POLLERR))) {
+                    bits.r[word] |= bit;
                     ready_bits++;
                 }
-                if (wbits && (revents & (POLLOUT | POLLHUP | POLLERR))) {
-                    wbits[word] |= bit;
+                if (bits.w && (revents & (POLLOUT | POLLHUP | POLLERR))) {
+                    bits.w[word] |= bit;
                     ready_bits++;
                 }
-                if (ebits && (revents & POLLPRI)) {
-                    ebits[word] |= bit;
+                if (bits.e && (revents & POLLPRI)) {
+                    bits.e[word] |= bit;
                     ready_bits++;
                 }
             } else if (RANGE_CHECK(host_fd, 0, FD_SETSIZE)) {
-                if (rbits && FD_ISSET(host_fd, &read_set))
-                    rbits[word] |= bit;
-                if (wbits && FD_ISSET(host_fd, write_setp))
-                    wbits[word] |= bit;
-                if (ebits && FD_ISSET(host_fd, except_setp))
-                    ebits[word] |= bit;
+                if (bits.r && FD_ISSET(host_fd, &read_set))
+                    bits.r[word] |= bit;
+                if (bits.w && FD_ISSET(host_fd, write_setp))
+                    bits.w[word] |= bit;
+                if (bits.e && FD_ISSET(host_fd, except_setp))
+                    bits.e[word] |= bit;
             }
         }
 
@@ -945,11 +951,11 @@ pselect_retry:
             ret = ready_bits;
 
         int bytes = nfds_words * 8;
-        if (rbits && guest_write_small(g, readfds_gva, rbits, bytes) < 0)
+        if (bits.r && guest_write_small(g, readfds_gva, bits.r, bytes) < 0)
             goto pselect_fault;
-        if (wbits && guest_write_small(g, writefds_gva, wbits, bytes) < 0)
+        if (bits.w && guest_write_small(g, writefds_gva, bits.w, bytes) < 0)
             goto pselect_fault;
-        if (ebits && guest_write_small(g, exceptfds_gva, ebits, bytes) < 0)
+        if (bits.e && guest_write_small(g, exceptfds_gva, bits.e, bytes) < 0)
             goto pselect_fault;
     }
 

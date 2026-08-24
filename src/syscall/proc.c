@@ -3580,6 +3580,230 @@ static bool vcpu_handle_bad_exception(guest_t *g,
     return false;
 }
 
+/* HVC #11: an EL0 fault, resolved into a retry or into a signal.
+ *
+ * Returns true when the vCPU should resume: the two retry exits that
+ * materialize a lazily mapped page or refresh a stale TLB entry, and a fault
+ * whose signal reached a handler. False means the disposition terminates the
+ * guest, which is the caller's cue to leave the run loop.
+ */
+static bool vcpu_handle_el0_fault(guest_t *g,
+                                  hv_vcpu_t vcpu,
+                                  bool verbose,
+                                  const char *prefix,
+                                  int *exit_code)
+{
+    /* The shim forwards EL0 faults here for signal delivery. EC-based dispatch
+     * determines the signal:
+     *   EC=0x20 (instruction abort) -> SIGSEGV
+     *   EC=0x24 (data abort)        -> SIGSEGV
+     *   EC=0x00 (undefined insn)    -> SIGILL
+     *   Other ECs from EL0           -> SIGILL (catch-all)
+     *
+     * For SIGSEGV, si_code is SEGV_MAPERR (translation fault) or SEGV_ACCERR
+     * (permission fault) based on xFSC[5:2]. For SIGILL, si_code is ILL_ILLOPC
+     * (illegal opcode). si_addr is FAR_EL1 for aborts, ELR_EL1 for SIGILL
+     * (FAR_EL1 is UNKNOWN for EC=0 per ARM ARM).
+     */
+    uint64_t esr, far_addr, elr_addr;
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far_addr);
+    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr_addr);
+
+    uint32_t fault_ec = (uint32_t) ((esr >> 26) & 0x3F);
+
+    /* Non-abort EC -> SIGILL. Branch out early so the abort / SIGSEGV path
+     * below stays at the case-body indent rather than nested inside an else
+     * branch. FAR_EL1 is UNKNOWN for non-abort exceptions, so use ELR_EL1 for
+     * si_addr.
+     *
+     * Only EC 0x20 (instruction abort from a lower EL) and EC 0x24 (data abort
+     * from a lower EL) are intentionally routed to the SIGSEGV path that
+     * follows. Every other forwarded EC lands here as SIGILL: 0x00 (undefined
+     * instruction), 0x18 (system instruction trap), 0x32/0x33 (software step),
+     * 0x3C (BRK), and any unrecognized class. If a future change adds a new
+     * lower-EL abort class (e.g. 0x21 / 0x25 for higher exception levels) that
+     * should map to SIGSEGV, the test below needs explicit widening; do NOT
+     * relax the check casually.
+     */
+    if (fault_ec != 0x20 && fault_ec != 0x24) {
+        if (verbose)
+            log_debug(
+                "%s: EL0 undefined insn at "
+                "PC=0x%llx (ESR=0x%llx EC=0x%x) "
+                "-> SIGILL/ILL_ILLOPC",
+                prefix, (unsigned long long) elr_addr, (unsigned long long) esr,
+                fault_ec);
+        signal_set_fault_info(LINUX_ILL_ILLOPC, elr_addr, esr);
+        int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGILL, exit_code);
+
+        /* HVC #11 consumes X8 as the post-fault TLBI opcode. signal_deliver()
+         * may leave it unchanged when no handler is materialized, or set the
+         * syscall-path frame-drop marker when one is. Neither is a TLBI request
+         * here; lazy materialization emits its own request and exits before
+         * this path.
+         */
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
+        if (verbose)
+            log_debug("%s: signal %d deliver returned %d", prefix, LINUX_SIGILL,
+                      sig_ret);
+        /* A SIG_DFL core disposition ends the guest. */
+        return sig_ret >= 0;
+    }
+
+    /* Instruction or data abort. Try lazy page materialization before declaring
+     * SIGSEGV: translation faults (xFSC[5:2] == 0x1) may come from a
+     * MAP_NORESERVE region with deferred page-table creation.
+     */
+    uint32_t fsc = (uint32_t) (esr & 0x3F);
+    uint32_t fsc_type = (fsc >> 2) & 0xF;
+    if (fsc_type == 0x01) {
+        uint64_t fault_off = far_addr - g->ipa_base;
+        pthread_mutex_lock(&mmap_lock);
+        int mat = guest_materialize_lazy(g, fault_off);
+        pthread_mutex_unlock(&mmap_lock);
+        if (mat == 0) {
+            /* Page materialized; the helpers inside guest_materialize_lazy
+             * populated the per-vCPU TLBI accumulator with the range just
+             * installed (plus the I-cache hint if the region's prot includes
+             * PROT_EXEC). Drain it through the shared emit helper so the shim's
+             * post-HVC-11 dispatch (handle_el0_fault) actually issues the TLBI
+             * before ERET. Without this, a PE that caches translation-fault
+             * (negative) entries would re-fault on the retry, looping until the
+             * entry self-evicts.
+             */
+            tlbi_request_emit_to_vcpu(vcpu);
+            return true;
+        }
+    }
+
+    /* Bounded retry on a stale-TLB data / instruction abort. Re-walk the live
+     * page tables for the faulting VA before declaring SIGSEGV. guest_ptr_avail
+     * consults pt_gen, which the mutating vCPU bumps under mmap_lock, so the
+     * walk reflects the current mapping regardless of this vCPU's cached
+     * (possibly stale) hardware TLB. A non-NULL result means the live PT is
+     * valid and grants the faulting access, the signature of a stale TLB entry
+     * that a cross-vCPU mprotect + TLBI failed to evict on this PE.
+     *
+     * On that signature, re-issue a selective TLBI for the faulting page from
+     * this vCPU (same accumulator + emit path the lazy-materialization branch
+     * uses) and return to EL0 to retry the instruction. A genuinely stale entry
+     * clears on the first retry, so the guest makes progress and never
+     * re-enters here for that VA.
+     *
+     * The retry is bounded per vCPU and per (page, faulting PC). If the same
+     * instruction keeps faulting on the same page despite the re-issued TLBI,
+     * the entry is not actually stale (a walker / hardware permission-model
+     * disagreement, or an HVF TLBI that did not take): after
+     * STALE_TLB_RETRY_MAX attempts, stop retrying and deliver SIGSEGV so a
+     * genuine fault is never silently swallowed. The per-vCPU slot resets when
+     * a different page or PC faults or when the cap is hit, so a cap-out cannot
+     * poison a later legitimate retry.
+     */
+    enum { STALE_TLB_RETRY_MAX = 16 };
+
+    /* Only translation (fsc_type 0x01) and permission (0x03) faults are
+     * stale-TLB plausible. Alignment, external-abort, and access-flag classes
+     * cannot be cleared by re-issuing TLBI, so do not spend the retry budget on
+     * them. A translation fault reaches here only after the lazy-
+     * materialization branch above already declined the address, so a live PT
+     * that still grants access is a stale negative (translation-fault) entry; a
+     * permission fault is the classic stale entry left by a cross-vCPU
+     * mprotect.
+     */
+    bool stale_plausible = (fsc_type == 0x01 || fsc_type == 0x03);
+    int want_perm = (fault_ec == 0x20)
+                        ? MEM_PERM_X
+                        : ((esr & (1u << 6)) ? MEM_PERM_W : MEM_PERM_R);
+    uint64_t live_avail = 0;
+    void *live_pt = NULL;
+    if (stale_plausible) {
+        pthread_mutex_lock(&mmap_lock);
+        live_pt = guest_ptr_avail(g, far_addr, &live_avail, want_perm);
+        pthread_mutex_unlock(&mmap_lock);
+    }
+    if (live_pt) {
+        /* Bound per vCPU and per (page, faulting PC). A genuinely stuck entry
+         * re-faults on the same instruction at the same page, so keying the
+         * counter on both distinguishes a non-recovering loop (cap it) from
+         * separate successful recoveries (a different PC, or the same page
+         * reached from a different instruction) that must each get a fresh
+         * budget.
+         */
+        static _Thread_local uint64_t stale_page;
+        static _Thread_local uint64_t stale_elr;
+        static _Thread_local int stale_count;
+        uint64_t page = far_addr & ~(GUEST_PAGE_SIZE - 1);
+        if (page == stale_page && elr_addr == stale_elr) {
+            stale_count++;
+        } else {
+            stale_page = page;
+            stale_elr = elr_addr;
+            stale_count = 1;
+        }
+        if (stale_count <= STALE_TLB_RETRY_MAX) {
+            static _Thread_local bool stale_warned;
+            if (!stale_warned) {
+                stale_warned = true;
+                log_warn(
+                    "%s: EL0 %s fault at 0x%llx (ESR=0x%llx) "
+                    "but "
+                    "live PT grants access (stale TLB); "
+                    "re-issuing TLBI and retrying (cap %d)",
+                    prefix, (fault_ec == 0x20) ? "inst" : "data",
+                    (unsigned long long) far_addr, (unsigned long long) esr,
+                    STALE_TLB_RETRY_MAX);
+            }
+            tlbi_request_clear();
+            tlbi_request_range(page, page + GUEST_PAGE_SIZE);
+            if (want_perm & MEM_PERM_X)
+                tlbi_request_mark_icache();
+            tlbi_request_emit_to_vcpu(vcpu);
+            return true;
+        }
+
+        /* Retry budget exhausted: the entry is not actually stale. Reset the
+         * slot and fall through to SIGSEGV.
+         */
+        log_warn(
+            "%s: stale-TLB retry cap (%d) hit at 0x%llx "
+            "(ESR=0x%llx); delivering SIGSEGV",
+            prefix, STALE_TLB_RETRY_MAX, (unsigned long long) far_addr,
+            (unsigned long long) esr);
+        stale_page = 0;
+        stale_elr = 0;
+        stale_count = 0;
+    }
+
+    /* Real SIGSEGV. Permission faults (xFSC[5:2] == 0x3) map to SEGV_ACCERR;
+     * address size, translation, and access-flag faults map to SEGV_MAPERR for
+     * Linux.
+     */
+    int si_code = (fsc_type == 0x03) ? LINUX_SEGV_ACCERR : LINUX_SEGV_MAPERR;
+    if (verbose) {
+        const char *fault_type = (fault_ec == 0x20) ? "inst" : "data";
+        const char *code_name =
+            (si_code == LINUX_SEGV_MAPERR) ? "MAPERR" : "ACCERR";
+        log_debug(
+            "%s: EL0 %s fault at 0x%llx "
+            "PC=0x%llx (ESR=0x%llx FSC=0x%x) "
+            "-> SIGSEGV/%s",
+            prefix, fault_type, (unsigned long long) far_addr,
+            (unsigned long long) elr_addr, (unsigned long long) esr, fsc,
+            code_name);
+    }
+    signal_set_fault_info(si_code, far_addr, esr);
+    int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGSEGV, exit_code);
+
+    /* Clear X8 for the same reason as the SIGILL exit above. */
+    hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
+    if (verbose)
+        log_debug("%s: signal %d deliver returned %d", prefix, LINUX_SIGSEGV,
+                  sig_ret);
+    /* A SIG_DFL core disposition ends the guest. */
+    return sig_ret >= 0;
+}
+
 /* Unified vCPU execution loop for both main and worker threads.
  *
  * When timeout_sec > 0 (main thread): uses alarm() for per-iteration safety
@@ -3857,253 +4081,10 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
                     break;
                 }
 
-                case 11: {
-                    /* HVC #11: EL0 fault -> deliver signal.
-                     *
-                     * The shim forwards EL0 faults here for signal delivery.
-                     * EC-based dispatch determines the signal:
-                     *   EC=0x20 (instruction abort) -> SIGSEGV
-                     *   EC=0x24 (data abort)        -> SIGSEGV
-                     *   EC=0x00 (undefined insn)    -> SIGILL
-                     *   Other ECs from EL0           -> SIGILL (catch-all)
-                     *
-                     * For SIGSEGV, si_code is SEGV_MAPERR (translation fault)
-                     * or SEGV_ACCERR (permission fault) based on xFSC[5:2]. For
-                     * SIGILL, si_code is ILL_ILLOPC (illegal opcode). si_addr
-                     * is FAR_EL1 for aborts, ELR_EL1 for SIGILL (FAR_EL1 is
-                     * UNKNOWN for EC=0 per ARM ARM).
-                     */
-                    uint64_t esr, far_addr, elr_addr;
-                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
-                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far_addr);
-                    hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr_addr);
-
-                    uint32_t fault_ec = (uint32_t) ((esr >> 26) & 0x3F);
-
-                    /* Non-abort EC -> SIGILL. Branch out early so the abort /
-                     * SIGSEGV path below stays at the case-body indent rather
-                     * than nested inside an else branch. FAR_EL1 is UNKNOWN for
-                     * non-abort exceptions, so use ELR_EL1 for si_addr.
-                     *
-                     * Only EC 0x20 (instruction abort from a lower EL) and EC
-                     * 0x24 (data abort from a lower EL) are intentionally
-                     * routed to the SIGSEGV path that follows. Every other
-                     * forwarded EC -- 0x00 (undefined instruction), 0x18
-                     * (system instruction trap), 0x32/0x33 (software step),
-                     * 0x3C (BRK), and any unrecognized class -- lands here as
-                     * SIGILL. If a future change adds a new lower-EL abort
-                     * class (e.g. 0x21 / 0x25 for higher exception levels) that
-                     * should map to SIGSEGV, the test below needs explicit
-                     * widening; do NOT relax the check casually.
-                     */
-                    if (fault_ec != 0x20 && fault_ec != 0x24) {
-                        if (verbose)
-                            log_debug(
-                                "%s: EL0 undefined insn at "
-                                "PC=0x%llx (ESR=0x%llx EC=0x%x) "
-                                "-> SIGILL/ILL_ILLOPC",
-                                prefix, (unsigned long long) elr_addr,
-                                (unsigned long long) esr, fault_ec);
-                        signal_set_fault_info(LINUX_ILL_ILLOPC, elr_addr, esr);
-                        int sig_ret = signal_deliver_fault(
-                            vcpu, g, LINUX_SIGILL, &exit_code);
-
-                        /* HVC #11 consumes X8 as the post-fault TLBI opcode.
-                         * signal_deliver() may leave it unchanged when no
-                         * handler is materialized, or set the syscall-path
-                         * frame-drop marker when one is. Neither is a TLBI
-                         * request here; lazy materialization emits its own
-                         * request and exits before this path.
-                         */
-                        hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
-                        if (verbose)
-                            log_debug("%s: signal %d deliver returned %d",
-                                      prefix, LINUX_SIGILL, sig_ret);
-                        if (sig_ret < 0)
-                            running = false; /* SIG_DFL core => terminate. */
-                        break;
-                    }
-
-                    /* Instruction or data abort. Try lazy page materialization
-                     * before declaring SIGSEGV: translation faults (xFSC[5:2]
-                     * == 0x1) may come from a MAP_NORESERVE region with
-                     * deferred page-table creation.
-                     */
-                    uint32_t fsc = (uint32_t) (esr & 0x3F);
-                    uint32_t fsc_type = (fsc >> 2) & 0xF;
-                    if (fsc_type == 0x01) {
-                        uint64_t fault_off = far_addr - g->ipa_base;
-                        pthread_mutex_lock(&mmap_lock);
-                        int mat = guest_materialize_lazy(g, fault_off);
-                        pthread_mutex_unlock(&mmap_lock);
-                        if (mat == 0) {
-                            /* Page materialized; the helpers inside
-                             * guest_materialize_lazy populated the per-vCPU
-                             * TLBI accumulator with the range just installed
-                             * (plus the I-cache hint if the region's prot
-                             * includes PROT_EXEC). Drain it through the shared
-                             * emit helper so the shim's post-HVC-11 dispatch
-                             * (handle_el0_fault) actually issues the TLBI
-                             * before ERET. Without this, a PE that caches
-                             * translation-fault (negative) entries would
-                             * re-fault on the retry, looping until the entry
-                             * self-evicts.
-                             */
-                            tlbi_request_emit_to_vcpu(vcpu);
-                            break;
-                        }
-                    }
-
-                    /* Bounded retry on a stale-TLB data / instruction abort.
-                     * Re-walk the live page tables for the faulting VA before
-                     * declaring SIGSEGV. guest_ptr_avail consults pt_gen, which
-                     * the mutating vCPU bumps under mmap_lock, so the walk
-                     * reflects the current mapping regardless of this vCPU's
-                     * cached (possibly stale) hardware TLB. A non-NULL result
-                     * means the live PT is valid and grants the faulting access
-                     * -- the signature of a stale TLB entry that a cross-vCPU
-                     * mprotect + TLBI failed to evict on this PE.
-                     *
-                     * On that signature, re-issue a selective TLBI for the
-                     * faulting page from this vCPU (same accumulator + emit
-                     * path the lazy-materialization branch uses) and return to
-                     * EL0 to retry the instruction. A genuinely stale entry
-                     * clears on the first retry, so the guest makes progress
-                     * and never re-enters here for that VA.
-                     *
-                     * The retry is bounded per vCPU and per (page, faulting
-                     * PC). If the same instruction keeps faulting on the same
-                     * page despite the re-issued TLBI, the entry is not
-                     * actually stale (a walker / hardware permission-model
-                     * disagreement, or an HVF TLBI that did not take): after
-                     * STALE_TLB_RETRY_MAX attempts, stop retrying and deliver
-                     * SIGSEGV so a genuine fault is never silently swallowed.
-                     * The per-vCPU slot resets when a different page or PC
-                     * faults or when the cap is hit, so a cap-out cannot poison
-                     * a later legitimate retry.
-                     */
-                    enum { STALE_TLB_RETRY_MAX = 16 };
-
-                    /* Only translation (fsc_type 0x01) and permission (0x03)
-                     * faults are stale-TLB plausible. Alignment,
-                     * external-abort, and access-flag classes cannot be cleared
-                     * by re-issuing TLBI, so do not spend the retry budget on
-                     * them. A translation fault reaches here only after the
-                     * lazy- materialization branch above already declined the
-                     * address, so a live PT that still grants access is a stale
-                     * negative (translation-fault) entry; a permission fault is
-                     * the classic stale entry left by a cross-vCPU mprotect.
-                     */
-                    bool stale_plausible =
-                        (fsc_type == 0x01 || fsc_type == 0x03);
-                    int want_perm =
-                        (fault_ec == 0x20)
-                            ? MEM_PERM_X
-                            : ((esr & (1u << 6)) ? MEM_PERM_W : MEM_PERM_R);
-                    uint64_t live_avail = 0;
-                    void *live_pt = NULL;
-                    if (stale_plausible) {
-                        pthread_mutex_lock(&mmap_lock);
-                        live_pt = guest_ptr_avail(g, far_addr, &live_avail,
-                                                  want_perm);
-                        pthread_mutex_unlock(&mmap_lock);
-                    }
-                    if (live_pt) {
-                        /* Bound per vCPU and per (page, faulting PC). A
-                         * genuinely stuck entry re-faults on the same
-                         * instruction at the same page, so keying the counter
-                         * on both distinguishes a non-recovering loop (cap it)
-                         * from separate successful recoveries -- a different
-                         * PC, or the same page reached from a different
-                         * instruction -- that must each get a fresh budget.
-                         */
-                        static _Thread_local uint64_t stale_page;
-                        static _Thread_local uint64_t stale_elr;
-                        static _Thread_local int stale_count;
-                        uint64_t page = far_addr & ~(GUEST_PAGE_SIZE - 1);
-                        if (page == stale_page && elr_addr == stale_elr) {
-                            stale_count++;
-                        } else {
-                            stale_page = page;
-                            stale_elr = elr_addr;
-                            stale_count = 1;
-                        }
-                        if (stale_count <= STALE_TLB_RETRY_MAX) {
-                            static _Thread_local bool stale_warned;
-                            if (!stale_warned) {
-                                stale_warned = true;
-                                log_warn(
-                                    "%s: EL0 %s fault at 0x%llx (ESR=0x%llx) "
-                                    "but "
-                                    "live PT grants access -- stale TLB; "
-                                    "re-issuing TLBI and retrying (cap %d)",
-                                    prefix,
-                                    (fault_ec == 0x20) ? "inst" : "data",
-                                    (unsigned long long) far_addr,
-                                    (unsigned long long) esr,
-                                    STALE_TLB_RETRY_MAX);
-                            }
-                            tlbi_request_clear();
-                            tlbi_request_range(page, page + GUEST_PAGE_SIZE);
-                            if (want_perm & MEM_PERM_X)
-                                tlbi_request_mark_icache();
-                            tlbi_request_emit_to_vcpu(vcpu);
-                            break;
-                        }
-
-                        /* Retry budget exhausted: the entry is not actually
-                         * stale. Reset the slot and fall through to SIGSEGV.
-                         */
-                        log_warn(
-                            "%s: stale-TLB retry cap (%d) hit at 0x%llx "
-                            "(ESR=0x%llx); delivering SIGSEGV",
-                            prefix, STALE_TLB_RETRY_MAX,
-                            (unsigned long long) far_addr,
-                            (unsigned long long) esr);
-                        stale_page = 0;
-                        stale_elr = 0;
-                        stale_count = 0;
-                    }
-
-                    /* Real SIGSEGV. Permission faults (xFSC[5:2] == 0x3) map to
-                     * SEGV_ACCERR; address size, translation, and access-flag
-                     * faults map to SEGV_MAPERR for Linux.
-                     */
-                    int si_code = (fsc_type == 0x03) ? LINUX_SEGV_ACCERR
-                                                     : LINUX_SEGV_MAPERR;
-                    if (verbose) {
-                        const char *fault_type =
-                            (fault_ec == 0x20) ? "inst" : "data";
-                        const char *code_name = (si_code == LINUX_SEGV_MAPERR)
-                                                    ? "MAPERR"
-                                                    : "ACCERR";
-                        log_debug(
-                            "%s: EL0 %s fault at 0x%llx "
-                            "PC=0x%llx (ESR=0x%llx FSC=0x%x) "
-                            "-> SIGSEGV/%s",
-                            prefix, fault_type, (unsigned long long) far_addr,
-                            (unsigned long long) elr_addr,
-                            (unsigned long long) esr, fsc, code_name);
-                    }
-                    signal_set_fault_info(si_code, far_addr, esr);
-                    int sig_ret = signal_deliver_fault(vcpu, g, LINUX_SIGSEGV,
-                                                       &exit_code);
-
-                    /* HVC #11 consumes X8 as the post-fault TLBI opcode.
-                     * signal_deliver() may leave it unchanged when no handler
-                     * is materialized, or set the syscall-path frame-drop
-                     * marker when one is. Neither is a TLBI request here; lazy
-                     * materialization emits its own request and exits before
-                     * this path.
-                     */
-                    hv_vcpu_set_reg(vcpu, HV_REG_X8, 0);
-                    if (verbose)
-                        log_debug("%s: signal %d deliver returned %d", prefix,
-                                  LINUX_SIGSEGV, sig_ret);
-                    if (sig_ret < 0)
-                        running = false; /* SIG_DFL core => terminate. */
+                case 11:
+                    running = vcpu_handle_el0_fault(g, vcpu, verbose, prefix,
+                                                    &exit_code);
                     break;
-                }
 
                 case 12: {
                     vcpu_handle_sysinstr_trap(vcpu, verbose, prefix);

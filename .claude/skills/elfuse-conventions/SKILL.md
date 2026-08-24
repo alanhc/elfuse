@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions that CONTRIBUTING.md does not carry: the register a comment or commit message is written in, comment brevity, the type and return conventions at the ABI boundary, PR etiquette, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. CONTRIBUTING.md is the tracked style guide and settles C style, formatter mechanics, and the gates; read it first and use this for what it leaves to a reviewer. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
+description: elfuse conventions that CONTRIBUTING.md does not carry: the register a comment or commit message is written in, comment brevity, the type and return conventions at the ABI boundary, PR etiquette, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, or wiring the build to anything a fresh clone would not have.
 ---
 
 # elfuse conventions
@@ -53,55 +53,30 @@ exempt and use normal GitHub Markdown, so do not strip backticks out of a
 The em dash (U+2014) is banned on every surface, markdown included: comments,
 commit messages, `docs/`, these skill files, PR bodies, and review replies.
 In an otherwise-ASCII tree it is the clearest mark of machine-written prose,
-rejected on sight (PR#209). The stand-in is ` -- ` (spaced double hyphen),
-used sparingly: reword first (commas, a period, or a colon usually serve),
-and more than one in a paragraph means restructure. Write the character as
-its codepoint, never the glyph, so `grep -rnP '\x{2014}'` stays a clean
-check; `-P` with the codepoint is required, since `grep $'\u2014'`
-matches nothing and reports a false all-clear.
+rejected on sight (PR#209). Write the character as its codepoint, never the
+glyph, so `grep -rnPI '\x{2014}'` stays a clean check; `-P` with the codepoint
+is required, since `grep $'\u2014'` matches nothing and reports a false
+all-clear.
 
-The rest of the machine register is banned on the same surfaces. State the
-fact and stop:
+A spaced double hyphen is not the way around it, on any of those surfaces.
+It carries the register the em dash carries, so a comment, a commit body, a
+docs paragraph, or a skill file reaches for a comma, a colon, parentheses, or
+two sentences instead. A dashed aside is nearly always one of those already:
+an appositive takes paired commas, a definition takes a colon, an afterthought
+takes its own sentence. A pair opened with a dash and closed with a comma is
+the tell that the sentence wanted commas from the start.
 
-- Describe the thing, not the change: no "previously", "now we", "we
-  refined", or "fixed", and no history of prior attempts or review rounds.
-  A decision that still matters is present-tense rationale.
-- Inflation words ("delve", "seamless", "robust", "leverage") and empty
-  pivots ("it's worth noting"): a sentence that survives deleting the phrase
-  never needed it.
-- Coined vocabulary, figurative accounting, and anthropomorphism: every
-  noun for a mechanism is an identifier in the tree or the standard term
-  from a man page, ELF or FUSE clause, or kernel source, and a value is
-  computed, cached, discarded, or re-derived. Name the flag or function
-  carrying the fact; a coined word cannot be grepped later.
-- Trailing "-ing" glosses (", ensuring ..."): the tail names a checkable
-  mechanism or goes.
-- Negative parallelism ("not X, but Y"): say Y. Copula avoidance ("serves
-  as", "acts as"): write "is".
-- Rule-of-three padding, stacked transitions ("Moreover"), wrap-ups ("In
-  conclusion"), hedge stacking ("could potentially"): cut; one hedge at
-  most, for real uncertainty.
-- Signposting, prompt echo, and the closing verdict: no announcement of what
-  the text is about to do ("This commit will", "Below we describe"), no
-  first line restating the subject or the PR title, and no closing sentence
-  grading the change ("this makes the code more maintainable"). The last
-  sentence carries a fact.
-- Effort and flattery: "carefully reviewed", "comprehensive", "thoroughly
-  tested", "Great catch", "You're absolutely right". Effort is not a
-  finding; name what ran and what it reported.
-- Formatting as emphasis in docs and PR text: bolded bullet-header runs
-  where a paragraph belongs, decorative rules, emoji.
-- Machine artifacts, defects on sight: zero-width and bidi characters,
-  homoglyphs, non-standard spaces, unfilled placeholders, leaked citation
-  markup. Legitimate Unicode lives in `docs/` (the casefold tables), so scan
-  the invisible class only, with a planted positive:
+The tree already carries hundreds of them, in `src/` comments and in `docs/`,
+and converting those is not a task: the diff would be unreviewable and the
+prose is not wrong, only dated. Reword the sentence you were editing anyway,
+and take the whole aside with you rather than half of it.
 
-  ```
-  grep -rnP '[\x{00A0}\x{200B}-\x{200F}\x{202A}-\x{202F}\x{2060}\x{FEFF}]' src/ tests/ docs/
-  ```
-
-Every class above binds every surface, so the sections below name only
-their own instance of one.
+The rest of the machine register is banned on the same surfaces:
+prompt echo, effort claims, inflation words, coined vocabulary, trailing
+"-ing" glosses, and the invisible-character class among them. Read
+`references/prose-register.md` before writing a comment block, a commit body,
+a PR reply, or a paragraph of `docs/`, and treat it as the one place those
+classes are defined.
 
 Comments and commit messages are third-person: name the subject (the caller,
 this function) or use imperative phrasing.
@@ -314,9 +289,10 @@ rather than joining it, so interleaved actors, a race window, or a
 byte-layout off-by-one earn a small ASCII diagram inside 72 columns with
 real names, the prose it replaces cut. Verify it as rendered.
 
-The Style rules above bind here: the register classes, ASCII with no
-backticks around symbol names, no em dashes or non-ASCII arrows, and third
-person throughout.
+The Style rules above bind here, `references/prose-register.md` included:
+ASCII with no backticks around symbol names, no em dashes or non-ASCII
+arrows, and third person throughout. A commit body is the surface those
+classes were written for.
 
 Merge commits keep git's generated subject and are exempt.
 

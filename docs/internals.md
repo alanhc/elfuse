@@ -1250,8 +1250,11 @@ It is a property of how the loader is structured.
 
 No formal-methods gate exists today. What gates CI is language-independent
 tooling: `clang-format`, a banned-API and unsafe-preprocessor scan,
-`cppcheck`, and the dispatch-table consistency check on Linux; `clang-tidy`
-and `scan-build` as advisory jobs; an Infer run that fails on any finding;
+`cppcheck`, and the dispatch-table consistency check on Linux; `scan-build`
+as an advisory job; `clang-tidy` advisory except for
+`readability-function-size`, which is named in `WarningsAsErrors` and fails
+the job when a function crosses its ceiling; an Infer run that fails on any
+finding;
 and a runtime matrix under ASAN, UBSAN, and TSAN (see [Testing And
 Confidence](#testing-and-confidence)).
 

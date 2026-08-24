@@ -114,10 +114,13 @@ CPP_DEFS :=
 # time. It would NOT be sound for a concurrency analysis. No target here is one.
 # See the stub for the same limit on the atomic builtins.
 #
-# Together these took the parsing set from 2 sources to 15 of the tree's 55.
-# The other 40 stop on macOS headers Frama-C's libc does not model (sys/mount.h,
-# sys/event.h, sys/sysctl.h, sys/xattr.h, sys/attr.h, sys/spawn.h), which is a
-# real modeling gap rather than a missing declaration.
+# Together these are what makes most of the parsing set parse at all: without
+# the stubs only a couple of sources load. The rest stop on macOS headers
+# Frama-C's libc does not model (sys/mount.h, sys/event.h, sys/sysctl.h,
+# sys/xattr.h, sys/attr.h, sys/spawn.h), which is a real modeling gap rather
+# than a missing declaration. How many sit on each side moves with the tree, so
+# count it rather than quote it: run FRAMAC with FRAMAC_CPP_ARGS over each of
+# git ls-files 'src/*.c' and tally the exits.
 FRAMAC_STUB_DIR := frama-c-stubs
 
 FRAMAC_CPP_ARGS = -nostdinc \
