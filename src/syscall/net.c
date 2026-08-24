@@ -202,6 +202,37 @@ bool net_recv_should_retry(const fd_block_state_t *st,
     return retry;
 }
 
+/* Whether a refusal from this socket could be a full backlog rather than the
+ * real answer.
+ *
+ * Only a connection-oriented AF_UNIX socket queues: a datagram socket has no
+ * backlog to fill, so its ECONNREFUSED is the final word and retrying would
+ * only delay it. The family alone is not the test.
+ */
+static bool connect_backlog_can_fill(int host_fd, const struct sockaddr *sa)
+{
+    if (sa->sa_family != AF_UNIX)
+        return false;
+
+    int so_type = 0;
+    socklen_t so_type_len = sizeof(so_type);
+    if (getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &so_type, &so_type_len) < 0)
+        return false;
+    return so_type == SOCK_STREAM || so_type == SOCK_SEQPACKET;
+}
+
+/* Attempts a refused AF_UNIX connect gets before the refusal is believed.
+ *
+ * The two costs pull opposite ways: too few and a listener still draining its
+ * backlog hands the guest a refusal Linux would not have produced, too many and
+ * a socket file nobody listens on takes that long to say so. Against the
+ * io_retry_backoff ramp this lands under half a second, which covered every run
+ * of tests/test-socket-accept-contended under four spinning cores while leaving
+ * a dead socket answering well inside any timeout. Measure both sides again
+ * before changing it rather than trusting this sentence.
+ */
+#define CONNECT_BACKLOG_RETRIES 128
+
 /* Drive an already-nonblocking connect to completion or interruption: start it,
  * wait for POLLOUT (or a guest signal), then read SO_ERROR.
  *
@@ -212,7 +243,31 @@ static int64_t connect_nonblock_wait(int host_fd,
                                      const struct sockaddr *sa,
                                      socklen_t len)
 {
-    if (connect(host_fd, sa, len) == 0)
+    /* macOS answers a full AF_UNIX backlog with ECONNREFUSED. Linux blocks a
+     * blocking connect there instead, waiting for the listener to drain
+     * (unix_wait_for_peer), and elfuse owns O_NONBLOCK on the sockets it opens,
+     * so a guest that asked to wait would see the refusal. This is the
+     * connect-shaped instance of the race the accept path already retries.
+     *
+     * The errno does not separate a full backlog from a socket file nobody
+     * listens on, so the wait is bounded and the refusal is reported once the
+     * budget runs out. That costs a genuinely refused connect the budget before
+     * it hears so, which is the price of not handing the guest a refusal Linux
+     * would never have produced. Retrying on the same socket is sound: it stays
+     * usable across the refusal and connects once the backlog drains.
+     */
+    unsigned backoff = 0;
+    unsigned refusals = 0;
+    int rc;
+    while ((rc = connect(host_fd, sa, len)) != 0 && errno == ECONNREFUSED &&
+           refusals < CONNECT_BACKLOG_RETRIES &&
+           connect_backlog_can_fill(host_fd, sa)) {
+        refusals++;
+        int64_t backoff_rc = io_retry_backoff(&backoff);
+        if (backoff_rc < 0)
+            return backoff_rc;
+    }
+    if (rc == 0)
         return 0;
 
     /* EALREADY is this same connect still in flight. Linux never reports it to
@@ -789,9 +844,9 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
         /* Rebuilding the slot must not mint a fresh description identity: any
          * dup alias of this fd keeps the old ofd_id, and the two would stop
          * being swept together by the O_NONBLOCK, O_ASYNC and SIGIO-owner
-         * walks. The aliases still carry the pre-upgrade host fd, which is a
-         * deeper divergence recorded in TODO.md; keeping the identity is what
-         * stops this path from also breaking the sweeps.
+         * walks. The aliases still carry the pre-upgrade host fd, a deeper
+         * divergence this path does not close; keeping the identity is what
+         * stops it from also breaking the sweeps.
          */
         fd_alias_spec_t spec;
         if (have_snap)
