@@ -31,7 +31,25 @@ DEFAULT_STUB = ROOT / "frama-c-stubs" / "macos-libc.h"
 # Only object-like defines with an integer value. A macro with parameters or a
 # non-numeric body is not a constant this can compare, and is reported as
 # unchecked rather than silently passed.
-DEFINE = re.compile(r"^#define\s+([A-Z_][A-Z_0-9]*)\s+(0x[0-9a-fA-F]+|\d+)\s*$", re.M)
+DEFINE = re.compile(
+    r"^#define\s+([A-Z_][A-Z_0-9]*)\s+(0[xX][0-9a-fA-F]+|\d+)\s*$", re.M
+)
+
+
+def c_int(token):
+    """Value of a C integer literal, octal included.
+
+    int(token, 0) is not this function: Python rejects a leading zero, and
+    Darwin writes whole families that way. TIOCM_DTR is 0002 in sys/ioccom.h,
+    so a gate using int(_, 0) does not report a mismatch on it, it raises
+    ValueError and takes the build down with a traceback.
+    """
+    text = token.lower()
+    if text.startswith("0x"):
+        return int(text, 16)
+    if len(text) > 1 and text.startswith("0"):
+        return int(text, 8)
+    return int(text, 10)
 
 
 def sdk_path():
@@ -59,7 +77,9 @@ def sdk_values(include_dir, names):
     and a scan costs roughly 0.75s, which a per-constant loop multiplied by the
     number of stub constants for no reason.
     """
-    pattern = r"^#define[ \t]+(" + "|".join(names) + r")[ \t]+(0x[0-9a-fA-F]+|[0-9]+)"
+    pattern = (
+        r"^#define[ \t]+(" + "|".join(names) + r")[ \t]+(0[xX][0-9a-fA-F]+|[0-9]+)"
+    )
     hit = subprocess.run(
         ["grep", "-rhoE", pattern, str(include_dir)],
         stdout=subprocess.PIPE,
@@ -70,7 +90,7 @@ def sdk_values(include_dir, names):
     for line in hit:
         parts = line.split()
         if len(parts) >= 3 and parts[1] in found:
-            found[parts[1]].add(int(parts[2], 0))
+            found[parts[1]].add(c_int(parts[2]))
     return found
 
 
@@ -98,7 +118,7 @@ def main():
     found = sdk_values(include_dir, [name for name, _ in defines])
     wrong, missing = [], []
     for name, raw in defines:
-        want = int(raw, 0)
+        want = c_int(raw)
         got = found[name]
         if not got:
             missing.append(name)
