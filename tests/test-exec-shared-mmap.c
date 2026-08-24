@@ -133,11 +133,16 @@ static int stage2(const char *path,
     if (p == MAP_FAILED) {
         FAIL("mmap");
     } else if ((uint64_t) (uintptr_t) p != shared_addr) {
-        /* Not the address asked for, so the check has nothing to say. Report it
-         * rather than passing on a mapping that was never the one at risk.
+        /* A failure, not a skip. The region table is empty after the reset, so
+         * elfuse honors this hint in both the fixed and the broken build
+         * (measured: the broken one reaches the check and fails it). If it ever
+         * stops being honored, this check silently stops testing anything, and
+         * a run that reports success without having looked is worse than a red
+         * one. Whoever changes the allocator gets to see this and decide.
          */
-        printf("SKIP: hint 0x%llx not honored (got %p)\n",
+        printf("hint 0x%llx not honored (got %p): ",
                (unsigned long long) shared_addr, (void *) p);
+        FAIL("could not place the mapping at the vacated address");
         munmap(p, MAP_LEN);
     } else {
         memset(p, 'S', MAP_LEN);
