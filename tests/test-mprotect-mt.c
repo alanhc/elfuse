@@ -18,9 +18,9 @@
  *      while reader threads call read(/dev/urandom, page, n). The kernel
  *      page-walks before touching the buffer, so any stale-TLB-induced
  *      anomaly surfaces as an unexpected return value (anything other than
- *      n or -EFAULT). The VM crashing mid-run -- the failure mode the
- *      bounded-retry hardening item in TODO.md is gated on -- is also
- *      caught here because the test driver wraps every run in a timeout.
+ *      n or -EFAULT). The VM crashing mid-run, the failure mode the
+ *      bounded-retry hardening is gated on, is also caught here because
+ *      the test driver wraps every run in a timeout.
  *
  * The test does not try to PROVE the cross-vCPU race window absent. A passing
  * run is evidence the bounded-retry hardening lacks a concrete reproducer

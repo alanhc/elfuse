@@ -75,8 +75,8 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events);
  * on it during exec teardown has to know which. A socket transfers with
  * MSG_DONTWAIT, which macOS ignores for AF_UNIX sends, so a send into a full
  * buffer blocks in the kernel. Inherited stdio is a description elfuse does not
- * own, so its transfer is a plain blocking read or write. Both are recorded in
- * TODO.md; everything else elfuse owns O_NONBLOCK on and cannot park here.
+ * own, so its transfer is a plain blocking read or write. Everything else
+ * elfuse owns O_NONBLOCK on and cannot park here.
  *
  * events picks the direction: POLLIN reads, POLLOUT writes. iov is scratch the
  * caller owns, and a partial write rewrites it. Regular files, fds the guest

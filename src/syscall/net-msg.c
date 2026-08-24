@@ -892,10 +892,11 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                      * O_NONBLOCK has no handling for.
                      *
                      * What stays wrong is a sender that meant the description
-                     * to be nonblocking: the receiver sees blocking. That is
-                     * the cross-process divergence in TODO.md, and this is its
-                     * survivable direction -- a wait the sender would not have
-                     * waited, rather than an error on an fd that has none.
+                     * to be nonblocking: the receiver sees blocking. The
+                     * O_NONBLOCK shadow is per process, and this is the
+                     * survivable direction of that divergence: a wait the
+                     * sender would not have waited, rather than an error on an
+                     * fd that has none.
                      */
                     int recv_fl = fcntl(host_recv_fd, F_GETFL);
                     fd_alias_spec_t spec = fd_alias_carried(

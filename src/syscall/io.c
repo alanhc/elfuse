@@ -380,7 +380,7 @@ static bool io_eagain_should_wait(const fd_block_state_t *st, int host_fd)
  * (measured) and a pipe has no path to reopen. The one kind of fd elfuse does
  * not own is inherited stdio, where this blocks: the loop above it goes round
  * again only if a host signal truncated the transfer, which is the residual
- * parking window TODO.md records for those three descriptors.
+ * parking window for those three descriptors.
  */
 static ssize_t io_xfer_once(int host_fd,
                             bool is_socket,
