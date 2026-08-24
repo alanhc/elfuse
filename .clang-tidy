@@ -27,7 +27,7 @@ Checks: >
   readability-function-size,
   readability-inconsistent-declaration-parameter-name
 
-WarningsAsErrors: ''
+WarningsAsErrors: 'readability-function-size'
 HeaderFilterRegex: 'src/.*\.h$'
 CheckOptions:
   - key: bugprone-unsafe-functions.ReportMoreUnsafeFunctions
@@ -39,16 +39,24 @@ CheckOptions:
   # With the eleven NOLINT suppressions in place the check reports nothing on
   # this tree today, and all eleven are load-bearing: clang-tidy accounts for
   # exactly eleven NOLINT suppressions on a full run. That is not the same as
-  # 400 being a comfortable margin. Eleven further functions already exceed
-  # 250 lines by this check's own counting, which includes comments and blank
-  # lines, so the next function to cross 400 is more likely to be one of those
-  # than anything newly written. Expect this to land on existing code first.
+  # 400 being a comfortable margin. A dozen further functions sit between 250
+  # and the ceiling by this check's own counting, which includes comments and
+  # blank lines, so the next function to cross 400 is more likely to be one of
+  # those than anything newly written. Expect this to land on existing code
+  # first, and count rather than trust that figure: the awk scan in
+  # elfuse-refactor reports it.
   #
-  # Advisory, like every other check here: WarningsAsErrors is empty and the
-  # tidy CI job says out loud that it logs rather than gates, so this reports
-  # a new oversized function, it does not stop one. Making it a real gate
-  # means naming it in WarningsAsErrors, which is a policy change and not one
-  # this threshold makes on its own.
+  # The one check here that gates: WarningsAsErrors names it, so a function
+  # crossing 400 lines fails make lint and the tidy CI job that runs it.
+  # Every other check stays advisory. Gating costs nothing today precisely
+  # because the eleven suppressions above are in place, which is what makes
+  # this the moment to turn it on: the ceiling now binds new growth, and the
+  # exempt bodies stay exempt in writing rather than by the check reporting
+  # into a log nobody fails on.
+  #
+  # A body that legitimately has to cross it takes a NOLINTNEXTLINE and says
+  # why in the commit. That is a decision someone makes, which is the whole
+  # difference from a warning that scrolls past.
   #
   # The other size axes stay off (-1) because the line count is the one that
   # correlates with a body no reader can hold at once.
