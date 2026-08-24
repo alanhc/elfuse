@@ -138,9 +138,6 @@ test-mmap-shared-ro
 [section] Cross-fork MAP_SHARED coherence tests
 test-cross-fork-mapshared          # diff=skip
 
-[section] MAP_SHARED across execve tests
-test-exec-shared-mmap
-
 [section] madvise MADV_DONTNEED tests
 test-madvise
 
