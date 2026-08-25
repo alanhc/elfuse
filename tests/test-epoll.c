@@ -300,6 +300,68 @@ int main(void)
         close(epfd);
     }
 
+    /* An op outside the three constants must be refused before anything is
+     * armed. The arms test DEL, then ADD, then MOD, so an unknown value used to
+     * fall past all three into the registration path and arm a knote.
+     *
+     * The null-event cases go with it: Linux reads no event for DEL, so a null
+     * pointer there is not an error, and faults for ADD and MOD.
+     */
+    int vep = epoll_create1(0);
+    int vfd[2];
+    if (vep >= 0 && pipe(vfd) == 0) {
+        struct epoll_event vev = {.events = EPOLLIN, .data.fd = vfd[0]};
+
+        TEST("an unknown epoll_ctl op is EINVAL");
+        EXPECT_ERRNO(epoll_ctl(vep, 99, vfd[0], &vev), EINVAL,
+                     "op 99 accepted");
+
+        TEST("and a negative op is EINVAL");
+        EXPECT_ERRNO(epoll_ctl(vep, -1, vfd[0], &vev), EINVAL,
+                     "op -1 accepted");
+
+        TEST("the rejected op armed nothing");
+        struct epoll_event got;
+        EXPECT_EQ(epoll_wait(vep, &got, 1, 0), 0, "a knote was registered");
+
+        TEST("a null event on ADD is EFAULT");
+        EXPECT_ERRNO(epoll_ctl(vep, EPOLL_CTL_ADD, vfd[0], NULL), EFAULT,
+                     "null event accepted");
+
+        /* The order these are decided in, measured against Linux 6.18 rather
+         * than read off the source. Each of these was a divergence: the first
+         * three because the fd == epfd test used to open the function, ahead of
+         * both descriptor lookups, and the last because the event was tested
+         * for NULL instead of being copied.
+         */
+        TEST("a bad epfd outranks a bad op");
+        EXPECT_ERRNO(epoll_ctl(-1, 99, vfd[0], &vev), EBADF, "not EBADF");
+
+        TEST("a bad target fd outranks a bad op");
+        EXPECT_ERRNO(epoll_ctl(vep, 99, -1, &vev), EBADF, "not EBADF");
+
+        TEST("a bad epfd outranks the self-add check");
+        EXPECT_ERRNO(epoll_ctl(-1, EPOLL_CTL_ADD, -1, &vev), EBADF,
+                     "not EBADF");
+
+        TEST("an unreadable event outranks a bad op");
+        EXPECT_ERRNO(epoll_ctl(vep, 99, vfd[0], (struct epoll_event *) 1),
+                     EFAULT, "not EFAULT");
+
+        TEST("an unreadable event outranks the self-add check");
+        EXPECT_ERRNO(epoll_ctl(vep, EPOLL_CTL_ADD, vep, NULL), EFAULT,
+                     "not EFAULT");
+
+        TEST("a null event on DEL is not an error for a registered fd");
+        EXPECT_EQ(epoll_ctl(vep, EPOLL_CTL_ADD, vfd[0], &vev), 0, "add failed");
+        EXPECT_EQ(epoll_ctl(vep, EPOLL_CTL_DEL, vfd[0], NULL), 0,
+                  "DEL rejected a null event");
+
+        close(vfd[0]);
+        close(vfd[1]);
+        close(vep);
+    }
+
     SUMMARY("test-epoll");
     return fails > 0 ? 1 : 0;
 }
