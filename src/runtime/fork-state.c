@@ -811,8 +811,9 @@ int fork_ipc_send_process_state(int ipc_sock,
                                   num_guest_regions) < 0)
         return -1;
 
-    const signal_state_t *sig = signal_get_state();
-    if (fork_ipc_write_all(ipc_sock, sig, sizeof(signal_state_t)) < 0)
+    signal_state_snapshot_t sig;
+    signal_get_state(&sig);
+    if (fork_ipc_write_all(ipc_sock, &sig, sizeof(sig)) < 0)
         return -1;
 
     const unsigned char *shim_ptr = proc_get_shim_blob();
@@ -896,7 +897,9 @@ static int fork_ipc_recv_backing_fds(int ipc_fd,
     return 0;
 }
 
-int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
+int fork_ipc_recv_process_state(int ipc_fd,
+                                guest_t *g,
+                                signal_state_snapshot_t *sig)
 {
     char cwd[LINUX_PATH_MAX];
     uint32_t umask_val;

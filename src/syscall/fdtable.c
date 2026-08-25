@@ -990,7 +990,11 @@ static fd_lifetime_t *fd_lifetime_pin_spare(int fd, fd_lifetime_t **spare)
         lifetime->type = fd_table[fd].type;
         fd_table[fd].lifetime = lifetime;
     }
-    atomic_fetch_add(&lifetime->refs, 1);
+
+    /* Relaxed: the caller already holds a reference, so this add cannot be what
+     * makes the object reachable.
+     */
+    atomic_fetch_add_explicit(&lifetime->refs, 1, memory_order_relaxed);
     return lifetime;
 }
 
@@ -1064,7 +1068,13 @@ int fd_host_ref_acquire(int guest_fd,
 
 void fd_lifetime_release(fd_lifetime_t *lifetime)
 {
-    unsigned int prev = atomic_fetch_sub(&lifetime->refs, 1);
+    /* Release so every use this thread made of the object happens before the
+     * decrement, then acquire below before the free, so the thread that runs
+     * the destructor sees all of them. Relaxed here would let the close/free
+     * race a sibling's last read.
+     */
+    unsigned int prev =
+        atomic_fetch_sub_explicit(&lifetime->refs, 1, memory_order_release);
 
     /* An unbalanced release wraps refs and the object silently never frees,
      * which surfaces later as an fd leak with no trace of its origin. Catch it
@@ -1073,6 +1083,7 @@ void fd_lifetime_release(fd_lifetime_t *lifetime)
     assert(prev != 0);
     if (prev != 1)
         return;
+    atomic_thread_fence(memory_order_acquire);
     if (lifetime->type != FD_STDIO)
         close(lifetime->host_fd);
     free(lifetime);

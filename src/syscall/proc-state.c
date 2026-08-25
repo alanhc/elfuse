@@ -444,12 +444,12 @@ bool proc_sysroot_snapshot(char *out, size_t outsz)
 
 void proc_set_sysroot_casefold(bool enabled)
 {
-    atomic_store(&sysroot_casefold, enabled);
+    atomic_store_explicit(&sysroot_casefold, enabled, memory_order_relaxed);
 }
 
 bool proc_sysroot_casefold_enabled(void)
 {
-    return atomic_load(&sysroot_casefold);
+    return atomic_load_explicit(&sysroot_casefold, memory_order_relaxed);
 }
 
 /* True when realpath(3) failed because the path stopped resolving rather than
