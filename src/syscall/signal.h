@@ -214,13 +214,26 @@ _Static_assert(offsetof(linux_rt_sigframe_t, uc) == 128,
 #define RT_SIGNAL_COUNT \
     (LINUX_NSIG - LINUX_SIGRTMIN + 1) /* 33 signals: 32-64 */
 
+/* The gap before si_ptr is a named member rather than padding the compiler
+ * inserts. Storing a value into a struct leaves its padding unspecified (C11
+ * 6.2.6.1), and these are assigned whole, from signal_default_info's compound
+ * literal among others, so the four bytes there would carry whatever the host
+ * stack held. Anything copying the struct as bytes carries that with it, and
+ * fork IPC does. Named, the field is copied as a value like any other and
+ * starts zero everywhere the struct does.
+ */
 typedef struct {
     int signum;
     int32_t si_code, si_pid;
     uint32_t si_uid;
     int32_t si_int;
+    uint32_t _pad;
     uint64_t si_ptr;
 } signal_rt_info_t;
+
+_Static_assert(sizeof(signal_rt_info_t) ==
+                   sizeof(int32_t) * 6 + sizeof(uint64_t),
+               "signal_rt_info_t has padding a byte-wise copy would carry");
 
 /* One pending-signal set. Linux keeps two of these per task: the thread's
  * private set (task->pending, targeted by tgkill/tkill) and the thread-group

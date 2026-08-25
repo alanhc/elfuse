@@ -995,8 +995,10 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected,
                 break;
             const signal_rt_info_t *head = &sp->rt_info[idx][sp->rt_head[idx]];
 
-            /* Compare field by field; signal_rt_info_t has padding between
-             * si_int and si_ptr that memcmp would treat as significant.
+            /* Compare field by field. The gap between si_int and si_ptr is a
+             * named _pad member rather than compiler padding, so its bytes are
+             * defined, but it carries no meaning and memcmp would weigh it the
+             * same as a payload field.
              */
             if (head->signum != want->signum ||
                 head->si_code != want->si_code ||
