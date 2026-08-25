@@ -223,6 +223,14 @@ int translate_open_flags(int linux_flags)
 #undef _
     /* clang-format on */
 
+    /* O_SYNC includes an independent __O_SYNC bit. Linux normalizes that bit,
+     * alone or with O_DSYNC, to O_SYNC. An O_DSYNC-only request stays weaker.
+     */
+    if (linux_flags & (LINUX_O_SYNC & ~LINUX_O_DSYNC))
+        flags |= O_SYNC;
+    else if (linux_flags & LINUX_O_DSYNC)
+        flags |= O_DSYNC;
+
     return flags;
 }
 
@@ -238,6 +246,15 @@ int mac_to_linux_status_flags(int mac_flags)
         linux_flags |= LINUX_O_APPEND;
     if (mac_flags & O_ASYNC)
         linux_flags |= LINUX_O_ASYNC;
+
+    /* The same asymmetry in reverse: reporting LINUX_O_SYNC sets the O_DSYNC
+     * bit too, which is what Linux does, so the weaker flag is only reported
+     * when the stronger one is not set.
+     */
+    if (mac_flags & O_SYNC)
+        linux_flags |= LINUX_O_SYNC;
+    else if (mac_flags & O_DSYNC)
+        linux_flags |= LINUX_O_DSYNC;
     return linux_flags;
 }
 
