@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-skill-refs test-gdbstub test-coreutils test-busybox \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -76,6 +76,12 @@ check-eintr-contract:
 check-lock-order:
 	@python3 scripts/check-lock-order.py --self-test
 	@python3 scripts/check-lock-order.py
+
+## Fail when an atomic access states no memory order
+check-atomics:
+	@echo "  ATOMICS src/"
+	@python3 scripts/check-atomics.py --self-test
+	@python3 scripts/check-atomics.py
 
 ## Verify every path, target, and section the skills name still resolves
 check-skill-refs:
@@ -228,7 +234,7 @@ check-sanitizer: $(ELFUSE_BIN) $(TEST_DEPS) $(CHECK_HOST_UNIT_BINS)
 	$(CHECK_SHARED_LANES)
 
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-skill-refs test-config \
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-config \
 		$(CHECK_HOST_UNIT_BINS)
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)

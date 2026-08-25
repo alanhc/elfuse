@@ -177,6 +177,12 @@ The rule covers the bare `atomic_load(x)` spelling too, not just `x` on its own.
 It is an atomic operation, but a sequentially-consistent one by default, so it
 states no more about the ordering than the plain operator does.
 
+`scripts/check-atomics.py` holds the two halves a regex can settle: no
+`__atomic_*` or `__sync_*`, and no C11 atomic call without its `_explicit`
+form. It does not check plain-operator access to an `_Atomic` object, because
+finding those needs the declarations resolved and the tree still carries a large
+pre-existing set of them; that half stays a review question.
+
 State the order and name what it pairs with. Relaxed is right under a lock that
 already serializes the access. Release and acquire are for a publish a lock-free
 reader chases, and the comment says which reader. Sequential consistency is for
