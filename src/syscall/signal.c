@@ -1720,6 +1720,15 @@ static int sigtimedwait_try_dequeue(uint64_t mask, signal_rt_info_t *info_out)
 
     /* Dequeue: same logic as signal_deliver. */
     if (signum >= LINUX_SIGRTMIN) {
+        /* Seed before dequeuing, the same way signal_deliver and
+         * signal_claim_shared_locked do. A pending RT bit whose queue holds no
+         * saved siginfo is reachable, and signal_rt_dequeue_locked leaves the
+         * descriptor untouched when it hits one, so without the seed the caller
+         * copies uninitialized host stack into the guest's siginfo_t. Linux
+         * collect_signal() fills the same default rather than withholding the
+         * signal, so the signum is still reported.
+         */
+        *info_out = signal_default_info(signum);
         signal_rt_dequeue_locked(src, signum, info_out);
     } else {
         *info_out = signal_standard_peek_locked(src, signum);
