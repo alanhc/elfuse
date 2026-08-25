@@ -1509,22 +1509,25 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 
         /* Remove all filters for this fd. EPOLLRDHUP alone registers
          * EVFILT_READ (see ADD path), so check both EPOLLIN and EPOLLRDHUP.
+         * Each delete goes in its own kevent call for the reason the MOD path
+         * below already states: a batched call with a NULL eventlist stops at
+         * the first failed change and leaks the survivor, and events names a
+         * filter that may not be registered -- a dropped write filter, or the
+         * one EPOLLONESHOT already removed. Errors are ignored either way,
+         * since the fd may already be closed.
          */
-        struct kevent changes[2];
-        int nchanges = 0;
         {
+            struct kevent del;
             if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
-                EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ,
-                       EV_DELETE, 0, 0, NULL);
-                nchanges++;
+                EV_SET(&del, target_host_fd, EVFILT_READ, EV_DELETE, 0, 0,
+                       NULL);
+                kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
             }
             if (reg->events & LINUX_EPOLLOUT) {
-                EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE,
-                       EV_DELETE, 0, 0, NULL);
-                nchanges++;
+                EV_SET(&del, target_host_fd, EVFILT_WRITE, EV_DELETE, 0, 0,
+                       NULL);
+                kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
             }
-            /* Ignore errors from EV_DELETE (fd might already be closed) */
-            kevent(epoll_ref.fd, changes, nchanges, NULL, 0, NULL);
             epoll_reg_deactivate_locked(inst, reg);
         }
         ret = 0;
