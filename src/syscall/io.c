@@ -412,10 +412,9 @@ static bool io_eagain_should_wait(const fd_block_state_t *st, int host_fd)
  * alone. Everything else relies on elfuse owning O_NONBLOCK on the host fd
  * (fd_init_entry); macOS has no per-call equivalent for a pipe and no private
  * open file description to borrow either, since dup shares the status flags
- * (measured) and a pipe has no path to reopen. The one kind of fd elfuse does
- * not own is inherited stdio, where this blocks: the loop above it goes round
- * again only if a host signal truncated the transfer, which is the residual
- * parking window for those three descriptors.
+ * (measured) and a pipe has no path to reopen. On a description elfuse does not
+ * own (io.h names which) this blocks, and the loop above goes round again only
+ * if a host signal truncated the transfer.
  */
 static ssize_t io_xfer_once(int host_fd,
                             bool is_socket,
@@ -2559,6 +2558,11 @@ int64_t sys_process_vm_writev(guest_t *g,
 
 /* terminal I/O. */
 
+/* Over the function-size limit on purpose.
+ *
+ * A dispatch switch: one arm per request code, arms independent. The length is
+ * the ioctl surface, not nesting.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
 {

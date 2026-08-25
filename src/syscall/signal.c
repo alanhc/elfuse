@@ -12,6 +12,30 @@
  * handler eventually calls rt_sigreturn (SYS 139), which restores the saved
  * register state from the frame.
  *
+ * Three paths here rebuild EL0 register state behind the guest's back, and each
+ * has to answer the same question: does the EL1 shim still hold a saved GPR
+ * frame that would overwrite the rebuild on ERET?
+ *
+ *                         ┌────────────────────┐
+ *                         │ rebuilds EL0 state │
+ *                         └────────────────────┘
+ *              ┌───────────────────┘ └┐└────────────────────┐
+ *              │                      │                     │
+ *   ┌──────────▾──────────┐   ┌───────▾──────┐   ┌──────────▾─────────┐
+ *   │ signal in a syscall │   │ rt_sigreturn │   │ signal at bare EL0 │
+ *   └─────────────────────┘   └──────────────┘   └────────────────────┘
+ *              └─────────┐ ┌──────────┘           ┌─────────┘
+ *                        │ │                      │
+ *              ┌─────────▾─▾────────┐   ┌─────────▾────────┐
+ *              │ X8 = 2, drop frame │   │ no frame to drop │
+ *              └────────────────────┘   └──────────────────┘
+ *
+ * rt_sigreturn always has a frame to drop, having entered through one.
+ * deliver_signal_locked and signal_rt_sigreturn each say why at the point they
+ * write the marker. sys_execve is a fourth rebuilder, in exec.c, and takes
+ * neither shape: it re-enters through the shim's MMU-off _start with the GPRs
+ * zeroed, so there is no frame to drop and no marker to write.
+ *
  * Reference: Linux arch/arm64/kernel/signal.c
  */
 

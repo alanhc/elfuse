@@ -23,6 +23,31 @@
  * fuse_lock is always dropped before the session lock is used that way, so the
  * two claims do not meet.
  *
+ * That path, in acquisition order:
+ *
+ *            ┌───────────┐
+ *            │ fuse_lock │
+ *            └───────────┘
+ *                  │
+ *   ┌──────────────▾──────────────┐
+ *   │ pin session, drop fuse_lock │
+ *   └─────────────────────────────┘
+ *                  └┐
+ *                   │
+ *           ┌───────▾──────┐
+ *           │ session lock │
+ *           └──────────────┘
+ *          ┌───────┘ └────┐
+ *          │              │
+ *     ┌────▾────┐   ┌─────▾────┐
+ *     │ fd_lock │   │ sig_lock │
+ *     └─────────┘   └──────────┘
+ *
+ * cwd_lock is not drawn above it. It nests fuse_lock beneath it on the one path
+ * that pairs them, and fuse_path_matches_mount drops fuse_lock before returning
+ * into the cwd view, so cwd_lock is released before any session is pinned and
+ * never reaches the rest of this chain.
+ *
  * The numbered "Lock order: N" comments at the definitions predate this list
  * and are not indices into it. This list is the document; a number there says
  * only which locks that one was known to precede when it was written.

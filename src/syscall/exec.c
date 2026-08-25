@@ -48,10 +48,6 @@
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
-/* fd_cleanup_entry() releases type-specific fd resources after the CLOEXEC
- * entry has been removed from the shared fd table.
- */
-
 /* Force HVF to commit the sysreg/GPR writes that sys_execve performs after a
  * guest_reset before vcpu_run resumes. HVF defers writes until the next
  * register-touch on the owning thread, and a stale read here is harmless. Use
@@ -705,9 +701,40 @@ static int64_t exec_preload_interp(const guest_t *g,
  * One slot, because two threads racing to replace the same image have no
  * meaningful joint outcome: the second waits for the first, and if the first
  * succeeded the second never wakes as a running thread (de_thread reaps it).
- * Linux serializes the same window on cred_guard_mutex. EMPTY -> PUBLISHED ->
- * TAKEN -> (EMPTY on success, DONE on failure). A successful exec never reaches
- * DONE: the requester is reaped by de_thread and has no one to report to.
+ * Linux serializes the same window on cred_guard_mutex.
+ *
+ *             ┌───────┐
+ *             │ EMPTY │
+ *             └───────┘
+ *                 │
+ *           ┌─────▾─────┐
+ *           │ PUBLISHED │
+ *           └───────────┘
+ *                 │
+ *             ┌───▾───┐
+ *             │ TAKEN │
+ *             └───────┘
+ *       ┌────────┘ └────┐
+ *       │               │
+ *   ┌───▾──┐   ┌────────▾────────┐
+ *   │ DONE │   │ leader frees it │
+ *   └──────┘   └─────────────────┘
+ *       └──────────┐
+ *                  │
+ *       ┌──────────▾─────────┐
+ *       │ requester frees it │
+ *       └────────────────────┘
+ *
+ * The leader runs the whole of sys_execve on its own vCPU. A successful exec
+ * never reaches DONE, because the requester is reaped by de_thread and has no
+ * one to report to, so the leader clears the slot itself. A failure before the
+ * point of no return posts its result in DONE, and the requester clears the
+ * slot once it has read it.
+ *
+ * One edge back to EMPTY is not drawn above: the requester copies host_path
+ * into the slot after publishing, so a name that does not fit withdraws its own
+ * request and answers ENAMETOOLONG without a leader ever seeing it. The leader
+ * tolerates that flap because it re-checks the state under the lock.
  */
 typedef enum {
     HANDOFF_EMPTY = 0,
@@ -1255,6 +1282,12 @@ static void exec_enter_new_image(hv_vcpu_t vcpu,
     exec_sync_vcpu_regs(vcpu);
 }
 
+/* Over the function-size limit on purpose.
+ *
+ * The point of no return runs through the middle of it. Before PNR every exit
+ * restores the old image; after it there is no exit but the fatal one. A split
+ * would put that boundary at a call edge, where it is invisible.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_execve(hv_vcpu_t vcpu,
                    guest_t *g,
@@ -1462,12 +1495,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         if (rc == 0)
             break;
 
-        /* The file at the current path is a shebang script. */
         exec_is_script = true;
 
-        /* The current path is a script. Bound the resolution chain only once a
-         * further shebang is confirmed, so a max-depth chain ending in a real
-         * ELF still loads (matches the prior elf_load-first loop).
+        /* Bound the resolution chain only once a further shebang is confirmed,
+         * so a max-depth chain ending in a real ELF still loads (matches the
+         * prior elf_load-first loop).
          */
         if (shebang_depth >= ELF_SHEBANG_MAX_DEPTH) {
             err = -LINUX_ELOOP;

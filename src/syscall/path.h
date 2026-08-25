@@ -142,6 +142,55 @@ static inline int path_component_copy(char *dst,
 bool path_might_use_open_intercept(const char *path);
 bool path_might_use_stat_intercept(const char *path);
 int path_check_intercept_access(const struct stat *st, int mode, int flags);
+
+/* Resolve a guest path against dirfd into every spelling a syscall handler
+ * needs, and fill tx with them.
+ *
+ * This is the one place a guest name becomes a host name. A handler that
+ * reaches the host with a path it assembled itself has bypassed the sysroot
+ * redirect and the containment check together.
+ *
+ *                         ┌────────────┐
+ *                         │ guest path │
+ *                         └────────────┘
+ *                                │
+ *                    ┌───────────▾──────────┐
+ *                    │ proc or FUSE rewrite │
+ *                    └──────────────────────┘
+ *           ┌──────────────────┘ │ └─────────────────┐
+ *           │                    │                   │
+ *           │                   ┌┘                   │
+ *   ┌───────▾──────┐   ┌────────▾────────┐   ┌───────▾───────┐
+ *   │ dev/shm leaf │   │ sysroot resolve │   │ fd magic link │
+ *   └──────────────┘   └─────────────────┘   └───────────────┘
+ *           │                   └┐                   └─┐
+ *           │                    │                     │
+ *          ┌┘                    │                     │
+ *   ┌──────▾──────┐   ┌──────────▾──────────┐   ┌──────▾──────┐
+ *   │ backing dir │   │ containment recheck │   │ the fd path │
+ *   └─────────────┘   └─────────────────────┘   └─────────────┘
+ *                                │
+ *                        ┌───────▾───────┐
+ *                        │ casefold walk │
+ *                        └───────────────┘
+ *
+ * tx carries three spellings and they are not interchangeable. guest_path is
+ * what the guest asked for, after the /proc and FUSE rewrites; intercept_path
+ * is what the synthetic-filesystem intercepts match against; host_path is what
+ * reaches a macOS syscall. Only host_path moves down the pipeline.
+ *
+ * The two side arms return with host_path already final, skipping sysroot
+ * resolution deliberately rather than by omission; each says why where it is
+ * taken. flags choose which sysroot resolver runs (create, nofollow, or
+ * follow), and the same choice decides whether the casefold walk follows its
+ * final component. The last two steps run for a relative path only: an absolute
+ * one was already contained by the resolver and has no dirfd to be measured
+ * against.
+ *
+ * Returns 0 with tx filled, or -1 with errno set. A NULL path is not an error;
+ * every spelling comes back NULL and the caller's own AT_EMPTY_PATH handling
+ * decides what that means.
+ */
 int path_translate_at(guest_fd_t dirfd,
                       const char *path,
                       unsigned int flags,

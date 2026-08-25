@@ -3,6 +3,44 @@
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Both ends of the FUSE protocol live inside the guest VM, so a guest libfuse
+ * program works with no macFUSE, FUSE-T or FSKit on the host. What a real
+ * kernel would put in its /dev/fuse queue this file puts in a per-session one,
+ * and the daemon on the other side is an ordinary guest process reading and
+ * writing that character device through the usual syscall path.
+ *
+ * One request, end to end:
+ *
+ *                        ┌───────────────┐
+ *                        │ guest syscall │
+ *                        └───────────────┘
+ *                                └┐
+ *                                 │
+ *                       ┌─────────▾────────┐
+ *                       │ queue, then wait │
+ *                       └──────────────────┘
+ *            ┌──────────────────┘ └┐└──────────────────┐
+ *            │                     │                   │
+ *   ┌────────▾────────┐   ┌────────▾───────┐   ┌───────▾───────┐
+ *   │ daemon reads it │   │ gone: ENOTCONN │   │ signal: EINTR │
+ *   └─────────────────┘   └────────────────┘   └───────────────┘
+ *            └──────────┐
+ *                       │
+ *              ┌────────▾───────┐
+ *              │ daemon replies │
+ *              └────────────────┘
+ *                       └─────────┐
+ *                                 │
+ *                         ┌───────▾──────┐
+ *                         │ waiter wakes │
+ *                         └──────────────┘
+ *
+ * The frame carries a unique the daemon echoes back, which is how a reply finds
+ * its waiter; a request is answered exactly once and the waiter owns the copy
+ * it takes away. The two ways a wait ends without a reply are documented at
+ * fuse_request_locked, which is where they are decided, and the two locks this
+ * file takes are placed in the order at the top of syscall/internal.h.
  */
 
 #include <errno.h>
@@ -947,12 +985,19 @@ static int fuse_send_init_locked(fuse_session_t *session)
  * Returns 0 on success, or a negative Linux errno on failure. The caller must
  * hold session->lock.
  *
- * Known limitation: the wait uses a plain pthread_cond_wait, so a signal
- * delivered to a blocked consumer does not return -EINTR and does not emit a
- * FUSE_INTERRUPT frame to the daemon. Honoring SA_RESTART and emitting
- * FUSE_INTERRUPT requires integrating with the per-thread signal eventfd and
- * remains a deferred compatibility item. Until then, daemon death or session
- * close are the only paths that wake a blocked consumer.
+ * The wait is a short timed wait rather than a plain cond wait, because a
+ * pending guest signal is not something this condvar is ever signalled on: the
+ * quantum is what gives the loop a chance to look. Which signals end it, and
+ * why the restartable ones do not, is at the check itself.
+ *
+ * The other way it ends without a reply is the daemon going away: session close
+ * and daemon death both break the loop condition, and the tail reports
+ * -ENOTCONN for a request no reply can now reach.
+ *
+ * A request that does end that way is detached rather than freed, because the
+ * daemon may still answer it and the reply needs somewhere to land. Detachment
+ * has no other cause, and a request carrying it is the only one this function
+ * leaves alive; every other one is freed here before returning.
  */
 static int fuse_request_locked(fuse_session_t *session,
                                uint32_t opcode,
