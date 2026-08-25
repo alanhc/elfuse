@@ -460,29 +460,44 @@ int main(void)
     unlink("/tmp/elfuse-fcntl-flags");
 
     /* A raw openat may carry __O_SYNC without O_DSYNC. Linux normalizes it to
-     * O_SYNC, while an O_DSYNC-only open remains weaker.
+     * O_SYNC, while an O_DSYNC-only open remains weaker. Every F_GETFL result
+     * is stored before it is masked. A failed call returns -1, whose bits
+     * satisfy every mask below, so testing the call inline would turn a failure
+     * into a row of green checks. check_accmode above guards the same way.
      */
     int sfd_sync = open(SYNC_FILE, O_RDWR | O_CREAT | O_SYNC, 0600);
     if (sfd_sync >= 0) {
+        int fl = fcntl(sfd_sync, F_GETFL);
         TEST("O_SYNC round trips through F_GETFL");
-        EXPECT_EQ(fcntl(sfd_sync, F_GETFL) & O_SYNC, O_SYNC, "flag was lost");
+        if (fl < 0)
+            FAIL("F_GETFL failed");
+        else
+            EXPECT_EQ(fl & O_SYNC, O_SYNC, "flag was lost");
         close(sfd_sync);
     }
     int sfd_raw_sync = syscall(SYS_openat, AT_FDCWD, SYNC_FILE,
                                O_RDWR | O_CREAT | (O_SYNC & ~O_DSYNC), 0600);
     if (sfd_raw_sync >= 0) {
+        int fl = fcntl(sfd_raw_sync, F_GETFL);
         TEST("standalone __O_SYNC normalizes through F_GETFL");
-        EXPECT_EQ(fcntl(sfd_raw_sync, F_GETFL) & O_SYNC, O_SYNC,
-                  "flag was lost");
+        if (fl < 0)
+            FAIL("F_GETFL failed");
+        else
+            EXPECT_EQ(fl & O_SYNC, O_SYNC, "flag was lost");
         close(sfd_raw_sync);
     }
     int sfd_dsync = open(SYNC_FILE, O_RDWR | O_CREAT | O_DSYNC, 0600);
     if (sfd_dsync >= 0) {
         int fl = fcntl(sfd_dsync, F_GETFL);
         TEST("O_DSYNC round trips through F_GETFL");
-        EXPECT_TRUE(fl & O_DSYNC, "flag was lost");
-        TEST("and an O_DSYNC open is not reported as O_SYNC");
-        EXPECT_EQ(fl & O_SYNC, O_DSYNC & O_SYNC, "the weaker flag was widened");
+        if (fl < 0) {
+            FAIL("F_GETFL failed");
+        } else {
+            EXPECT_TRUE(fl & O_DSYNC, "flag was lost");
+            TEST("and an O_DSYNC open is not reported as O_SYNC");
+            EXPECT_EQ(fl & O_SYNC, O_DSYNC & O_SYNC,
+                      "the weaker flag was widened");
+        }
         close(sfd_dsync);
     }
     unlink(SYNC_FILE);

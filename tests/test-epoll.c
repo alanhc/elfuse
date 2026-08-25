@@ -332,8 +332,30 @@ int main(void)
          * than read off the source. Each of these was a divergence: the first
          * three because the fd == epfd test used to open the function, ahead of
          * both descriptor lookups, and the last because the event was tested
-         * for NULL instead of being copied.
+         * for NULL instead of being copied. And above all of them, the copy.
+         * The kernel runs it in the syscall wrapper, before do_epoll_ctl
+         * reaches either fdget, so an unreadable event outranks a bad
+         * descriptor for every op that reads one. DEL reads none, which is the
+         * one call in this family that still answers EBADF.
          */
+        TEST("an unreadable event outranks a bad epfd");
+        EXPECT_ERRNO(
+            epoll_ctl(-1, EPOLL_CTL_ADD, vfd[0], (struct epoll_event *) 1),
+            EFAULT, "not EFAULT");
+
+        TEST("an unreadable event outranks a bad target fd");
+        EXPECT_ERRNO(
+            epoll_ctl(vep, EPOLL_CTL_ADD, -1, (struct epoll_event *) 1), EFAULT,
+            "not EFAULT");
+
+        TEST("an unreadable event outranks a bad epfd and a bad op");
+        EXPECT_ERRNO(epoll_ctl(-1, 99, -1, (struct epoll_event *) 1), EFAULT,
+                     "not EFAULT");
+
+        TEST("but DEL reads none, so a bad epfd wins there");
+        EXPECT_ERRNO(epoll_ctl(-1, EPOLL_CTL_DEL, -1, (struct epoll_event *) 1),
+                     EBADF, "not EBADF");
+
         TEST("a bad epfd outranks a bad op");
         EXPECT_ERRNO(epoll_ctl(-1, 99, vfd[0], &vev), EBADF, "not EBADF");
 
