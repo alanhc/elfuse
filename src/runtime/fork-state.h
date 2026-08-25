@@ -148,4 +148,6 @@ int fork_ipc_send_process_state(int ipc_sock,
                                 bool regions_tracker_stale_snapshot,
                                 const guest_region_t *preannounced_snapshot,
                                 uint32_t num_preannounced);
-int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig);
+int fork_ipc_recv_process_state(int ipc_fd,
+                                guest_t *g,
+                                signal_state_snapshot_t *sig);

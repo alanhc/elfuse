@@ -372,7 +372,8 @@ static int oom_score_adj_to_adj(int v)
 
 static int proc_oom_format_value(int kind, char *buf, size_t bufsz)
 {
-    int score_adj = atomic_load(&oom_score_adj_value);
+    int score_adj =
+        atomic_load_explicit(&oom_score_adj_value, memory_order_relaxed);
     int val = 0;
     if (kind == OOM_PATH_SCORE_ADJ)
         val = score_adj;
@@ -1691,7 +1692,7 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
 {
     proc_task_collect_ctx_t *c = arg;
     if (c->ntids < MAX_THREADS)
-        c->tids[c->ntids++] = t->guest_tid;
+        c->tids[c->ntids++] = thread_tid(t);
 }
 
 
@@ -3608,7 +3609,8 @@ int proc_intercept_write(int guest_fd,
     if (!use_pwrite && lseek(host_fd, offset + (int64_t) count, SEEK_SET) < 0)
         goto unlock;
 
-    atomic_store(&oom_score_adj_value, score_adj);
+    atomic_store_explicit(&oom_score_adj_value, score_adj,
+                          memory_order_relaxed);
     proc_oom_refresh_live_fds_locked();
     *written_out = (ssize_t) count;
     rc = 1;

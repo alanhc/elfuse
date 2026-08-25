@@ -10,6 +10,7 @@
  */
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1922,9 +1923,9 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
              * translation failure so genuine errors are not silently dropped.
              */
             if (errno == ENAMETOOLONG) {
-                static bool overlong_warned;
-                if (!__atomic_exchange_n(&overlong_warned, true,
-                                         __ATOMIC_RELAXED))
+                static _Atomic bool overlong_warned;
+                if (!atomic_exchange_explicit(&overlong_warned, true,
+                                              memory_order_relaxed))
                     log_warn(
                         "getdents64: skipping host dirent whose name "
                         "exceeds Linux NAME_MAX (%u); first hit was "
