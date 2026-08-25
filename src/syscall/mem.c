@@ -888,6 +888,12 @@ static bool high_va_replaceable_gpa_base(guest_t *g,
     return true;
 }
 
+/* Over the function-size limit on purpose.
+ *
+ * The Rosetta high-VA mapping loop plus its rollback, which has to undo page
+ * tables installed by the loop it follows. The two cannot be separated without
+ * publishing the in-flight block state.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 static int64_t sys_mmap_high_va(guest_t *g,
                                 uint64_t addr,
@@ -2723,6 +2729,12 @@ static void mmap_fresh_dispose(mmap_fresh_t *fresh)
     errno = saved_errno;
 }
 
+/* Over the function-size limit on purpose.
+ *
+ * Flag combinations, not steps: MAP_FIXED, MAP_SHARED, the file-backed overlay
+ * and the anonymous path each qualify the others. Splitting by flag duplicates
+ * the interactions between them.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_mmap(guest_t *g,
                  uint64_t addr,
@@ -3499,6 +3511,11 @@ int64_t sys_mmap(guest_t *g,
 
 /* sys_mremap. */
 
+/* Over the function-size limit on purpose.
+ *
+ * Same shape as sys_mmap, with the grow-in-place and move cases sharing one
+ * rollback of the region table.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_mremap(guest_t *g,
                    uint64_t old_addr,

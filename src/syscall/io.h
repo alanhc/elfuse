@@ -83,16 +83,36 @@ int64_t io_wait_fd_timed_or_interrupted(int host_fd,
  * moved, which is what a blocking write(2) promises, and reports the partial
  * count when a signal arrives with bytes already gone.
  *
- * Two kinds of fd fall outside the no-parking guarantee, and a caller relying
- * on it during exec teardown has to know which. A socket transfers with
- * MSG_DONTWAIT, which macOS ignores for AF_UNIX sends, so a send into a full
- * buffer blocks in the kernel. Inherited stdio is a description elfuse does not
- * own, so its transfer is a plain blocking read or write. Everything else
- * elfuse owns O_NONBLOCK on and cannot park here.
+ * Which order the wait and the transfer run in is decided once, at the top,
+ * from the pinned state:
+ *
+ *                                ┌────────┐
+ *                                │ the fd │
+ *                                └────────┘
+ *             ┌─────────────────────┘ │ └────────────────┐
+ *             │                       │                  │
+ *             │                   ┌───┘                  │
+ *     ┌───────▾──────┐   ┌────────▾───────┐   ┌──────────▾──────────┐
+ *     │ cannot block │   │ elfuse owns it │   │ elfuse does not own │
+ *     └──────────────┘   └────────────────┘   └─────────────────────┘
+ *             │                   │                      └──┐
+ *             │                   │                         │
+ *           ┌─┘                   │                         │
+ *   ┌───────▾──────┐   ┌──────────▾──────────┐   ┌──────────▾──────────┐
+ *   │ one transfer │   │ transfer, then wait │   │ wait, then transfer │
+ *   └──────────────┘   └─────────────────────┘   └─────────────────────┘
+ *
+ * That last branch is the whole of the residual parking window, and a caller
+ * relying on the guarantee during exec teardown has to know which fds reach it:
+ * inherited stdio, whose open file description belongs to the launching
+ * process, and an SCM_RIGHTS arrival that was not already nonblocking.
+ * Everything else elfuse owns the flag on, sockets included. io_xfer itself
+ * says why the order differs per branch.
  *
  * events picks the direction: POLLIN reads, POLLOUT writes. iov is scratch the
- * caller owns, and a partial write rewrites it. Regular files, fds the guest
- * set nonblocking, and direction mismatches transfer straight through.
+ * caller owns, and a partial write rewrites it. Beyond the left branch above,
+ * an fd the guest set nonblocking and a direction mismatch also come back in
+ * one transfer, having never reached the wait.
  *
  * Returns 0 with *out set to the raw host result (errno live when it is -1), or
  * a negative Linux errno, in which case nothing moved and iov is untouched: the

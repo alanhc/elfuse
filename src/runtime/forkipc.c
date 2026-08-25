@@ -8,6 +8,33 @@
  * Implements clone via posix_spawn + IPC state transfer. macOS HVF allows only
  * one VM per process, so fork spawns a new elfuse process and serializes the
  * full VM state (registers, memory, FDs) over a socketpair.
+ *
+ * Registers and the fd table are small. Guest memory is not, and how it crosses
+ * is the whole cost of a fork:
+ *
+ *                      ┌──────────────┐
+ *                      │ guest memory │
+ *                      └──────────────┘
+ *              ┌──────────────┘ └──────────┐
+ *              │                           │
+ *   ┌──────────▾─────────┐   ┌─────────────▾─────────────┐
+ *   │ no shm fd: copy it │   │ shm fd: try an APFS clone │
+ *   └────────────────────┘   └───────────────────────────┘
+ *                    ┌────────────────────┘ │
+ *                    │                      │
+ *        ┌───────────▾──────────┐   ┌───────▾──────┐
+ *        │ cloned: send that fd │   │ clone failed │
+ *        └──────────────────────┘   └──────────────┘
+ *              ┌───────────────────────────┘ │
+ *              │                             │
+ *              │                          ┌──┘
+ *    ┌─────────▾────────┐   ┌─────────────▾────────────┐
+ *    │ Rosetta: copy it │   │ native: send the live fd │
+ *    └──────────────────┘   └──────────────────────────┘
+ *
+ * What each branch costs, and why the two fallbacks are not interchangeable, is
+ * at the CoW block in sys_clone where the choice is made.
+ * tests/bench-fork-cost.sh is what measures it on a given host.
  */
 
 #include <stdbool.h>
@@ -82,6 +109,12 @@ void fork_notify_vfork_exec(void)
     fork_child_vfork_notify_fd = -1;
 }
 
+/* Over the function-size limit on purpose.
+ *
+ * The child's whole bring-up in receive order, and the order is the contract:
+ * every step depends on the one before it, and the rollback on failure differs
+ * per step. Splitting hides which stage a failure came from.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int fork_child_main(int ipc_fd,
                     int vfork_notify_fd,
@@ -300,6 +333,11 @@ int fork_child_main(int ipc_fd,
      * needs to recognize the slave fds inherited from the parent and put them
      * back on the books. Without it the parent's close of its own copy makes
      * the pty look hung up while this child still holds a live slave.
+     *
+     * From here on every bail gives the credit back before destroying the
+     * guest. Nothing below reaches the teardown that normally returns it, and a
+     * child that never runs must not leave the pty looking busy to the master
+     * the parent still holds.
      */
     proc_pty_adopt_inherited_slaves();
 
@@ -307,11 +345,6 @@ int fork_child_main(int ipc_fd,
     if (fork_ipc_recv_process_state(ipc_fd, &g, &sig) < 0) {
         log_error("fork-child: failed to receive process state");
 
-        /* Give back the credit the parent added for this child before bailing:
-         * nothing here reaches the teardown that normally returns it, and a
-         * child that never runs must not leave the pty looking busy to the
-         * master the parent still holds.
-         */
         proc_pty_release_process_slaves();
         guest_destroy(&g);
         return 1;
@@ -320,11 +353,6 @@ int fork_child_main(int ipc_fd,
     if (chown_overlay_recv(ipc_fd) < 0) {
         log_error("fork-child: failed to receive chown overlay");
 
-        /* Give back the credit the parent added for this child before bailing:
-         * nothing here reaches the teardown that normally returns it, and a
-         * child that never runs must not leave the pty looking busy to the
-         * master the parent still holds.
-         */
         proc_pty_release_process_slaves();
         guest_destroy(&g);
         return 1;
@@ -341,11 +369,6 @@ int fork_child_main(int ipc_fd,
         admission_ready != 1) {
         log_error("fork-child: parent did not commit child admission");
 
-        /* Give back the credit the parent added for this child before bailing:
-         * nothing here reaches the teardown that normally returns it, and a
-         * child that never runs must not leave the pty looking busy to the
-         * master the parent still holds.
-         */
         proc_pty_release_process_slaves();
         guest_destroy(&g);
         return 1;
@@ -401,11 +424,7 @@ int fork_child_main(int ipc_fd,
      * the single-threaded child at this point).
      */
     if (shim_globals_install_per_vcpu(vcpu, &g, hdr.child_pid) < 0) {
-        /* Give back the credit the parent added for this child before bailing:
-         * nothing here reaches the teardown that normally returns it, and a
-         * child that never runs must not leave the pty looking busy to the
-         * master the parent still holds.
-         */
+        /* Give the pty credit back, as every bail below the adopt does. */
         proc_pty_release_process_slaves();
         guest_destroy(&g);
         return 1;
@@ -1489,6 +1508,12 @@ static int fork_snapshot_shm_via_clonefile(int src_fd)
     return clone_fd;
 }
 
+/* Over the function-size limit on purpose.
+ *
+ * One transaction. The failure paths unwind state established earlier in the
+ * same function (quiesced siblings, promoted overlays, the snapshot fd), so the
+ * goto ladder has to see all of it.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_clone(hv_vcpu_t vcpu,
                   guest_t *g,

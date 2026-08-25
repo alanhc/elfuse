@@ -2267,6 +2267,11 @@ static int proc_open_mounts_node(const char *path)
     return PROC_NOT_INTERCEPTED;
 }
 
+/* Over the function-size limit on purpose.
+ *
+ * One arm per intercepted /proc, /sys and /dev path. The arms share only the
+ * guest and the buffer, so a split would be a jump table by another name.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int proc_intercept_open(const guest_t *g,
                         const char *path,

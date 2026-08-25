@@ -461,6 +461,12 @@ static size_t msg_iov_total(const struct iovec *iov, int iovcnt)
     return total;
 }
 
+/* Over the function-size limit on purpose.
+ *
+ * The msghdr round trip: read the guest structure, transfer, then write back
+ * name, control and flags. The write-back has to see what the read established,
+ * and the SCM_RIGHTS arm has to unwind fds it installed.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 {

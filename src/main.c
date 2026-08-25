@@ -220,6 +220,12 @@ static int host_dc_zva_assert(void)
 #define ELFUSE_USAGE ELFUSE_USAGE_BODY(" ")
 #define ELFUSE_USAGE_WRAPPED ELFUSE_USAGE_BODY("\n              ")
 
+/* Over the function-size limit on purpose.
+ *
+ * Option parsing: one flag per arm, no shared state between them. Splitting
+ * trades a flat table for a dozen one-caller helpers and a struct to thread the
+ * results through.
+ */
 /* NOLINTNEXTLINE(readability-function-size) */
 int main(int argc, char **argv)
 {
@@ -652,9 +658,9 @@ int main(int argc, char **argv)
             goto cleanup;
         }
 
-        /* The current path is a script. Bound the resolution chain only once a
-         * further shebang is confirmed, so a max-depth chain ending in a real
-         * ELF still boots (matches sys_execve and the Linux kernel).
+        /* Bound the resolution chain only once a further shebang is confirmed,
+         * so a max-depth chain ending in a real ELF still boots (matches
+         * sys_execve and the Linux kernel).
          */
         if (shebang_depth >= ELF_SHEBANG_MAX_DEPTH) {
             log_error(

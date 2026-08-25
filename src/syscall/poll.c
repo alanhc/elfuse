@@ -1367,9 +1367,21 @@ int64_t sys_epoll_create1(int flags)
 
 int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 {
-    /* Linux returns EINVAL when trying to add an epoll fd to itself */
-    if (fd == epfd)
-        return -LINUX_EINVAL;
+    /* The event is copied before anything else, because that is where the
+     * kernel copies it. SYSCALL_DEFINE4(epoll_ctl) runs the copy_from_user in
+     * the syscall wrapper and returns EFAULT there, before do_epoll_ctl reaches
+     * either fdget, so an unreadable event outranks a bad descriptor for every
+     * op that reads one. Measured against Linux 6.18: epoll_ctl(-1, ADD, fd,
+     * (void *) 1) is EFAULT, not EBADF.
+     *
+     * ep_op_has_event(op) is op != EPOLL_CTL_DEL, so an unknown op copies too,
+     * and DEL reads nothing: epoll_ctl(-1, DEL, -1, (void *) 1) is the one call
+     * in that family that answers EBADF.
+     */
+    linux_epoll_event_t ev_in;
+    if (op != LINUX_EPOLL_CTL_DEL &&
+        guest_read_small(g, event_gva, &ev_in, sizeof(ev_in)) < 0)
+        return -LINUX_EFAULT;
 
     host_fd_ref_t epoll_ref;
     int64_t ref_err = host_fd_ref_open(epfd, &epoll_ref);
@@ -1398,6 +1410,26 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     fd_entry_t target_snap;
     if (!fd_snapshot(fd, &target_snap)) {
         ret = -LINUX_EBADF;
+        goto out;
+    }
+
+    /* The op and the pairing, in that order and here rather than at the top,
+     * because the kernel decides both inside do_epoll_ctl after both fdgets:
+     * epoll_ctl(-1, 99, fd, &ev) is EBADF, not EINVAL.
+     *
+     * Without the op check the arms below test DEL, then ADD, then MOD, and any
+     * other value fell past all three into the registration path and armed a
+     * knote. The pairing check used to open this function, ahead of both
+     * lookups, which made epoll_ctl(-1, ADD, -1, &ev) answer EINVAL where the
+     * kernel answers EBADF.
+     */
+    if (op != LINUX_EPOLL_CTL_ADD && op != LINUX_EPOLL_CTL_DEL &&
+        op != LINUX_EPOLL_CTL_MOD) {
+        ret = -LINUX_EINVAL;
+        goto out;
+    }
+    if (fd == epfd) {
+        ret = -LINUX_EINVAL;
         goto out;
     }
     int target_host_fd = target_snap.host_fd;
@@ -1469,12 +1501,12 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         goto out_locked;
     }
 
-    /* ADD or MOD: read the epoll_event from guest */
-    linux_epoll_event_t ev;
-    if (guest_read_small(g, event_gva, &ev, sizeof(ev)) < 0) {
-        ret = -LINUX_EFAULT;
-        goto out_locked;
-    }
+    /* Copied above, in the order Linux copies it. Reading it a second time here
+     * would let a sibling change the value between the fault check and the
+     * registration, and would report EFAULT after the EEXIST and ENOENT checks
+     * that Linux answers it before.
+     */
+    linux_epoll_event_t ev = ev_in;
 
     /* For MOD, remove old registrations first if they exist in kqueue.
      * EPOLLRDHUP alone registers EVFILT_READ (see ADD path), so check both

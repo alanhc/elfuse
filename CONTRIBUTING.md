@@ -146,12 +146,29 @@ A patch written in a style foreign to its surroundings costs the reviewer more t
 author.
 
 Three project-wide rules that no formatter will fix for you:
-* Source comments and commit messages are ASCII only.
-  No em dashes, no typographic quotes, no non-ASCII arrows.
-  Write `-`, `--`, or `:` instead, and drop the markdown: inside a comment a symbol or path is
-  written bare, as EPOLL_CTL_MOD or tests/foo.c, not wrapped in backticks.
+* Comment prose and commit messages are ASCII only. The one thing that is not prose, a diagram, is
+  the one exception, and it is spelled out below.
+  No em dashes, no typographic quotes, and no non-ASCII arrows outside a diagram.
+  Reword an em dash away with a comma, a colon, parentheses, or two sentences.
+  A spaced `--` carries the em dash's register rather than replacing it, and a bare `-` joining two
+  clauses does the same, so reach for the rewording first.
+  Both stay legal and neither earns a review comment on its own, but prose leaning on them has
+  disguised the em dash rather than removed it.
+  Drop the markdown as well: inside a comment a symbol or path is written bare, as EPOLL_CTL_MOD or
+  tests/foo.c, not wrapped in backticks.
   This governs what goes into a `.c`, `.h`, or `.S` file and into a commit message.
   Markdown documents, this one included, use ordinary markdown.
+
+  The exception, in full: a diagram drawn inside a comment may use the Unicode box-drawing block
+  (U+2500 to U+257F), plus the geometric arrowhead that terminates an edge, of which the diagrams in
+  this tree use one, U+25BE.
+  A flow or a layout a reader has to see is worth more than the byte width of its borders, and those
+  glyphs have corners, junctions, and arrowheads that `+`, `-`, and `|` only approximate.
+  The exception covers the picture and nothing else.
+  The sentence introducing it, and every other comment in the file, stay ASCII, and a commit message
+  has no exception at all.
+  Draw the whole picture in one charset rather than mixing the two, and keep it inside the column
+  limit like any other comment.
 * Comments use `/* ... */` exclusively.
   `//` never appears, not even for a single line.
 * Filenames use kebab-case (`proc-state.c`), identifiers use snake_case (`proc_state`).
@@ -213,9 +230,9 @@ A labelled pair such as `Usage:` and `Example:` needs a blank comment line betwe
 the reflow reads them as one paragraph and splices the two commands onto a single line.
 
 What it will not touch, so you can still lay these out by hand: blank lines inside a comment, the
-existing indentation, a preformatted region (a table, an ASCII diagram, a code fence), an SPDX
+existing indentation, a preformatted region (a table, a diagram, a code fence), an SPDX
 identifier, and a tool directive such as `clang-format off`.
-An ASCII diagram of a race window or a byte layout survives the reflow intact.
+A diagram of a race window or a byte layout survives the reflow intact.
 
 Single-line comments should be written in C89 style:
 ```c

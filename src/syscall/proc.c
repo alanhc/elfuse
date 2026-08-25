@@ -3816,6 +3816,11 @@ static bool vcpu_handle_el0_fault(guest_t *g,
  *
  * Both modes check proc_exit_group_requested so the main thread also reacts to
  * exit_group called by a worker.
+ *
+ * Over the function-size limit on purpose: the HVC dispatch is one arm per call
+ * number. This is also the deepest nest in the tree at eight levels, which is
+ * worth knowing, because the depth is a switch inside a loop inside the
+ * leader/worker split rather than logic layered on logic.
  */
 /* NOLINTNEXTLINE(readability-function-size) */
 int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
