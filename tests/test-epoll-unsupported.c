@@ -109,6 +109,41 @@ static void expect_op_errno(const char *label,
     close(fd);
 }
 
+/* Register @path for @events and require the readiness Linux reports for it.
+ * @want is the event mask a zero-timeout wait must produce, or 0 for none.
+ */
+static void expect_ready(const char *label,
+                         const char *path,
+                         uint32_t events,
+                         uint32_t want)
+{
+    TEST(label);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        FAIL("open failed");
+        return;
+    }
+    int epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1 failed");
+        close(fd);
+        return;
+    }
+    struct epoll_event ev = {.events = events, .data.fd = fd};
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        FAIL("ADD was refused");
+    } else {
+        struct epoll_event out[2];
+        int n = epoll_wait(epfd, out, 2, 0);
+        if (want)
+            EXPECT_TRUE(n == 1 && out[0].events == want, "wrong readiness");
+        else
+            EXPECT_EQ(n, 0, "expected no ready event");
+    }
+    close(epfd);
+    close(fd);
+}
+
 /* Require the errno of one epoll_ctl against a target with no poll method, and
  * the errno of the same call against a pollable one. Linux decides EPERM from
  * the target before it validates either the op or the epoll descriptor, so the
@@ -153,10 +188,31 @@ int main(void)
     expect_eperm("/dev/null EPOLLIN", open("/dev/null", O_RDWR), EPOLLIN);
     expect_eperm("/dev/null EPOLLOUT", open("/dev/null", O_RDWR), EPOLLOUT);
     expect_eperm("/dev/zero EPOLLIN", open("/dev/zero", O_RDONLY), EPOLLIN);
-    expect_eperm("/dev/urandom EPOLLIN", open("/dev/urandom", O_RDONLY),
-                 EPOLLIN);
     expect_eperm("directory EPOLLIN|EPOLLOUT",
                  open("/", O_RDONLY | O_DIRECTORY), EPOLLIN | EPOLLOUT);
+
+    /* The two random devices split, and not the way their names suggest.
+     * random_fops carries .poll and urandom_fops does not, since a read from
+     * urandom never waits, so Linux 6.12 accepts the first and answers EPERM
+     * for the second. macOS refuses a knote on both, so nothing but the path
+     * separates them here.
+     */
+    expect_eperm("/dev/urandom EPOLLIN", open("/dev/urandom", O_RDONLY),
+                 EPOLLIN);
+    expect_accepted("/dev/random EPOLLIN", open("/dev/random", O_RDONLY),
+                    EPOLLIN);
+    expect_accepted("/dev/random EPOLLOUT", open("/dev/random", O_RDONLY),
+                    EPOLLOUT);
+    expect_accepted("/dev/random EPOLLIN|EPOLLOUT",
+                    open("/dev/random", O_RDONLY), EPOLLIN | EPOLLOUT);
+
+    /* Accepting the registration is only half of it: no knote can carry the
+     * readiness, so the wait has to answer from the registration itself. Linux
+     * reports the pool readable and never writable.
+     */
+    expect_ready("/dev/random reports EPOLLIN", "/dev/random", EPOLLIN,
+                 EPOLLIN);
+    expect_ready("/dev/random reports no EPOLLOUT", "/dev/random", EPOLLOUT, 0);
 
     /* A plain file has no poll method on Linux. A fifo opened by path does, and
      * so does /proc/self/mountinfo, which is a plain file to fstat: both are

@@ -1049,6 +1049,13 @@ typedef struct {
                          * reporting but allow MOD.
                          */
     bool pty_master;    /* Registration is for a tracked pty master. */
+
+    /* The target is pollable on Linux but takes no knote here, so read
+     * readiness can never arrive through kqueue. /dev/random is the only such
+     * target today. Linux reports it readable as soon as the pool is seeded and
+     * from then on always, which is what the wait synthesizes.
+     */
+    bool always_readable;
 } epoll_reg_t;
 
 /* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance has its
@@ -1075,6 +1082,7 @@ typedef struct {
     pthread_mutex_t lock;
     int active_count;
     int pty_master_count;
+    int always_readable_count;
     epoll_reg_t regs[FD_TABLE_SIZE];
 } epoll_instance_t;
 
@@ -1085,9 +1093,12 @@ static void epoll_reg_deactivate_locked(epoll_instance_t *inst,
         inst->active_count--;
     if (reg->pty_master && inst->pty_master_count > 0)
         inst->pty_master_count--;
+    if (reg->always_readable && inst->always_readable_count > 0)
+        inst->always_readable_count--;
     reg->active = false;
     reg->oneshot_armed = false;
     reg->pty_master = false;
+    reg->always_readable = false;
     reg->generation = 0;
     reg->ofd_id = 0;
 }
@@ -1395,9 +1406,13 @@ static bool epoll_target_pollable(int kq, int host_fd)
  */
 static bool epoll_target_supported(int kq, const fd_entry_t *snap)
 {
+    /* A settled path answers for itself. The kqueue probe would veto
+     * /dev/random, which Linux polls and macOS refuses a knote on.
+     */
+    if (snap->path_poll_capable)
+        return true;
     struct stat st;
-    if (!snap->path_poll_capable && fstat(snap->host_fd, &st) == 0 &&
-        S_ISREG(st.st_mode))
+    if (fstat(snap->host_fd, &st) == 0 && S_ISREG(st.st_mode))
         return false;
     return epoll_target_pollable(kq, snap->host_fd);
 }
@@ -1708,6 +1723,11 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * leave the survivor registered. EINVAL on the read filter, or on a write
      * filter whose target takes no knote at all, is the EPERM case.
      *
+     * A target the path already settled is never that case: /dev/random is
+     * pollable on Linux and takes no knote here, so its refusal drops the
+     * filter the way a kqueue's write filter does. Read readiness then has no
+     * knote to arrive on, which always_readable carries to the wait.
+     *
      * An error that is not EINVAL abandons a registration this loop may have
      * already armed filters for, each carrying the udata of an entry the bail
      * never activates. Undo them: sys_epoll_pwait does reap such a knote, but
@@ -1720,6 +1740,7 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * means the mask named no read filter at all.
      */
     bool read_registered = false;
+    bool read_refused = false;
     for (int i = 0; i < nchanges; i++) {
         if (kevent(epoll_ref.fd, &changes[i], 1, NULL, 0, NULL) == 0) {
             if (changes[i].filter == EVFILT_READ)
@@ -1730,6 +1751,11 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
             ret = linux_errno();
             epoll_undo_changes(epoll_ref.fd, changes, i);
             goto out_locked;
+        }
+        if (target_snap.path_poll_capable) {
+            if (changes[i].filter == EVFILT_READ)
+                read_refused = true;
+            continue;
         }
         if (changes[i].filter == EVFILT_READ ||
             !(read_registered ||
@@ -1755,9 +1781,15 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     else if (!target_pty_master && reg->pty_master &&
              inst->pty_master_count > 0)
         inst->pty_master_count--;
+    if (read_refused && !reg->always_readable)
+        inst->always_readable_count++;
+    else if (!read_refused && reg->always_readable &&
+             inst->always_readable_count > 0)
+        inst->always_readable_count--;
     reg->active = true;
     reg->oneshot_armed = false;
     reg->pty_master = target_pty_master;
+    reg->always_readable = read_refused;
 
     ret = 0;
 
@@ -1767,6 +1799,18 @@ out:
     host_fd_ref_close(&epoll_ref);
     epoll_instance_release(inst);
     return ret;
+}
+
+/* Whether this instance holds a registration whose read readiness kqueue can
+ * never deliver. Same shape as a pending hangup: the wait must not block to its
+ * deadline waiting for an event that cannot arrive.
+ */
+static bool epoll_has_always_readable(epoll_instance_t *inst)
+{
+    pthread_mutex_lock(&inst->lock);
+    bool any = inst->always_readable_count > 0;
+    pthread_mutex_unlock(&inst->lock);
+    return any;
 }
 
 /* Collect guest fds registered in this instance whose pty master has hung up.
@@ -1901,7 +1945,8 @@ int64_t sys_epoll_pwait(guest_t *g,
     int hup_probe;
     uint64_t hup_probe_gen;
     bool hup_ready =
-        epoll_collect_hung_up(inst, &hup_probe, &hup_probe_gen, 1) > 0;
+        epoll_collect_hung_up(inst, &hup_probe, &hup_probe_gen, 1) > 0 ||
+        epoll_has_always_readable(inst);
     struct timespec zero_ts = {.tv_sec = 0, .tv_nsec = 0};
 
     /* Collect kqueue events. For indefinite waits, use a short timeout and loop
@@ -2048,6 +2093,33 @@ int64_t sys_epoll_pwait(guest_t *g,
         out[idx]._pad = 0;
         out[idx].data = reg->data;
         epoll_merge_event(&out[idx], &kevents[i], reg);
+    }
+
+    /* Stamp EPOLLIN for the registrations whose read readiness kqueue cannot
+     * deliver. /dev/random is the only such target: Linux reports it readable
+     * once the pool is seeded and from then on always, so the answer is a
+     * property of the registration rather than something to sample. Unlike the
+     * hangup scan below this reads regs[] under the lock it already holds, so
+     * there is no unlocked snapshot to re-verify against a generation.
+     */
+    if (inst->always_readable_count > 0) {
+        for (int gfd = 0; gfd < FD_TABLE_SIZE && nout < maxevents; gfd++) {
+            epoll_reg_t *areg = &inst->regs[gfd];
+            if (!areg->always_readable || !areg->active || areg->oneshot_armed)
+                continue;
+            if (!(areg->events & LINUX_EPOLLIN))
+                continue;
+            int idx = out_index[gfd];
+            if (idx < 0) {
+                idx = nout++;
+                out_index[gfd] = (int16_t) idx;
+                out_gfds[idx] = gfd;
+                out[idx].events = 0;
+                out[idx]._pad = 0;
+                out[idx].data = areg->data;
+            }
+            out[idx].events |= LINUX_EPOLLIN;
+        }
     }
 
     /* Stamp EPOLLHUP for the masters the host cannot report on. Linux delivers

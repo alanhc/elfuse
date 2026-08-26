@@ -145,14 +145,22 @@ bool path_intercept_poll_capable(const char *path)
 
     /* sysfs attributes are pollable through kernfs, and /etc/mtab is a symlink
      * onto the mount table. What is left of the intercept surface --
-     * /etc/passwd and /etc/group, the utmp files, /dev and the FUSE mounts --
-     * is a plain file, a character device or a fifo, all of which the host
-     * object describes correctly, so the caller's fstat and kqueue probe answer
-     * for them.
+     * /etc/passwd and /etc/group, the utmp files, most of /dev and the FUSE
+     * mounts -- is a plain file, a character device or a fifo, all of which the
+     * host object describes correctly, so the caller's fstat and kqueue probe
+     * answer for them.
+     *
+     * /dev/random is the exception, and it does not extend to the /dev/urandom
+     * beside it. random_fops carries .poll and urandom_fops does not, since a
+     * read from urandom never waits, so Linux 6.12 answers 0 for the first and
+     * EPERM for the second. macOS refuses a knote on both, which leaves the
+     * host object unable to tell them apart.
      */
     if (!strncmp(path, "/proc/", 6))
         return true;
     if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
+        return true;
+    if (!strcmp(path, "/dev/random"))
         return true;
     return !strcmp(path, "/etc/mtab");
 }
