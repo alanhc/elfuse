@@ -76,6 +76,11 @@ bool path_might_use_open_intercept(const char *path)
  * when the path names no process directory at all: "/proc/self/stat" and
  * "/proc/41/stat" both yield "stat", "/proc/self" yields "", and
  * "/proc/meminfo" yields NULL.
+ *
+ * A "task/<tid>/" segment is stripped with the process directory it sits in, so
+ * "/proc/41/task/41/mounts" yields "mounts" too. Linux answers the thread
+ * spelling of these names the way it answers the process one, measured on 6.12
+ * over mounts, mountinfo, net/dev and stat.
  */
 static const char *proc_pid_dir_suffix(const char *path)
 {
@@ -96,7 +101,18 @@ static const char *proc_pid_dir_suffix(const char *path)
             return NULL;
         p = d;
     }
-    return *p == '/' ? p + 1 : p;
+    if (*p == '/')
+        p++;
+
+    if (!strncmp(p, "task/", 5)) {
+        const char *d = p + 5;
+        const char *tid = d;
+        while (*d >= '0' && *d <= '9')
+            d++;
+        if (d != tid && (*d == '\0' || *d == '/'))
+            p = (*d == '/') ? d + 1 : d;
+    }
+    return p;
 }
 
 /* Whether Linux gives the file behind this intercepted guest path a poll
