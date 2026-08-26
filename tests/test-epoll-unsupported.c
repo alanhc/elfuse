@@ -109,6 +109,30 @@ static void expect_op_errno(const char *label,
     close(fd);
 }
 
+/* Require the errno of one epoll_ctl against a target with no poll method, and
+ * the errno of the same call against a pollable one. Linux decides EPERM from
+ * the target before it validates either the op or the epoll descriptor, so the
+ * pair is what shows the ordering rather than a lucky single answer.
+ */
+static void expect_outranks_einval(const char *label, int epfd, int op)
+{
+    TEST(label);
+    int plain = open("/etc/hosts", O_RDONLY);
+    int pipefd[2];
+    if (plain < 0 || pipe(pipefd) != 0) {
+        FAIL("setup failed");
+        close(plain);
+        return;
+    }
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = plain};
+    bool eperm = epoll_ctl(epfd, op, plain, &ev) == -1 && errno == EPERM;
+    bool einval = epoll_ctl(epfd, op, pipefd[0], &ev) == -1 && errno == EINVAL;
+    EXPECT_TRUE(eperm && einval, "EPERM does not outrank this EINVAL");
+    close(pipefd[0]);
+    close(pipefd[1]);
+    close(plain);
+}
+
 static void expect_accepted(const char *label, int fd, uint32_t events)
 {
     TEST(label);
@@ -396,6 +420,25 @@ int main(void)
     }
     close(sysfd);
     close(regfd);
+
+    /* do_epoll_ctl tests file_can_poll before is_file_epoll and before the op
+     * switch, so a target with no poll method outranks both EINVALs this
+     * syscall would otherwise answer first.
+     */
+    {
+        int ep = epoll_create1(0);
+        int notep = open("/etc/hosts", O_RDONLY);
+        if (ep < 0 || notep < 0) {
+            TEST("EPERM outranks EINVAL");
+            FAIL("setup failed");
+        } else {
+            expect_outranks_einval("unknown op", ep, 99);
+            expect_outranks_einval("epfd is not an epoll fd", notep,
+                                   EPOLL_CTL_ADD);
+        }
+        close(ep);
+        close(notep);
+    }
 
     SUMMARY("test-epoll-unsupported");
     return fails > 0 ? 1 : 0;

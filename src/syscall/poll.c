@@ -1419,6 +1419,35 @@ static void epoll_undo_changes(int kq, const struct kevent *changes, int n)
     }
 }
 
+/* epoll_target_supported for the paths that have no instance to probe on,
+ * because the epoll descriptor is not one or the op never named a registration.
+ * The probe needs any kqueue rather than this instance's, so a call that is
+ * already failing borrows one; the paths that succeed never reach here and
+ * still pay nothing.
+ */
+static bool epoll_target_supported_standalone(const fd_entry_t *snap)
+{
+    if (snap->path_poll_capable)
+        return true;
+    struct stat st;
+    if (fstat(snap->host_fd, &st) == 0 && S_ISREG(st.st_mode))
+        return false;
+    int kq = kqueue();
+    if (kq < 0)
+        return true;
+    bool ok = epoll_target_pollable(kq, snap->host_fd);
+    close(kq);
+    return ok;
+}
+
+/* EINVAL unless the target has no poll method, which the kernel decides first.
+ */
+static int64_t epoll_einval_unless_unsupported(const fd_entry_t *snap)
+{
+    return epoll_target_supported_standalone(snap) ? -LINUX_EINVAL
+                                                   : -LINUX_EPERM;
+}
+
 int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 {
     /* The event is copied before anything else, because that is where the
@@ -1442,15 +1471,6 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     if (ref_err < 0)
         return ref_err;
 
-    /* Pin the instance so a concurrent close(epfd) cannot free it under us. */
-    epoll_instance_t *inst = epoll_instance_acquire(epfd);
-    if (!inst) {
-        host_fd_ref_close(&epoll_ref);
-        return -LINUX_EINVAL;
-    }
-
-    int64_t ret;
-
     /* Validate the target fd and read its persistent host fd in a single
      * fd_lock snapshot, so the kqueue knote ident is taken from the same entry
      * that was validated. A kqueue knote is keyed by the fd number and the
@@ -1460,12 +1480,31 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * under one fd_lock. The snapshot's generation then guards the cross-call
      * ABA below. Result mapping uses udata (the guest fd), so the ident only
      * needs to stay open and refer to the same open file description.
+     *
+     * Ahead of the instance lookup because do_epoll_ctl reaches both fdgets
+     * first, and because the target decides EPERM ahead of every EINVAL below.
      */
     fd_entry_t target_snap;
     if (!fd_snapshot(fd, &target_snap)) {
-        ret = -LINUX_EBADF;
-        goto out;
+        host_fd_ref_close(&epoll_ref);
+        return -LINUX_EBADF;
     }
+
+    /* Pin the instance so a concurrent close(epfd) cannot free it under us.
+     *
+     * A target with no poll method outranks this EINVAL: do_epoll_ctl tests
+     * file_can_poll before is_file_epoll. Measured on Linux 6.12,
+     * epoll_ctl(plain_file, ADD, plain_file, &ev) is EPERM while the same call
+     * on a pipe is EINVAL.
+     */
+    epoll_instance_t *inst = epoll_instance_acquire(epfd);
+    if (!inst) {
+        int64_t err = epoll_einval_unless_unsupported(&target_snap);
+        host_fd_ref_close(&epoll_ref);
+        return err;
+    }
+
+    int64_t ret;
 
     /* The op and the pairing, in that order and here rather than at the top,
      * because the kernel decides both inside do_epoll_ctl after both fdgets:
@@ -1479,7 +1518,7 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      */
     if (op != LINUX_EPOLL_CTL_ADD && op != LINUX_EPOLL_CTL_DEL &&
         op != LINUX_EPOLL_CTL_MOD) {
-        ret = -LINUX_EINVAL;
+        ret = epoll_einval_unless_unsupported(&target_snap);
         goto out;
     }
     if (fd == epfd) {
@@ -1553,9 +1592,15 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 
     /* The plain-file half of epoll_target_supported, inline so an ADD does not
      * pay for the kqueue probe: the registration below already asks kqueue the
-     * rest of the question. It sits ahead of the EEXIST and ENOENT checks
-     * because do_epoll_ctl tests the target's poll support before it looks up
-     * the registration, so EPERM outranks both.
+     * rest of the question.
+     *
+     * do_epoll_ctl decides poll support earlier than this position alone
+     * suggests: file_can_poll runs ahead of is_file_epoll and ahead of the op
+     * switch, not merely ahead of the registration lookup. Everything it
+     * outranks that this function answers sooner is answered by
+     * epoll_einval_unless_unsupported at those two sites, so by the time a call
+     * reaches here the only checks left below are the EEXIST and ENOENT this
+     * position covers.
      */
     if (!target_snap.path_poll_capable) {
         struct stat target_st;
