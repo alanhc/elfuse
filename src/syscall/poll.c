@@ -1402,6 +1402,23 @@ static bool epoll_target_supported(int kq, const fd_entry_t *snap)
     return epoll_target_pollable(kq, snap->host_fd);
 }
 
+/* Remove the filters an aborted registration pass already armed. Each carries
+ * the udata of a registration the caller is about to abandon, and a knote left
+ * on a live target wakes the next sys_epoll_pwait with an event that wait can
+ * only drop, returning 0 ahead of its timeout. Deleting a filter this pass
+ * dropped rather than armed fails with ENOENT and is ignored, the way every
+ * other delete here is.
+ */
+static void epoll_undo_changes(int kq, const struct kevent *changes, int n)
+{
+    for (int i = 0; i < n; i++) {
+        struct kevent del;
+        EV_SET(&del, changes[i].ident, changes[i].filter, EV_DELETE, 0, 0,
+               NULL);
+        kevent(kq, &del, 1, NULL, 0, NULL);
+    }
+}
+
 int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 {
     /* The event is copied before anything else, because that is where the
@@ -1645,6 +1662,17 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * whole ADD. A batched call would also stop at the first failed change and
      * leave the survivor registered. EINVAL on the read filter, or on a write
      * filter whose target takes no knote at all, is the EPERM case.
+     *
+     * An error that is not EINVAL abandons a registration this loop may have
+     * already armed filters for, each carrying the udata of an entry the bail
+     * never activates. Undo them: sys_epoll_pwait does reap such a knote, but
+     * only after it has woken the wait and counted the event, so the call
+     * returns 0 ahead of its timeout. MOD arrives here with its old filters
+     * already deleted, so this is also what keeps a half-failed re-registration
+     * from leaving one behind. The EPERM arm below needs no undo: it is
+     * reachable only while nothing is armed, since a refused read filter is the
+     * first change and a refused write filter without a registered read one
+     * means the mask named no read filter at all.
      */
     bool read_registered = false;
     for (int i = 0; i < nchanges; i++) {
@@ -1655,6 +1683,7 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         }
         if (errno != EINVAL) {
             ret = linux_errno();
+            epoll_undo_changes(epoll_ref.fd, changes, i);
             goto out_locked;
         }
         if (changes[i].filter == EVFILT_READ ||
