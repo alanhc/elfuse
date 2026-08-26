@@ -216,6 +216,13 @@ typedef struct {
     bool foreign_description;
     bool nonblock_owned;
 
+    /* Whether Linux gives the source's file a poll method. It is a fact about
+     * the description, not about the name: every alias of one open
+     * /proc/self/mountinfo has to answer epoll_target_supported the same way,
+     * and fstat cannot recover the answer from elfuse's staging file.
+     */
+    bool path_poll_capable;
+
     /* The live source to re-read under fd_lock, or -1 for a site with no
      * in-process source. The fields above are a snapshot the caller took before
      * the allocation, and an F_SETFL landing in between sweeps the aliases that
@@ -252,6 +259,7 @@ static inline fd_alias_spec_t fd_alias_of(int src_guest_fd,
         .linux_flags = src->linux_flags & FD_DESCRIPTION_FLAGS,
         .foreign_description = src->foreign_description,
         .nonblock_owned = src->nonblock_owned,
+        .path_poll_capable = src->path_poll_capable,
         .src_guest_fd = src_guest_fd,
         .src_generation = src->generation,
     };
@@ -268,6 +276,7 @@ static inline fd_alias_spec_t fd_alias_host_shared(const fd_entry_t *src)
         .src_guest_fd = -1,
         .foreign_description = src->foreign_description,
         .nonblock_owned = src->nonblock_owned,
+        .path_poll_capable = src->path_poll_capable,
     };
 }
 

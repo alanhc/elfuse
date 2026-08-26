@@ -492,6 +492,14 @@ static int fd_alloc_opened_host(int host_fd,
         if (have_proc_path)
             memcpy(fd_table[guest_fd].proc_path, proc_path_buf,
                    sizeof(proc_path_buf));
+
+        /* An alias already carries the description's answer, and the path would
+         * describe the magic link rather than the file behind it:
+         * /proc/self/fd/N is a per-process procfs name whatever it points at.
+         */
+        if (!spec)
+            fd_table[guest_fd].path_poll_capable =
+                path_intercept_poll_capable(virtual_path);
         bool readable_urandom =
             type == FD_URANDOM &&
             (linux_flags & LINUX_O_ACCMODE) != LINUX_O_WRONLY;

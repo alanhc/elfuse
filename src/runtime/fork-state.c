@@ -325,6 +325,7 @@ int fork_ipc_send_fd_table(int ipc_sock)
         fd_entries[num_fds].foreign_description =
             fd_table[i].foreign_description;
         fd_entries[num_fds].nonblock_owned = fd_table[i].nonblock_owned;
+        fd_entries[num_fds].path_poll_capable = fd_table[i].path_poll_capable;
         fd_entries[num_fds].seals = fd_table[i].seals;
         fd_entries[num_fds].ofd_id = fd_table[i].ofd_id;
         fd_entries[num_fds].fasync_owner_type = fd_table[i].fasync_owner_type;
@@ -467,6 +468,8 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_refresh_urandom_bitmap(gfd);
             memcpy(fd_table[gfd].proc_path, fd_entries[i].proc_path,
                    sizeof(fd_table[gfd].proc_path));
+            fd_table[gfd].path_poll_capable =
+                fd_entries[i].path_poll_capable != 0;
             fd_table[gfd].seals = fd_entries[i].seals;
         } else if (fd_type_is_synthetic(fd_entries[i].type)) {
             /* Defense in depth: the parent's fork_ipc_send_fd_table already
@@ -500,6 +503,8 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             fd_refresh_urandom_bitmap(gfd);
             memcpy(fd_table[gfd].proc_path, fd_entries[i].proc_path,
                    sizeof(fd_table[gfd].proc_path));
+            fd_table[gfd].path_poll_capable =
+                fd_entries[i].path_poll_capable != 0;
             fd_table[gfd].seals = fd_entries[i].seals;
             if (fd_entries[i].type == FD_URANDOM)
                 urandom_fd_reset_cache(gfd);
