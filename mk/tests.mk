@@ -14,7 +14,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-rosetta-cli test-rosetta-statics test-rosetta-failure-modes \
         test-rosetta-alpine test-rosetta-audit test-rosetta-jit \
         test-rosetta-glibc test-rosetta-madvise test-rosetta-msync \
-        test-rosetta-mremap test-rosetta-all bench-rosetta \
+        test-rosetta-mremap test-rosetta-all test-sharun bench-rosetta \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
@@ -274,6 +274,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-launch-flags,launch flags)
 	$(call run-lane,test-rosetta-cli,rosetta CLI gating)
 	$(call run-lane,test-bench-guardrail,hot-syscall guardrail)
+	$(call run-lane,test-sharun,sharun launcher and probe)
 
 ## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
 ## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
@@ -284,7 +285,7 @@ BENCH_GUARDRAIL_REQUIRE_STATIC := 0
 ifndef GUEST_TEST_BINARIES
   BENCH_GUARDRAIL_DEPS += $(BUILD_DIR)/bench-hot-guard
   BENCH_GUARDRAIL_REQUIRE_STATIC := 1
-  ifneq ($(wildcard $(LINUX_TOOLCHAIN)/aarch64-unknown-linux-gnu/sysroot/.),)
+  ifneq ($(CROSS_GLIBC_SYSROOT_PRESENT),)
     BENCH_GUARDRAIL_DEPS += $(BUILD_DIR)/bench-hot-guard-glibc
   endif
 endif
@@ -293,6 +294,7 @@ test-bench-guardrail: $(BENCH_GUARDRAIL_DEPS)
 	    BENCH_GUARDRAIL_DIR="$(TEST_DIR)" \
 	    BENCH_GUARDRAIL_REQUIRE_STATIC="$(BENCH_GUARDRAIL_REQUIRE_STATIC)" \
 	    LINUX_TOOLCHAIN="$(LINUX_TOOLCHAIN)" \
+	    GLIBC_SYSROOT="$(CROSS_GLIBC_SYSROOT)" \
 	    bash tests/test-bench-guardrail.sh
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
@@ -1211,6 +1213,22 @@ ifeq ($(BUSYBOX_BIN),$(BUILD_DIR)/busybox)
 else
   BUSYBOX_DEPS :=
 endif
+
+# The probe is built only when the cross-glibc sysroot exists; without it the
+# lane still covers the launcher and reports the probe arm as skipped.
+# The launcher binaries are fetched by tests/fetch-sharun-bin.sh, not listed
+# here: a make prerequisite that cannot be downloaded is fatal, and this lane
+# runs inside "make check". Fetching from the script lets an unreachable
+# network degrade to a skip, the same way the glibc package already does.
+TEST_SHARUN_PROBE_DIR :=
+ifneq ($(CROSS_GLIBC_SYSROOT_PRESENT),)
+  TEST_SHARUN_PROBE_DIR := $(BUILD_DIR)
+endif
+
+## Run sharun and its probe under elfuse: the prebuilt launcher and the
+## cross-built probe always, plus a bundle assembled from those two.
+test-sharun: $(ELFUSE_BIN) $(TEST_SHARUN_PROBE_DIR:%=%/probe)
+	$(call RUN_OPTIONAL_SKIP77,FIXTURES_DIR="$(FIXTURES_DIR)" CROSS_COMPILE="$(CROSS_COMPILE)" SHARUN_FIXTURE_DIR="$(SHARUN_FIXTURE_DIR)" MATRIX_ROSETTA_TRANSLATOR="$(MATRIX_ROSETTA_TRANSLATOR)" ELFUSE_NO_ROSETTA="$(ELFUSE_NO_ROSETTA)" TEST_TIMEOUT="$(TEST_TIMEOUT)" bash tests/test-sharun.sh $(ELFUSE_BIN) $(TEST_SHARUN_PROBE_DIR),test-sharun)
 
 $(BUILD_DIR)/busybox: | $(BUILD_DIR)
 	@printf "$(BLUE)▸ Downloading$(RESET) busybox-static (arm64) from $(BUSYBOX_PACKAGE_PAGE)\n"
