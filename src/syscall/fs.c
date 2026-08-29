@@ -346,27 +346,70 @@ typedef struct {
                            */
 } dir_stream_t;
 
-/* Wrap an already-open DIR* for storage in fd_table[].dir. Takes ownership of
- * dir on success.
+/* Open a stream over host_fd and take ownership of the descriptor.
  *
- * Returns NULL on allocation failure, in which case the caller still owns dir
- * and must closedir() it.
+ * Returns NULL with errno set on failure, in which case host_fd is untouched
+ * and still the caller's to close. The wrapper is allocated before fdopendir
+ * for exactly that reason: once fdopendir succeeds the descriptor is inside the
+ * DIR* and nothing short of closedir() -- which closes it -- gets it back, so
+ * there must be no failure left after that point.
  */
-void *dir_stream_create(DIR *dir)
+void *dir_stream_open(int host_fd)
 {
     dir_stream_t *ds = malloc(sizeof(*ds));
-    if (!ds)
+    if (!ds) {
+        errno = ENOMEM;
         return NULL;
+    }
+
+    /* Darwin's fdopendir sets FD_CLOEXEC on the descriptor it adopts. That was
+     * invisible while the stream ran on a private duplicate; on the guest's own
+     * descriptor it silently flips a flag elfuse never asked for, so the flag
+     * is read before the call and put back after.
+     *
+     * Only the bit fdopendir added is taken back, which is why the before value
+     * is needed rather than an unconditional clear: an open the guest made with
+     * O_CLOEXEC reaches the host open as O_CLOEXEC too (translate_open_flags),
+     * and that descriptor is meant to carry the flag. When the flag cannot be
+     * read the descriptor is left as fdopendir set it, since clearing on a
+     * guess is the direction that loses information.
+     */
+    int flags_before = fcntl(host_fd, F_GETFD);
+
+    DIR *dir = fdopendir(host_fd);
+    if (!dir) {
+        int saved_errno = errno;
+        free(ds);
+        errno = saved_errno;
+        return NULL;
+    }
+
+    if (flags_before >= 0 && !(flags_before & FD_CLOEXEC)) {
+        int flags_after = fcntl(host_fd, F_GETFD);
+        if (flags_after >= 0 && (flags_after & FD_CLOEXEC))
+            fcntl(host_fd, F_SETFD, flags_after & ~FD_CLOEXEC);
+    }
+
     ds->dir = dir;
     pthread_mutex_init(&ds->lock, NULL);
     ds->refcount = 1;
     return ds;
 }
 
+/* Take an extra reference. Caller holds fd_lock. */
+void dir_stream_ref_locked(void *ds_ptr)
+{
+    dir_stream_t *ds = ds_ptr;
+    if (ds)
+        ds->refcount++;
+}
+
 /* Tear down a wrapper that was never published to fd_table (an allocation or
- * install failure between dir_stream_create() and the point the pointer would
+ * install failure between dir_stream_open() and the point the pointer would
  * have been written to fd_table[].dir). No other thread can have acquired a
- * reference yet, so this always closes and frees unconditionally.
+ * reference yet, so this always closes and frees unconditionally -- including
+ * the host descriptor the stream owns, which the caller must therefore not
+ * close again.
  */
 static void dir_stream_discard(void *ds_ptr)
 {
@@ -397,11 +440,14 @@ static dir_stream_t *dir_stream_acquire(int fd)
     return ds;
 }
 
-/* Drop a reference taken by dir_stream_acquire(), or the fd-table's own
- * reference from fd_cleanup_entry(). No-op when passed NULL. The decrement
- * happens under fd_lock; the actual closedir()/free() runs after releasing it,
- * matching fd_cleanup_entry's own "do not hold fd_lock across slow syscalls"
- * convention.
+/* Drop a reference taken by dir_stream_acquire(), by an fd_lifetime pin, or the
+ * fd-table's own reference from fd_cleanup_entry(). No-op when passed NULL. The
+ * decrement happens under fd_lock; the actual closedir()/free() runs after
+ * releasing it, matching fd_cleanup_entry's own "do not hold fd_lock across
+ * slow syscalls" convention.
+ *
+ * The closedir() here is what closes the guest fd's host descriptor, so this is
+ * the single point where a directory fd is given back to the host.
  */
 void dir_stream_release(void *ds_ptr)
 {
@@ -421,6 +467,12 @@ void dir_stream_release(void *ds_ptr)
 /* spec is the description this fd inherits from, or NULL for a fresh one. Only
  * the magic-link open passes one: it implements the open as a dup, so the host
  * flags are shared with the source and must not be probed or changed.
+ *
+ * Takes ownership of host_fd unconditionally: every failure path below closes
+ * it, so callers hand the descriptor over and never close it themselves. A
+ * directory makes that mandatory rather than merely tidy -- its stream adopts
+ * the same descriptor (see dir_stream_open) and from then on only the stream
+ * can give it back.
  */
 static int fd_alloc_opened_host(int host_fd,
                                 int type,
@@ -433,33 +485,35 @@ static int fd_alloc_opened_host(int host_fd,
     dir_stream_t *ds = NULL;
 
     if (type == FD_DIR) {
-        int dup_fd = dup(host_fd);
-        if (dup_fd < 0)
-            return -1;
-
-        DIR *dir = fdopendir(dup_fd);
-        if (!dir) {
-            close_keep_errno(dup_fd);
-            return -1;
-        }
-        ds = dir_stream_create(dir);
+        ds = dir_stream_open(host_fd);
         if (!ds) {
-            int saved_errno = errno;
-            closedir(dir);
-            errno = saved_errno;
+            proc_pty_forget_host_fd(host_fd);
+            close_keep_errno(host_fd);
             return -1;
         }
     }
 
-    int guest_fd =
-        min_guest_fd >= 0
-            ? fd_alloc_alias_relaxed(spec, -1, min_guest_fd, type, host_fd,
-                                     cleanup, NULL)
-            : fd_alloc_alias_relaxed(spec, -1, 0, type, host_fd, cleanup, NULL);
+    /* A directory publishes its stream in the same fd_lock window as the slot,
+     * so the slot is never visible as FD_DIR with a NULL dir while this call is
+     * still holding the only reference. Sharing one descriptor is what forces
+     * that: in the gap, a sibling's close would find a directory slot whose
+     * descriptor looks plain, close it, and leave this side's stream sitting on
+     * a number the next open can claim. The other types keep the relaxed
+     * allocator and install their metadata below.
+     */
+    int minfd = min_guest_fd >= 0 ? min_guest_fd : 0;
+    uint64_t alloc_gen = 0;
+    int guest_fd = ds ? fd_alloc_alias_dir(spec, -1, minfd, type, host_fd,
+                                           cleanup, ds, linux_flags, &alloc_gen)
+                      : fd_alloc_alias_relaxed(spec, -1, minfd, type, host_fd,
+                                               cleanup, &alloc_gen);
     if (guest_fd < 0) {
         int saved_errno = errno;
+        proc_pty_forget_host_fd(host_fd);
         if (ds)
-            dir_stream_discard(ds);
+            dir_stream_discard(ds); /* closes host_fd */
+        else
+            close(host_fd);
         errno = saved_errno;
         return -1;
     }
@@ -471,24 +525,26 @@ static int fd_alloc_opened_host(int host_fd,
     bool have_proc_path = resolve_virtual_path(virtual_path, proc_path_buf,
                                                sizeof(proc_path_buf));
 
-    /* Publish linux_flags, dir, proc_path, and the urandom bitmap bit
-     * atomically with respect to the slot's identity. fd_alloc_*_relaxed drops
-     * fd_lock before returning, so a sibling vCPU's pathological
-     * close(guest_fd) + open() could reuse the slot between alloc and the
-     * metadata install below. Re-acquire fd_lock and verify the (type, host_fd)
-     * tuple still matches what just got allocated; if it does not, the slot
-     * belongs to a different file now and any install would clobber the
-     * sibling's entry. The sibling's close path already cleaned up the host_fd
-     * of this side via fd_cleanup_entry, so this side only owns ds, which gets
-     * discarded below.
+    /* Publish linux_flags, proc_path, and the urandom bitmap bit atomically
+     * with respect to the slot's identity. The allocator drops fd_lock before
+     * returning, so a sibling vCPU's pathological close(guest_fd) + open()
+     * could reuse the slot between alloc and the metadata install below.
+     * Re-acquire fd_lock and verify the generation stamped at alloc still
+     * matches; if it does not, the slot belongs to a different file now and any
+     * install would clobber the sibling's entry. A (type, host_fd) tuple alone
+     * cannot tell a close+reopen that landed on the same number, so it stays
+     * only as the cheap early-out.
+     *
+     * Nothing is left to unwind on that path: the sibling's close ran
+     * fd_cleanup_entry over this side's slot, which released the stream (and
+     * with it the descriptor) exactly once, because the stream was published
+     * with the slot rather than installed here.
      */
-    bool installed = false;
     pthread_mutex_lock(&fd_lock);
     if (fd_table[guest_fd].type == type &&
-        fd_table[guest_fd].host_fd == host_fd) {
+        fd_table[guest_fd].host_fd == host_fd &&
+        fd_table[guest_fd].generation == alloc_gen) {
         fd_table[guest_fd].linux_flags = linux_flags;
-        if (ds)
-            fd_table[guest_fd].dir = ds;
         if (have_proc_path)
             memcpy(fd_table[guest_fd].proc_path, proc_path_buf,
                    sizeof(proc_path_buf));
@@ -504,12 +560,8 @@ static int fd_alloc_opened_host(int host_fd,
             type == FD_URANDOM &&
             (linux_flags & LINUX_O_ACCMODE) != LINUX_O_WRONLY;
         shim_globals_mark_urandom_fd(guest_fd, readable_urandom);
-        installed = true;
     }
     pthread_mutex_unlock(&fd_lock);
-
-    if (!installed && ds)
-        dir_stream_discard(ds);
 
     return guest_fd;
 }
@@ -630,10 +682,8 @@ int64_t sys_openat_path(guest_t *g,
         }
         int guest_fd = fd_alloc_opened_host(host_fd, type, linux_flags, -1,
                                             NULL, NULL, NULL);
-        if (guest_fd < 0) {
-            close_keep_errno(host_fd);
+        if (guest_fd < 0)
             return linux_errno();
-        }
         return guest_fd;
     }
 
@@ -696,11 +746,8 @@ int64_t sys_openat_path(guest_t *g,
                 fd_alloc_opened_host(intercepted, type, linux_flags,
                                      min_guest_fd, fd_cleanup_for_type(type),
                                      tx.intercept_path, aliased ? &spec : NULL);
-            if (guest_fd < 0) {
-                proc_pty_forget_host_fd(intercepted);
-                close_keep_errno(intercepted);
+            if (guest_fd < 0)
                 return linux_errno();
-            }
             return guest_fd;
         }
         if (intercepted == -1) {
@@ -723,10 +770,8 @@ int64_t sys_openat_path(guest_t *g,
         }
         int guest_fd = fd_alloc_opened_host(host_fd, type, linux_flags, -1,
                                             NULL, NULL, NULL);
-        if (guest_fd < 0) {
-            close_keep_errno(host_fd);
+        if (guest_fd < 0)
             return linux_errno();
-        }
         return guest_fd;
     }
 
@@ -748,10 +793,8 @@ int64_t sys_openat_path(guest_t *g,
     }
     int guest_fd =
         fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL, NULL);
-    if (guest_fd < 0) {
-        close_keep_errno(host_fd);
+    if (guest_fd < 0)
         return linux_errno();
-    }
     return guest_fd;
 }
 
@@ -922,19 +965,14 @@ int64_t sys_close(int fd)
 
 /* dup/fcntl. */
 
-static void discard_allocated_fd(int guest_fd)
-{
-    fd_entry_t snap;
-    if (fd_snapshot_and_close(guest_fd, &snap))
-        fd_cleanup_entry(guest_fd, &snap);
-}
-
-/* Open a DIR stream over a dup of dst_host_fd if the source was an FD_DIR.
+/* Open a DIR stream over dst_host_fd if the source was an FD_DIR. The dup that
+ * produced dst_host_fd is the alias's own descriptor, and the stream adopts it:
+ * a second one, which is what this used to take, would give the guest fd two
+ * host descriptors for the rest of its life.
  *
- * Returns NULL on success-but-no-stream-needed (non-dir source) or on
- * dup/fdopendir/allocation failure with errno preserved. Pulled out of the
- * critical section in install_fd_alias_metadata_atomic because dup and
- * fdopendir are slow syscalls that must not hold fd_lock.
+ * Returns NULL on success-but-no-stream-needed (non-dir source) or on failure
+ * with errno preserved, distinguished by *out_failed. Runs outside fd_lock
+ * because fdopendir is a slow syscall.
  */
 static dir_stream_t *clone_dir_stream(const fd_entry_t *src_snap,
                                       int dst_host_fd,
@@ -944,27 +982,9 @@ static dir_stream_t *clone_dir_stream(const fd_entry_t *src_snap,
     if (src_snap->type != FD_DIR)
         return NULL;
 
-    int dir_fd = dup(dst_host_fd);
-    if (dir_fd < 0) {
+    dir_stream_t *ds = dir_stream_open(dst_host_fd);
+    if (!ds)
         *out_failed = true;
-        return NULL;
-    }
-    DIR *dir = fdopendir(dir_fd);
-    if (!dir) {
-        int saved_errno = errno;
-        close(dir_fd);
-        errno = saved_errno;
-        *out_failed = true;
-        return NULL;
-    }
-    dir_stream_t *ds = dir_stream_create(dir);
-    if (!ds) {
-        int saved_errno = errno;
-        closedir(dir);
-        errno = saved_errno;
-        *out_failed = true;
-        return NULL;
-    }
     return ds;
 }
 
@@ -973,15 +993,20 @@ static dir_stream_t *clone_dir_stream(const fd_entry_t *src_snap,
  * duplicate_guest_fd call; a sibling vCPU's pathological close + open between
  * the relaxed allocator's lock release and this call could otherwise clobber
  * the sibling's freshly-installed entry.
- * Returns true on successful install, false if the slot was reallocated (caller
- * must dir_stream_discard() any cloned ds to avoid a leak).
+ *
+ * The directory stream is not among the fields installed here: it is published
+ * by the allocator, in the window that creates the slot, because it owns the
+ * slot's host descriptor and a gap would leave that descriptor looking
+ * ownerless to a concurrent close.
+ *
+ * Returns true on successful install, false if the slot was reallocated, which
+ * leaves this side owning nothing.
  */
 static bool install_fd_alias_metadata_atomic(int dst_fd,
                                              int expected_type,
                                              int expected_host_fd,
                                              const fd_entry_t *src_snap,
                                              int linux_flags,
-                                             dir_stream_t *ds,
                                              uint64_t expected_gen)
 {
     bool installed = false;
@@ -1003,8 +1028,6 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
         fd_table[dst_fd].seals = src_snap->seals;
         memcpy(fd_table[dst_fd].proc_path, src_snap->proc_path,
                sizeof(fd_table[dst_fd].proc_path));
-        if (ds)
-            fd_table[dst_fd].dir = ds;
 
         /* Read the mode back from the slot the allocator published rather than
          * from a local copy of it, so there is one answer to what this fd's
@@ -1118,9 +1141,31 @@ static int duplicate_guest_fd(int src_fd,
      */
     fd_alias_spec_t spec = fd_alias_of(src_fd, &src_snap);
     spec.linux_flags |= linux_flags;
-    int guest_fd = fd_alloc_alias_relaxed(
-        &spec, fixed_slot ? fixed_guest_fd : -1, min_guest_fd, new_type,
-        new_host_fd, cleanup, &alloc_gen);
+
+    /* Open the alias's DIR stream before the slot exists, outside fd_lock
+     * because fdopendir is a slow syscall. It has to precede the allocation
+     * rather than follow it: the stream owns new_host_fd, and a slot published
+     * as FD_DIR before its stream exists is a slot whose descriptor a
+     * concurrent close would treat as plain and close underneath this call.
+     */
+    bool dir_clone_failed = false;
+    dir_stream_t *ds =
+        clone_dir_stream(&src_snap, new_host_fd, &dir_clone_failed);
+    if (dir_clone_failed) {
+        int saved_errno = errno;
+        proc_pty_forget_host_fd(new_host_fd);
+        close(new_host_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    int guest_fd =
+        ds ? fd_alloc_alias_dir(&spec, fixed_slot ? fixed_guest_fd : -1,
+                                min_guest_fd, new_type, new_host_fd, cleanup,
+                                ds, spec.linux_flags, &alloc_gen)
+           : fd_alloc_alias_relaxed(&spec, fixed_slot ? fixed_guest_fd : -1,
+                                    min_guest_fd, new_type, new_host_fd,
+                                    cleanup, &alloc_gen);
     if (guest_fd < 0) {
         if (fixed_slot)
             errno = EBADF;
@@ -1131,39 +1176,26 @@ static int duplicate_guest_fd(int src_fd,
          * is about to be closed on the books, and the master would never see
          * its last slave go.
          */
-        proc_pty_forget_host_fd(new_host_fd);
-        close_keep_errno(new_host_fd);
-        return -1;
-    }
-
-    /* Clone the DIR stream outside fd_lock (dup + fdopendir would block other
-     * fd ops), then install everything atomically under fd_lock with a
-     * generation verification so a sibling close + reopen on the same guest_fd
-     * cannot make this install land on an unrelated slot.
-     */
-    bool dir_clone_failed = false;
-    dir_stream_t *ds =
-        clone_dir_stream(&src_snap, new_host_fd, &dir_clone_failed);
-    if (dir_clone_failed) {
         int saved_errno = errno;
-        discard_allocated_fd(guest_fd);
+        proc_pty_forget_host_fd(new_host_fd);
+        if (ds)
+            dir_stream_discard(ds); /* closes new_host_fd */
+        else
+            close(new_host_fd);
         errno = saved_errno;
         return -1;
     }
 
-    if (!install_fd_alias_metadata_atomic(guest_fd, new_type, new_host_fd,
-                                          &src_snap, linux_flags, ds,
-                                          alloc_gen)) {
-        /* Slot was reallocated by a sibling while metadata install was pending;
-         * the sibling's close path already cleaned up new_host_fd via
-         * fd_cleanup_entry, so the only resource this side still owns is the
-         * cloned DIR stream.
-         */
-        if (ds)
-            dir_stream_discard(ds);
-    } else if ((src_snap.linux_flags & LINUX_O_ASYNC) ||
-               (src_snap.type == FD_SOCKET &&
-                src_snap.fasync_owner_type != FASYNC_OWNER_NONE)) {
+    /* A false return means a sibling reallocated the slot while the metadata
+     * install was pending. Nothing to unwind: that sibling's close path already
+     * ran fd_cleanup_entry over new_host_fd, stream included, so this side owns
+     * nothing either way.
+     */
+    if (install_fd_alias_metadata_atomic(guest_fd, new_type, new_host_fd,
+                                         &src_snap, linux_flags, alloc_gen) &&
+        ((src_snap.linux_flags & LINUX_O_ASYNC) ||
+         (src_snap.type == FD_SOCKET &&
+          src_snap.fasync_owner_type != FASYNC_OWNER_NONE))) {
         /* dup shares O_ASYNC (per open-file-description); register the alias
          * with the readiness watcher. install only returns true when the slot
          * still carries alloc_gen, so arming with it drops any stale event from

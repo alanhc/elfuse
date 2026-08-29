@@ -47,6 +47,14 @@ struct fd_lifetime {
     _Atomic unsigned int refs;
     int host_fd;
     int type;
+
+    /* FD_DIR only: the directory stream that owns host_fd. fdopendir() adopted
+     * the descriptor and only closedir() releases it, so a pin on a directory
+     * cannot close host_fd itself -- it holds a reference on the stream and
+     * lets the stream's last release do it. NULL for every other type, which
+     * closes host_fd directly.
+     */
+    void *dir;
 };
 
 /* RLIMIT_NOFILE tracking. Guest-side soft limit for RLIMIT_NOFILE. fd_alloc
@@ -575,7 +583,8 @@ int fd_alloc_dir_from(int minfd,
                       int host_fd,
                       void (*cleanup)(int),
                       void *dir,
-                      int linux_flags)
+                      int linux_flags,
+                      uint64_t *out_gen)
 {
     fd_host_probe_t probe = fd_probe_host(type, host_fd);
     pthread_mutex_lock(&fd_lock);
@@ -584,6 +593,8 @@ int fd_alloc_dir_from(int minfd,
         fd_table[fd].dir = dir;
         fd_table[fd].linux_flags =
             fd_flags_with_accmode(fd_table[fd].type, linux_flags);
+        if (out_gen)
+            *out_gen = fd_table[fd].generation;
     }
     pthread_mutex_unlock(&fd_lock);
     return fd;
@@ -598,7 +609,8 @@ int fd_alloc_dir_at(int fd,
                     int host_fd,
                     void (*cleanup)(int),
                     void *dir,
-                    int linux_flags)
+                    int linux_flags,
+                    uint64_t *out_gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -1;
@@ -616,6 +628,8 @@ int fd_alloc_dir_at(int fd,
     fd_table[fd].dir = dir;
     fd_table[fd].linux_flags =
         fd_flags_with_accmode(fd_table[fd].type, linux_flags);
+    if (out_gen)
+        *out_gen = fd_table[fd].generation;
     pthread_mutex_unlock(&fd_lock);
 
     if (old.type != FD_CLOSED)
@@ -696,13 +710,14 @@ int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
                        int host_fd,
                        void (*cleanup)(int),
                        void *dir,
-                       int linux_flags)
+                       int linux_flags,
+                       uint64_t *out_gen)
 {
     fd_alias_begin(spec);
     int fd = fixed_fd >= 0 ? fd_alloc_dir_at(fixed_fd, type, host_fd, cleanup,
-                                             dir, linux_flags)
+                                             dir, linux_flags, out_gen)
                            : fd_alloc_dir_from(minfd, type, host_fd, cleanup,
-                                               dir, linux_flags);
+                                               dir, linux_flags, out_gen);
     return fd_alias_end(fd);
 }
 
@@ -998,6 +1013,15 @@ static fd_lifetime_t *fd_lifetime_pin_spare(int fd, fd_lifetime_t **spare)
         atomic_init(&lifetime->refs, 1);
         lifetime->host_fd = fd_table[fd].host_fd;
         lifetime->type = fd_table[fd].type;
+
+        /* Taken once, at the object's birth, and dropped once at its death:
+         * every later pin shares this object, so the stream reference is per
+         * lifetime rather than per pin. fd_lock is held, which is the lock
+         * guarding the stream's own refcount.
+         */
+        lifetime->dir = fd_table[fd].type == FD_DIR ? fd_table[fd].dir : NULL;
+        if (lifetime->dir)
+            dir_stream_ref_locked(lifetime->dir);
         fd_table[fd].lifetime = lifetime;
     }
 
@@ -1094,7 +1118,14 @@ void fd_lifetime_release(fd_lifetime_t *lifetime)
     if (prev != 1)
         return;
     atomic_thread_fence(memory_order_acquire);
-    if (lifetime->type != FD_STDIO)
+
+    /* A directory's descriptor belongs to its stream; releasing the reference
+     * taken at birth is this object's whole share of it. dir_stream_release
+     * takes fd_lock, which is why no caller may hold it here.
+     */
+    if (lifetime->dir)
+        dir_stream_release(lifetime->dir);
+    else if (lifetime->type != FD_STDIO)
         close(lifetime->host_fd);
     free(lifetime);
 }
@@ -1366,13 +1397,24 @@ int fd_to_host_dup(int guest_fd)
  */
 void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
 {
-    /* dir_stream_t / epoll_instance_t stored in the dir field */
-    if (snap->dir) {
-        if (snap->type == FD_DIR)
-            dir_stream_release(snap->dir);
-        else if (snap->type == FD_EPOLL)
-            epoll_instance_free(snap->dir);
-    }
+    /* Who owns host_fd, in the order the answers are checked below:
+     *
+     *   a directory with a stream -> the stream (closedir at its last
+     *                                reference, which is taken last here so
+     *                                the descriptor outlives the teardown
+     *                                below that is keyed by its number)
+     *   a lifetime pin            -> the pin (close at its last reference)
+     *   otherwise                 -> this function
+     *
+     * A directory *without* a stream is the third case, not the first: the slot
+     * is one an in-flight open or fork-restore published and has not adopted
+     * yet, so the descriptor is still plain and still closable here.
+     */
+    bool stream_owns_host_fd = snap->type == FD_DIR && snap->dir;
+
+    /* epoll_instance_t shares the dir field with dir_stream_t. */
+    if (snap->dir && snap->type == FD_EPOLL)
+        epoll_instance_free(snap->dir);
 
     /* Type-specific teardown via vtable (replaces per-type switch) */
     if (snap->cleanup)
@@ -1397,6 +1439,12 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
 
     if (snap->lifetime)
         fd_lifetime_release(snap->lifetime);
-    else if (snap->type != FD_STDIO)
+    else if (!stream_owns_host_fd && snap->type != FD_STDIO)
         close(snap->host_fd);
+
+    /* Last: the slot's own reference on the stream, and with it the descriptor
+     * when no getdents64 or pin still holds one.
+     */
+    if (stream_owns_host_fd)
+        dir_stream_release(snap->dir);
 }
