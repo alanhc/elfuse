@@ -352,6 +352,7 @@ MAKEFILE_INERT_INCLUDES = {
     "mk/lint.mk",
     "mk/format.mk",
     "mk/help.mk",
+    "mk/oci.mk",
 }
 
 # The stub headers reach every proof and no include closure can see them: they
