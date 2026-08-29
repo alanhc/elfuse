@@ -442,6 +442,7 @@ Suggested minimum validation:
 
 | Change area | Recommended validation |
 |-------------|------------------------|
+| `cmd/oci/` | `make oci-lint && make oci-test` |
 | CLI, logging, docs-only build rules | `make elfuse` |
 | Filename codec, case-exact walk, sysroot resolvers | `make check` (runs the codec unit tests, name lanes, and byte-exact oracle lane), plus `make test-sysroot-name-soak` for resolver concurrency. A red golden vector in `test-casefold-host` means the on-disk format moved: see `docs/filenames.md` before touching `tests/casefold-vectors.h` |
 | General syscall or runtime logic | `make elfuse && make check && make test-matrix-elfuse-aarch64` |
@@ -449,3 +450,16 @@ Suggested minimum validation:
 | Rosetta hosting, x86_64 dispatch, VZ ioctls, AOT cache | `make elfuse && make test-rosetta-all` |
 | Broad behavioral changes | `make elfuse && make check && make test-matrix` |
 | Debugger or ptrace flow | `make elfuse && make test-gdbstub` |
+
+## OCI Image CLI
+
+The Go CLI has separate format, vet, and race-test targets:
+
+```sh
+make oci-lint
+make oci-test
+ELFUSE_OCI_NETTEST=1 make oci-test
+```
+
+The default suite constructs image data in temporary stores and does not use a
+registry. `ELFUSE_OCI_NETTEST=1` adds a pull from Docker Hub.
