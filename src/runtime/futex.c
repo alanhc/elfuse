@@ -1374,6 +1374,36 @@ static int64_t futex_requeue(guest_t *g,
         }
     }
 
+    /* A PI waiter remains tied to its entry bucket while it retries the PI
+     * acquisition. FUTEX_REQUEUE has no PI-aware counterpart here, so reject an
+     * attempted migration before waking or moving any waiter.
+     */
+    if (uaddr != uaddr2 && requeue_count != 0) {
+        uint32_t skips = wake_count;
+        uint32_t remaining = requeue_count;
+
+        for (futex_waiter_t *w = b_src->head; w; w = w->next) {
+            if (w->uaddr != uaddr)
+                continue;
+            if (skips != 0) {
+                skips--;
+                continue;
+            }
+
+            /* pub_follows is false only for a PI waiter today; see where it is
+             * set in futex_lock_pi_inner.
+             */
+            if (!w->pub_follows) {
+                if (idx_src != idx_dst)
+                    pthread_mutex_unlock(&b_dst->lock);
+                pthread_mutex_unlock(&b_src->lock);
+                return -LINUX_EINVAL;
+            }
+            if (--remaining == 0)
+                break;
+        }
+    }
+
     int woken = 0, requeued = 0;
 
     /* Walk source bucket: wake up to wake_count, requeue up to requeue_count */
@@ -1394,22 +1424,9 @@ static int64_t futex_requeue(guest_t *g,
             /* Requeue: remove from source, add to destination */
             *pp = w->next;
 
-            /* Move the publication with the waiter. Both bucket locks are held
-             * here, and the waiter is parked, so nothing reads pub_bucket
-             * concurrently. The shim's wake fast path does read the counts
-             * without either lock, though, so the destination is charged before
-             * the source is debited: the reverse order leaves an instant in
-             * which this waiter is charged to no bucket at all, and a wake on
-             * the destination landing there reads zero for a waiter that is on
-             * its way to that queue.
-             *
-             * The debit is only for an owner that drops what pub_bucket names.
-             * For one that debits its entry bucket regardless, charge the
-             * destination and leave the source alone: that over-charges the
-             * destination for the life of the process, costing its wake fast
-             * path and nothing else, where debiting a source the owner debits
-             * again underflows it. Of the two wrong answers only one can lose a
-             * wakeup.
+            /* Move the publication with the waiter. The destination is charged
+             * before the source is debited, so the shim never sees this parked
+             * waiter charged to no bucket.
              */
             shim_globals_futex_waiters_add(g, idx_dst, +1);
             if (w->pub_follows) {
@@ -1790,7 +1807,16 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             .woken = 0,
             .next = b->head,
             .pub_bucket = idx,
-            /* Deliberately false: this function's wrapper drops idx. */
+
+            /* Deliberately false: this function's wrapper drops idx.
+             *
+             * futex_requeue reads this same bit as "is a PI waiter" when it
+             * decides whether to reject a migration, which is sound only
+             * because this is the one place that sets it false. A future waiter
+             * that cannot follow pub_bucket for some unrelated reason would be
+             * rejected there as if it were PI, so give that one its own bit
+             * rather than widening this one.
+             */
             .pub_follows = false,
         };
         pthread_cond_init(&waiter.cond, NULL);

@@ -41,6 +41,7 @@
 int passes = 0, fails = 0;
 
 static uint32_t addr_a, addr_b;
+static uint32_t pi_source, pi_destination;
 
 static long wait_bitset(uint32_t *w, uint32_t expect)
 {
@@ -66,6 +67,18 @@ static long cmp_requeue(uint32_t *from,
                         (long) to, (long) (int32_t) expect);
 }
 
+static long lock_pi(uint32_t *w)
+{
+    return raw_syscall6(__NR_futex, (long) w,
+                        FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0);
+}
+
+static long unlock_pi(uint32_t *w)
+{
+    return raw_syscall6(__NR_futex, (long) w,
+                        FUTEX_UNLOCK_PI | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0);
+}
+
 /* Give a thread time to reach its park. A sleep, not a spin: a guest thread is
  * a host thread, and a spin starves rather than converges under load.
  */
@@ -81,6 +94,15 @@ static void *park_on_a(void *arg)
     while (__atomic_load_n(&addr_a, __ATOMIC_SEQ_CST) == 0)
         wait_bitset(&addr_a, 0);
     return NULL;
+}
+
+static void *wait_on_pi(void *arg)
+{
+    (void) arg;
+    long rc = lock_pi(&pi_source);
+    if (rc == 0)
+        rc = unlock_pi(&pi_source);
+    return (void *) (intptr_t) rc;
 }
 
 int main(void)
@@ -108,6 +130,30 @@ int main(void)
             wake(&addr_b, 1);
             pthread_join(t1, NULL);
             PASS();
+        }
+    }
+
+    TEST("PI waiters are not requeued");
+    if (lock_pi(&pi_source) != 0) {
+        FAIL("lock_pi");
+    } else if (pthread_create(&t1, NULL, wait_on_pi, NULL) != 0) {
+        FAIL("pthread_create");
+        unlock_pi(&pi_source);
+    } else {
+        settle();
+        long rc = cmp_requeue(&pi_source, &pi_destination, 0, 1,
+                              __atomic_load_n(&pi_source, __ATOMIC_SEQ_CST));
+        if (unlock_pi(&pi_source) != 0) {
+            FAIL("unlock_pi");
+        } else {
+            void *wait_rc;
+            pthread_join(t1, &wait_rc);
+            if (rc == -EINVAL && (intptr_t) wait_rc == 0)
+                PASS();
+            else
+                (printf("FAIL: PI cmp_requeue rc=%ld waiter=%ld\n", rc,
+                        (long) (intptr_t) wait_rc),
+                 fails++);
         }
     }
 
