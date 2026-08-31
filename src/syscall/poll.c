@@ -1216,7 +1216,7 @@ int epoll_dup_fd(int src_fd,
     fd_alias_spec_t spec = fd_alias_identity(src_ofd_id, 0);
     int new_guest_fd = fd_alloc_alias_dir(
         &spec, fixed_slot ? fixed_guest_fd : -1, min_guest_fd, FD_EPOLL,
-        new_host_fd, NULL, inst, lflags);
+        new_host_fd, NULL, inst, lflags, NULL);
     if (new_guest_fd < 0) {
         /* fd_alloc_dir_at fails only when fixed_guest_fd is out of range or
          * over RLIMIT_NOFILE; dup2/dup3 report that as EBADF, not the EMFILE

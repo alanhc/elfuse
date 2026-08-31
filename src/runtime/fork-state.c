@@ -518,25 +518,19 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
                  * yields EBADF, an honest signal that the fd did not survive
                  * the fork.
                  */
-                int dir_fd = dup(host_fds[i]);
-                if (dir_fd < 0) {
-                    log_error("fork-child: dup failed for DIR gfd %d: %s", gfd,
-                              strerror(errno));
-                    fd_retire_published(gfd, host_fds[i]);
-                    continue;
-                }
-                DIR *dir = fdopendir(dir_fd);
-                if (!dir) {
-                    close(dir_fd);
-                    log_error("fork-child: fdopendir failed for gfd %d", gfd);
-                    fd_retire_published(gfd, host_fds[i]);
-                    continue;
-                }
-                void *ds = dir_stream_create(dir);
+
+                /* The stream adopts the descriptor that arrived over
+                 * SCM_RIGHTS; it does not take one of its own. On failure the
+                 * descriptor is still this side's, which is what lets
+                 * fd_retire_published close it -- and it must, because a slot
+                 * left published as FD_DIR with a NULL dir owns its descriptor
+                 * the ordinary way (see fd_cleanup_entry).
+                 */
+                void *ds = dir_stream_open(host_fds[i]);
                 if (!ds) {
-                    closedir(dir);
-                    log_error("fork-child: dir_stream_create failed for gfd %d",
-                              gfd);
+                    log_error(
+                        "fork-child: dir_stream_open failed for gfd %d: %s",
+                        gfd, strerror(errno));
                     fd_retire_published(gfd, host_fds[i]);
                     continue;
                 }

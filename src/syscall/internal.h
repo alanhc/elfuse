@@ -343,7 +343,8 @@ int fd_alloc_alias_dir(const fd_alias_spec_t *spec,
                        int host_fd,
                        void (*cleanup)(int),
                        void *dir,
-                       int linux_flags);
+                       int linux_flags,
+                       uint64_t *out_gen);
 
 /* Allocate the lowest available FD and publish type, host_fd, dir, and
  * linux_flags in one fd_lock critical section, so the slot never becomes
@@ -368,13 +369,15 @@ int fd_alloc_dir_from(int minfd,
                       int host_fd,
                       void (*cleanup)(int),
                       void *dir,
-                      int linux_flags);
+                      int linux_flags,
+                      uint64_t *out_gen);
 int fd_alloc_dir_at(int fd,
                     int type,
                     int host_fd,
                     void (*cleanup)(int),
                     void *dir,
-                    int linux_flags);
+                    int linux_flags,
+                    uint64_t *out_gen);
 
 /* Allocate the lowest available FD >= minfd.
  *
@@ -759,15 +762,28 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap);
  * for FD_DIR entries (see syscall/fs.c). A raw DIR* would let a sibling's
  * close()/dup2()/fork-restore free it via closedir() while sys_getdents64() is
  * still mid-loop reading it; the wrapper defers the closedir() until every
- * acquirer -- the fd-table's own reference, plus any in-flight sys_getdents64
- * -- has released it. Guarded by fd_lock, mirroring poll.c's epoll_instance_t
- * refcount.
+ * acquirer has released it. Guarded by fd_lock, mirroring poll.c's
+ * epoll_instance_t refcount.
  *
- * dir_stream_create() takes ownership of dir and returns the wrapper, or NULL
- * on allocation failure (caller still owns dir and must closedir() it itself).
- * dir_stream_release() drops a reference and is a no-op when passed NULL.
+ * The wrapper also owns the host descriptor. fdopendir() adopts the descriptor
+ * it is handed and only closedir() gives it back, so an FD_DIR slot cannot also
+ * close its own host_fd -- that is what the descriptor doubling this replaced
+ * was paying for. (fdclosedir(3) would hand the descriptor back without closing
+ * it, but it is macOS 26.4+ and elfuse supports macOS 13+.) Everything that
+ * needs the descriptor to stay valid therefore holds a reference here:
+ *
+ *   - the fd-table slot          (released by fd_cleanup_entry)
+ *   - an in-flight getdents64    (dir_stream_acquire, syscall/fs.c)
+ *   - an fd_lifetime pin         (fdtable.c, which delegates its close here)
+ *
+ * dir_stream_open() takes ownership of host_fd and returns the wrapper, or NULL
+ * with errno set, in which case host_fd is untouched and still the caller's.
+ * dir_stream_ref_locked() takes an extra reference and requires fd_lock.
+ * dir_stream_release() drops a reference and is a no-op when passed NULL; it
+ * takes fd_lock itself, so no caller may hold it.
  */
-void *dir_stream_create(DIR *dir);
+void *dir_stream_open(int host_fd);
+void dir_stream_ref_locked(void *ds);
 void dir_stream_release(void *ds);
 
 /* Translation helpers. */
