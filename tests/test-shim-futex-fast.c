@@ -170,7 +170,7 @@ int main(void)
     expect(
         raw_syscall6(__NR_futex, (long) &word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
                      0, (long) &invalid_timeout, 0, 0),
-        -EINVAL, "timeout stays host-validated");
+        -EINVAL, "malformed timeout still EINVAL");
     expect(raw_syscall6(__NR_futex, (long) ((char *) &word + 1),
                         FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0),
            -EINVAL, "unaligned address stays host-validated");

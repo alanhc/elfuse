@@ -198,6 +198,14 @@
  */
 .equ SHIM_STATS_EN_OFF,      0x04
 
+/* Iterations futex_wait_fast re-reads a matching futex word before handing the
+ * call to the host, and how often it re-reads attention while doing so. See the
+ * spin note above futex_wait_fast for why the count is this large and why a
+ * smaller one is worse than none at all.
+ */
+.equ FUTEX_EL1_SPIN_ITERS,   4096
+.equ FUTEX_EL1_SPIN_ATTN_MASK, 63
+
 .equ CB_ATTN_BAIL,           0
 .equ CB_URANDOM_FD_OOR,      8
 .equ CB_URANDOM_FD_BMISS,    16
@@ -480,8 +488,8 @@ getsid_fast:
     COUNTER_INC CB_PGSID_HIT
     b svc_restore_eret
 
-/* futex_wait_fast: serve an untimed FUTEX_WAIT or FUTEX_WAIT_BITSET whose word
- * already differs from expected. It answers EAGAIN once an EL0 read proves the
+/* futex_wait_fast: serve a FUTEX_WAIT or FUTEX_WAIT_BITSET, timed or not, whose
+ * word differs from expected. It answers EAGAIN once an EL0 read proves the
  * caller will not block, and EFAULT when that read faults
  * (handle_el1_data_abort_recover below). Anything that could need a waiter, and
  * every other shape, bails to the host.
@@ -492,9 +500,46 @@ getsid_fast:
  * a moved word, and its four callers reject the timeout, the bitset and the
  * alignment before reaching it. Every one of those rejections bails below.
  *
- * A non-NULL timeout stays on the host even when the word differs, because both
- * host waiters build the deadline first, so a malformed timespec has to outrank
- * the moved word.
+ * A non-NULL timeout is served too, but only once the timespec behind it has
+ * been read and found valid, because both host waiters build the deadline
+ * first: a malformed timespec outranks a moved word, exactly as it does on
+ * Linux, whose syscall entry validates the timeout before futex_wait compares
+ * anything.
+ *
+ * That shape is worth the extra loads. glibc issues every timed wait as
+ * FUTEX_WAIT_BITSET with an absolute deadline and MATCH_ANY, which is
+ * pthread_cond_timedwait, sem_timedwait, pthread_mutex_timedlock and the timed
+ * rwlocks; musl converts the deadline in userspace and issues plain FUTEX_WAIT
+ * with a relative one. Measured on a glibc pthread_cond_timedwait ping-pong,
+ * 5878 of 5884 timed waits returned EAGAIN without ever parking, and every one
+ * of them paid a round trip to find that out.
+ *
+ * A word that still matches is re-read up to FUTEX_EL1_SPIN_ITERS times before
+ * the call is handed over. What that catches is the waker's store, which every
+ * correct futex user issues before its FUTEX_WAKE, and the reason it belongs
+ * here rather than only in futex_spin_word_moved on the host is that the host
+ * spin starts one HVC round trip too late: on a four-thread contended mutex,
+ * three quarters of the waits that reached the host found the word already
+ * moved before that spin ran a single iteration, and 99.3 percent of them never
+ * parked at all. Answering them at EL1 costs a load instead of a round trip.
+ *
+ * EAGAIN for a word that moved is what Linux returns whenever the value differs
+ * at the check, and nothing is enqueued here, so no wake can be lost: a guest
+ * that gets EAGAIN re-reads its own predicate and calls again.
+ *
+ * The count is large deliberately, and a smaller one is worse than no spin.
+ * Measured on a four-thread contended mutex (tests/bench-futex-contend, median
+ * of nine, seconds): no spin 0.74, 256 iterations 1.01, 1024 0.31, 2048 0.25,
+ * 4096 0.23. A spin too short to win the handoff pays for itself twice, once in
+ * the spin and once in the park it failed to avoid, which is the 256 row. The
+ * same shape decided FUTEX_SPIN_ITERS in runtime/futex.c, whose knee is also
+ * 4096; the two are independent numbers that happen to agree.
+ *
+ * Attention is re-read every FUTEX_EL1_SPIN_ATTN_MASK+1 iterations rather than
+ * only before the spin. A signal raises attention before it kicks the vCPU
+ * (shim_globals_raise_attention), and the run loop declines to build a signal
+ * frame while the vCPU sits at EL1, so a spin that ignored attention would hold
+ * the delivery for its whole length.
  *
  * The shape decode reads only the saved SVC frame, so it runs before the
  * attention load. That ordering is what makes CB_ATTN_BAIL count only calls
@@ -518,11 +563,25 @@ futex_wait_fast:
     ldr w16, [sp, #40]                /* val3 = bitset */
     cbz w16, futex_shape_bail         /* zero bitset is EINVAL on the host */
 futex_wait_shape:
-    ldr x14, [sp, #24]                /* timeout */
-    cbnz x14, futex_shape_bail
+    ldr x20, [sp, #24]                /* timeout, NULL for an untimed wait */
     ldr x14, [sp, #0]                 /* uaddr */
     tst x14, #3
     b.ne futex_shape_bail
+
+    /* A timeout is served too, but only after the timespec behind it has been
+     * read and found valid, because Linux validates it before it compares the
+     * word: a bad pointer is EFAULT and a malformed timespec is EINVAL, and
+     * both outrank a word that moved. The pointer gets the same alignment and
+     * tag tests uaddr does, for the same reasons, plus eight bytes of headroom
+     * so the second field cannot straddle into an address the first proved
+     * nothing about.
+     */
+    cbz x20, futex_uaddr_tag
+    tst x20, #7
+    b.ne futex_shape_bail
+    tst x20, #0xFF00000000000000
+    b.ne futex_shape_bail
+futex_uaddr_tag:
 
     /* TCR_EL1.TBI0 is set (hvutil.h TCR_EL1_VALUE), so the LDTR below ignores
      * uaddr[63:56]. The host's software walker does not: gva_resolve_perm
@@ -571,18 +630,87 @@ futex_wait_shape:
      * The recovery slot below keeps ELR/SPSR under the outer SVC frame so the
      * abort handler resumes EL0 at the original post-SVC PC.
      */
+    ldr w17, [sp, #16]                /* expected */
+    mov w15, #FUTEX_EL1_SPIN_ITERS
     mrs x18, elr_el1
     mrs x19, spsr_el1
     stp x18, x19, [sp, #-16]!
+    cbz x20, .Lfutex_spin
+
+    /* Timed shape. The timespec is read through the same LDTR the word is, so
+     * an unreadable one takes the EL0 permission fault in hardware and
+     * handle_el1_data_abort_recover answers EFAULT, which is what Linux answers
+     * for it and in the same order.
+     *
+     * Validity is deliberately narrower than the host's. futex.c accepts tv_sec
+     * up to INT64_MAX/4; this accepts up to 2^31, about 68 years, and hands
+     * everything else over. A bail is always correct where an answer might not
+     * be, and the alternative is a second copy of timespec_valid_capped here,
+     * free to drift from the proved one.
+     *
+     * No spin on this shape, hence the count of one. For an absolute deadline a
+     * spin would only be wasteful, but for the relative form musl issues the
+     * host re-derives the deadline after the fast path declines, so a spin
+     * would add itself to the guest's timeout. futex_wait_inner already
+     * declines to spin on an expired deadline for the same reason, having
+     * measured 4788 ns against 1756 for a sem_timedwait used as a non-blocking
+     * probe. The rule stays: EL1 spins only where the host would otherwise have
+     * blocked with no deadline.
+     */
+    mov w15, #1
+.globl futex_ts_load_start
+.globl futex_ts_load_end
+futex_ts_load_start:
+    ldtr x21, [x20]                   /* tv_sec */
+    ldtr x22, [x20, #8]               /* tv_nsec */
+futex_ts_load_end:
+    tst x21, #0xFFFFFFFF80000000      /* tv_sec outside [0, 2^31) */
+    b.ne .Lfutex_ts_bail
+    mov x23, #0xCA00                  /* 1000000000 */
+    movk x23, #0x3B9A, lsl #16
+    cmp x22, x23                      /* unsigned: negative tv_nsec fails too */
+    b.hs .Lfutex_ts_bail
+    b .Lfutex_spin
+
+.Lfutex_ts_bail:
+    add sp, sp, #16
+    b futex_shape_bail
+
 .globl futex_load_start
 .globl futex_load_end
 futex_load_start:
+.Lfutex_spin:
     ldtr w16, [x14]
 futex_load_end:
-    add sp, sp, #16
-    ldr w17, [sp, #16]                /* expected */
     cmp w16, w17
-    b.eq futex_match_bail             /* caller blocks; host owns the queue */
+    b.ne .Lfutex_moved                /* moved: EAGAIN, nothing was queued */
+    subs w15, w15, #1
+    b.eq .Lfutex_stay                 /* still matching: the host owns it */
+    tst w15, #FUTEX_EL1_SPIN_ATTN_MASK
+    b.ne .Lfutex_next
+    ldar w13, [x12]                   /* x12 still holds TPIDR_EL1 */
+    cbnz w13, .Lfutex_attn
+.Lfutex_next:
+    yield
+    b .Lfutex_spin
+
+    /* Named labels, not the numeric locals the rest of the file uses. A bare "b
+     * 1f" here once resolved into handle_inst_abort, which svc_restore_eret
+     * records having caught the hard way; five of them in twenty lines is the
+     * same trap re-set for whoever edits this next.
+     *
+     * All three exits drop the recovery slot first: past this point the LDTR
+     * can no longer fault, so handle_el1_data_abort_recover has nothing left to
+     * pop.
+     */
+.Lfutex_stay:
+    add sp, sp, #16
+    b futex_match_bail
+.Lfutex_attn:
+    add sp, sp, #16
+    b attn_bail
+.Lfutex_moved:
+    add sp, sp, #16
     mov x0, #-11                      /* Linux EAGAIN */
     COUNTER_INC CB_FUTEX_EAGAIN_HIT
     b svc_restore_eret
@@ -1135,25 +1263,38 @@ not_svc:
  *   - SAVE_GPRS allocated 256 bytes for THIS (inner) entry on top of
  *     whatever the outer SVC entry already pushed. Dropping that 256
  *     puts SP at the recovery slot the faulting fast path pushed before
- *     entering its access (futex_wait_fast before the ldtr,
- *     urandom_read_fast before the strb region).
+ *     entering its access (futex_wait_fast before either its timespec
+ *     ldtrs or its word ldtr, urandom_read_fast before the strb region).
  *   - Recovery slot is 16 bytes: [sp+0]=ELR_EL1, [sp+8]=SPSR_EL1.
  *   - The urandom range holds the lock at TPIDR_EL1 + 0x10C0 at the time the
  *     strb faults, so that range releases it before transferring out. The
  *     futex range holds no lock and no exclusive monitor, which is the whole
  *     difference between the two tails below.
  *
- * If the fault PC is outside both the futex ldtr and the urandom strb ranges
- * this is a genuine shim bug; fall back to restore_and_bad.
+ * If the fault PC is outside the two futex ldtr ranges and the urandom strb
+ * ranges this is a genuine shim bug; fall back to restore_and_bad.
  */
 handle_el1_data_abort_recover:
     mrs x11, elr_el1
     adr x12, futex_load_start
     cmp x11, x12
-    b.lo 3f
+    b.lo 4f
     adr x12, futex_load_end
     cmp x11, x12
+    b.lo 5f
+4:
+    /* The timespec loads on the timed shape. Same recovery as the word load
+     * below and for the same reason: they are LDTRs under the same pushed slot,
+     * they hold no lock and no exclusive monitor, and an unreadable timeout is
+     * EFAULT on Linux before the word is looked at.
+     */
+    adr x12, futex_ts_load_start
+    cmp x11, x12
+    b.lo 3f
+    adr x12, futex_ts_load_end
+    cmp x11, x12
     b.hs 3f
+5:
 
     /* The futex load holds no lock or exclusive monitor. Its recovery slot is
      * otherwise the same shape as urandom's: discard the nested exception

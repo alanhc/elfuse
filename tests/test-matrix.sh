@@ -883,6 +883,8 @@ run_unit_tests()
     test_check "$runner" "test-futex-pi" "0 failed" "$bindir/test-futex-pi"
     test_rc "$runner" "test-futex-waitv" 0 "$bindir/test-futex-waitv"
     test_rc "$runner" "test-futex-wake-op" 0 "$bindir/test-futex-wake-op"
+    test_check "$runner" "test-futex-timed" "0 failed" \
+        "$bindir/test-futex-timed"
     test_rc "$runner" "test-futex-wake-nowaiter" 0 \
         "$bindir/test-futex-wake-nowaiter"
     test_rc "$runner" "test-futex-requeue-account" 0 \
@@ -1453,15 +1455,16 @@ run_suite()
 # without fixtures, by the amount it adds.
 #
 # elfuse-aarch64 went 243 to 247 for test-shim-futex-fast, test-futex-wake-op,
-# test-futex-wake-nowaiter and test-futex-requeue-account, then 247 to 249 for
-# test-signal-in-shim and test-ptrace-interrupt. All six are built from tests/,
-# so they run in any checkout. Only test-signal-in-shim is in the qemu list, a
-# ptrace-stop's register snapshot having no counterpart there, and the qemu row
-# stays at 225 regardless: the qemu fixtures are not present on the machine that
-# made this change, so a raised number would be one nobody observed. A floor too
-# low costs nothing; an unobserved one asserts a run that did not happen.
+# test-futex-wake-nowaiter and test-futex-requeue-account, then 247 to 250 for
+# test-signal-in-shim, test-ptrace-interrupt and test-futex-timed. All seven are
+# built from tests/, so they run in any checkout. qemu-aarch64 runs
+# test-futex-timed too, the other two being elfuse-internal, so its floor should
+# be 226; it stays at 225 deliberately, because the qemu fixtures are not
+# present on the machine that made these changes and 226 would be a number
+# nobody observed. A floor too low costs nothing; an unobserved one asserts a
+# run that did not happen.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|249|0"
+    "elfuse-aarch64|250|0"
     "qemu-aarch64|225|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"

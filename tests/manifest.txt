@@ -158,6 +158,9 @@ test-futex-pi                  # diff=skip
 [section] futex_waitv (SYS 449) tests
 test-futex-waitv               # diff=skip
 
+[section] Timed futex wait ordering
+test-futex-timed
+
 [section] FUTEX_WAKE_OP operand decode
 test-futex-wake-op
 
