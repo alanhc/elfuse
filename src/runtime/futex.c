@@ -604,6 +604,11 @@ int futex_interrupt_consume(void)
  */
 #define FUTEX_TIMESPEC_SEC_MAX (INT64_MAX / 4)
 
+/*@ requires \valid_read(lts);
+    assigns \nothing;
+    ensures \result != 0 <==> (0 <= lts->tv_sec <= FUTEX_TIMESPEC_SEC_MAX &&
+                               0 <= lts->tv_nsec < TIMESPEC_NSEC_PER_SEC);
+ */
 static int linux_timespec_is_valid(const linux_timespec_t *lts)
 {
     /* timespec_valid_capped is the proved statement of what Linux accepts on
@@ -673,7 +678,22 @@ static int futex_make_deadline(guest_t *g,
  * futex as a caller, and a second convention would differ on inputs neither
  * caller can produce, which is the same provenance argument this replaces.
  */
-
+/*@ requires \valid_read(deadline);
+    requires now_out == \null || \valid(now_out);
+    requires 0 <= deadline->tv_sec;
+    requires 0 <= deadline->tv_nsec < TIMESPEC_NSEC_PER_SEC;
+    ensures 0 <= \result <= cap_ns;
+    assigns *now_out, __fc_time;
+    behavior reports_now:
+      assumes now_out != \null;
+      assigns *now_out, __fc_time;
+      ensures 0 <= *now_out <= INT64_MAX;
+    behavior discards_now:
+      assumes now_out == \null;
+      assigns __fc_time;
+    complete behaviors;
+    disjoint behaviors;
+ */
 static uint64_t futex_remaining_ns(const struct timespec *deadline,
                                    uint64_t cap_ns,
                                    int64_t *now_out)
@@ -701,6 +721,15 @@ static uint64_t futex_remaining_ns(const struct timespec *deadline,
  * the memory the waiter touches on wake.
  * Returns false when the guest deadline has already passed.
  */
+/*@ requires \valid_read(deadline);
+    requires \valid(out);
+    requires 0 <= deadline->tv_sec;
+    requires 0 <= deadline->tv_nsec < TIMESPEC_NSEC_PER_SEC;
+    requires \separated(deadline, out);
+    assigns *out, __fc_time;
+    ensures \result ==> 0 <= out->tv_nsec < TIMESPEC_NSEC_PER_SEC;
+    ensures \result ==> 0 <= out->tv_sec;
+ */
 static bool futex_quantum_deadline(const struct timespec *deadline,
                                    struct timespec *out)
 {
@@ -720,12 +749,10 @@ static bool futex_quantum_deadline(const struct timespec *deadline,
      * now_ns is the reading rem_ns was measured against, so this lands on the
      * guest deadline exactly whenever the deadline is the nearer of the two.
      *
-     * The clamp is what makes the cast and the add total rather than merely
-     * true. futex_remaining_ns does return at most the cap it was given, but it
-     * carries no contract saying so, so nothing here establishes that rem_ns
-     * fits an int64_t; without the clamp a negative add makes INT64_MAX - add
-     * overflow, and Frama-C reports it. An earlier revision had this clamp,
-     * lost it to a dead-code cleanup, and the obligation came straight back.
+     * The futex_remaining_ns contract establishes that rem_ns is at most the
+     * cap. The clamp still makes the cast and the add total if that
+     * implementation ever drifts past its own bound: an unclamped rem_ns above
+     * INT64_MAX casts to a negative add, and INT64_MAX - add then overflows.
      * Clamping in the unsigned domain keeps the comparison well defined.
      */
     uint64_t bounded = rem_ns > (uint64_t) FUTEX_OS_SYNC_POLL_CAP_NS

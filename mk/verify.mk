@@ -259,6 +259,33 @@ reply buffer state
 VERIFY_NETLINKWALK_UNPROVED := the reply builders, the socket I/O, and whether \
 their callers honor these preconditions stay test-covered
 
+# The deadline arithmetic in futex.c is proved in place because
+# futex_remaining_ns reads the clock. Typed suffices; no function in the set
+# touches a byte buffer.
+#
+# The four proved/timespec.h helpers are re-proved here rather than assumed, the
+# same reason VERIFY_UTILS_FCTS exists: futex_remaining_ns rests on
+# timespec_to_ns_sat's saturation. All four, not just the two futex.c reaches:
+# check-acsl-coverage.py reads the whole of each scanned file, so a contracted
+# function left out of the set is an assumed axiom whether or not this target
+# calls it, and dropping timespec_to_poll_ms fails the gate by name.
+#
+# The cost is that verify-mutants lists those four as unmutated under this
+# target as well as under verify-timespec, where they are mutated. That is a
+# second target proving the same functions, not lost coverage.
+VERIFY_FUTEXDEADLINE_SRC  := src/runtime/futex.c
+VERIFY_FUTEXDEADLINE_FCTS := futex_remaining_ns futex_quantum_deadline \
+                             linux_timespec_is_valid futex_uaddr_is_aligned \
+                             timespec_valid timespec_valid_capped \
+                             timespec_to_ns_sat timespec_to_poll_ms
+VERIFY_FUTEXDEADLINE_MIN_GOALS ?= 128
+VERIFY_FUTEXDEADLINE_MODEL := typed
+VERIFY_FUTEXDEADLINE_SCAN := src/runtime/futex.c src/proved/timespec.h
+VERIFY_FUTEXDEADLINE_CLAIM := for ANY guest deadline and ANY cap the wait \
+paths hand it
+VERIFY_FUTEXDEADLINE_UNPROVED := the wait loops that consume the deadline, and \
+whether their callers honor these preconditions stay test-covered
+
 VERIFY_SIGFRAME_SRC  := src/proved/sigframe.h
 VERIFY_SIGFRAME_FCTS := sigframe_base sigframe_fpsimd_vreg_offset
 VERIFY_SIGFRAME_MIN_GOALS ?= 20
