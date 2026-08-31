@@ -346,6 +346,12 @@ $(BUILD_DIR)/test-eventfd-semaphore-contended: \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-signal-in-shim aims a stream of signals at threads contending for one
+# mutex, so the kick lands while a vCPU is inside the EL1 shim.
+$(BUILD_DIR)/test-signal-in-shim: tests/test-signal-in-shim.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-fd-pin-lock keeps a sibling thread live so the fd syscalls under test
 # take the multi-threaded pin path rather than the single-active fast path.
 $(BUILD_DIR)/test-fd-pin-lock: \

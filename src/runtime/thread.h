@@ -170,11 +170,20 @@ typedef struct thread_entry {
     int ptrace_waiters;          /* Tracers currently blocked on ptrace_cond */
     bool ptrace_cleanup_pending; /* Destroy condvars after last waiter leaves */
     int ptrace_cont_sig;         /* Signal to inject on resume (0=none) */
-    bool ptrace_interrupt_pending;    /* PTRACE_INTERRUPT arrived while the vCPU
-                                       * was still in bring-up (!vcpu_valid), so
-                                       * it could not be delivered via
-                                       * hv_vcpus_exit; the worker self-kicks at
-                                       * publish to deliver it. Under thread_lock.
+    bool ptrace_interrupt_pending;    /* A ptrace-stop is owed to this thread.
+                                       * Set by every PTRACE_INTERRUPT, not only
+                                       * the bring-up race it started as: the
+                                       * kick alone is not enough, because it can
+                                       * land while the vCPU is at EL1 in the
+                                       * shim, where the live registers are shim
+                                       * scratch and a stop would show the tracer
+                                       * those instead of the guest's. Consumed
+                                       * where the state is readable: the HVC #5
+                                       * epilogue, or the canceled-exit handler
+                                       * once it has established EL0. A vCPU
+                                       * still in bring-up (!vcpu_valid) cannot
+                                       * be kicked at all and self-kicks at
+                                       * publish. Under thread_lock.
                                        */
     linux_user_pt_regs_t ptrace_regs; /* snapshot for cross-thread access */
     bool ptrace_regs_dirty;           /* Tracer modified registers */

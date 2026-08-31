@@ -65,10 +65,19 @@
  *                      takes HVC instead of a half-updated cred set.
  *   ATTN_BIT_TRACE     --verbose. Set for the run so fast paths bail and
  *                      syscall_dispatch can log them.
+ *   ATTN_BIT_PTRACE    A PTRACE_INTERRUPT owes some thread a stop. Set so an
+ *                      EL1 fast path takes HVC instead of ERETing to EL0,
+ *                      where nothing would trap again until the guest's next
+ *                      syscall and the tracer would wait on it. Cleared when a
+ *                      stop is taken; process-wide, so with two traced threads
+ *                      one clear can drop the hint early, which costs the other
+ *                      thread nothing it did not already have (its own kick
+ *                      still stands).
  */
 #define ATTN_BIT_SIGTIMER 0x00000001u
 #define ATTN_BIT_CRED 0x00000002u
 #define ATTN_BIT_TRACE 0x00000004u
+#define ATTN_BIT_PTRACE 0x00000008u
 
 #define SHIM_IDENTITY_BASE 0x08
 #define SHIM_IDENTITY_OFF_PID 0x08
@@ -299,6 +308,12 @@ int shim_globals_install_per_vcpu(hv_vcpu_t vcpu,
  * singleton registered at process init (signal_set_shim_globals_guest).
  */
 void shim_globals_raise_attention(guest_t *g);
+
+/* Raise or drop the ptrace lane. Separate from the signal lane's
+ * raise/recompute pair because nothing recomputes this one: the thread that
+ * takes the stop is what drops it.
+ */
+void shim_globals_ptrace_attention(guest_t *g, bool owed);
 void shim_globals_recompute_attention(guest_t *g);
 void shim_globals_set_trace_enabled(guest_t *g, bool enabled);
 

@@ -389,6 +389,19 @@ void shim_globals_attn_and(guest_t *g, uint32_t mask)
     vdso_attention_and(g, mask);
 }
 
+void shim_globals_ptrace_attention(guest_t *g, bool owed)
+{
+    /* OR to raise, AND to drop, so the signal and cred lanes are untouched
+     * either way. The raise has to be visible before the kick that follows it,
+     * which is the same ordering shim_globals_raise_attention documents; the
+     * drop only ever costs a spurious HVC, so RELEASE is enough.
+     */
+    if (owed)
+        shim_globals_attn_or(g, ATTN_BIT_PTRACE);
+    else
+        shim_globals_attn_and(g, ~ATTN_BIT_PTRACE);
+}
+
 void shim_globals_raise_attention(guest_t *g)
 {
     /* Signal/timer/exit-group lane. OR-only update so a concurrent cred
