@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DEFAULT_STUB = ROOT / "frama-c-stubs" / "macos-libc.h"
+STUB_DIR = ROOT / "frama-c-stubs"
 
 # Only object-like defines with an integer value. A macro with parameters or a
 # non-numeric body is not a constant this can compare, and is reported as
@@ -66,6 +66,27 @@ def sdk_path():
     return path if path and (path / "usr" / "include").is_dir() else None
 
 
+def sdk_mentions(search_dirs, names):
+    """Names the SDK mentions at all, however it spells them.
+
+    The value check below can only compare object-like defines. Hypervisor
+    declares its constants as enumerators, so a grep for #define finds nothing
+    and every one of them would read as a name the SDK does not have, which is
+    the report reserved for a typo. Splitting the two questions keeps that
+    report meaningful: a name the SDK mentions but does not #define is an
+    enumerator this cannot value-check, while a name it never mentions is
+    wrong whatever the spelling.
+    """
+    pattern = r"\b(" + "|".join(names) + r")\b"
+    hit = subprocess.run(
+        ["grep", "-rhoE", "--include=*.h", pattern, *[str(d) for d in search_dirs]],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ).stdout.split()
+    return set(hit)
+
+
 def sdk_values(include_dir, names):
     """{name: {values the SDK defines it as}} for every @names, in one pass.
 
@@ -94,14 +115,29 @@ def sdk_values(include_dir, names):
     return found
 
 
+def stub_files(explicit):
+    """Every header under frama-c-stubs, not just macos-libc.h.
+
+    The constants moved out of that one file when the shadow headers arrived:
+    sys/ipc.h and sys/msg.h carry Darwin values for the same reason and with
+    the same consequence if one is wrong. Scanning the directory rather than a
+    list means a new stub is covered the day it lands instead of the day
+    somebody remembers to add it here.
+    """
+    if explicit:
+        path = pathlib.Path(explicit)
+        return [path] if path.is_file() else []
+    return sorted(p for p in STUB_DIR.rglob("*.h"))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stub", default=str(DEFAULT_STUB))
+    ap.add_argument("--stub", default=None)
     args = ap.parse_args()
 
-    stub = pathlib.Path(args.stub)
-    if not stub.is_file():
-        print(f"  stub not found: {stub}")
+    stubs = stub_files(args.stub)
+    if not stubs:
+        print(f"  no stub headers found under {STUB_DIR}")
         return 1
 
     sdk = sdk_path()
@@ -109,19 +145,51 @@ def main():
         print("  STUBCONST no macOS SDK; skipping (a macOS run checks this)")
         return 0
     include_dir = sdk / "usr" / "include"
+    # Only the frameworks the stub tree actually mirrors, named by its own
+    # subdirectories: frama-c-stubs/Hypervisor means Hypervisor.framework. The
+    # whole Frameworks tree is 6,266 headers and a grep over it costs half a
+    # minute for one framework's worth of answers.
+    #
+    # Resolved rather than globbed, because a framework's Headers is a symlink
+    # into Versions/A and grep -r does not descend a symlinked directory. That
+    # silently found nothing for two of the Hypervisor names while finding the
+    # others, which reads as "the SDK does not have this name" and is the one
+    # report this gate must not get wrong.
+    fw_root = sdk / "System" / "Library" / "Frameworks"
+    frameworks = []
+    for sub in sorted(p.name for p in STUB_DIR.iterdir() if p.is_dir()):
+        headers = fw_root / f"{sub}.framework" / "Headers"
+        if headers.is_dir():
+            frameworks.append(headers.resolve())
 
-    defines = DEFINE.findall(stub.read_text())
+    defines = []
+    origin = {}
+    for stub in stubs:
+        for name, raw in DEFINE.findall(stub.read_text()):
+            defines.append((name, raw))
+            origin[name] = stub.relative_to(ROOT)
     if not defines:
-        print(f"  no integer defines found in {stub}; the regex or the file moved")
+        print(f"  no integer defines found under {STUB_DIR}; the regex moved")
         return 1
 
-    found = sdk_values(include_dir, [name for name, _ in defines])
-    wrong, missing = [], []
+    names = [name for name, _ in defines]
+    found = sdk_values(include_dir, names)
+
+    # Only for the names the value scan came up empty on. Asking it about all of
+    # them means grepping a 3,400-file tree for bare words, and one of those
+    # words is NAME_MAX: the match list runs to tens of thousands of lines and
+    # the gate went from under a second to half a minute for an answer it
+    # already had.
+    unresolved = [n for n in names if not found[n]]
+    mentioned = (
+        sdk_mentions([include_dir, *frameworks], unresolved) if unresolved else set()
+    )
+    wrong, missing, enum_only = [], [], []
     for name, raw in defines:
         want = c_int(raw)
         got = found[name]
         if not got:
-            missing.append(name)
+            (enum_only if name in mentioned else missing).append(name)
         elif got != {want}:
             # One value that disagrees, or several headers disagreeing with each
             # other; either way there is nothing here that matches the stub.
@@ -130,7 +198,7 @@ def main():
     if wrong:
         print("  stub constants disagree with the macOS SDK:")
         for name, want, got in wrong:
-            print(f"    {name}: stub {want} ({hex(want)}), SDK {got}")
+            print(f"    {origin[name]}: {name}: stub {want} ({hex(want)}), SDK {got}")
         print("  The analyzer never links, so this changes what the proofs")
         print("  reason about rather than what runs. Use the SDK value.")
         return 1
@@ -138,12 +206,21 @@ def main():
     if missing:
         print("  stub constants the SDK does not define uniquely:")
         for name in missing:
-            print(f"    {name}")
+            print(f"    {origin[name]}: {name}")
         print("  Either the name is wrong or it is not an SDK constant; if it")
         print("  is deliberately synthetic, it does not belong in this file.")
         return 1
 
-    print(f"  STUBCONST {len(defines)} stub constant(s) match the macOS SDK")
+    checked = len(defines) - len(enum_only)
+    note = ""
+    if enum_only:
+        note = (
+            f"; {len(enum_only)} named by the SDK as enumerators, value not comparable"
+        )
+    print(
+        f"  STUBCONST {checked} stub constant(s) in {len(stubs)} "
+        f"header(s) match the macOS SDK{note}"
+    )
     return 0
 
 

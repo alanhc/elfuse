@@ -1,7 +1,7 @@
 # Frama-C WP proofs
 
 .PHONY: verify check-contracts verify-mutants check-char-signedness \
-        check-stub-constants print-verify-targets
+        check-stub-constants check-stub-shadow print-verify-targets
 
 # Frama-C proof of the ELF parsing core. ELF headers come from untrusted
 # binaries, so every offset and extent computed from them is discharged as a
@@ -439,7 +439,7 @@ $(foreach t,$(VERIFY_TARGETS),$(eval $(call verify-target-vars,$(t))))
 # lives in scripts/check-wp-result.py: as a shell recipe it needed every $
 # doubled and every line continued, which put the gate that matters out of
 # reach of any test.
-$(VERIFY_RULES): check-stub-constants | $(BUILD_DIR)
+$(VERIFY_RULES): check-stub-constants check-stub-shadow | $(BUILD_DIR)
 	@command -v $(FRAMAC) >/dev/null 2>&1 || { \
 		printf "$(RED)frama-c not found$(RESET) "; \
 		printf "(set FRAMAC=, or eval \$$(opam env --switch=<switch>))\n"; \
@@ -540,6 +540,17 @@ VERIFY_JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || ech
 # another arm of the same linux_errno() switch, and only a review caught it.
 check-stub-constants:
 	$(Q)python3 scripts/check-stub-constants.py
+
+## Assert a shadow stub's rename still hits exactly one declaration
+#
+# frama-c-stubs/sys/socket.h and frama-c-stubs/pthread.h take the modeled libc
+# header whole and rename one name inside it. That is sound only while the
+# modeled header names it once. A second use would follow the rename into a
+# prototype and change a signature, and the file would still parse and the
+# proofs would still discharge, about a different program.
+check-stub-shadow:
+	$(Q)python3 scripts/check-stub-shadow.py --self-test
+	$(Q)python3 scripts/check-stub-shadow.py
 
 verify:
 	+@$(MAKE) --no-print-directory \

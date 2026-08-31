@@ -116,3 +116,29 @@ struct fpunchhole {
 #ifndef IP_DONTFRAG
 #define IP_DONTFRAG 28
 #endif
+
+/* sys/stat.h: Darwin names the three timestamp members st_atimespec,
+ * st_mtimespec and st_ctimespec, where POSIX and the modeled libc name them
+ * st_atim, st_mtim and st_ctim. Same struct timespec, different spelling, and
+ * fs-stat.c and fuse.c use the Darwin one in both directions, so the files
+ * stopped with "Cannot find field st_atimespec in type struct stat".
+ *
+ * A macro rather than a shadowed sys/stat.h, because the modeled header already
+ * uses exactly this idiom for the same reason one level down: it writes
+ * "#define st_atime st_atim.tv_sec" beside the member. These alias the member
+ * itself rather than a field of it, so the type is struct timespec on both
+ * sides and nothing is reinterpreted.
+ *
+ * st_birthtimespec has no counterpart at all in the modeled struct and is not
+ * mapped: nothing in the tree reads it, and aliasing it onto one of the three
+ * that do exist would make two distinct timestamps the same storage.
+ */
+#ifndef st_atimespec
+#define st_atimespec st_atim
+#endif
+#ifndef st_mtimespec
+#define st_mtimespec st_mtim
+#endif
+#ifndef st_ctimespec
+#define st_ctimespec st_ctim
+#endif

@@ -319,10 +319,10 @@ CONTENT_SENSITIVE = {
     "mk/config.mk": makefile_proof_slice,
 }
 
-# What "$(VERIFY_RULES): check-stub-constants | $(BUILD_DIR)" in mk/verify.mk
-# names. A content-sensitive file that started defining one of these would put
-# its recipe on the proof path.
-VERIFY_PREREQUISITES = ("check-stub-constants", "$(BUILD_DIR)")
+# What "$(VERIFY_RULES): check-stub-constants check-stub-shadow | $(BUILD_DIR)"
+# in mk/verify.mk names. A content-sensitive file that started defining one of
+# these would put its recipe on the proof path.
+VERIFY_PREREQUISITES = ("check-stub-constants", "check-stub-shadow", "$(BUILD_DIR)")
 
 # The makefiles a proof runs inside. Their variable references are what the
 # slicer treats as proof-relevant names, and taking all four rather than
