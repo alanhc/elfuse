@@ -36,10 +36,12 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
+        test-usb-desc-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
-        test-sysroot-root \
+        test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
+        test-usb-sysfs-overflow \
         test-sysroot-symlink-target \
         test-sysroot-name-i18n test-sysroot-name-length \
         test-sysroot-name-staged test-sysroot-name-race \
@@ -144,6 +146,14 @@ check-tsan:
 # CI budget. "I/O subsystem" is included for its fd-table refcount/ABA races
 # (epoll-mt/aba/refcount, getdents-refcount) now that fd_entry_t.type is atomic;
 # the remaining compat sections (rseq, /proc, sockets) stay on the release lane.
+#
+# The USB tree is reached through CHECK_SHARED_LANES rather than through a
+# section here: it is not in tests/manifest.txt (it has no counterpart the
+# reference kernel can adjudicate, so test-matrix.sh does not register it, and
+# .ci/check-matrix-lists.sh rejects a manifest binary the matrix never runs).
+# It belongs on the sanitizer lane all the same -- the layer composes a dev_t
+# by shifting a major number, which is exactly the arithmetic UBSAN is there to
+# adjudicate, and nothing else on the lane builds that tree.
 SANITIZER_SECTIONS := Threading|Stress|Signal.*thread|Fork edge|CoW fork|Guard page|mremap|MAP_SHARED|madvise|futex|FD table race|Multithreaded|SysV shared|membarrier|I/O subsystem
 
 # One banner-plus-run pair, for a host unit binary run directly and for a
@@ -201,7 +211,8 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-teardown-live-vcpu-host test-stdio-nonblock-host test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
-        test-wakeup-pipe-host test-guest-env-host)
+        test-wakeup-pipe-host test-guest-env-host \
+        test-usb-desc-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -221,6 +232,10 @@ $(call run-host-unit,test-string-builder-host,string builder unit test)
 $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
+$(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
+$(call run-lane,test-usb-sysfs,synthetic USB tree contract)
+$(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
+$(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)
@@ -385,6 +400,7 @@ test-sysroot-symlink-escape: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-symlink-esc
 	ln -sf "$$secret_dir/secret.txt" "$$tmpdir/d1/abs-link"; \
 	ln -sf "$$secret_dir/secret.txt" "$$tmpdir/d2/abs-link"; \
 	ln -sf "../d2/abs-link" "$$tmpdir/d1/chain-link"; \
+	ln -sf /dev "$$tmpdir/d1/dev-bridge"; \
 	depth=$$(printf '%s' "$$tmpdir/d1" | tr -cd '/' | wc -c | tr -d ' '); \
 	relback=""; i=0; \
 	while [ "$$i" -lt "$$depth" ]; do relback="../$$relback"; i=$$((i + 1)); done; \
@@ -1531,9 +1547,44 @@ test-casefold-host: $(BUILD_DIR)/test-casefold-host
 test-casefold-walk-host: $(BUILD_DIR)/test-casefold-walk-host
 	$(BUILD_DIR)/test-casefold-walk-host
 
+## Assert the synthetic USB tree's contract and its two agreeing views
+# The device-dependent half only runs against whatever is attached, so the lane
+# prints the device count rather than letting an empty bus read as full cover.
+test-usb-sysfs: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs
+
+## The /sys ours/not-ours split and the fchdir/cwd containment need a populated
+## /sys behind the synthetic USB view, so this lane stages a sysroot skeleton
+## (a net address, a THP knob, a node list) and runs the guest against it with
+## the deterministic USB fixture so the /sys/bus/usb assertions have devices.
+test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	sysroot="$$tmpdir/sysroot"; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$sysroot/sys/class/net/eth0" \
+		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
+		"$$sysroot/sys/devices/system/node"; \
+	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
+	printf 'always [madvise] never\n' \
+		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
+	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-sysroot
+
+## The devnum cap needs more than 127 address-less devices on one bus, which
+## the overflow fixture injects through the real fallback path. No sysroot: the
+## whole model is synthetic here.
+test-usb-sysfs-overflow: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+	ELFUSE_USB_FIXTURE=overflow $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+
 ## Run the absock derived-name unit test natively on the host
 test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 	$(BUILD_DIR)/test-absock-names-host
+
+## Run the USB descriptor blob walk unit test natively on the host
+test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host
+	$(BUILD_DIR)/test-usb-desc-host
 
 # Wakeup pipe concurrency unit test. Only a -fsanitize=thread build carries a
 # race detector, so check-sanitizer is where this lane has its full weight.

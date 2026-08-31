@@ -39,6 +39,7 @@ _Static_assert(NAME_MAX == DIRENT64_NAME_MAX,
 #include "core/shim-globals.h" /* shim_globals_mark_urandom_fd */
 
 #include "runtime/procemu.h"
+#include "runtime/usb-sysfs.h"
 
 #include "syscall/linux-wire.h"
 #include "syscall/asyncio.h"
@@ -210,6 +211,20 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
      */
     if (!strcmp(path, "/dev/pts") || !strcmp(path, "/dev/pts/")) {
         str_copy_trunc(out, "/dev/pts", out_size);
+        return true;
+    }
+
+    /* The synthetic USB trees (usb-sysfs.c) are scratch-dir backed like
+     * /dev/pts, and their consumers walk them with per-component relative
+     * openat (systemd chase()) and then fstatfs the result expecting
+     * SYSFS_MAGIC. Both need the guest spelling on the descriptor: the former
+     * so resolve_proc_dirfd_path keeps the walk on the intercepts, the latter
+     * so sys_fstatfs can answer synthetically instead of leaking the /tmp
+     * filesystem.
+     */
+    if (path_prefix_match(path, "/sys", 4) ||
+        path_prefix_match(path, "/dev/bus", 8)) {
+        str_copy_trunc(out, path, out_size);
         return true;
     }
 
@@ -659,6 +674,32 @@ int64_t sys_openat_path(guest_t *g,
                         int linux_flags,
                         int mode)
 {
+    /* Linux rejects O_DIRECTORY|O_CREAT while it is still building the open
+     * flags, before the path is resolved and before the dirfd is validated:
+     * EINVAL for a name that exists, one that does not, a directory, and a bad
+     * dirfd alike (measured on 6.19; macOS open(2) agrees, so host-backed names
+     * already answered this and only the intercepts did not). Deciding it here
+     * rather than inside each intercept keeps the one answer in the one place
+     * the kernel decides it, and stops a synthetic directory from reporting
+     * EISDIR for a request the kernel never got far enough to look at.
+     *
+     * O_PATH does not reach that test at all: the same function first masks
+     * the flags down to O_DIRECTORY|O_NOFOLLOW|O_PATH, so the creation bit is
+     * gone before the pair is looked at and O_PATH|O_DIRECTORY|O_CREAT opens
+     * the directory and hands back a descriptor, behaving exactly like
+     * O_PATH|O_DIRECTORY on a present name, an absent one and a regular file
+     * alike (measured). Dropping the bit here rather than only skipping the
+     * test is what makes the rest of the path agree: left set, it reads as
+     * write intent, and the read-only sysfs gate answered EISDIR for a
+     * descriptor the kernel hands out.
+     */
+    if (linux_flags & LINUX_O_PATH)
+        linux_flags &= ~LINUX_O_CREAT;
+
+    if ((linux_flags & (LINUX_O_DIRECTORY | LINUX_O_CREAT)) ==
+        (LINUX_O_DIRECTORY | LINUX_O_CREAT))
+        return -LINUX_EINVAL;
+
     path_translation_t tx;
     unsigned int tx_flags =
         (linux_flags & LINUX_O_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE;
@@ -742,10 +783,40 @@ int64_t sys_openat_path(guest_t *g,
                  */
                 spec = fd_alias_host_shared(&alias_src);
             }
-            int guest_fd =
-                fd_alloc_opened_host(intercepted, type, linux_flags,
-                                     min_guest_fd, fd_cleanup_for_type(type),
-                                     tx.intercept_path, aliased ? &spec : NULL);
+
+            /* The virtual-path stamp follows the same dup: opening a magic link
+             * reopens the underlying file, so the new descriptor must inherit
+             * the target fd's stamped identity, not the literal magic-link
+             * spelling. fstatfs on a reopened /sys directory has to keep
+             * answering SYSFS_MAGIC (systemd's sd-device reopens every chased
+             * syspath this way and gates on it), and a reopened regular file
+             * must not masquerade as procfs -- so a magic link whose target
+             * carries no virtual identity stamps nothing at all.
+             */
+            const char *stamp = tx.intercept_path;
+
+            /* Under /sys the request and the result can name different objects:
+             * opening <dev>/subsystem without O_NOFOLLOW hands back the
+             * directory the link resolves to, and Linux's fd then reports that
+             * directory -- /proc/self/fd/N names it, and openat(fd, "..") pops
+             * *its* parent. Stamping the guest's spelling made every relative
+             * walk off such a descriptor restart from the link's own directory
+             * instead. Ask the descriptor what it holds; it names the link
+             * itself for the O_PATH|O_NOFOLLOW open that asked for the link,
+             * and the target for every open that followed one.
+             */
+            char sys_stamp[LINUX_PATH_MAX];
+            if (usb_sysfs_guest_path_for_fd(intercepted, sys_stamp,
+                                            sizeof(sys_stamp)) > 0)
+                stamp = sys_stamp;
+
+            if (alias_fd >= 0)
+                stamp = (aliased && alias_src.proc_path[0] != '\0')
+                            ? alias_src.proc_path
+                            : NULL;
+            int guest_fd = fd_alloc_opened_host(
+                intercepted, type, linux_flags, min_guest_fd,
+                fd_cleanup_for_type(type), stamp, aliased ? &spec : NULL);
             if (guest_fd < 0)
                 return linux_errno();
             return guest_fd;
@@ -782,6 +853,26 @@ int64_t sys_openat_path(guest_t *g,
 
     int host_fd =
         open_nonblocking_writer(dir_ref.fd, tx.host_path, flags, mode);
+    if (host_fd < 0 && errno == ENOENT) {
+        /* Relative walkers (systemd chase() opens one component per openat)
+         * step from host-backed directories into synthetic subtrees the host
+         * does not carry -- openat(<sysroot>/sys fd, "bus") is ENOENT on the
+         * host while /sys/bus is served by an intercept. Rebase the relative
+         * path to its guest-absolute spelling and, only when that spelling is
+         * gated for interception, retry through the normal absolute-path flow.
+         * Host semantics for everything else are unchanged: the fallback runs
+         * only after a host ENOENT.
+         */
+        char rebased[LINUX_PATH_MAX];
+        if (path_rebase_hostdirfd(dir_ref.fd, tx.host_path, rebased,
+                                  sizeof(rebased)) > 0 &&
+            path_might_use_open_intercept(rebased)) {
+            host_fd_ref_close(&dir_ref);
+            return sys_openat_path(g, LINUX_AT_FDCWD, rebased, linux_flags,
+                                   mode);
+        }
+        errno = ENOENT;
+    }
     host_fd_ref_close(&dir_ref);
     if (host_fd < 0)
         return linux_errno();
@@ -2121,6 +2212,21 @@ int64_t sys_fchdir(int fd)
      */
     if (!proc_virtual && !strcmp(fd_table[fd].proc_path, "/dev/pts"))
         proc_virtual = "/dev/pts";
+
+    /* The synthetic USB trees are virtual for the same reason as /dev/pts: the
+     * scratch directory behind a /sys or /dev/bus descriptor is not what the
+     * guest named, and its host location is not a name the guest may see. Left
+     * to proc_cwd_refresh() the fd's real cwd would surface through getcwd, and
+     * a relative open resolved against it would land in the scratch tree --
+     * writing into a read-only view and reporting the wrong statfs magic.
+     * Publishing the stamped guest spelling instead keeps the cwd on the
+     * intercepts, exactly as chdir() does for these paths.
+     * resolve_proc_cwd_path knows the same two prefixes.
+     */
+    if (!proc_virtual && fd_table[fd].proc_path[0] &&
+        (path_prefix_match(fd_table[fd].proc_path, "/sys", 4) ||
+         path_prefix_match(fd_table[fd].proc_path, "/dev/bus", 8)))
+        proc_virtual = fd_table[fd].proc_path;
     if (fchdir(host_ref.fd) < 0) {
         host_fd_ref_close(&host_ref);
         return linux_errno();
@@ -2853,7 +2959,8 @@ int64_t sys_faccessat(guest_t *g,
      */
     struct stat intercepted_st;
     if (path_might_use_stat_intercept(tx.intercept_path) &&
-        proc_intercept_stat(tx.intercept_path, &intercepted_st) == 0) {
+        proc_intercept_stat_at(tx.intercept_path, &intercepted_st,
+                               !(flags & LINUX_AT_SYMLINK_NOFOLLOW)) == 0) {
         host_fd_ref_close(&dir_ref);
         if (path_check_intercept_access(&intercepted_st, mode, flags) < 0)
             return linux_errno();
