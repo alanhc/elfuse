@@ -447,10 +447,15 @@ int guest_bootstrap_prepare(guest_t *g,
         t0 = startup_trace_now_ns();
         uint64_t infra_lo, infra_hi;
         guest_infra_window(g, &infra_lo, &infra_hi);
+
+        /* Forbidden from the reserve to the top of the slab: everything from
+         * interp_base up is the interpreter's and the runtime's, so an ET_EXEC
+         * linked above it must not be placed there.
+         */
         if (elf_map_segments(&boot->elf_info, elf_host_path, g->host_base,
                              g->guest_size,
                              (elf_window_t) {0, boot->elf_load_base}, infra_lo,
-                             infra_hi) < 0) {
+                             g->guest_size) < 0) {
             log_error("failed to map ELF segments");
             return -1;
         }

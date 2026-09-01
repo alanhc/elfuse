@@ -1717,14 +1717,18 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * reads it itself, so elf_load_base describes no mapping elfuse will make.
      * The parse-time rejections in elf_load_fd still apply to it, and should:
      * those judge whether the file is a well-formed ELF, which the translator
-     * needs as much as elfuse does.
+     * needs as much as elfuse does. The forbidden window for the executable
+     * runs from the reserve to the top of the slab, not just across the
+     * reserve. Everything from interp_base up belongs to the interpreter and
+     * the runtime, so an ET_EXEC with a PT_LOAD above it would otherwise be
+     * accepted here and then have the interpreter mapped straight over it.
      */
     uint64_t pre_infra_lo, pre_infra_hi;
     guest_infra_window(g, &pre_infra_lo, &pre_infra_hi);
     if (!target_is_rosetta &&
         !elf_check_placement(&elf_info, path, g->guest_size,
                              (elf_window_t) {0, elf_load_base}, pre_infra_lo,
-                             pre_infra_hi)) {
+                             g->guest_size)) {
         err = -LINUX_ENOEXEC;
         goto fail;
     }
@@ -1997,7 +2001,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     guest_infra_window(g, &infra_lo, &infra_hi);
     if (elf_map_segments_fd(&elf_info, exec_fd, path_host, g->host_base,
                             g->guest_size, (elf_window_t) {0, elf_load_base},
-                            infra_lo, infra_hi) < 0) {
+                            infra_lo, g->guest_size) < 0) {
         log_fatal(
             "execve failed after point of no return: "
             "failed to map ELF segments for %s",

@@ -440,6 +440,20 @@ static void test_placement(void)
     current = "placement clear of the infra reserve";
     CHECK(elf_check_placement(&info, "test", guest_size, at_zero, 0x8000,
                               0x9000));
+
+    /* The executable's caller forbids everything from the reserve to the top of
+     * the slab, not just the reserve itself: the interpreter is mapped above
+     * it, so a segment up there would be overwritten by the loader that lands
+     * on the same addresses.
+     */
+    current = "placement above the reserve, with the window open to the top";
+    image_init(&img, ET_EXEC);
+    image_add_load(&img, 0x4000, 256, 0x1000);
+    CHECK(parse(&img, &info));
+    CHECK(!elf_check_placement(&info, "test", guest_size, at_zero, 0x2000,
+                               guest_size));
+    CHECK(elf_check_placement(&info, "test", guest_size, at_zero, 0x2000,
+                              0x3000));
 }
 
 int main(void)
