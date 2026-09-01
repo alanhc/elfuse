@@ -378,7 +378,7 @@ VERIFY_FUTEXHASH_CLAIM := for ANY guest futex address and ANY table size
 VERIFY_FUTEXHASH_UNPROVED := the queue walks around it stay test-covered
 
 VERIFY_FUTEXOP_SRC  := src/proved/futexop.h
-VERIFY_FUTEXOP_FCTS := futex_op_sign_extend12 futex_op_shift_arg_ok
+VERIFY_FUTEXOP_FCTS := futex_op_sign_extend12 futex_op_shift_arg_mask
 VERIFY_FUTEXOP_MIN_GOALS ?= 6
 # typed: scalar arithmetic on one guest-supplied word, no buffer and no
 # aliasing question.

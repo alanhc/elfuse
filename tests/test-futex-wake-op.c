@@ -118,22 +118,27 @@ int main(void)
     else
         PASS();
 
-    /* Out of range is EINVAL, not a reduced shift. A negative operand here was
-     * CVE-2018-6927 in Linux.
+    /* Linux masks an out-of-range shift operand to its low five bits and warns;
+     * it does not reject it. Its own comment says the EINVAL it would prefer
+     * waits on userspace getting sane. So the assertion is that the call is
+     * accepted, and that the operand it actually shifted by is the masked one:
+     * -1 masks to 31 and 32 masks to 0, which the comparison value below
+     * distinguishes.
      */
-    TEST("OPARG_SHIFT rejects a negative operand");
-    EXPECT_RAW_ERRNO(
-        wake_op(&w1, &w2,
-                futex_op_encode(FUTEX_OP_SET | FUTEX_OP_OPARG_SHIFT,
-                                FUTEX_OP_CMP_EQ, 0xFFF, 0)),
-        -EINVAL, "negative shift operand was not rejected");
+    TEST("OPARG_SHIFT masks a negative operand rather than rejecting it");
+    w2 = 0;
+    rc = wake_op(&w1, &w2,
+                 futex_op_encode(FUTEX_OP_SET | FUTEX_OP_OPARG_SHIFT,
+                                 FUTEX_OP_CMP_EQ, 0xFFF, 0));
+    EXPECT_TRUE(rc >= 0 && w2 == 0x80000000u,
+                "negative shift operand did not mask to 31");
 
-    TEST("OPARG_SHIFT rejects an operand above 31");
-    EXPECT_RAW_ERRNO(
-        wake_op(&w1, &w2,
-                futex_op_encode(FUTEX_OP_SET | FUTEX_OP_OPARG_SHIFT,
-                                FUTEX_OP_CMP_EQ, 32, 0)),
-        -EINVAL, "out-of-range shift operand was not rejected");
+    TEST("OPARG_SHIFT masks an operand above 31");
+    w2 = 0;
+    rc = wake_op(&w1, &w2,
+                 futex_op_encode(FUTEX_OP_SET | FUTEX_OP_OPARG_SHIFT,
+                                 FUTEX_OP_CMP_EQ, 32, 0));
+    EXPECT_TRUE(rc >= 0 && w2 == 1u, "operand 32 did not mask to 0");
 
     /* The comparison branch is exercised, not adjudicated. Whether the compare
      * is signed decides only how many waiters at uaddr2 are woken, and with

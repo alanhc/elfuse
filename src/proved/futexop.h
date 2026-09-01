@@ -70,15 +70,29 @@ static inline int32_t futex_op_sign_extend12(uint32_t raw)
     return (int32_t) v - FUTEX_OP_ARG_SPAN;
 }
 
-/* Whether a shift-flavored op operand (FUTEX_OP_OPARG_SHIFT) is one 1u << arg
- * can evaluate. Linux rejects the rest with EINVAL rather than reducing it: the
- * upper half was CVE-2018-6927, where a negative operand reached the shift.
+/* A shift-flavored op operand (FUTEX_OP_OPARG_SHIFT) reduced to one 1u << arg
+ * can evaluate. Linux masks an out-of-range operand to its low five bits and
+ * warns rather than rejecting it, and its own comment says the EINVAL it would
+ * prefer waits on userspace getting sane; the reference kernel measured here
+ * (6.18.44, through the qemu lane) accepts both a negative operand and one
+ * above 31. Matching that is what keeps this from breaking a guest Linux runs.
+ *
+ * The masking is what CVE-2018-6927 was about. A negative or oversized operand
+ * reaching the shift is the undefined behavior, and bounding it to [0, 31]
+ * removes that whether the caller is then rejected or not.
+ *
+ * Masking in the unsigned domain, because the value is a bit pattern here and
+ * an implementation-defined signed one is not worth relying on. Spelled as a
+ * remainder rather than an and, for the same reason futex_op_sign_extend12 next
+ * door is: the bitwise form leaves the provers reasoning about bits and the two
+ * postconditions below stay open, while the remainder discharges.
  */
 /*@
   assigns \nothing;
-  ensures \result <==> (0 <= arg <= 31);
+  ensures 0 <= \result <= 31;
+  ensures 0 <= arg <= 31 ==> \result == arg;
 */
-static inline int futex_op_shift_arg_ok(int32_t arg)
+static inline int32_t futex_op_shift_arg_mask(int32_t arg)
 {
-    return arg >= 0 && arg <= 31;
+    return (int32_t) ((uint32_t) arg % 32u);
 }

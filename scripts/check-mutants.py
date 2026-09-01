@@ -205,10 +205,10 @@ MUTATIONS = [
     (
         "futexop",
         "src/proved/futexop.h",
-        "futex_op_shift_arg_ok",
-        "accept a negative shift operand (this was CVE-2018-6927 in Linux)",
-        "    return arg >= 0 && arg <= 31;\n",
-        "    return arg <= 31;\n",
+        "futex_op_shift_arg_mask",
+        "drop the mask (a negative operand reaches the shift, CVE-2018-6927)",
+        "    return (int32_t) ((uint32_t) arg % 32u);\n",
+        "    return arg;\n",
     ),
     # ---- verify-align ------------------------------------------------------
     (

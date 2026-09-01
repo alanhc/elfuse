@@ -1537,15 +1537,14 @@ static int64_t futex_wake_op(guest_t *g,
     uint32_t op_val = (uint32_t) op_arg;
 
     /* FUTEX_OP_OPARG_SHIFT (bit 3 of wake_op): interpret op_arg as 1<<op_arg.
-     * Linux rejects an operand outside 0..31 with EINVAL rather than reducing
-     * it; the negative half of that check is CVE-2018-6927, where a negative
-     * operand reached the shift itself.
+     * Linux masks an operand outside 0..31 to its low five bits and warns,
+     * rather than rejecting it, so an out-of-range operand still names a shift
+     * and the call proceeds. The bound is what CVE-2018-6927 was about: a
+     * negative operand reaching the shift is the undefined behavior, and the
+     * mask removes it.
      */
-    if (wake_op & 8) {
-        if (!futex_op_shift_arg_ok(op_arg))
-            return -LINUX_EINVAL;
-        op_val = 1U << op_arg;
-    }
+    if (wake_op & 8)
+        op_val = 1U << futex_op_shift_arg_mask(op_arg);
     wake_op &= 7; /* Actual operation is bits 0-2 */
 
     unsigned idx1 = futex_hash(uaddr);
