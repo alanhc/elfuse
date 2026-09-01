@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -260,6 +260,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
 	$(call run-lane,test-sysroot-name-race,concurrent creation of colliding names)
+	$(call run-lane,test-vcpu-watchdog,vCPU watchdog kills a wedged guest)
 	$(call run-lane,test-sysroot-pathmax,guest paths at the host path ceiling)
 	$(call run-lane,test-sysroot-corpus,frozen on-disk spelling corpus)
 	$(call run-lane,test-sysroot-path-matrix,addressing modes agree across the path matrix)
@@ -1615,3 +1616,8 @@ test-shebang-host: $(BUILD_DIR)/test-shebang-host
 ## Run the proved/gva.h call-site precondition checks (skips without the flag)
 test-gva-contracts: $(BUILD_DIR)/test-gva-contracts
 	$(BUILD_DIR)/test-gva-contracts
+
+## Verify the vCPU watchdog still kills a wedged guest and spares a blocked one
+test-vcpu-watchdog: $(ELFUSE_BIN) $(TEST_DIR)/spin-forever \
+		$(TEST_DIR)/test-sleep-long
+	@bash tests/test-vcpu-watchdog.sh $(ELFUSE_BIN) $(TEST_DIR)

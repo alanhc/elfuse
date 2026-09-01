@@ -628,10 +628,10 @@ typedef struct vcpu_run_hooks {
  *
  * Returns the exit code.
  *
- * When timeout_sec > 0 (main thread): uses alarm() for per-iteration safety
- * timeout. When timeout_sec == 0 (worker thread): skips alarm() (SIGALRM is
- * process-wide). Workers are terminated by exit_group via hv_vcpus_exit(). Both
- * modes check proc_exit_group_requested.
+ * When timeout_sec > 0 (main thread): arms the repeating watchdog timer and
+ * publishes progress to it. When timeout_sec == 0 (worker thread): neither
+ * (SIGALRM is process-wide). Workers are terminated by exit_group via
+ * hv_vcpus_exit(). Both modes check proc_exit_group_requested.
  */
 int vcpu_run_loop(hv_vcpu_t vcpu,
                   hv_vcpu_exit_t *vexit,

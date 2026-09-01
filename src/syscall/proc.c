@@ -2874,9 +2874,9 @@ void proc_request_hvc6_yield(void)
 }
 
 /* Preemption signals: SIGUSR2 is the cross-process guest-signal doorbell
- * (proc_send_guest_signal), SIGALRM is the main thread's per-iteration safety
- * timeout (armed by alarm() in vcpu_run_loop). Both are consumed by a dedicated
- * sigwait thread rather than a per-thread signal handler.
+ * (proc_send_guest_signal), SIGALRM is the main thread's watchdog tick (a
+ * repeating timer armed once in vcpu_run_loop). Both are consumed by a
+ * dedicated sigwait thread rather than a per-thread signal handler.
  *
  * The reason is Apple HVF: when either signal is delivered to a vCPU thread
  * while it is inside hv_vcpu_run, the run aborts with HV_EXIT_REASON_UNKNOWN
@@ -2891,6 +2891,32 @@ void proc_request_hvc6_yield(void)
  * same-thread async signal handlers.
  */
 static _Atomic int g_timed_out, g_external_guest_signal;
+
+/* Watchdog progress word, written by the guest main thread's run loop and read
+ * by preempt_thread_main. A Linux-style seqlock counter, the same shape the
+ * vvar uses in core/vdso.c: odd means the loop is inside hv_vcpu_run, even
+ * means it is not, and the value changes on every entry and every return.
+ *
+ * The loop used to arm and disarm alarm() around every hv_vcpu_run. On macOS
+ * alarm() is setitimer(ITIMER_REAL), so that was two real syscalls per guest
+ * syscall: measured 693 ns for the pair, against a 1226 ns bare HVF round trip.
+ * It made every host-served syscall on the main thread about 38 percent slower
+ * than the same syscall on a worker, which passes timeout_sec == 0 and skipped
+ * the alarm entirely. Single-threaded guests run wholly on the main thread, so
+ * that was most of the emulator's syscall cost.
+ *
+ * The timer is now a repeating one, armed once with an it_interval, and a tick
+ * that finds this word odd and unchanged since the previous tick has seen no
+ * progress for a whole period. One word rather than a flag beside a counter is
+ * what keeps that decision free of any ordering argument: a single atomic
+ * object has one modification order, so relaxed access is enough and there is
+ * no pairing to get wrong. An earlier revision split the state in two and got
+ * the pairing wrong twice.
+ *
+ * Detection therefore takes one to two periods rather than exactly one, which
+ * for a ten-second backstop is not a property anything depends on.
+ */
+static _Atomic uint64_t g_vcpu_progress;
 
 static pthread_t g_preempt_thread;
 static bool g_preempt_started;
@@ -2922,6 +2948,20 @@ static void *preempt_thread_main(void *arg)
             drain_external_guest_signal();
             wakeup_pipe_signal();
         } else if (sig == SIGALRM) {
+            static uint64_t last_progress;
+            uint64_t now =
+                atomic_load_explicit(&g_vcpu_progress, memory_order_relaxed);
+            bool wedged = (now == last_progress) && (now & 1);
+
+            last_progress = now;
+
+            /* Progress since the last tick, or not in the guest at all: say
+             * nothing, because interrupting here would hand a spurious EINTR to
+             * whatever the guest is waiting on. The timer repeats on its own
+             * interval, so there is nothing to re-arm.
+             */
+            if (!wedged)
+                continue;
             atomic_store_explicit(&g_timed_out, 1, memory_order_release);
         }
         thread_interrupt_all();
@@ -3815,13 +3855,13 @@ static bool vcpu_handle_el0_fault(guest_t *g,
 
 /* Unified vCPU execution loop for both main and worker threads.
  *
- * When timeout_sec > 0 (main thread): uses alarm() for per-iteration safety
- * timeout, logs with "elfuse:" prefix.
+ * When timeout_sec > 0 (main thread): arms the repeating watchdog timer and
+ * publishes progress to it, logs with "elfuse:" prefix.
  *
- * When timeout_sec == 0 (worker thread): skips alarm() setup (SIGALRM is
- * process-wide and would conflict). Workers are terminated by exit_group
- * setting proc_exit_group_requested and calling hv_vcpus_exit() to cancel
- * pending hv_vcpu_run calls. Logs with "elfuse: worker" prefix.
+ * When timeout_sec == 0 (worker thread): no watchdog (SIGALRM is process-wide
+ * and would conflict). Workers are terminated by exit_group setting
+ * proc_exit_group_requested and calling hv_vcpus_exit() to cancel pending
+ * hv_vcpu_run calls. Logs with "elfuse: worker" prefix.
  *
  * Both modes check proc_exit_group_requested so the main thread also reacts to
  * exit_group called by a worker.
@@ -3843,7 +3883,14 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
     int exit_code = 0;
     (void) signal_take_termination_wait_status();
     bool running = true;
-    int iter = 0;
+
+    /* Unsigned, and 64-bit, because the watchdog derives a parity from it
+     * below: signed overflow is undefined, and this increments once per guest
+     * exit, so a guest making a million syscalls a second reaches 2^31 in about
+     * half an hour. Unsigned wrap is defined and preserves the parity, 2^64
+     * being even.
+     */
+    uint64_t iter = 0;
     const int is_main = (timeout_sec > 0);
     const char *prefix = is_main ? "elfuse" : "elfuse: worker";
 
@@ -3853,15 +3900,27 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
      */
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    /* Main thread: arm the alarm-based per-iteration timeout below. SIGALRM is
-     * blocked here and consumed by the preemption thread (proc_preempt_init),
-     * which sets g_timed_out and kicks the vCPU via hv_vcpus_exit. Guest
-     * ITIMER_REAL is emulated internally by signal_check_timer() rather than
-     * using host setitimer, because macOS shares alarm() and
-     * setitimer(ITIMER_REAL) as the same underlying timer.
+    /* Main thread: arm the watchdog timer. SIGALRM is blocked here and consumed
+     * by the preemption thread (proc_preempt_init), which sets g_timed_out and
+     * kicks the vCPU via hv_vcpus_exit. Guest ITIMER_REAL is emulated
+     * internally by signal_check_timer() rather than using host setitimer,
+     * because macOS shares alarm() and setitimer(ITIMER_REAL) as the same
+     * underlying timer.
+     *
+     * Repeating rather than one-shot: it_interval is what lets the watchdog
+     * tick on its own forever instead of re-arming itself from the signal
+     * handler. Re-arming would need the period published across threads and
+     * would race the loop's own disarm.
      */
-    if (is_main)
+    if (is_main) {
         atomic_store_explicit(&g_timed_out, 0, memory_order_relaxed);
+
+        struct itimerval every = {
+            .it_interval = {.tv_sec = timeout_sec, .tv_usec = 0},
+            .it_value = {.tv_sec = timeout_sec, .tv_usec = 0},
+        };
+        setitimer(ITIMER_REAL, &every, NULL);
+    }
 
     while (running) {
         /* Check if another thread called exit_group */
@@ -3910,22 +3969,25 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         if (verbose) {
             uint64_t pc;
             hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
-            log_debug("%s: [%d] vcpu_run PC=0x%llx", prefix, iter,
-                      (unsigned long long) pc);
+            log_debug("%s: [%llu] vcpu_run PC=0x%llx", prefix,
+                      (unsigned long long) iter, (unsigned long long) pc);
         }
         iter++;
 
-        /* Main: arm per-iteration safety timeout */
+        /* Main: publish progress to the watchdog. Odd while inside the guest,
+         * even outside; see g_vcpu_progress.
+         */
         if (is_main)
-            alarm((unsigned) timeout_sec);
+            atomic_store_explicit(&g_vcpu_progress, iter * 2 + 1,
+                                  memory_order_relaxed);
 
         HV_CHECK_CTX(hv_vcpu_run(vcpu), vcpu, g);
 
-        drain_external_guest_signal();
-
-        /* Main: disarm timeout */
         if (is_main)
-            alarm(0);
+            atomic_store_explicit(&g_vcpu_progress, iter * 2 + 2,
+                                  memory_order_relaxed);
+
+        drain_external_guest_signal();
 
         /* Re-check exit_group after waking from hv_vcpu_run */
         if (proc_exit_group_requested()) {
@@ -4378,9 +4440,15 @@ int vcpu_run_loop_with_hooks(hv_vcpu_t vcpu,
         }
     }
 
-    /* Clean up timeout if the run loop sets it up */
-    if (is_main)
-        alarm(0);
+    /* Clean up the timeout the run loop armed. Clearing it_interval as well as
+     * it_value is what makes the disarm final: the timer repeats on its own
+     * interval, so zeroing only the pending shot would leave it ticking for the
+     * life of the process with nothing watching it.
+     */
+    if (is_main) {
+        struct itimerval off = {0};
+        setitimer(ITIMER_REAL, &off, NULL);
+    }
 
     if (wait_status_out) {
         int signal_status = signal_take_termination_wait_status();
