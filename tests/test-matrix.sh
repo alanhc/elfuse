@@ -973,6 +973,9 @@ run_unit_tests()
     printf "\nfchmodat2 AT_EMPTY_PATH\n"
     test_rc "$runner" "test-fchmodat-empty-path" 0 "$bindir/test-fchmodat-empty-path"
 
+    printf "\nfstatat/statx AT_EMPTY_PATH\n"
+    test_rc "$runner" "test-fstatat-empty-path" 0 "$bindir/test-fstatat-empty-path"
+
     printf "\nX11 raw protocol\n"
     test_check "$runner" "test-x11" "0 failed" "$bindir/test-x11"
 
