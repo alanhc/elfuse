@@ -348,6 +348,19 @@ static const char *proc_virtual_dir_path(const char *path,
     return NULL;
 }
 
+/* One entry read out of a union directory's backing, held after that
+ * directory's stream has been closed. The name is the host spelling, not yet
+ * put through path_translate_dirent_name: translation depends on the backing's
+ * escape policy, which is recorded once per drain, and a host name may be
+ * longer than Linux NAME_MAX -- the emit path is where that is already
+ * diagnosed, and keeping it there keeps one copy of the rule.
+ */
+typedef struct {
+    uint64_t ino;
+    unsigned char type;
+    char name[]; /* NUL-terminated */
+} backing_name_t;
+
 /* Reference-counted wrapper around a directory stream. See the declaration in
  * syscall/internal.h for why this exists: a raw DIR* stored in fd_table[fd].dir
  * would let a sibling close()/dup2()/fork-restore free it via closedir() while
@@ -358,16 +371,66 @@ static const char *proc_virtual_dir_path(const char *path,
 typedef struct {
     DIR *dir;
 
-    /* Second stream, over the host/sysroot directory that backs the same guest
-     * name, for the synthetic directories that must extend their backing rather
-     * than replace it (see usb_sysfs_dir_unions_backing). Opened lazily, once,
-     * when the primary stream runs out, so a directory that is never read to
-     * the end never pays for it and a directory that has no backing never opens
-     * one. Guarded by `lock` along with the walk itself.
+    /* The tail of the listing for a synthetic directory that must extend its
+     * backing rather than replace it (see usb_sysfs_dir_unions_backing): the
+     * names of the host/sysroot directory that backs the same guest name, read
+     * out of it in one pass and held here as data.
+     *
+     * Names rather than a second open stream, because a stream would be a
+     * second host descriptor charged to one guest fd for as long as the fd
+     * lives, and elfuse sizes its host budget as one descriptor per guest fd
+     * (FD_TABLE_SIZE + HOST_FD_RESERVE, src/elfuse-limits.h). The backing
+     * stream is opened and closed inside the single getdents64 call that first
+     * needs it -- see dir_backing_drain -- so the extra descriptor is transient
+     * and never spans a return to the guest.
+     *
+     * Filled lazily, when the primary stream runs out, so a directory that is
+     * never read to the end never pays for it and a directory that has no
+     * backing never opens one. Guarded by `lock` along with the walk itself.
      */
-    DIR *overlay;
-    bool overlay_tried; /* the lazy open has run; do not retry */
-    bool on_overlay;    /* the walk has moved to the overlay stream */
+    backing_name_t **backing; /* NULL until the drain has run */
+    size_t backing_count;
+    size_t backing_pos;   /* how much of `backing` the walk has emitted */
+    bool backing_drained; /* the one-shot drain has run; do not retry */
+    bool backing_private; /* this stream may not read a backing of its own:
+                           * another stream on the same open file description
+                           * owns the backing half of this listing. Set only on
+                           * the stream a forked child builds over an inherited
+                           * descriptor -- see dir_stream_open_inherited. It
+                           * stops the drain and nothing else; the primary walk
+                           * runs exactly as it does on any other stream,
+                           * because the primary position IS shared through the
+                           * description and splitting it is the one part of
+                           * Linux's answer this can give.
+                           */
+    bool backing_escapes; /* path_dirent_dir_holds_escapes for the backing,
+                           * recorded while its descriptor still existed
+                           */
+    int listing_errno;    /* non-zero when this listing is incomplete and can
+                           * never be completed. Sticky: set once and never
+                           * cleared, because the stream has lost names it can
+                           * no longer produce. sys_getdents64 reads it at the
+                           * top of every call and returns it, so the failure
+                           * outlives the call that hit it instead of being
+                           * swallowed by that call's partial return.
+                           *
+                           * Set from either half of the walk. The drain sets it
+                           * when the backing could not be read; the primary
+                           * walk sets it when readdir() on the synthetic stream
+                           * fails. Both are the same defect from the guest's
+                           * side -- names that exist and were not delivered --
+                           * so they answer through one field and one delivery
+                           * point rather than one being reported and the other
+                           * spelled as an end of directory.
+                           */
+
+    size_t primary_seen; /* Entries readdir() has returned from the synthetic
+                          * stream over this stream's whole life. Only the
+                          * fault hook reads it (see dir_primary_fault_after);
+                          * the walk itself needs no count, because the primary
+                          * side keeps its position in the DIR* rather than in
+                          * an index. Guarded by `lock` with the walk.
+                          */
 
     pthread_mutex_t lock; /* Serializes the telldir/readdir/seekdir walk in
                            * sys_getdents64. The refcount below only pins the
@@ -380,12 +443,25 @@ typedef struct {
                            * never destroyed while held.
                            */
     int refcount;         /* Guarded by fd_lock. Starts at 1 (the fd-table's
-                           * own reference) and gains one per in-flight
-                           * sys_getdents64 that pinned it via
+                           * own reference), gains one per guest fd that dup'd
+                           * its way onto the same open file description, and
+                           * one per in-flight sys_getdents64 that pinned it via
                            * dir_stream_acquire(). Freed only when the count
                            * reaches zero.
                            */
 } dir_stream_t;
+
+/* Release the drained backing names. Safe on a stream that never drained one.
+ */
+static void dir_backing_free(dir_stream_t *ds)
+{
+    for (size_t i = 0; i < ds->backing_count; i++)
+        free(ds->backing[i]);
+    free((void *) ds->backing);
+    ds->backing = NULL;
+    ds->backing_count = 0;
+    ds->backing_pos = 0;
+}
 
 /* Open a stream over host_fd and take ownership of the descriptor.
  *
@@ -395,7 +471,7 @@ typedef struct {
  * DIR* and nothing short of closedir() -- which closes it -- gets it back, so
  * there must be no failure left after that point.
  */
-void *dir_stream_open(int host_fd)
+static dir_stream_t *dir_stream_new(int host_fd)
 {
     dir_stream_t *ds = malloc(sizeof(*ds));
     if (!ds) {
@@ -432,11 +508,37 @@ void *dir_stream_open(int host_fd)
     }
 
     ds->dir = dir;
-    ds->overlay = NULL;
-    ds->overlay_tried = false;
-    ds->on_overlay = false;
+    ds->backing = NULL;
+    ds->backing_count = 0;
+    ds->backing_pos = 0;
+    ds->backing_drained = false;
+    ds->backing_private = false;
+    ds->backing_escapes = false;
+    ds->listing_errno = 0;
+    ds->primary_seen = 0;
     pthread_mutex_init(&ds->lock, NULL);
     ds->refcount = 1;
+    return ds;
+}
+
+void *dir_stream_open(int host_fd)
+{
+    return dir_stream_new(host_fd);
+}
+
+/* A stream for an inherited descriptor: the same wrapper, forbidden to read a
+ * backing of its own. See internal.h for which half of the listing the child
+ * shares with its parent and which half it must leave alone.
+ *
+ * Only the backing half is suppressed. The primary is read normally, because
+ * the primary lives in the shared open file description and reading it is what
+ * splits the listing between the two processes instead of losing part of it.
+ */
+void *dir_stream_open_inherited(int host_fd)
+{
+    dir_stream_t *ds = dir_stream_new(host_fd);
+    if (ds)
+        ds->backing_private = true;
     return ds;
 }
 
@@ -458,8 +560,7 @@ void dir_stream_ref_locked(void *ds_ptr)
 static void dir_stream_discard(void *ds_ptr)
 {
     dir_stream_t *ds = ds_ptr;
-    if (ds->overlay)
-        closedir(ds->overlay);
+    dir_backing_free(ds);
     closedir(ds->dir);
     pthread_mutex_destroy(&ds->lock);
     free(ds);
@@ -475,9 +576,10 @@ static void dir_stream_discard(void *ds_ptr)
  * the descriptor's identity therefore travels with the pinned stream instead of
  * being re-read from fd_table[fd] later: a sibling's close()+open() can put a
  * different file behind that number while this walk still holds the original
- * stream, and a re-read would then union some other directory's backing into it
+ * stream, and a re-read would then drain some other directory's backing into it
  * -- or, when the number is merely closed, find no stamp at all and end the
- * listing early with the backing half silently missing and success reported.
+ * union listing early with the backing half silently missing and success
+ * reported.
  *
  * @proc_path_out receives that stamp, empty when the slot carried none.
  *
@@ -522,8 +624,7 @@ void dir_stream_release(void *ds_ptr)
     bool last = --ds->refcount == 0;
     pthread_mutex_unlock(&fd_lock);
     if (last) {
-        if (ds->overlay)
-            closedir(ds->overlay);
+        dir_backing_free(ds);
         closedir(ds->dir);
         pthread_mutex_destroy(&ds->lock);
         free(ds);
@@ -1107,29 +1208,6 @@ int64_t sys_close(int fd)
 
 /* dup/fcntl. */
 
-/* Open a DIR stream over dst_host_fd if the source was an FD_DIR. The dup that
- * produced dst_host_fd is the alias's own descriptor, and the stream adopts it:
- * a second one, which is what this used to take, would give the guest fd two
- * host descriptors for the rest of its life.
- *
- * Returns NULL on success-but-no-stream-needed (non-dir source) or on failure
- * with errno preserved, distinguished by *out_failed. Runs outside fd_lock
- * because fdopendir is a slow syscall.
- */
-static dir_stream_t *clone_dir_stream(const fd_entry_t *src_snap,
-                                      int dst_host_fd,
-                                      bool *out_failed)
-{
-    *out_failed = false;
-    if (src_snap->type != FD_DIR)
-        return NULL;
-
-    dir_stream_t *ds = dir_stream_open(dst_host_fd);
-    if (!ds)
-        *out_failed = true;
-    return ds;
-}
-
 /* Install dup-alias metadata atomically with the slot identity. Uses the (type,
  * host_fd) tuple as proof that the slot still belongs to the in-flight
  * duplicate_guest_fd call; a sibling vCPU's pathological close + open between
@@ -1207,7 +1285,9 @@ static int duplicate_guest_fd(int src_fd,
      */
     proc_pty_lock_for_dup();
     fd_entry_t src_snap;
-    int new_host_fd = fd_snapshot_and_dup(src_fd, &src_snap);
+    bool shared_dir = false;
+    int new_host_fd =
+        fd_snapshot_and_dup_or_share_dir(src_fd, &src_snap, &shared_dir);
     if (new_host_fd < 0 && src_snap.type == FD_CLOSED) {
         proc_pty_unlock_for_dup();
         errno = EBADF;
@@ -1253,20 +1333,28 @@ static int duplicate_guest_fd(int src_fd,
         return -1;
     }
 
-    /* Mirror any /dev/ptmx keepalive BEFORE fd_alloc publishes guest_fd. Once
-     * the guest fd exists, a sibling thread can close it; that runs
-     * fd_cleanup_entry which calls proc_pty_close_keepalive(new_host_fd). For
-     * that cleanup to drop the freshly-duped keepalive, the keepalive entry
-     * must already be in the table; registering after fd_alloc would lose the
-     * race and leak the slave fd. No-op when the source has no keepalive.
+    /* Not for a shared directory descriptor: source and alias are the one
+     * descriptor there, so there is no second reference for either table to
+     * record, and registering a descriptor as its own duplicate would count it
+     * twice. A directory is never a pty either way.
      */
-    proc_pty_dup_keepalive_locked(src_snap.host_fd, new_host_fd);
+    if (!shared_dir) {
+        /* Mirror any /dev/ptmx keepalive BEFORE fd_alloc publishes guest_fd.
+         * Once the guest fd exists, a sibling thread can close it; that runs
+         * fd_cleanup_entry which calls proc_pty_close_keepalive(new_host_fd).
+         * For that cleanup to drop the freshly-duped keepalive, the keepalive
+         * entry must already be in the table; registering after fd_alloc would
+         * lose the race and leak the slave fd. No-op when the source has no
+         * keepalive.
+         */
+        proc_pty_dup_keepalive_locked(src_snap.host_fd, new_host_fd);
 
-    /* Same reasoning for the slave side: the alias is a live reference to the
-     * pty and must be on the books before the guest fd is published, or the
-     * source's close will retire the only counted reference.
-     */
-    proc_pty_dup_guest_slave_locked(src_snap.host_fd, new_host_fd);
+        /* Same reasoning for the slave side: the alias is a live reference to
+         * the pty and must be on the books before the guest fd is published, or
+         * the source's close will retire the only counted reference.
+         */
+        proc_pty_dup_guest_slave_locked(src_snap.host_fd, new_host_fd);
+    }
     proc_pty_unlock_for_dup();
 
     int new_type = (src_snap.type == FD_STDIO) ? FD_REGULAR : src_snap.type;
@@ -1284,22 +1372,13 @@ static int duplicate_guest_fd(int src_fd,
     fd_alias_spec_t spec = fd_alias_of(src_fd, &src_snap);
     spec.linux_flags |= linux_flags;
 
-    /* Open the alias's DIR stream before the slot exists, outside fd_lock
-     * because fdopendir is a slow syscall. It has to precede the allocation
-     * rather than follow it: the stream owns new_host_fd, and a slot published
-     * as FD_DIR before its stream exists is a slot whose descriptor a
-     * concurrent close would treat as plain and close underneath this call.
+    /* A directory alias publishes the source's own stream, referenced in the
+     * window that snapshotted the slot. Nothing is opened here: the alias is
+     * the same open file description as the source, so it must be the same
+     * position, the same union state, and the same descriptor -- which is also
+     * why a dup costs no second host descriptor, as it does not on Linux.
      */
-    bool dir_clone_failed = false;
-    dir_stream_t *ds =
-        clone_dir_stream(&src_snap, new_host_fd, &dir_clone_failed);
-    if (dir_clone_failed) {
-        int saved_errno = errno;
-        proc_pty_forget_host_fd(new_host_fd);
-        close(new_host_fd);
-        errno = saved_errno;
-        return -1;
-    }
+    dir_stream_t *ds = shared_dir ? (dir_stream_t *) src_snap.dir : NULL;
 
     int guest_fd =
         ds ? fd_alloc_alias_dir(&spec, fixed_slot ? fixed_guest_fd : -1,
@@ -1319,11 +1398,15 @@ static int duplicate_guest_fd(int src_fd,
          * its last slave go.
          */
         int saved_errno = errno;
-        proc_pty_forget_host_fd(new_host_fd);
-        if (ds)
-            dir_stream_discard(ds); /* closes new_host_fd */
-        else
+        if (shared_dir) {
+            /* The descriptor is the source's and stays open with it; only this
+             * side's reference on the shared stream is given back.
+             */
+            dir_stream_release(ds);
+        } else {
+            proc_pty_forget_host_fd(new_host_fd);
             close(new_host_fd);
+        }
         errno = saved_errno;
         return -1;
     }
@@ -2029,9 +2112,8 @@ int64_t sys_close_range(unsigned int first,
  * used to name -- and the outcome that has to be pinned is that the walk keeps
  * answering for the directory it pinned, rather than reading someone else's
  * backing into it or quietly returning a listing missing its backing half.
- * tests/test-dir-union-fd-reuse drives it. Read from the environment, with no
- * effect at all when unset, like the ELFUSE_USB_FIXTURE hook in
- * src/runtime/usb-sysfs.c.
+ * tests/test-dir-union-fd-reuse drives it. Same shape and the same reasoning as
+ * the drain's fault hook; no effect at all when unset.
  */
 static void dir_backing_window_delay(void)
 {
@@ -2049,26 +2131,32 @@ static void dir_backing_window_delay(void)
 
 /* Open the host/sysroot directory that backs the same guest name as @fd, for a
  * synthetic directory whose listing has to extend its backing instead of
- * replacing it.
+ * replacing it. See docs/internals.md, "Union Directory Listings".
  *
- * The backing is found from the descriptor's stamped guest path rather than
- * remembered at open time, so a dup'd or fork-restored directory fd -- which
- * gets a fresh stream over the same host descriptor and would otherwise lose
- * the union -- resolves it the same way the original did.
+ * @guest_path is the stamp as dir_stream_acquire read it, not as fd_table holds
+ * it now: the stream was pinned by fd number and can outlive the slot that
+ * number names, so the number must never be consulted again.
  *
- * @guest_path is that stamp as dir_stream_acquire read it, not as fd_table
- * holds it now. The distinction is the whole point: the stream this extends was
- * pinned by fd number and can outlive the slot that number names, so the number
- * must never be consulted again once the walk owns the stream.
+ * Returns the stream, or NULL when there is no backing listing to add. NULL
+ * splits two ways and *@hard_errno tells them apart. Left at 0, no readable
+ * backing was ever there to lose -- no union here, the guest path does not
+ * translate, the backing is behind FUSE, ENOENT, or ENOTDIR. ENOENT covers the
+ * backing being unlinked between the guest's open and this drain, which is a
+ * name vanishing mid-walk: POSIX leaves that unspecified and Linux does not
+ * report it either.
  *
- * Returns the stream, or NULL when this directory has no union to do, when the
- * backing does not exist (no sysroot, or a sysroot with no such directory), or
- * when it cannot be opened. Every one of those is "nothing to add", so the
- * caller simply finishes with the entries it already has.
+ * Set, the backing exists and could not be read -- EACCES, EMFILE/ENFILE, ELOOP
+ * -- and the caller must report rather than hand back a listing quietly missing
+ * those names. Linux never answers that case short: measured in docker (gcc:13,
+ * Linux 6.19 aarch64), an unprivileged open() of a chmod 000 directory fails
+ * EACCES outright. elfuse cannot refuse the open, because the synthetic half
+ * opened fine and the guest already holds the fd, so it reports on the read.
  */
-static DIR *dir_backing_stream(const char *guest_path)
+static DIR *dir_backing_stream(const char *guest_path, int *hard_errno)
 {
+    *hard_errno = 0;
     dir_backing_window_delay();
+
     if (guest_path[0] != '/')
         return NULL;
     if (!usb_sysfs_dir_unions_backing(guest_path))
@@ -2081,12 +2169,189 @@ static DIR *dir_backing_stream(const char *guest_path)
         return NULL;
 
     int host_fd = open(tx.host_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (host_fd < 0)
+    if (host_fd < 0) {
+        if (errno != ENOENT && errno != ENOTDIR)
+            *hard_errno = errno;
         return NULL;
+    }
     DIR *dir = fdopendir(host_fd);
-    if (!dir)
+    if (!dir) {
+        *hard_errno = errno;
         close_keep_errno(host_fd);
+    }
     return dir;
+}
+
+/* Fault-injection hook for the drain, off unless ELFUSE_DIR_BACKING_FAULT is
+ * set to a positive count: the drain then fails with ENOMEM once it has
+ * buffered that many names. It exists because the failure it drives -- a
+ * malloc/realloc that comes back NULL part-way through a real backing listing
+ * -- cannot be provoked on demand, and the behavior on that path (the guest is
+ * told, and never handed a short listing it reads as complete) is exactly what
+ * regressed once already and so has to be pinned by a test rather than argued
+ * about. tests/test-dir-backing-drain-error drives it. Same shape as the
+ * ELFUSE_USB_FIXTURE hook in src/runtime/usb-sysfs.c: read from the
+ * environment, no effect at all when unset.
+ */
+static size_t dir_backing_fault_after(void)
+{
+    static _Atomic size_t cached = 0; /* 0 = unread, SIZE_MAX = off */
+    size_t v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v != 0)
+        return v;
+
+    const char *env = getenv("ELFUSE_DIR_BACKING_FAULT");
+    long long n = env ? strtoll(env, NULL, 10) : -1;
+    v = (n > 0) ? (size_t) n : SIZE_MAX;
+    atomic_store_explicit(&cached, v, memory_order_relaxed);
+    return v;
+}
+
+/* Fault-injection hook for the primary (synthetic) stream, off unless
+ * ELFUSE_DIR_PRIMARY_READ_FAULT is set to a positive count: readdir() on the
+ * primary then fails with EIO once it has returned that many entries.
+ *
+ * Same reason the drain has one, and the same shape: a readdir() that fails
+ * part-way through a directory elfuse itself materialized cannot be provoked
+ * from a test, and the behavior on that path -- the guest is told, and is never
+ * handed a listing that stops early but reads as complete -- is exactly what
+ * regressed on the backing side and has to be pinned rather than argued about.
+ * tests/test-dir-primary-read-error drives it. No effect at all when unset.
+ */
+static size_t dir_primary_fault_after(void)
+{
+    static _Atomic size_t cached = 0; /* 0 = unread, SIZE_MAX = off */
+    size_t v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v != 0)
+        return v;
+
+    const char *env = getenv("ELFUSE_DIR_PRIMARY_READ_FAULT");
+    long long n = env ? strtoll(env, NULL, 10) : -1;
+    v = (n > 0) ? (size_t) n : SIZE_MAX;
+    atomic_store_explicit(&cached, v, memory_order_relaxed);
+    return v;
+}
+
+/* Read the whole backing listing for @fd into @ds and close the backing stream
+ * before returning, so the second host descriptor exists only for the duration
+ * of this call and never spans a return to the guest. That is the whole point:
+ * elfuse promises one host descriptor per guest fd (tests/test-dir-fd-budget),
+ * and a resident second stream would charge union directories two.
+ *
+ * Names already present in the primary (synthetic) directory are dropped here
+ * rather than at emit time, which is both the deduplication the union needs --
+ * synthetic wins, and "." / ".." therefore appear once -- and what keeps the
+ * buffer to the names that will actually be emitted. Asking the primary
+ * directory itself rather than remembering the names already emitted keeps that
+ * state out of the stream: the backing is only ever read once the primary is
+ * exhausted, so a name that is in the primary has already been offered.
+ *
+ * There is no ceiling on what this buffers. A cap invents a failure Linux never
+ * returns -- getdents64 on a directory of any size succeeds -- and spells it
+ * ENOMEM, which is a lie about what went wrong. The memory is not the memory
+ * that matters either: this buffer replaced a host descriptor held for the
+ * whole life of the guest fd, and the widest sysfs directory on a real Linux
+ * host (/sys/kernel/slab, 496 names, 5883 bytes of them) is a few tens of KiB,
+ * freed at close. Grow until the allocator says no, and let a real ENOMEM be
+ * the only ENOMEM.
+ *
+ * Always marks the drain as done, so it runs at most once per stream. Sets
+ * ds->listing_errno when it could not deliver the whole backing listing -- a
+ * failed allocation, a readdir that errored part-way, or a backing that exists
+ * but could not be opened. The caller turns that into an error return rather
+ * than a short one. A backing that was never there is not a failure: it means
+ * there is nothing to add (see dir_backing_stream).
+ */
+static void dir_backing_drain(dir_stream_t *ds, const char *guest_path, int fd)
+{
+    ds->backing_drained = true;
+
+    int open_failed = 0;
+    DIR *backing = dir_backing_stream(guest_path, &open_failed);
+    if (!backing) {
+        ds->listing_errno = open_failed;
+        if (open_failed)
+            log_warn(
+                "getdents64: the backing directory for fd %d exists but "
+                "could not be read (%s); reporting the listing as "
+                "incomplete rather than dropping its names",
+                fd, strerror(open_failed));
+        return;
+    }
+
+    ds->backing_escapes = path_dirent_dir_holds_escapes(dirfd(backing));
+
+    size_t cap = 0, count = 0;
+    backing_name_t **names = NULL;
+    int failed = 0;
+    const size_t fault_after = dir_backing_fault_after();
+
+    for (;;) {
+        /* readdir returns NULL for both end-of-stream and error, and only errno
+         * separates them. Left unread, a readdir that failed part-way would end
+         * the drain as if the backing had simply run out and the names past the
+         * failure would go missing with nothing said -- the same silent
+         * truncation the ceiling used to cause.
+         */
+        errno = 0;
+        struct dirent *de = readdir(backing);
+        if (!de) {
+            failed = errno; /* 0 on a genuine end of stream */
+            break;
+        }
+
+        struct stat dup_st;
+        if (fstatat(dirfd(ds->dir), de->d_name, &dup_st, AT_SYMLINK_NOFOLLOW) ==
+            0)
+            continue;
+
+        if (count >= fault_after) {
+            failed = ENOMEM;
+            break;
+        }
+
+        size_t len = strlen(de->d_name);
+
+        if (count == cap) {
+            size_t want = cap ? cap * 2 : 16;
+            backing_name_t **grown = (backing_name_t **) realloc(
+                (void *) names, want * sizeof(*grown));
+            if (!grown) {
+                failed = ENOMEM;
+                break;
+            }
+            names = grown;
+            cap = want;
+        }
+
+        backing_name_t *entry = malloc(sizeof(*entry) + len + 1);
+        if (!entry) {
+            failed = ENOMEM;
+            break;
+        }
+        entry->ino = de->d_ino;
+        entry->type = de->d_type;
+        memcpy(entry->name, de->d_name, len + 1);
+        names[count++] = entry;
+    }
+
+    closedir(backing); /* the transient descriptor goes back here */
+
+    if (failed) {
+        log_warn(
+            "getdents64: the backing directory for fd %d could not be read "
+            "to the end (%s) after %zu names; reporting the listing as "
+            "incomplete rather than truncating it",
+            fd, strerror(failed), count);
+        for (size_t i = 0; i < count; i++)
+            free(names[i]);
+        free((void *) names);
+        ds->listing_errno = failed;
+        return;
+    }
+
+    ds->backing = names;
+    ds->backing_count = count;
 }
 
 /* getdents64: read directory entries from a guest directory fd. Uses the
@@ -2128,6 +2393,18 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         goto out;
     }
 
+    /* A stream that lost names it can never produce again fails here, before
+     * the walk, and goes on failing: the errno is sticky. Without this the
+     * stream came back with nothing buffered and returned 0, an end of
+     * directory the guest cannot tell from a real one. See docs/internals.md,
+     * "Union Directory Listings", for the contract and why it is not one-shot.
+     */
+    if (ds->listing_errno) {
+        errno = ds->listing_errno;
+        ret = linux_errno();
+        goto out;
+    }
+
     size_t guest_pos = 0;
     struct dirent *de;
 
@@ -2144,54 +2421,119 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     uint8_t entry_buf[DIRENT64_MAX_RECLEN];
 
     /* The walk runs over the primary stream and then, for a synthetic directory
-     * that has a backing, over the backing's own stream. `cur` is whichever one
-     * is being read; every telldir/readdir/seekdir below uses it, so a rewind
-     * always rewinds the stream the entry came from.
+     * that has a backing, over the names drained out of the backing. Which side
+     * it is on survives the return to the guest, in the stream: the drain is
+     * what exhausts the primary, so a stream that has drained is a stream whose
+     * remaining entries are all on the backing side.
      */
-    DIR *cur = ds->on_overlay && ds->overlay ? ds->overlay : ds->dir;
+    bool on_backing = ds->backing_drained;
 
     /* One answer per stream, not per entry: which side of the sysroot boundary
-     * the stream reads from is a property of the directory.
+     * the stream reads from is a property of the directory. The backing's
+     * answer was recorded by the drain, while its descriptor still existed.
      */
-    bool dir_holds_escapes = path_dirent_dir_holds_escapes(dirfd(cur));
+    bool dir_holds_escapes =
+        on_backing ? ds->backing_escapes
+                   : path_dirent_dir_holds_escapes(dirfd(ds->dir));
 
     while (1) {
-        /* Save position BEFORE readdir so getdents emulation can rewind if the
-         * entry does not fit. macOS telldir returns an opaque cookie --
-         * arithmetic on it (e.g. telldir()-1) is undefined.
-         */
-        long saved_pos = telldir(cur);
-        de = readdir(cur);
-        if (!de) {
-            if (ds->on_overlay || ds->overlay_tried)
-                break;
-            ds->overlay_tried = true;
-            ds->overlay = dir_backing_stream(walk_path);
-            if (!ds->overlay)
-                break;
-            ds->on_overlay = true;
-            cur = ds->overlay;
-            dir_holds_escapes = path_dirent_dir_holds_escapes(dirfd(cur));
-            continue;
-        }
+        const char *host_name;
+        uint64_t entry_ino;
+        unsigned char entry_type;
+        int64_t entry_off = 0; /* backing side only; the primary asks telldir */
+        long saved_pos = 0;
 
-        /* Deduplicate by name with the synthetic side winning, which is also
-         * what makes "." and ".." appear once. Asking the primary directory
-         * itself rather than remembering the names already emitted keeps the
-         * state out of the stream: the overlay is only ever read after the
-         * primary is exhausted, so a name that is in the primary has already
-         * been offered to the guest.
-         */
-        if (ds->on_overlay) {
-            struct stat dup_st;
-            if (fstatat(dirfd(ds->dir), de->d_name, &dup_st,
-                        AT_SYMLINK_NOFOLLOW) == 0)
+        if (on_backing) {
+            if (ds->backing_pos >= ds->backing_count)
+                break;
+            const backing_name_t *bn = ds->backing[ds->backing_pos];
+            host_name = bn->name;
+            entry_ino = bn->ino;
+            entry_type = bn->type;
+
+            /* The backing side numbers its entries from one. d_off is an opaque
+             * cookie the guest may only hand back, so the primary's telldir
+             * cookies and these indices share one space, exactly as the two
+             * streams' separate cookie spaces did before.
+             */
+            entry_off = (int64_t) (ds->backing_pos + 1);
+        } else {
+            /* Save position BEFORE readdir so getdents emulation can rewind if
+             * the entry does not fit. macOS telldir returns an opaque cookie --
+             * arithmetic on it (e.g. telldir()-1) is undefined.
+             */
+            saved_pos = telldir(ds->dir);
+
+            /* readdir() reports end-of-stream and failure the same way -- NULL
+             * -- and only errno separates them, so errno has to be cleared
+             * first or a value left by an earlier call would read as this one's
+             * failure. Left unchecked, a primary readdir that failed part-way
+             * was taken for exhaustion: the walk unioned the backing in as if
+             * the synthetic half were finished, dropped every synthetic name
+             * past the failure, and handed the result back as a clean end of
+             * directory. That is the same silent truncation the drain side was
+             * repaired for, on the other half of the union.
+             */
+            errno = 0;
+            de = readdir(ds->dir);
+            if (de && ++ds->primary_seen > dir_primary_fault_after()) {
+                de = NULL;
+                errno = EIO;
+            }
+            if (!de && errno) {
+                int primary_errno = errno;
+                ds->listing_errno = primary_errno;
+                log_warn(
+                    "getdents64: the directory behind fd %d could not be read "
+                    "to the end (%s); reporting the listing as incomplete "
+                    "rather than ending it early",
+                    fd, strerror(primary_errno));
+
+                /* Linux's two-part shape, the same one the drain failure uses:
+                 * a call that has already written entries returns their count
+                 * and leaves the error for the next call, which the sticky
+                 * listing_errno delivers at the top of this function; a call
+                 * that has written nothing returns -1 with the errno.
+                 */
+                errno = primary_errno;
+                ret = guest_pos > 0 ? (int64_t) guest_pos : linux_errno();
+                goto out;
+            }
+            if (!de) {
+                if (ds->backing_drained || ds->backing_private)
+                    break;
+
+                /* Primary exhausted: pull in the backing's names. The drain
+                 * opens the backing directory and closes it before returning,
+                 * so the second descriptor does not outlive this call.
+                 */
+                dir_backing_drain(ds, walk_path, fd);
+                if (ds->listing_errno) {
+                    /* Linux's two-part shape: a call that has written entries
+                     * returns their count and leaves the error for the next
+                     * call, which the sticky listing_errno delivers at the top
+                     * of this function; a call that has written nothing is the
+                     * guest_pos == 0 arm here and returns -1. Measured before
+                     * the repair, with the drain failed after two names against
+                     * a backing of six: the guest got 3 of 9 names and errno 0
+                     * at every buffer size from 24 bytes to 32KiB.
+                     */
+                    errno = ds->listing_errno;
+                    ret = guest_pos > 0 ? (int64_t) guest_pos : linux_errno();
+                    goto out;
+                }
+                on_backing = true;
+                dir_holds_escapes = ds->backing_escapes;
                 continue;
+            }
+            host_name = de->d_name;
+            entry_ino = de->d_ino;
+            entry_type = de->d_type;
         }
 
         char guest_name[NAME_MAX + 1];
         int name_rc = path_translate_dirent_name(
-            dir_holds_escapes, de->d_name, guest_name, sizeof(guest_name));
+            dir_holds_escapes, host_name, guest_name, sizeof(guest_name));
         if (name_rc < 0) {
             /* macOS APFS accepts UTF-8 filenames whose byte length exceeds
              * Linux NAME_MAX (255). A guest libc cannot represent such a name
@@ -2214,7 +2556,9 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
                         "getdents64: skipping host dirent whose name "
                         "exceeds Linux NAME_MAX (%u); first hit was "
                         "%zu bytes on fd %d",
-                        NAME_MAX, strlen(de->d_name), fd);
+                        NAME_MAX, strlen(host_name), fd);
+                if (on_backing)
+                    ds->backing_pos++;
                 continue;
             }
             ret = guest_pos > 0 ? (int64_t) guest_pos : linux_errno();
@@ -2229,16 +2573,19 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 
         if (!dirent_record_bounds(name_len, guest_pos, count, &reclen,
                                   &pad_start)) {
-            /* Entry does not fit; rewind so next call gets it */
-            seekdir(cur, saved_pos);
+            /* Entry does not fit; rewind so next call gets it. The backing side
+             * rewinds by simply not advancing its cursor.
+             */
+            if (!on_backing)
+                seekdir(ds->dir, saved_pos);
             break;
         }
 
         linux_dirent64_t lde;
-        lde.d_ino = de->d_ino;
-        lde.d_off = telldir(cur);
+        lde.d_ino = entry_ino;
+        lde.d_off = on_backing ? entry_off : telldir(ds->dir);
         lde.d_reclen = (uint16_t) reclen;
-        lde.d_type = de->d_type;
+        lde.d_type = entry_type;
 
         /* Serialize entry into temp buffer, then copy to guest via
          * guest_write() which handles 2MiB block boundary crossings.
@@ -2253,6 +2600,8 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
             goto out;
         }
 
+        if (on_backing)
+            ds->backing_pos++;
         guest_pos += reclen;
     }
 

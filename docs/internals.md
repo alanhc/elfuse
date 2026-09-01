@@ -1122,6 +1122,57 @@ The stamp and the descriptor are read in one `fd_lock` window
 and read separately a close and reopen between them gives the stamp of one and
 the descriptor of another.
 
+### Union Directory Listings
+
+A directory that exists on both sides -- `/sys`, `/dev/bus` -- lists the union.
+`sys_getdents64` walks the synthetic (primary) stream first and then the names
+drained out of the backing; the drain opens the backing directory and closes it
+before returning, so elfuse keeps its promise of one host descriptor per guest
+fd and a union directory costs no more than a plain one.
+
+What the guest is told when part of the listing cannot be delivered is the
+contract that matters, because the failure mode is silent: a listing that lost
+a name and still ends at `0` is an end-of-directory the guest cannot tell from
+a real one, and having read it, it never asks again.
+
+- A failure that costs the stream names it can never produce again -- a drain
+  that failed part-way, a primary `readdir` that stopped -- is recorded in
+  `listing_errno`. It is sticky: every later call on that fd fails the same
+  way. Linux has no case that re-delivers an error on a directory stream, so
+  there is no shape to copy; clearing it would put the next call back on the
+  silent path, and the stream has nothing truthful left to return.
+- Linux's two-part shape is followed for reporting one: a call that has already
+  written entries returns their count and leaves the error for the next call; a
+  call that has written nothing returns `-1` with the errno.
+- A buffer too small to hold one entry is `EINVAL`, not `0`. Measured on Linux
+  over a directory holding a twelve-byte name: `getdents64` with 8- and
+  16-byte buffers returns `EINVAL` immediately, and with 24 bytes it delivers
+  the names that fit and then reports.
+- No exit from the walk may consume an entry without putting it back. The
+  entry-does-not-fit path and the guest-write fault path both rewind the
+  primary with `seekdir`; the backing side rewinds by not advancing its cursor.
+- A host name too long for Linux `NAME_MAX` is skipped, and the rest of the
+  stream is delivered. This is an elfuse compatibility policy with no Linux
+  counterpart: Linux enforces `NAME_MAX` at the filesystem layer, so no
+  oversize entry ever reaches `getdents64` there. macOS APFS accepts them, and
+  aborting the stream truncated `ls` / `find` listings against APFS trees.
+
+`dir_stream_t` is the wrapper around the `DIR*`. It is refcounted and carries
+its own lock, so an in-flight `getdents64` pins it against a sibling's
+`close()`; `dup`, `dup2` and `F_DUPFD` share one wrapper rather than opening a
+second, which is what makes two guest fds on one open file description share
+one position and one union state. A forked child's inherited fds share one
+wrapper per inherited open file description for the same reason. The wrapper
+owns the descriptor it was opened on -- only `closedir()` gives it back -- so
+an alias names the descriptor the shared wrapper holds and the redundant one is
+closed.
+
+A stream built for an inherited descriptor has `backing_private` set: the
+primary is shared with the parent through the description and must be read, and
+the backing belongs to whichever stream first ran out of primary and must not
+be drained twice. `docs/testing.md` records the one state this cannot deliver
+whole.
+
 ### Limits Of The IOKit Mapping
 
 This tree enumerates devices; the pieces that follow open them and
