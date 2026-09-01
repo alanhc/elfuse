@@ -168,6 +168,7 @@ run_guest()
     local tag="$1"
     shift
     set +e
+    test_host_busy_mark
     timeout "$GUEST_TIMEOUT" "$@" > "$scratch/$tag.out" 2> "$scratch/$tag.err"
     guest_rc=$?
 
@@ -185,7 +186,7 @@ run_guest()
     # the launcher and the probe, which exit 1 to 6 and never 124. A 124 here is
     # the cap and nothing else, so the only open question is whether load caused
     # it.
-    if [ "$guest_rc" -eq 124 ] && test_host_is_busy; then
+    if [ "$guest_rc" -eq 124 ] && test_host_busy_since_mark; then
         printf 'timeout under host load, re-running: %s\n' "$tag" >&2
         timeout "$GUEST_TIMEOUT" "$@" > "$scratch/$tag.out" 2> "$scratch/$tag.err"
         guest_rc=$?
