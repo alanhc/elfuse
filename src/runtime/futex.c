@@ -170,9 +170,9 @@ static bool os_sync_wait_enabled;
 #define FUTEX_BUCKETS 1024u
 
 /* How many times a census violation has to reproduce before it is believed. See
- * the contract assert in futex_wake_bitset for why one reading cannot decide.
- * Five, because the observed transients cleared on the first re-read every time
- * and the cost is paid only on a reading that already looks wrong.
+ * the contract assert in futex_wake for why one reading cannot decide. Five,
+ * because the observed transients cleared on the first re-read every time and
+ * the cost is paid only on a reading that already looks wrong.
  */
 #define FUTEX_CENSUS_RECHECKS 5
 

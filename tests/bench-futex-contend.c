@@ -6,6 +6,7 @@
  */
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -47,14 +48,28 @@ int main(int argc, char **argv)
     if (nthreads > 16)
         nthreads = 16;
 
-    for (int i = 0; i < nthreads; i++)
-        pthread_create(&t[i], NULL, mutex_worker, (void *) iters);
+    /* Checked, because a silent spawn failure makes this print a number that
+     * looks like a result. The mutex phase would undercount shared and still
+     * say "phase done", and the join below would be handed an indeterminate
+     * pthread_t, which is undefined rather than merely wrong.
+     */
+    for (int i = 0; i < nthreads; i++) {
+        int rc = pthread_create(&t[i], NULL, mutex_worker, (void *) iters);
+        if (rc != 0) {
+            fprintf(stderr, "pthread_create: %s\n", strerror(rc));
+            return 1;
+        }
+    }
     for (int i = 0; i < nthreads; i++)
         pthread_join(t[i], NULL);
     fprintf(stderr, "mutex phase done, shared=%ld\n", shared);
 
     pthread_t c;
-    pthread_create(&c, NULL, consumer, (void *) iters);
+    int rc = pthread_create(&c, NULL, consumer, (void *) iters);
+    if (rc != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(rc));
+        return 1;
+    }
     for (long i = 0; i < iters; i++) {
         pthread_mutex_lock(&mu);
         while (ready)

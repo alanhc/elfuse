@@ -39,11 +39,24 @@ skip=0
 # failing it. run-lane in mk/tests.mk adds no timeout of its own. Two guests,
 # because no single one produces both shapes: the wait guest never wakes
 # anything, and the wake guest's waits all block rather than mismatching. Which
-# counters each is expected to move is the point of splitting them.
+# counters each is expected to move is the point of splitting them. The exit
+# code is captured rather than left to set -e. A regression that hangs a guest
+# gets killed by $TIMEOUT and returns 124, and a bare assignment would abort the
+# script right here, so the counter checks below and the final dump of $stats,
+# which exist precisely to explain this failure, would never run. The lane would
+# report an opaque non-zero with no reason shown.
 stats=$("$TIMEOUT" 60 env ELFUSE_SHIM_STATS=1 "$ELFUSE" "$WAIT_GUEST" \
-    2>&1 > /dev/null)
+    2>&1 > /dev/null) && wait_rc=0 || wait_rc=$?
 wake_stats=$("$TIMEOUT" 120 env ELFUSE_SHIM_STATS=1 "$ELFUSE" "$WAKE_GUEST" \
-    2>&1 > /dev/null)
+    2>&1 > /dev/null) && wake_rc=0 || wake_rc=$?
+for guest_rc in "wait:$wait_rc" "wake:$wake_rc"; do
+    case $guest_rc in
+    *:0) ;;
+    *)
+        report_fail "${guest_rc%%:*} guest exited ${guest_rc##*:}"
+        ;;
+    esac
+done
 
 counter()
 {

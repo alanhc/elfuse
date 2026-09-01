@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #include <linux/futex.h>
@@ -115,7 +116,9 @@ int main(void)
      * names the wrong bucket wraps A's count here.
      */
     TEST("a requeued waiter wakes on its new address");
-    if (pthread_create(&t1, NULL, park_on_a, NULL) != 0) {
+    int rc1 = pthread_create(&t1, NULL, park_on_a, NULL);
+    if (rc1 != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(rc1));
         FAIL("pthread_create");
     } else {
         settle();
@@ -134,9 +137,11 @@ int main(void)
     }
 
     TEST("PI waiters are not requeued");
+    int rc2;
     if (lock_pi(&pi_source) != 0) {
         FAIL("lock_pi");
-    } else if (pthread_create(&t1, NULL, wait_on_pi, NULL) != 0) {
+    } else if ((rc2 = pthread_create(&t1, NULL, wait_on_pi, NULL)) != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(rc2));
         FAIL("pthread_create");
         unlock_pi(&pi_source);
     } else {
@@ -162,7 +167,9 @@ int main(void)
      */
     TEST("a later waiter on the vacated address wakes promptly");
     __atomic_store_n(&addr_a, 0, __ATOMIC_SEQ_CST);
-    if (pthread_create(&t2, NULL, park_on_a, NULL) != 0) {
+    int rc3 = pthread_create(&t2, NULL, park_on_a, NULL);
+    if (rc3 != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(rc3));
         FAIL("pthread_create");
     } else {
         struct timespec t0, t1s;

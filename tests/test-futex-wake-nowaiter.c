@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 #include <linux/futex.h>
@@ -116,7 +117,9 @@ int main(void)
      */
     TEST("no wakeup is lost against a concurrent waiter");
     pthread_t th;
-    if (pthread_create(&th, NULL, waker, NULL) != 0) {
+    int rc1 = pthread_create(&th, NULL, waker, NULL);
+    if (rc1 != 0) {
+        fprintf(stderr, "pthread_create: %s\n", strerror(rc1));
         FAIL("pthread_create");
     } else {
         for (int i = 0; i < ROUNDS; i++) {

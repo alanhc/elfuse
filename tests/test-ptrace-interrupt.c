@@ -51,11 +51,22 @@
  */
 #define CANARY 0x5ec0ffee5ec0ffeeULL
 
-/* Above every EL0 mapping this guest has (its text is at 4 MiB, its stacks and
- * mmap region well under 8 GiB) and far below the shim, which sits just under
- * the interpreter base at 60 GiB.
+/* Between the highest address this guest maps and the lowest the shim uses, so
+ * a PC at or above it can only be shim state.
+ *
+ * Both bounds matter and the earlier value satisfied only one. 64 GiB sits
+ * above the shim rather than below it on the common configuration: a 36-bit IPA
+ * host gives a 64 GiB guest whose interpreter base is 60 GiB, with the infra
+ * reserve and the shim just beneath that, so no shim PC ever reached the
+ * comparison and this assertion could not fail there. It separated the two only
+ * on a 40-bit guest, whose interpreter base is 1020 GiB.
+ *
+ * 16 GiB clears this guest's own mappings, whose text is at 4 MiB and whose
+ * mmap allocations start at the 8 GiB RW base, and stays far under the shim on
+ * either configuration. A guest that mapped 8 GiB of address space would need
+ * this raised, which no test here does.
  */
-#define EL0_PC_CEILING 0x1000000000ULL
+#define EL0_PC_CEILING 0x400000000ULL
 
 /* Enough interrupts that the kick lands inside the shim repeatedly. A
  * regression does not need all of them: one stop reporting scratch fails.

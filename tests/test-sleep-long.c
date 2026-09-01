@@ -15,6 +15,7 @@
  */
 
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -22,9 +23,22 @@ int main(int argc, char **argv)
 {
     /* Seconds from argv so the caller ties this to its own watchdog period. A
      * compiled-in constant has no textual link to the script's PERIOD, so
-     * raising PERIOD would silently stop this crossing a tick.
+     * raising PERIOD would silently stop this crossing a tick. Validated,
+     * because an unparsable argument silently becomes 0 and nanosleep then
+     * returns at once. The fixture would print "slept" and exit 0, and the
+     * watchdog lane's "a long blocking syscall is not killed" case would pass
+     * without ever blocking.
      */
-    long secs = argc > 1 ? strtol(argv[1], NULL, 10) : 5;
+    char *end = NULL;
+    long secs = 5;
+    if (argc > 1) {
+        errno = 0;
+        secs = strtol(argv[1], &end, 10);
+        if (errno != 0 || end == argv[1] || *end != '\0' || secs <= 0) {
+            fprintf(stderr, "usage: %s <positive seconds>\n", argv[0]);
+            return 2;
+        }
+    }
     struct timespec req = {.tv_sec = secs, .tv_nsec = 0};
     if (nanosleep(&req, NULL) != 0) {
         puts("nanosleep interrupted");

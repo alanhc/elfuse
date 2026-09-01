@@ -282,6 +282,7 @@ unstage_sysroot_fixtures()
 # the observed divergence. Do not add a test here just because it *might* behave
 # differently; confirm it first the same way.
 QEMU_SKIP="
+    test-ptrace-interrupt
     test-session
     test-pidfd
     test-userfaultfd
@@ -717,6 +718,8 @@ run_unit_tests()
     test_check "$runner" "test-signal-thread" "PASS|0 failed" "$bindir/test-signal-thread"
     test_check "$runner" "test-signal-in-shim" "0 failed" \
         "$bindir/test-signal-in-shim"
+    test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \
+        "$bindir/test-ptrace-interrupt"
     test_check "$runner" "test-sigsuspend" "PASS|0 failed" "$bindir/test-sigsuspend"
     test_check "$runner" "test-tgkill-directed" "0 failed" "$bindir/test-tgkill-directed"
     test_check "$runner" "test-sigill" "0 failed" "$bindir/test-sigill"
@@ -1457,12 +1460,16 @@ run_suite()
 # elfuse-aarch64 went 243 to 247 for test-shim-futex-fast, test-futex-wake-op,
 # test-futex-wake-nowaiter and test-futex-requeue-account, then 247 to 250 for
 # test-signal-in-shim, test-ptrace-interrupt and test-futex-timed. All seven are
-# built from tests/, so they run in any checkout. qemu-aarch64 runs
-# test-futex-timed too, the other two being elfuse-internal, so its floor should
-# be 226; it stays at 225 deliberately, because the qemu fixtures are not
-# present on the machine that made these changes and 226 would be a number
-# nobody observed. A floor too low costs nothing; an unobserved one asserts a
-# run that did not happen.
+# built from tests/, so they run in any checkout, and all seven are invoked
+# here: test-ptrace-interrupt was credited in this count before it was, which
+# made the floor one higher than the lanes could reach on a checkout without
+# fixtures. qemu-aarch64 runs test-futex-timed too. The other two are
+# elfuse-internal, test-ptrace-interrupt by way of QEMU_SKIP since a ptrace-stop
+# register snapshot has no counterpart there, so the qemu floor should be 226;
+# it stays at 225 deliberately, because the qemu fixtures are not present on the
+# machine that made these changes and 226 would be a number nobody observed. A
+# floor too low costs nothing; an unobserved one asserts a run that did not
+# happen.
 EXPECTED_BASELINES=(
     "elfuse-aarch64|250|0"
     "qemu-aarch64|225|0"
