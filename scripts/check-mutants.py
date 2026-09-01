@@ -206,7 +206,7 @@ MUTATIONS = [
         "futexop",
         "src/proved/futexop.h",
         "futex_op_shift_arg_mask",
-        "drop the mask (a negative operand reaches the shift, CVE-2018-6927)",
+        "drop the mask (a negative operand reaches the shift: undefined)",
         "    return (int32_t) ((uint32_t) arg % 32u);\n",
         "    return arg;\n",
     ),

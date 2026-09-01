@@ -993,7 +993,16 @@ attn_bail:
     COUNTER_INC CB_ATTN_BAIL
     b handle_svc_0
 
-/* futex_wake_fast: answer a FUTEX_WAKE that has nobody to wake.
+/* UNREACHABLE for now, and deliberately kept. The dispatch above sends both
+ * wake shapes to futex_shape_bail, so nothing branches here; see the comment
+ * there for why, and for what turns it back on. It stays because it is the path
+ * the census exists to feed, and because deleting it would separate the
+ * assembly from the shim_globals_futex_waiters_add ordering argument it
+ * implements, which is the part that took the measurements to get right.
+ * tests/test-shim-futex-stats asserts these counters read zero, so restoring
+ * the two dispatch branches fails there until this description is live again.
+ *
+ * futex_wake_fast: answer a FUTEX_WAKE that has nobody to wake.
  *
  * The whole result of such a call is the count woken, which is zero, so once
  * EL1 can prove the address has no waiter there is nothing left for the host to

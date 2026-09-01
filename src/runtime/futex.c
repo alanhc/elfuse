@@ -1539,9 +1539,9 @@ static int64_t futex_wake_op(guest_t *g,
     /* FUTEX_OP_OPARG_SHIFT (bit 3 of wake_op): interpret op_arg as 1<<op_arg.
      * Linux masks an operand outside 0..31 to its low five bits and warns,
      * rather than rejecting it, so an out-of-range operand still names a shift
-     * and the call proceeds. The bound is what CVE-2018-6927 was about: a
-     * negative operand reaching the shift is the undefined behavior, and the
-     * mask removes it.
+     * and the call proceeds. The bound is what removes the undefined behavior:
+     * a negative operand reaching the shift is the fault, and the mask fixes
+     * it. Linux commit 30d6e0a4190d is the same change.
      */
     if (wake_op & 8)
         op_val = 1U << futex_op_shift_arg_mask(op_arg);

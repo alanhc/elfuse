@@ -10,10 +10,10 @@
  * extension nor the operand validation had any coverage.
  *
  * What is checked here: that a set bit 11 reads back as a negative operand
- * rather than a large positive one, and that the shift flavor rejects an
- * operand outside 0..31 the way Linux does. The signedness of the comparison is
- * not: it is visible only in how many waiters at uaddr2 wake, and this file
- * parks none.
+ * rather than a large positive one, and that the shift flavor masks an operand
+ * outside 0..31 to its low five bits the way Linux does, rather than rejecting
+ * it. The signedness of the comparison is not: it is visible only in how many
+ * waiters at uaddr2 wake, and this file parks none.
  */
 #include <stdint.h>
 #include <stdio.h>

@@ -77,9 +77,13 @@ static inline int32_t futex_op_sign_extend12(uint32_t raw)
  * (6.18.44, through the qemu lane) accepts both a negative operand and one
  * above 31. Matching that is what keeps this from breaking a guest Linux runs.
  *
- * The masking is what CVE-2018-6927 was about. A negative or oversized operand
- * reaching the shift is the undefined behavior, and bounding it to [0, 31]
- * removes that whether the caller is then rejected or not.
+ * The masking is what removes the undefined behavior: a negative or oversized
+ * operand reaching the shift is the fault, and bounding it to [0, 31] fixes
+ * that whether the caller is then rejected or not. Linux did the same in commit
+ * 30d6e0a4190d, "futex: Remove duplicated code and fix undefined behaviour".
+ * Not CVE-2018-6927, which an earlier revision of this comment cited: that one
+ * is an integer overflow in futex_requeue reached through a negative wake or
+ * requeue count, a different path and a different fix.
  *
  * Masking in the unsigned domain, because the value is a bit pattern here and
  * an implementation-defined signed one is not worth relying on. Spelled as a
