@@ -1043,6 +1043,46 @@ that string on Linux and shows nothing here.
 Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
 `src/syscall/fs.c`, `src/syscall/proc-state.c`, `src/runtime/usb-sysfs.c`.
 
+### Ownership Of `/sys` And `/dev/bus` Names
+
+The layer synthesizes exactly one subtree on each side, `/sys/bus/usb` and
+`/dev/bus/usb`, on top of a `/sys` and a `/dev/bus` that a sysroot supplies.
+Which of the two answers a name is one decision, taken once in
+`classify_and_normalize`, and every entry point -- `open`, `stat`, `lstat`,
+`readlink`, `access`, `getdents64`, `statfs`, `chdir` -- answers from it.
+An entry point that re-derives the decision is how four regressions arrived,
+each one a shadow: the layer claiming a name it does not serve and reporting
+`ENOENT` for a file the sysroot really has.
+
+The classes and who answers them:
+
+| Class | Path | Answered by |
+|-------|------|-------------|
+| `USB_PATH_SYS` | `/sys[/suffix]` | the layer, if the folded suffix resolves in the scratch tree; otherwise the backing, unless the suffix is under `bus/usb`, where an absence is authoritative |
+| `USB_PATH_DEV_BUS` | `/dev/bus` | both: a union listing, synthetic `usb` plus the backing's names |
+| `USB_PATH_DEV_USB` | `/dev/bus/usb` | the layer |
+| `USB_PATH_DEV_BUSNUM` | `/dev/bus/usb/BBB` | the layer |
+| `USB_PATH_DEV_NODE` | `/dev/bus/usb/BBB/DDD` | the layer |
+| `USB_PATH_DEV_NODE_SUB` | a node used as a directory | the layer (`ENOTDIR` once the node exists) |
+| `USB_PATH_DEV_ABSENT` | under `/dev/bus/usb`, no such device | the layer, `ENOENT` |
+| `USB_PATH_DEV_FOREIGN` | under `/dev/bus`, a bus we do not model | the backing |
+| `USB_PATH_NONE` | anything else, and a name that folds above its root | the backing |
+
+Only `PROC_NOT_INTERCEPTED` means "ask the backing". A name the layer claims
+and then fails to serve is an answer, not a fall-through: taking the failure
+for one let `access(2)`, and then `statfs(2)`, answer from the backing while
+`open` and `stat` reported `ENOENT` for the same path.
+
+`.` and `..` are folded lexically before ownership is decided, on both halves.
+The fold is the ours/not-ours gate and nothing else -- the served path is built
+by `usb_sys_resolve_suffix`, which resolves symlinks and applies each `..` to
+what the previous component resolved to, the way the kernel does, so
+`<dev>/subsystem/..` names `/sys/bus`. Deciding ownership on the guest's
+spelling instead splits the two halves apart in both directions:
+`/dev/bus/usb/../other/f` reads as a malformed device number and is claimed,
+and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
+A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
+
 ### Limits Of The IOKit Mapping
 
 This tree enumerates devices; the pieces that follow open them and
