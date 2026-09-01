@@ -555,27 +555,10 @@ futex_wait_fast:
     cmp w15, #0                       /* FUTEX_WAIT */
     b.eq futex_wait_shape
 
-    /* The wake shapes go to the host, for now. The zero-count answer below is
-     * sound only while the published census never understates what is parked,
-     * and it does: under ELFUSE_CONTRACT_ASSERT, tests/test-signal-in-shim
-     * reaches futex_wake with a bucket whose census reads 0 while a waiter is
-     * parked on it. Measured, the unaccounted waiter is always in the Darwin
-     * address-wait population rather than the bucket chain (chain=0 osync=1),
-     * so a publication path around futex_os_sync_wait is what is missing.
-     *
-     * Serving a wake from a stale zero loses that wakeup, which is the one
-     * error this path is not allowed to make: issue #315 named it as the
-     * difference between costing a round trip and hanging a guest. A wasted HVC
-     * is the safe direction, so take it until the invariant holds.
-     *
-     * The census itself stays. It is what the wake path will read once the
-     * missing publication is found, and the contract assert is what will say
-     * so. Restoring these two branches is the whole of turning it back on.
-     */
     cmp w15, #1                       /* FUTEX_WAKE */
-    b.eq futex_shape_bail
+    b.eq futex_wake_shape
     cmp w15, #10                      /* FUTEX_WAKE_BITSET */
-    b.eq futex_shape_bail
+    b.eq futex_wakebs_shape
     cmp w15, #9                       /* FUTEX_WAIT_BITSET */
     b.ne futex_shape_bail
     ldr w16, [sp, #40]                /* val3 = bitset */
@@ -993,16 +976,7 @@ attn_bail:
     COUNTER_INC CB_ATTN_BAIL
     b handle_svc_0
 
-/* UNREACHABLE for now, and deliberately kept. The dispatch above sends both
- * wake shapes to futex_shape_bail, so nothing branches here; see the comment
- * there for why, and for what turns it back on. It stays because it is the path
- * the census exists to feed, and because deleting it would separate the
- * assembly from the shim_globals_futex_waiters_add ordering argument it
- * implements, which is the part that took the measurements to get right.
- * tests/test-shim-futex-stats asserts these counters read zero, so restoring
- * the two dispatch branches fails there until this description is live again.
- *
- * futex_wake_fast: answer a FUTEX_WAKE that has nobody to wake.
+/* futex_wake_fast: answer a FUTEX_WAKE that has nobody to wake.
  *
  * The whole result of such a call is the count woken, which is zero, so once
  * EL1 can prove the address has no waiter there is nothing left for the host to

@@ -169,6 +169,13 @@ static bool os_sync_wait_enabled;
 
 #define FUTEX_BUCKETS 1024u
 
+/* How many times a census violation has to reproduce before it is believed. See
+ * the contract assert in futex_wake_bitset for why one reading cannot decide.
+ * Five, because the observed transients cleared on the first re-read every time
+ * and the cost is paid only on a reading that already looks wrong.
+ */
+#define FUTEX_CENSUS_RECHECKS 5
+
 /* The shim's wake fast path recomputes this bucket index in assembly, so both
  * the table size and the multiplier are pinned here. A divergence would send
  * the shim to the wrong count, and a wrong count that reads zero is a lost
@@ -1324,13 +1331,44 @@ static int64_t futex_wake(const guest_t *g,
      * assembly and out of reach.
      */
     {
+        /* Re-read before believing a violation, because a single reading of
+         * this cannot tell one from a transient.
+         *
+         * The chain is stable here: this holds the bucket lock. os_sync_waiters
+         * is not, by design, since the Darwin address-wait path takes no lock.
+         * So the three loads are not one instant, and either order is wrong in
+         * one direction. Read the census last and a waiter that finishes in
+         * between drops it under a population already counted; read it first
+         * and a waiter that arrives in between raises the population above a
+         * census already read. Neither is an understatement.
+         *
+         * A real one is a charge that is missing rather than in flight, so it
+         * does not go away when looked at again. Requiring the violation to
+         * hold across re-reads is what separates the two. Measured before this
+         * was added: test-signal-in-shim reported pub=0 against parked=1 on
+         * every run and it survived 0 of 5 re-reads every time, on four
+         * workloads including the contended benchmark. That was a false alarm
+         * being read as a lost wakeup.
+         */
         unsigned parked = 0;
         for (const futex_waiter_t *q = b->head; q; q = q->next)
             parked++;
         parked +=
             atomic_load_explicit(&b->os_sync_waiters, memory_order_seq_cst);
-        if (shim_globals_futex_waiters_get(g, idx) < parked)
-            abort();
+        if (shim_globals_futex_waiters_get(g, idx) < parked) {
+            int persisted = 0;
+            for (int retry = 0; retry < FUTEX_CENSUS_RECHECKS; retry++) {
+                unsigned again = 0;
+                for (const futex_waiter_t *q = b->head; q; q = q->next)
+                    again++;
+                again += atomic_load_explicit(&b->os_sync_waiters,
+                                              memory_order_seq_cst);
+                if (shim_globals_futex_waiters_get(g, idx) < again)
+                    persisted++;
+            }
+            if (persisted == FUTEX_CENSUS_RECHECKS)
+                abort();
+        }
     }
 #endif
 
