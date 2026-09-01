@@ -22,6 +22,13 @@
  * stub's does: nothing proved reads sun_len, but a proof about how much of a
  * sockaddr a conversion may touch is a proof about this layout, so it is the
  * real one rather than an approximation.
+ *
+ * sun_family is unsigned char, not sa_family_t. The modeled libc defines that
+ * as a 16-bit type, which is Linux's width, so spelling it that way would put
+ * sun_path at offset 3 and make the structure 107 bytes where Darwin measures
+ * offset 2 and 106. The sibling sys/socket.h stub answers the same question the
+ * same way for ss_family. Measured on this SDK rather than read off the header:
+ * sizeof 106, offsetof(sun_path) 2, sizeof(sun_family) 1.
  */
 
 #ifndef __FC_SYS_UN_H
@@ -31,7 +38,7 @@
 
 struct sockaddr_un {
     unsigned char sun_len;
-    sa_family_t sun_family;
+    unsigned char sun_family;
     char sun_path[104];
 };
 
