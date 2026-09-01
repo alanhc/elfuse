@@ -47,6 +47,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-dir-backing-drain-error test-dir-union-fd-reuse \
         test-fstatfs-fd-identity \
         test-dir-union-alias test-dir-primary-read-error \
+        test-getdents64-small-buf \
         test-sysroot-symlink-target \
         test-sysroot-name-i18n test-sysroot-name-length \
         test-sysroot-name-staged test-sysroot-name-race \
@@ -266,6 +267,7 @@ $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory i
 $(call run-lane,test-fstatfs-fd-identity,fstatfs answers for the descriptor it pinned)
 $(call run-lane,test-dir-union-alias,a dup shares one listing position and one union)
 $(call run-lane,test-dir-primary-read-error,a failed synthetic read is reported not ended)
+$(call run-lane,test-getdents64-small-buf,a getdents64 buffer too small for one entry)
 $(call run-lane,test-fstatat-empty-path,AT_EMPTY_PATH stat by fd under a sysroot)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
@@ -1075,6 +1077,18 @@ test-getdents64-overlong: $(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-overlong
 		: > "$$tmpdir/fixture/$$overlong"; \
 	done; \
 	$(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-overlong "$$tmpdir/fixture"
+
+## Verify a getdents64 buffer too small for one entry reports EINVAL
+test-getdents64-small-buf: $(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-small-buf
+	@$(SYSROOT_SCRATCH); \
+	mkdir -p "$$tmpdir/fixture" "$$tmpdir/wide"; \
+	: > "$$tmpdir/fixture/aaaaaaaaaaaa"; \
+	: > "$$tmpdir/fixture/bb"; \
+	i=0; while [ $$i -lt 96 ]; do \
+		printf '' > "$$tmpdir/wide/name-that-is-fairly-long-$$i"; \
+		i=$$((i + 1)); \
+	done; \
+	$(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-small-buf "$$tmpdir/fixture" "$$tmpdir/wide" 96
 
 test-sysroot-create-paths: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-create-paths
 	@set -e; \

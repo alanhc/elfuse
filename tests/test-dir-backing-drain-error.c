@@ -184,9 +184,22 @@ static void mode_complete(void)
 
 /* A drain that failed part-way is reported, at every buffer size, and is never
  * allowed to look like the end of the directory.
+ *
+ * EINVAL is the one other answer a size may legitimately give. A buffer too
+ * small to hold one record of the directory's own names ends the walk there,
+ * before the primary is exhausted and so before the drain runs at all, and
+ * Linux answers that with EINVAL (tests/test-getdents64-small-buf). The
+ * synthetic tree's widest name decides which sizes that covers, so it is a
+ * property of the build under test rather than of this fixture, and the sizes
+ * it swallows are counted rather than asserted on. What is asserted at every
+ * size regardless is the thing this lane exists for: the walk never ends at
+ * EOF. And at least one size must reach the drain, or the lane has measured
+ * nothing.
  */
 static void mode_error(const char *what, int want_errno)
 {
+    int reached_drain = 0;
+
     for (size_t i = 0; i < NBUFSIZES; i++) {
         char label[64];
         snprintf(label, sizeof(label), "%s reported at %zu bytes", what,
@@ -200,13 +213,25 @@ static void mode_error(const char *what, int want_errno)
             /* The defect, exactly: a short listing that ends at EOF. */
             fprintf(stderr, "  walk ended at EOF after %d names\n", w.names);
             FAIL("truncated listing ended cleanly instead of reporting");
+        } else if (w.end_errno == EINVAL && want_errno != EINVAL) {
+            fprintf(stderr,
+                    "  buffer too small for this tree's own names; the walk "
+                    "reported EINVAL before reaching the drain\n");
+            PASS();
         } else if (w.end_errno != want_errno) {
             errno = w.end_errno;
             FAIL("walk reported the wrong errno");
         } else {
+            reached_drain++;
             PASS();
         }
     }
+
+    TEST("some buffer size actually reached the drain");
+    if (!reached_drain)
+        FAIL("every size stopped short of the drain; nothing was measured");
+    else
+        PASS();
 }
 
 int main(int argc, char **argv)

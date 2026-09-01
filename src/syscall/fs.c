@@ -2535,18 +2535,17 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         int name_rc = path_translate_dirent_name(
             dir_holds_escapes, host_name, guest_name, sizeof(guest_name));
         if (name_rc < 0) {
-            /* macOS APFS accepts UTF-8 filenames whose byte length exceeds
-             * Linux NAME_MAX (255). A guest libc cannot represent such a name
-             * in its 256-byte dirent buffer at all, so elfuse silently skips
-             * the unrepresentable entry and keeps the rest of the stream
-             * intact. This is an elfuse compatibility policy, not Linux kernel
-             * behavior: real getdents64 has no equivalent skip path because
-             * Linux NAME_MAX is enforced at the filesystem layer, so no
-             * oversize entry ever reaches verify_dirent_name. Aborting the
-             * whole stream the way the pre-fix code did truncated ls / find /
-             * coreutils listings against APFS-mounted source trees. Skip on
-             * ENAMETOOLONG; keep the existing partial-return path for any other
-             * translation failure so genuine errors are not silently dropped.
+            /* A host name a guest libc cannot represent is skipped and the rest
+             * of the stream delivered -- an elfuse policy with no Linux
+             * counterpart; see docs/internals.md, "Union Directory Listings".
+             *
+             * ENAMETOOLONG is the only failure the translator can raise here:
+             * its other arm is an EINVAL guarding null arguments and a
+             * zero-sized output, and this call site passes the entry's own name
+             * and a NAME_MAX + 1 array with its own sizeof. The exit below is
+             * therefore unreachable rather than a second policy, and it rewinds
+             * the way the does-not-fit path does, so that no exit from this
+             * walk can consume an entry without putting it back.
              */
             if (errno == ENAMETOOLONG) {
                 static _Atomic bool overlong_warned;
@@ -2561,6 +2560,8 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
                     ds->backing_pos++;
                 continue;
             }
+            if (!on_backing)
+                seekdir(ds->dir, saved_pos);
             ret = guest_pos > 0 ? (int64_t) guest_pos : linux_errno();
             goto out;
         }
@@ -2578,6 +2579,22 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
              */
             if (!on_backing)
                 seekdir(ds->dir, saved_pos);
+
+            /* Nothing written yet means the buffer is too small for this one
+             * entry, and no larger call will ever be made on a stream the guest
+             * believes has ended. Linux answers EINVAL -- measured in docker
+             * (gcc 14.4, Linux 6.19 aarch64) over a directory holding one
+             * twelve-byte name and one two-byte name: 8 and 16 bytes report at
+             * once, and 24 bytes delivers the three names a 24-byte record can
+             * hold, one to a call, and then reports. Returning the count, zero
+             * here, is an end of directory the guest cannot tell from a real
+             * one. A call that has already written entries keeps the other half
+             * of the shape and returns their count -- the break below.
+             */
+            if (guest_pos == 0) {
+                ret = -LINUX_EINVAL;
+                goto out;
+            }
             break;
         }
 
@@ -2596,6 +2613,29 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
             memset(entry_buf + pad_start, 0, reclen - pad_start);
 
         if (guest_write(g, buf_gva + guest_pos, entry_buf, reclen) < 0) {
+            /* readdir has already handed this entry over, so leaving now
+             * without putting it back resumes the next call past it: the guest
+             * gets a listing one name short that still ends at 0, which is the
+             * silent truncation this walk was repaired for on its other paths.
+             *
+             * Rewind, the shape the does-not-fit path above uses, rather than
+             * setting ds->listing_errno. The two shapes answer different
+             * questions. listing_errno is for a name the stream can never
+             * produce again -- a failed drain, a primary that stopped reading
+             * -- and it is sticky, so every later call on the fd fails. Nothing
+             * is lost here: the guest buffer could not take one entry, which is
+             * the same thing the record-does-not-fit break says, and Linux
+             * answers it the same way, by returning the short count and
+             * delivering the entry on the following call. Measured over a
+             * 96-name directory read through a buffer whose tail is unmapped,
+             * at gaps of 120, 410 and 700 bytes: Linux (docker gcc:14, 6.19
+             * aarch64) delivers all 96 names at every gap, and elfuse before
+             * this rewind lost the entry at the fault -- 97 of the 98 names the
+             * directory holds, errno 0, ending at a clean 0. The backing side
+             * rewinds by not advancing backing_pos, which it has not done yet.
+             */
+            if (!on_backing)
+                seekdir(ds->dir, saved_pos);
             ret = guest_pos > 0 ? (int64_t) guest_pos : -LINUX_EFAULT;
             goto out;
         }
