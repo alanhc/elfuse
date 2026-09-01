@@ -40,9 +40,10 @@ _Static_assert(STACK_ALIGN == 16ULL,
 _Static_assert(STACK_WORD == sizeof(uint64_t),
                "the initial stack is built from 64-bit words");
 
-/* Ceiling on the structured area, in words. build_linux_stack computes 35 +
- * extra + argc + envc with extra <= 8 and argc, envc each capped at 131072 by
- * read_string_array, so the true maximum is 262187. Rounded up to a power of
+/* Ceiling on the structured area, in words. build_linux_stack computes
+ * auxv.nwords + 3 + argc + envc, with auxv.nwords bounded by
+ * LINUX_STACK_AUXV_WORDS_MAX (48) and argc, envc each capped at 131072 by
+ * read_string_array, so the true maximum is 262195. Rounded up to a power of
  * two: the value only has to keep words * STACK_WORD far from overflow, and a
  * loose bound is easier to keep true as the auxv set changes.
  */

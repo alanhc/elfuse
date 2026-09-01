@@ -153,7 +153,7 @@
 #include "proved/timespec.h"
 
 #include "syscall/linux-wire.h"
-#include "syscall/linux-limits.h"
+#include "linux-limits.h"
 #include "runtime/thread.h"
 
 typedef int guest_fd_t;
