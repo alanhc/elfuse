@@ -654,7 +654,19 @@ int main(int argc, char **argv)
         }
 
         if (rc < 0) {
-            log_error("empty or invalid shebang interpreter in %s", elf_path);
+            /* elf_read_shebang forwards -errno from its own open(), so a file
+             * that could not be opened arrives here beside a malformed "#!"
+             * line. Both spellings are reported because under --sysroot an
+             * absolute path resolves into the sysroot, not to the host file the
+             * caller meant.
+             */
+            if (rc == -ENOEXEC) {
+                log_error("empty or invalid shebang interpreter in %s",
+                          elf_path);
+            } else {
+                log_error("cannot read %s (resolved to %s): %s", elf_path,
+                          elf_host_path, strerror(-rc));
+            }
             goto cleanup;
         }
 
