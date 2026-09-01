@@ -579,7 +579,7 @@ check-stub-constants:
 # proofs would still discharge, about a different program.
 check-stub-shadow:
 	$(Q)python3 scripts/check-stub-shadow.py --self-test
-	$(Q)python3 scripts/check-stub-shadow.py --frama-c $(FRAMAC)
+	$(Q)python3 scripts/check-stub-shadow.py $(if $(FRAMAC),--frama-c $(FRAMAC))
 
 verify:
 	+@$(MAKE) --no-print-directory \
