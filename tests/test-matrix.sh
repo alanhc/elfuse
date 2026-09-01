@@ -892,6 +892,8 @@ run_unit_tests()
         "$bindir/test-futex-wake-nowaiter"
     test_rc "$runner" "test-futex-requeue-account" 0 \
         "$bindir/test-futex-requeue-account"
+    test_rc "$runner" "test-futex-requeue-pi" 0 \
+        "$bindir/test-futex-requeue-pi"
     test_rc "$runner" "test-robust-futex" 0 "$bindir/test-robust-futex"
     test_check "$runner" "test-shim-futex-fast" "OK" \
         "$bindir/test-shim-futex-fast"
