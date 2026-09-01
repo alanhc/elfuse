@@ -36,7 +36,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-linkat-symlink-fallback test-casefold-host \
         test-casefold-walk-host test-absock-names-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host \
+        test-usb-desc-host test-elf-headers-host \
         test-sysroot-name-unique \
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
@@ -218,7 +218,7 @@ CHECK_HOST_UNIT_BINS := $(addprefix $(BUILD_DIR)/, \
         test-casefold-walk-host test-absock-names-host \
         test-dynamic-array-host test-string-builder-host \
         test-wakeup-pipe-host test-guest-env-host \
-        test-usb-desc-host)
+        test-usb-desc-host test-elf-headers-host)
 
 # Lanes shared by check and check-sanitizer, in execution order: the host
 # unit binaries, then the name-contract lanes cheap enough for a sanitizer
@@ -239,6 +239,7 @@ $(call run-host-unit,test-wakeup-pipe-host,wakeup pipe concurrency unit test)
 $(call run-host-unit,test-stdio-nonblock-host,launcher stdio flags across a guest)
 $(call run-host-unit,test-guest-env-host,guest environment merge cross product)
 $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
+$(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
@@ -1600,6 +1601,10 @@ test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
 ## Run the USB descriptor blob walk unit test natively on the host
 test-usb-desc-host: $(BUILD_DIR)/test-usb-desc-host
 	$(BUILD_DIR)/test-usb-desc-host
+
+## Run the ELF header validation host unit test
+test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host
+	$(BUILD_DIR)/test-elf-headers-host
 
 # Wakeup pipe concurrency unit test. Only a -fsanitize=thread build carries a
 # race detector, so check-sanitizer is where this lane has its full weight.

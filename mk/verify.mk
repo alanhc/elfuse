@@ -145,8 +145,10 @@ VERIFY_UTILS_FCTS := hex_nibble
 VERIFY_ELF_SRC   := src/core/elf.c
 VERIFY_ELF_FCTS  := elf_add_no_wrap elf_phdr_gpa_in_segment \
                     elf_phdr_table_bytes elf_phdr_fetch elf_segment_extent \
+                    elf_place_segment elf_check_placement elf_record_load \
+                    elf_read_interp \
                     $(VERIFY_UTILS_FCTS)
-VERIFY_ELF_MIN_GOALS ?= 78
+VERIFY_ELF_MIN_GOALS ?= 156
 VERIFY_ELF_MODEL := caveat
 
 # Includes utils.h and elf.h: elf.c includes both, and utils.h already carries
