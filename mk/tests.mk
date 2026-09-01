@@ -114,6 +114,12 @@ endef
 # (test-runner.sh defaults to 10s) to keep the slowdown from surfacing as a
 # spurious TIMEOUT. TEST_TIMEOUT is only overridden if the caller has not
 # already set one.
+#
+# ASAN was raised from 30 after test-dup-setfl-race, whose 700 rounds take ~10s
+# under ASAN on an idle host, timed out on a CI runner that shares its machine
+# with a second runner. These defaults are for a local run: CI never reaches
+# these targets, it sets TEST_TIMEOUT itself in .github/workflows/build.yml.
+# The two are policy for different machines and may legitimately differ.
 
 # No "clean" prerequisite. These lanes used to depend on it, which removed the
 # whole build tree including the 186 cross-compiled guest binaries -- built with
@@ -129,7 +135,7 @@ endef
 
 ## Run the sanitizer subset with AddressSanitizer (ASAN)
 check-asan:
-	ASAN_OPTIONS="abort_on_error=1:detect_leaks=0" TEST_TIMEOUT="$${TEST_TIMEOUT:-30}" $(MAKE) EXTRA_CFLAGS="-fsanitize=address -fno-omit-frame-pointer" check-sanitizer
+	ASAN_OPTIONS="abort_on_error=1:detect_leaks=0" TEST_TIMEOUT="$${TEST_TIMEOUT:-60}" $(MAKE) EXTRA_CFLAGS="-fsanitize=address -fno-omit-frame-pointer" check-sanitizer
 
 ## Run the sanitizer subset with UndefinedBehaviorSanitizer (UBSAN)
 check-ubsan:
