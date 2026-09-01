@@ -918,6 +918,45 @@ static inline int64_t host_fd_ref_open_state(guest_fd_t guest_fd,
     return 0;
 }
 
+/* Pin the host fd and take the slot's whole entry together, for a caller that
+ * decides something from the slot's own record -- its stamped virtual path, say
+ * -- as well as from the descriptor. Two separate lookups of one guest fd let a
+ * close and reopen between them answer from the record of one open file
+ * description and the descriptor of another.
+ *
+ * The same shape as host_fd_ref_open_state, and the same reasoning: with one
+ * active thread there is no mutator, and with siblings alive both come from the
+ * fd_lock window inside fd_host_ref_acquire.
+ */
+static inline int64_t host_fd_ref_open_entry(guest_fd_t guest_fd,
+                                             host_fd_ref_t *ref,
+                                             fd_entry_t *snap_out)
+{
+    ref->fd = -1;
+    ref->lifetime = NULL;
+
+    /* Settle the entry before anything can fail, so a caller that reads it
+     * after a refused open reads a closed slot rather than its own stack.
+     */
+    *snap_out = (fd_entry_t) {.type = FD_CLOSED};
+
+    if (thread_is_single_active()) {
+        int host_fd = fd_to_host(guest_fd);
+        if (host_fd < 0)
+            return -LINUX_EBADF;
+        if (!fd_snapshot(guest_fd, snap_out))
+            return -LINUX_EBADF;
+        ref->fd = host_fd;
+        return 0;
+    }
+
+    int host_fd = fd_host_ref_acquire(guest_fd, snap_out, &ref->lifetime);
+    if (host_fd < 0)
+        return linux_errno();
+    ref->fd = host_fd;
+    return 0;
+}
+
 static inline void host_fd_ref_close(host_fd_ref_t *ref)
 {
     /* Preserve errno across close(2). Callers commonly invoke this on the

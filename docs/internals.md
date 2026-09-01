@@ -1083,6 +1083,45 @@ spelling instead splits the two halves apart in both directions:
 and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
 A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
 
+### Filesystem Identity Of A Descriptor
+
+Two questions have one answer here: what `statfs` reports for a name, and what
+`fstatfs` reports for a descriptor opened by that name. systemd's `sd-device`
+gates every enumerated syspath on `fstatfs(fd) == SYSFS_MAGIC` and libusb gates
+on `statfs("/sys")`, so a build where the two disagree is one where a device
+enumerates through one library and not the other.
+
+The rules:
+
+- `/sys`, whichever side served it, reports `SYSFS_MAGIC` (`0x62656572`). That
+  covers the scratch-dir backed names, where the host `fstatfs` would leak the
+  `/tmp` filesystem's magic, and the ones that fell through to a sysroot's own
+  `/sys`, where it would leak the sysroot's.
+- `/dev/bus` reports devtmpfs, on both entry points.
+- `..` is folded and a relative name is resolved against the cwd before either
+  entry point decides, so the two cannot be handed different spellings of one
+  object.
+
+A descriptor's identity comes from the virtual path stamped on its slot when
+this layer served the open, and from the descriptor's own host path mapped back
+through the sysroot when there is no stamp -- a fall-through open stamps
+nothing, which is exactly the case that used to make `statfs("/sys/class")`
+report `SYSFS_MAGIC` while `fstatfs` on the fd it had just opened reported the
+sysroot's filesystem.
+
+`fstat` answers from the stamp for `O_PATH` descriptors and for `/sys` and
+`/dev/bus` names, because the object behind a `/dev/bus/usb/BBB/DDD` node is a
+placeholder file: libusb `fstat`s the node it just opened and refuses anything
+that is not a character device, so the descriptor has to report the character
+device the path side described. `/proc` stays `O_PATH`-only there: its
+descriptors are real host files whose contents are the answer, and stamping
+their type would misdescribe the object the guest is reading.
+
+The stamp and the descriptor are read in one `fd_lock` window
+(`host_fd_ref_open_entry`). They are two facts about one open file description,
+and read separately a close and reopen between them gives the stamp of one and
+the descriptor of another.
+
 ### Limits Of The IOKit Mapping
 
 This tree enumerates devices; the pieces that follow open them and

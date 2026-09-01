@@ -5,10 +5,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <fcntl.h>
+#include <limits.h>
+#include <stdatomic.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "debug/log.h"
 
@@ -146,6 +151,19 @@ static int write_linux_statx(guest_t *g,
     return guest_write_small(g, statx_gva, &sx, sizeof(sx));
 }
 
+/* Whether a descriptor's identity comes from the stamp rather than from the
+ * host object underneath it: O_PATH, /sys and /dev/bus do, /proc does not. See
+ * docs/internals.md, "Filesystem Identity Of A Descriptor", for why.
+ */
+static bool fd_stat_answers_from_stamp(const fd_entry_t *snap)
+{
+    if (snap->proc_path[0] == '\0')
+        return false;
+    return snap->type == FD_PATH ||
+           path_prefix_match(snap->proc_path, "/sys", 4) ||
+           path_prefix_match(snap->proc_path, "/dev/bus", 8);
+}
+
 static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
 {
     memset(lin, 0, sizeof(*lin));
@@ -223,7 +241,7 @@ static int64_t stat_empty_path_fd(int dirfd, struct stat *mac_st)
     }
 
     int64_t rc = 0;
-    if (snap.type == FD_PATH && snap.proc_path[0] != '\0') {
+    if (fd_stat_answers_from_stamp(&snap)) {
         /* The descriptor already names one object: an O_PATH open that followed
          * refers to the target, one made with O_NOFOLLOW to the link itself, so
          * the open's flag is what selects here.
@@ -490,17 +508,10 @@ static void fill_proc_statfs(linux_statfs_t *lin)
 /* Boundary-checked "/sys or under it", applied to the folded name, which is
  * also published so the caller can act on the same spelling it classified.
  *
- * Linux resolves the path before deciding which filesystem answers it, so
- * statfs("/sys/../etc") reports the filesystem behind /etc and not sysfs. The
- * intercept path arrives here unnormalized, so testing the "/sys" prefix as
- * spelled would hand SYSFS_MAGIC to every name that merely starts inside /sys
- * and then climbs back out of it. Fold '.' and '..' first and test what the
- * name actually resolves to.
- *
- * A relative name resolves the same way, against the cwd -- statfs("sys") from
- * / is statfs("/sys") to the kernel, and sd-device and libusb both reach sysfs
- * through relative walks. Refusing every name that did not start with '/' left
- * those on the pass-through, which on a host with no /sys is ENOENT.
+ * Fold before deciding, and resolve a relative name against the cwd first: the
+ * kernel decides which filesystem answers a path after resolving it, so
+ * statfs("/sys/../etc") is /etc's filesystem and statfs("sys") from / is
+ * /sys's. See docs/internals.md, "Filesystem Identity Of A Descriptor".
  *
  * path_openat2_normalize_in_root clamps '..' at the root, which is what the
  * kernel does with a leading "/..", and yields a root-relative spelling --
@@ -531,6 +542,36 @@ static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
         return false;
     int n = snprintf(abs, abssz, "/%s", folded);
     return n > 0 && (size_t) n < abssz;
+}
+
+/* True for a /dev/bus name the synthetic USB tree serves.
+ *
+ * That tree has no host backing, so the pass-through statfs reported ENOENT for
+ * a node stat() and open() both answer for, while fstatfs on the descriptor
+ * open() handed back reported the filesystem of elfuse's staging file. Linux
+ * serves usbfs nodes from the devtmpfs that carries the rest of /dev and
+ * reports TMPFS_MAGIC for them (0x01021994, measured on 6.x alongside /dev and
+ * /dev/null, which report the same). Both entry points ask this one question so
+ * they agree on every /dev/bus name either can reach.
+ *
+ * A /dev/bus name the layer does not claim -- another bus's subtree, which the
+ * sysroot may well carry -- answers false and keeps the host statfs.
+ */
+static bool statfs_name_is_synthetic_dev_bus(const char *path)
+{
+    if (!path || !path_prefix_match(path, "/dev/bus", 8))
+        return false;
+    struct stat st;
+    return proc_intercept_stat_at(path, &st, true) == 0;
+}
+
+static void fill_dev_statfs(linux_statfs_t *lin)
+{
+    memset(lin, 0, sizeof(*lin));
+    lin->f_type = 0x01021994; /* TMPFS_MAGIC, what devtmpfs reports */
+    lin->f_bsize = 4096;
+    lin->f_namelen = 255;
+    lin->f_frsize = 4096;
 }
 
 static void fill_sysfs_statfs(linux_statfs_t *lin)
@@ -637,6 +678,14 @@ static int64_t sys_statfs_impl(guest_t *g,
         return 0;
     }
 
+    if (statfs_name_is_synthetic_dev_bus(tx.intercept_path)) {
+        linux_statfs_t lin_st;
+        fill_dev_statfs(&lin_st);
+        if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+
     /* glibc's posix_openpt() opens /dev/ptmx and then confirms devpts is
      * mounted before handing the master back (sysdeps/unix/sysv/linux/getpt.c).
      * /dev/pts has no host backing here, so a pass-through statfs fails and
@@ -701,16 +750,56 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
     return sys_statfs_impl(g, path, buf_gva, 0);
 }
 
+/* Widen the window between reading a descriptor's stamp and pinning the host fd
+ * it names, off unless ELFUSE_FD_IDENTITY_WINDOW_US is set to a positive
+ * microsecond count.
+ *
+ * The window is real and far too narrow to reach from a test: unaided, over 160
+ * runs at four delays, a sibling close-and-reopen between the two lookups was
+ * never distinguishable in the answer. What lives in it is a guest fd number
+ * whose slot can be replaced while this call is deciding what filesystem to
+ * report for it, so the identity would come from one description and the
+ * descriptor from another. tests/test-fstatfs-fd-identity drives it. Same shape
+ * and the same reasoning as dir_backing_window_delay in syscall/fs.c; no effect
+ * at all when unset.
+ */
+static void fd_identity_window_delay(void)
+{
+    static _Atomic long cached = -1; /* -1 = unread */
+    long v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v < 0) {
+        const char *env = getenv("ELFUSE_FD_IDENTITY_WINDOW_US");
+        long long n = env ? strtoll(env, NULL, 10) : 0;
+        v = (n > 0 && n < 1000000) ? (long) n : 0;
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
+    }
+    if (v > 0)
+        usleep((useconds_t) v);
+}
+
 int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
 {
     /* Deliberately no devpts case for a pty master fd: Linux answers from
      * whatever filesystem provides /dev/ptmx, which is devpts only when it is
      * the bind-mounted /dev/pts/ptmx and tmpfs or devtmpfs otherwise. There is
-     * no single correct value to report, and nothing needs one.
+     * no single correct value to report, and nothing needs one. The stamp and
+     * the descriptor come out of one fd_lock window. They are two facts about
+     * one open file description, and read separately a close and reopen between
+     * them gave the stamp of the description the caller named and the
+     * descriptor of whatever took the number afterwards -- so every branch
+     * below, /proc included, could answer for an object this call is not
+     * holding. Measured with the window widened: a plain sysroot file whose
+     * slot was replaced mid-call by a /sys descriptor was reported as sysfs.
      */
     fd_entry_t snap;
-    memset(&snap, 0, sizeof(snap));
-    if (fd_snapshot(fd, &snap) && statfs_path_is_proc(snap.proc_path)) {
+    host_fd_ref_t host_ref;
+    int64_t ref_err = host_fd_ref_open_entry(fd, &host_ref, &snap);
+    if (ref_err < 0)
+        return ref_err;
+    fd_identity_window_delay();
+
+    if (statfs_path_is_proc(snap.proc_path)) {
+        host_fd_ref_close(&host_ref);
         linux_statfs_t proc_st;
         fill_proc_statfs(&proc_st);
         if (guest_write_small(g, buf_gva, &proc_st, sizeof(proc_st)) < 0)
@@ -718,14 +807,27 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
         return 0;
     }
 
-    /* Descriptors opened under /sys are scratch-dir backed; the host fstatfs
-     * would leak the /tmp filesystem's magic. systemd's sd-device gates every
-     * enumerated syspath on fstatfs(fd) == SYSFS_MAGIC, so answer as sysfs
-     * exactly like path statfs("/sys") does.
+    /* Descriptors under /sys are sysfs whichever side served them, and the
+     * spelling to test comes from the stamp when the fd carries one and from
+     * the descriptor's own host path otherwise -- a fall-through open stamps
+     * nothing. Both go to statfs_path_is_sysfs, the test the path side uses.
+     * See docs/internals.md, "Filesystem Identity Of A Descriptor".
      */
+    char fd_guest[LINUX_PATH_MAX];
+    const char *fd_name = NULL;
+    if (snap.proc_path[0]) {
+        fd_name = snap.proc_path;
+    } else {
+        char fd_host[PATH_MAX];
+        if (fcntl(host_ref.fd, F_GETPATH, fd_host) == 0 &&
+            path_host_to_guest(fd_host, fd_guest, sizeof(fd_guest)) == 0)
+            fd_name = fd_guest;
+    }
+
     char fd_sys_abs[LINUX_PATH_MAX];
-    if (snap.proc_path[0] &&
-        statfs_path_is_sysfs(snap.proc_path, fd_sys_abs, sizeof(fd_sys_abs))) {
+    if (fd_name &&
+        statfs_path_is_sysfs(fd_name, fd_sys_abs, sizeof(fd_sys_abs))) {
+        host_fd_ref_close(&host_ref);
         linux_statfs_t sys_st;
         fill_sysfs_statfs(&sys_st);
         if (guest_write_small(g, buf_gva, &sys_st, sizeof(sys_st)) < 0)
@@ -733,10 +835,14 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
         return 0;
     }
 
-    host_fd_ref_t host_ref;
-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
-    if (ref_err < 0)
-        return ref_err;
+    if (fd_name && statfs_name_is_synthetic_dev_bus(fd_name)) {
+        host_fd_ref_close(&host_ref);
+        linux_statfs_t dev_st;
+        fill_dev_statfs(&dev_st);
+        if (guest_write_small(g, buf_gva, &dev_st, sizeof(dev_st)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
 
     struct statfs mac_st;
     if (fstatfs(host_ref.fd, &mac_st) < 0) {

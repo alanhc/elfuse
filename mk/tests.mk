@@ -43,6 +43,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
         test-usb-sysfs-overflow test-dir-union-fd-reuse \
+        test-fstatfs-fd-identity \
         test-sysroot-symlink-target \
         test-sysroot-name-i18n test-sysroot-name-length \
         test-sysroot-name-staged test-sysroot-name-race \
@@ -256,6 +257,7 @@ $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
+$(call run-lane,test-fstatfs-fd-identity,fstatfs answers for the descriptor it pinned)
 $(call run-lane,test-fstatat-empty-path,AT_EMPTY_PATH stat by fd under a sysroot)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
@@ -1618,6 +1620,23 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 ## whole model is synthetic here.
 test-usb-sysfs-overflow: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
 	ELFUSE_USB_FIXTURE=overflow $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+
+## fstatfs answers for the descriptor it pinned, not for the fd number
+# The identity is decided from the slot's stamp and from the descriptor itself,
+# and those used to be two lookups with a window between them. The window is far
+# too narrow to reach unaided, so ELFUSE_FD_IDENTITY_WINDOW_US widens it and the
+# test swaps the slot inside it. The sysroot carries both sides the test needs:
+# a plain file, and a /sys directory this layer does not synthesize, so the
+# descriptor falls through to the sysroot and still has to answer sysfs.
+test-fstatfs-fd-identity: $(ELFUSE_BIN) $(TEST_DIR)/test-fstatfs-fd-identity
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" "$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" "$$sysroot/etc"; \
+	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
+	ELFUSE_FD_IDENTITY_WINDOW_US=120000 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-fstatfs-fd-identity /etc/hostname /sys/kernel
 
 ## A union walk must answer for the directory it pinned, not the fd number
 # The window between pinning the stream and looking the backing up is far too
