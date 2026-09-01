@@ -544,9 +544,11 @@ static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
     return n > 0 && (size_t) n < abssz;
 }
 
-/* True for a /dev/bus name the synthetic USB tree serves.
+/* What the synthetic USB tree answers for a /dev/bus name: 0 when it serves the
+ * name, -1 with errno set when it owns the name and the lookup failed, and
+ * PROC_NOT_INTERCEPTED when the name is not ours at all.
  *
- * That tree has no host backing, so the pass-through statfs reported ENOENT for
+ * The tree has no host backing, so the pass-through statfs reported ENOENT for
  * a node stat() and open() both answer for, while fstatfs on the descriptor
  * open() handed back reported the filesystem of elfuse's staging file. Linux
  * serves usbfs nodes from the devtmpfs that carries the rest of /dev and
@@ -554,15 +556,18 @@ static bool statfs_path_is_sysfs(const char *path, char *abs, size_t abssz)
  * /dev/null, which report the same). Both entry points ask this one question so
  * they agree on every /dev/bus name either can reach.
  *
- * A /dev/bus name the layer does not claim -- another bus's subtree, which the
- * sysroot may well carry -- answers false and keeps the host statfs.
+ * The last two answers stay distinct because collapsing them is the bug
+ * sys_faccessat had: a sysroot carrying a name inside /dev/bus/usb -- on a bus
+ * number no device has -- would otherwise have its file answer statfs while
+ * open, stat and access all report ENOENT for the same path. Only
+ * PROC_NOT_INTERCEPTED means "ask the backing".
  */
-static bool statfs_name_is_synthetic_dev_bus(const char *path)
+static int statfs_dev_bus_class(const char *path)
 {
     if (!path || !path_prefix_match(path, "/dev/bus", 8))
-        return false;
+        return PROC_NOT_INTERCEPTED;
     struct stat st;
-    return proc_intercept_stat_at(path, &st, true) == 0;
+    return proc_intercept_stat_at(path, &st, true);
 }
 
 static void fill_dev_statfs(linux_statfs_t *lin)
@@ -678,7 +683,10 @@ static int64_t sys_statfs_impl(guest_t *g,
         return 0;
     }
 
-    if (statfs_name_is_synthetic_dev_bus(tx.intercept_path)) {
+    int dev_bus = statfs_dev_bus_class(tx.intercept_path);
+    if (dev_bus == -1)
+        return linux_errno();
+    if (dev_bus == 0) {
         linux_statfs_t lin_st;
         fill_dev_statfs(&lin_st);
         if (guest_write_small(g, buf_gva, &lin_st, sizeof(lin_st)) < 0)
@@ -835,7 +843,11 @@ int64_t sys_fstatfs(guest_t *g, int fd, uint64_t buf_gva)
         return 0;
     }
 
-    if (fd_name && statfs_name_is_synthetic_dev_bus(fd_name)) {
+    /* Only the "we serve it" answer applies here: an open descriptor stays a
+     * valid one whatever became of its name, so a claimed-and-failed lookup is
+     * no reason to fail fstatfs, and the host answers as it did before.
+     */
+    if (fd_name && statfs_dev_bus_class(fd_name) == 0) {
         host_fd_ref_close(&host_ref);
         linux_statfs_t dev_st;
         fill_dev_statfs(&dev_st);

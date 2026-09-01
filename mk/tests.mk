@@ -1620,8 +1620,12 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 ## Every entry point that can name something under /sys or /dev/bus, against
 ## every class of name those trees can hold. The layer synthesizes one subtree
 ## on each side and the rest belongs to the sysroot, so the sysroot has to carry
-## the other side of each column: a /sys skeleton, a foreign /dev/bus, and an
-## /etc file for the '..' chain that leaves the tree. Expected values are the
+## the other side of each column: a /sys skeleton, a foreign /dev/bus, an /etc
+## file for the '..' chain that leaves the tree, and one name planted inside
+## /dev/bus/usb, which the layer owns and the backing must not reach into.
+## Nothing is planted under the sysroot's /sys/bus: a Linux rootfs image carries
+## an empty /sys, and its not having a `bus` is the shape the escape-syn column
+## records. Expected values are the
 ## ones recorded on Linux; see tests/usb-sysfs-matrix-vectors.h.
 test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
 	@$(SYSROOT_SCRATCH); \
@@ -1631,7 +1635,7 @@ test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
 		"$$sysroot/sys/devices/system/node" \
 		"$$sysroot/sys/fs/cgroup" \
 		"$$sysroot/sys/bus/pci/devices" \
-		"$$sysroot/dev/bus/other" \
+		"$$sysroot/dev/bus/other" "$$sysroot/dev/bus/usb/099" \
 		"$$sysroot/etc"; \
 	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
 	printf 'always [madvise] never\n' \
@@ -1639,6 +1643,7 @@ test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
 	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
 	: > "$$sysroot/sys/fs/cgroup/g"; \
 	: > "$$sysroot/dev/bus/other/f"; \
+	: > "$$sysroot/dev/bus/usb/099/001"; \
 	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-matrix

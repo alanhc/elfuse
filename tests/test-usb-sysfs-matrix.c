@@ -54,9 +54,15 @@
 #include <unistd.h>
 
 #ifdef MATRIX_STANDALONE
-/* Recording build: runs natively on Linux with no elfuse harness. */
+/* Recording build: runs natively on Linux with no elfuse harness. The four
+ * harness macros the assertions below use are spelled out here rather than
+ * included, because test-harness.h is built for the guest side.
+ */
 #include <sys/syscall.h>
 static int passes, fails;
+#define TEST(name) printf("  %-30s ", name)
+#define PASS() (printf("OK\n"), passes++)
+#define FAIL(msg) (printf("FAIL: %s\n", msg), fails++)
 #define EXPECT_TRUE(cond, msg)                    \
     do {                                          \
         if (cond)                                 \
@@ -85,13 +91,19 @@ enum {
     COL_LONG,       /* a /sys spelling longer than the 63-byte fd stamp */
     COL_SYS_ROOT,   /* /sys itself: synthetic and backed at once */
     COL_DEV_BUS,    /* /dev/bus itself: synthetic and backed at once */
+    COL_SHADOW,     /* a backing name inside a subtree this layer owns */
     COL_SUBSYS_OUT, /* a walk through the subsystem link and back out of usb */
+    COL_FOLD_OUT, /* a '..' out of /dev/bus/usb onto a name the backing owns */
+    COL_FOLD_IN,  /* a '..' out of a foreign bus and back into /dev/bus/usb */
+    COL_SYS_FOLD_IN, /* a '..' out of a backing /sys name and back into ours */
     COL_COUNT,
 };
 
 static const char *col_name[COL_COUNT] = {
-    "synth-dir", "back-sys", "back-dev", "subsys",   "escape",  "escape-syn",
-    "usb-node",  "absent",   "long-sys", "sys-root", "dev-bus", "subsys-out",
+    "synth-dir",  "back-sys",     "back-dev",    "subsys",
+    "escape",     "escape-syn",   "usb-node",    "absent",
+    "long-sys",   "sys-root",     "dev-bus",     "shadow",
+    "subsys-out", "dev-fold-out", "dev-fold-in", "sys-fold-in",
 };
 
 /* COL_SUBSYS is the one spelling that cannot be shared: the recording host's
@@ -149,12 +161,60 @@ static const char *col_path(int c)
         return long_path;
     case COL_SYS_ROOT:
         return "/sys";
+    case COL_SHADOW:
+        return "/dev/bus/usb/099/001";
     case COL_SUBSYS_OUT:
         return subsys_out_path;
+    case COL_FOLD_OUT:
+        return "/dev/bus/usb/../other/f";
+    case COL_FOLD_IN:
+        return "/dev/bus/other/../usb/001/001";
+    case COL_SYS_FOLD_IN:
+        return "/sys/class/../bus/usb/devices";
     default:
         return "/dev/bus";
     }
 }
+
+/* COL_SHADOW is the mirror of COL_BACK_DEV: a name the *backing* carries inside
+ * /dev/bus/usb, one of the two subtrees this layer owns, on a bus number no
+ * device has. Ownership runs both ways -- the layer falls through for the
+ * backing's names outside its subtrees, and the backing must not surface inside
+ * them -- so the sysroot fixture plants this file and every entry point still
+ * has to report what Linux reports for a name that is simply not there.
+ *
+ * It is the column that holds the "claimed and then failed" arm. Only
+ * PROC_NOT_INTERCEPTED means "ask the backing"; taking a claimed name's failure
+ * as one too let access(2), and then statfs(2), answer from the backing here
+ * while open and stat reported ENOENT for the same path.
+ */
+
+/* COL_FOLD_OUT and COL_FOLD_IN are the two spellings that cross the /dev/bus
+ * ownership boundary through a '..'. They are the same two names COL_BACK_DEV
+ * and COL_NODE already carry, written so that the component deciding ownership
+ * is not the one the object ends up under: /dev/bus/usb/../other/f is
+ * COL_BACK_DEV's file reached through the subtree this layer owns, and
+ * /dev/bus/other/../usb/001/001 is COL_NODE's node reached through a bus it
+ * does not.
+ *
+ * They exist because the /sys half of the classifier folds the name before
+ * deciding whose it is and the /dev/bus half used to decide on the guest's
+ * spelling, so both spellings went wrong and in opposite directions: the first
+ * was claimed and answered ENOENT for a file the sysroot really has, the second
+ * was disowned and missed the synthetic node. One column each way, so a fold
+ * applied to only one direction cannot pass.
+ */
+
+/* COL_SYS_FOLD_IN is the /sys mirror of COL_FOLD_IN, and the one direction that
+ * stays unmet. /sys/class/../bus/usb/devices folds to a name this layer owns
+ * and serves, and ownership is decided on that folded name -- but the resolve
+ * behind it joins the unfolded suffix onto the scratch tree, which carries no
+ * `class`, so the lookup fails and the layer answers its own authoritative
+ * ENOENT for a directory it does serve. Recorded as XFAIL rather than repaired:
+ * it is not this series\' doing, and the vectors header carries the measurement
+ * against the merge base and the reason a fold cannot fix this half the way it
+ * fixed the /dev one.
+ */
 
 /* Names that must be listed by the union directories, one comma-free name per
  * entry, NULL-terminated. Empty for the columns where enumeration is not the
