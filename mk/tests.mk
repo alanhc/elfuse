@@ -42,6 +42,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
+        test-usb-sysfs-matrix \
         test-usb-sysfs-overflow test-dir-union-fd-reuse \
         test-fstatfs-fd-identity \
         test-sysroot-symlink-target \
@@ -255,6 +256,7 @@ $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
 $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
+$(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point against every path class)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
 $(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
 $(call run-lane,test-fstatfs-fd-identity,fstatfs answers for the descriptor it pinned)
@@ -1614,6 +1616,32 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot
+
+## Every entry point that can name something under /sys or /dev/bus, against
+## every class of name those trees can hold. The layer synthesizes one subtree
+## on each side and the rest belongs to the sysroot, so the sysroot has to carry
+## the other side of each column: a /sys skeleton, a foreign /dev/bus, and an
+## /etc file for the '..' chain that leaves the tree. Expected values are the
+## ones recorded on Linux; see tests/usb-sysfs-matrix-vectors.h.
+test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net/eth0" \
+		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
+		"$$sysroot/sys/devices/system/node" \
+		"$$sysroot/sys/fs/cgroup" \
+		"$$sysroot/sys/bus/pci/devices" \
+		"$$sysroot/dev/bus/other" \
+		"$$sysroot/etc"; \
+	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
+	printf 'always [madvise] never\n' \
+		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
+	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	: > "$$sysroot/sys/fs/cgroup/g"; \
+	: > "$$sysroot/dev/bus/other/f"; \
+	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-matrix
 
 ## The devnum cap needs more than 127 address-less devices on one bus, which
 ## the overflow fixture injects through the real fallback path. No sysroot: the
