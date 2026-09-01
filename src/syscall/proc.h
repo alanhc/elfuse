@@ -370,6 +370,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
  */
 void syscall_restart_arm(hv_vcpu_t vcpu,
                          uint64_t elr_after_svc,
+                         uint64_t nr,
                          int64_t result);
 void syscall_restart_cancel(hv_vcpu_t vcpu);
 

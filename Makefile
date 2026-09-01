@@ -490,6 +490,32 @@ $(BUILD_DIR)/test-shim-urandom-toctou: tests/test-shim-urandom-toctou.c | $(BUIL
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-futex-requeue-account parks a waiter, requeues it, and parks another, so
+# it needs threads.
+$(BUILD_DIR)/test-futex-requeue-account: tests/test-futex-requeue-account.c \
+    | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-futex-wake-nowaiter races a waker against a waiter to prove the EL1 wake
+# path never answers 0 for an address that still has one, so it needs a thread.
+$(BUILD_DIR)/test-futex-wake-nowaiter: tests/test-futex-wake-nowaiter.c \
+    | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-shim-futex-fast spawns a waker thread for the matching-word case, which
+# is the one branch of the futex fast path that must decline and block.
+$(BUILD_DIR)/test-shim-futex-fast: tests/test-shim-futex-fast.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# test-shim-futex-toctou races mprotect(PROT_NONE) against the futex EL1 ldtr
+# to exercise its data abort recovery slot. Needs pthreads.
+$(BUILD_DIR)/test-shim-futex-toctou: tests/test-shim-futex-toctou.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-fuse-basic runs a guest daemon thread and consumer in one process
 $(BUILD_DIR)/test-fuse-basic: tests/test-fuse-basic.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
@@ -537,6 +563,32 @@ $(BUILD_DIR)/test-lowbase-mem-300000: tests/test-lowbase-mem.c | $(BUILD_DIR)
 $(BUILD_DIR)/bench-hot-guard: tests/bench-hot-guard.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+# bench-futex-contend is the workload that decides what the futex fast paths are
+# worth: contended mutexes plus a condvar handoff, which is what glibc and musl
+# locking actually issue. It is what showed that a wake with no waiter is 59.8
+# percent of futex calls there while the wait fast path fires not once, the
+# reverse of what a two-thread ping-pong suggests. Run by hand, not a gate.
+$(BUILD_DIR)/bench-futex-contend: tests/bench-futex-contend.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+.PHONY: bench-futex-contend
+bench-futex-contend: $(ELFUSE_BIN) $(BUILD_DIR)/bench-futex-contend
+	$(Q)ELFUSE_SHIM_STATS=1 $(ELFUSE_BIN) $(BUILD_DIR)/bench-futex-contend
+
+# bench-futex is the comprehensive futex bench: uncontended fast-path rows plus
+# threaded wake/wait handoff, so it links -lpthread like bench-hot-guard above.
+# Run by hand (make bench-futex); it is not a gate, because handoff latency is a
+# host-scheduler measurement and would flake as one. The rows that can be gated
+# live in bench-hot-guard instead.
+$(BUILD_DIR)/bench-futex: tests/bench-futex.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
+.PHONY: bench-futex
+bench-futex: $(ELFUSE_BIN) $(BUILD_DIR)/bench-futex
+	$(Q)$(ELFUSE_BIN) $(BUILD_DIR)/bench-futex
 
 # bench-hot-guard-glibc is the dynamic-glibc twin of bench-hot-guard.
 # Built only when the cross-glibc toolchain ships its own sysroot

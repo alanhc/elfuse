@@ -67,6 +67,7 @@ test-shim-data-el1
 test-shim-urandom-smp
 test-shim-urandom-toctou
 test-shim-urandom-wrap
+test-shim-futex-toctou
 test-shim-cred-race
 test-mremap-infra
 test-mremap-fork-tracking

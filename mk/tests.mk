@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox test-vcpu-watchdog \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -266,6 +266,7 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	$(call run-lane,test-sysroot-path-matrix,addressing modes agree across the path matrix)
 	$(call run-lane,test-usage-synopsis,usage synopsis renderings)
 	$(call run-lane,test-shebang-host,shebang parser unit test)
+	$(call run-lane,test-shim-futex-stats,futex EL1 fast path is live)
 	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
@@ -1297,6 +1298,13 @@ $(BUILD_DIR)/busybox: | $(BUILD_DIR)
 	cp "$$tmpdir/root/usr/bin/busybox" "$@"; \
 	chmod 0755 "$@"; \
 	rm -rf "$$tmpdir"
+
+## Verify the futex EL1 fast path actually served the calls, via shim counters
+test-shim-futex-stats: $(ELFUSE_BIN) $(TEST_DIR)/test-shim-futex-fast \
+		$(TEST_DIR)/test-futex-wake-nowaiter
+	@bash tests/test-shim-futex-stats.sh $(ELFUSE_BIN) \
+		$(TEST_DIR)/test-shim-futex-fast \
+		$(TEST_DIR)/test-futex-wake-nowaiter
 
 ## Run busybox applet smoke tests
 test-busybox: $(ELFUSE_BIN) $(BUSYBOX_DEPS)

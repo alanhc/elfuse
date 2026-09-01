@@ -5,63 +5,53 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Loaded at g->shim_base (a 16MiB infra reserve placed just below
- * g->interp_base; computed at guest_init time). Runs at EL1. All system
- * registers (VBAR, MAIR, TCR, TTBR0, SCTLR, etc.) are configured by the host
- * before vCPU start. The shim entry point transitions to EL0 via ERET.
- * Exception vectors handle SVC #0 (Linux syscall) forwarding to the host via
- * HVC #5.
+ * Loaded at g->shim_base, in the 16 MiB infra reserve below g->interp_base.
+ * Runs at EL1 with every system register (VBAR, MAIR, TCR, TTBR0, SCTLR) set by
+ * the host before vCPU start; the entry point ERETs to EL0. The vectors forward
+ * SVC #0 to the host as HVC #5, and serve some syscalls inline.
  *
  * HVC protocol:
- *   #0  Normal exit       (x0 = exit code)
- *   #2  Bad exception     (x0=ESR, x1=FAR, x2=ELR, x3=SPSR, x5=vector)
- *   #4  Set sysreg        (x0 = reg ID (0-8), x1 = value)
- *   #5  Syscall forward   (X0-X5=args, X8=syscall nr;
- *                          on return X8 carries the post-syscall request:
- *                            0 = no TLB flush
- *                            1 = broadcast TLBI VMALLE1IS
- *                            2 = execve replaced register state (full flush
- *                                + drop frame + ERET without GPR restore)
- *                            3 = selective: TLBI VAE1IS over X10 pages
- *                                starting at page-aligned VA in X9
- *                            4 = single-shot TLBI RVAE1IS (FEAT_TLBIRANGE);
- *                                X9 carries the pre-encoded RVAE1IS operand
- *                                (baddr | NUM<<39 | SCALE<<44 | TTL<<37 |
- *                                ASID<<48; SCALE=0, TTL=0, ASID=0 today)
- *                          X11 carries the I-cache hint for X8 in {1, 3, 4}:
- *                          1 = IC IALLU after the TLBI sequence (new
- *                          executable content visible to EL0), 0 = skip the
- *                          I-cache invalidation (data-only PT change). The
- *                          X8 == 2 exec_drop_frame path always flushes
- *                          regardless because execve loads new code. The
- *                          shim restores X11 from the saved frame before
- *                          ERET so the EL0 caller never observes this hint.)
- *   #7  MRS trap          (host reads reg from ESR ISS; returns value in x0)
- *   #9  W^X toggle        (x0=FAR, x1=type: 0=exec->RX, 1=write->RW.
- *                          On return, X8==0 means retry after W^X TLBI;
- *                          X8==2 means host delivered a signal frame and the
- *                          shim must drop the saved fault frame.)
- *   #10 BRK from EL0      (SIGTRAP delivery / ptrace-stop; GPRs in frame)
- *   #11 EL0 fault         (SIGSEGV/SIGILL delivery; GPRs in frame.
- *                          On return the host sets X8 to the same TLBI
- *                          wire code as SVC #5 above (0/1/3/4 only;
- *                          X8 == 2 exec_drop_frame is rejected and falls
- *                          through to the conservative full flush). The
- *                          lazy MAP_NORESERVE materialize path uses this
- *                          to invalidate any negative TLB entry the EL0
- *                          retry would otherwise re-fault on. Eret tail
- *                          preserves X0/X1/X2/X30 so signal_deliver's
- *                          register writes survive.)
- *   #12 System instr trap (cache maintenance logging: DC CVAU, IC IVAU, etc.)
+ *   #0   Normal exit       x0 = exit code
+ *   #2   Bad exception     x0=ESR, x1=FAR, x2=ELR, x3=SPSR, x5=vector
+ *   #4   Set sysreg        x0 = reg ID (0-8), x1 = value
+ *   #5   Syscall forward   X0-X5 = args, X8 = syscall nr; see X8 below
+ *   #7   MRS trap          host reads the reg named in ESR ISS, returns in x0
+ *   #9   W^X toggle        x0=FAR, x1: 0 = exec->RX, 1 = write->RW. Returns
+ *                          X8 = 0 to retry after the W^X TLBI, or X8 = 2 when
+ *                          the host built a signal frame and the saved fault
+ *                          frame must be dropped.
+ *   #10  BRK from EL0      SIGTRAP or ptrace-stop; GPRs in the frame
+ *   #11  EL0 fault         SIGSEGV or SIGILL; GPRs in the frame. Returns the
+ *                          same X8 wire code as #5 but only 0/1/3/4, since
+ *                          there is no frame to drop; a stray 2 falls through
+ *                          to the full flush. The lazy MAP_NORESERVE
+ *                          materialize path uses this to retire the negative
+ *                          TLB entry the EL0 retry would re-fault on. Its eret
+ *                          tail preserves X0/X1/X2/X30 so signal_deliver's
+ *                          register writes survive.
+ *   #12  System instr trap cache maintenance logging (DC CVAU, IC IVAU, ...)
  *
- * macOS as uses ';' as a comment character on AArch64, NOT as a statement
- * separator. Each instruction must be on its own line.
+ * X8 on return from #5, the post-syscall request:
+ *   0  no flush
+ *   1  broadcast TLBI VMALLE1IS
+ *   2  host replaced the EL0 register state (execve, rt_sigreturn, signal
+ *      delivery on the syscall-return path): full flush, drop the saved frame,
+ *      ERET without restoring GPRs
+ *   3  TLBI VAE1IS over X10 pages from the page-aligned VA in X9
+ *   4  single-shot TLBI RVAE1IS (FEAT_TLBIRANGE), operand pre-encoded in X9 as
+ *      baddr | NUM<<39 | SCALE<<44 | TTL<<37 | ASID<<48 (SCALE, TTL and ASID
+ *      are all 0 today)
  *
- * The Linux syscall ABI requires ALL general-purpose registers (X1-X30) to be
- * preserved across SVC #0, with only X0 modified (return value). Musl and other
- * libc implementations rely on this; the compiler does NOT save scratch
- * registers (X9-X15) across SVC calls. Therefore, the exception handler MUST
- * save and restore ALL 31 GPRs.
+ * X11 is the I-cache hint, read for X8 in {1, 3, 4}: 1 issues IC IALLU after
+ * the TLBI because the change made new content executable, 0 skips it. X8 == 2
+ * always flushes, since execve loads new code. The shim restores X11 from the
+ * saved frame before ERET, so EL0 never sees the hint.
+ *
+ * Two constraints on everything below. macOS 'as' treats ';' on AArch64 as a
+ * comment, not a statement separator, so every instruction needs its own line.
+ * And the Linux SVC #0 ABI preserves X1-X30 and modifies only X0: the compiler
+ * does not save scratch X9-X15 across an SVC, so the handler must save and
+ * restore all 31 GPRs.
  */
 
 /*
@@ -219,6 +209,12 @@
 .equ CB_URANDOM_HIT,         72
 .equ CB_GETRANDOM_HIT,       80
 .equ CB_PGSID_HIT,           88
+.equ CB_FUTEX_EAGAIN_HIT,    96
+.equ CB_FUTEX_EFAULT_HIT,    104
+.equ CB_FUTEX_SHAPE_BAIL,    112
+.equ CB_FUTEX_MATCH_BAIL,    120
+.equ CB_FUTEX_WAKE_HIT,      128
+.equ CB_FUTEX_WAKE_WAITER_BAIL, 136
 
 /* Slot 48 (SHIM_COUNTER_URANDOM_RING_WRAP) deliberately omitted: wrap is
  * handled inline by urandom_copy_loop, so no assembly path bumps it. The C-side
@@ -229,26 +225,24 @@
  * \byte_off) from TPIDR_EL1 by 1, only when the host has published a nonzero
  * stats gate at SHIM_STATS_EN_OFF.
  *
- * The gate keeps every fast-path tail from touching the counter cache line in
- * the common case (ELFUSE_SHIM_STATS unset). Without it, each getpid / getuid /
- * urandom hit drove a non-atomic load-add-store on a single shared line,
- * generating multi-vCPU coherence ping-pong on top of the unconditional
- * five-instruction tax.
+ * The gate is what keeps a fast-path tail off the counter cache line when
+ * ELFUSE_SHIM_STATS is unset. Without it every getpid and urandom hit drove a
+ * load-add-store on one shared line, so the cost was multi-vCPU coherence
+ * ping-pong on top of five unconditional instructions. Disabled now expands to
+ * three (mrs, ldrb, cbz); enabled adds the original five.
  *
- * One shifted add carries the SHIM_COUNTERS_OFF_HI (#0x1000) high half; the
- * ldr/str fold the LO12 + slot-byte offset into the immediate (well within the
- * imm12*8 = 32760 byte range).
+ * One shifted add carries the SHIM_COUNTERS_OFF_HI (#0x1000) half, and the
+ * ldr/str fold LO12 plus the slot byte into the immediate, well inside the
+ * imm12*8 range.
  *
- * Non-atomic ldr/add/str. Even with the gate enabled, multi-vCPU concurrent
- * bails may race and lose a small fraction of counts; acceptable for diagnostic
- * ratios. The gate-disabled tail expands to three instructions (mrs + ldrb +
- * cbz); the gate-enabled tail adds the original five.
+ * The increment is non-atomic, so concurrent bails lose a few counts even with
+ * the gate on. These are diagnostic ratios.
  *
  * x29/x30 are clobbered. svc_restore_eret's RESTORE_GPRS_KEEP_X0 reloads
  * X1..X30 from the saved frame, so the clobber is safe on any fast path. The
  * end label uses GAS .L\@ macro-local naming so every expansion gets a unique
- * symbol -- nested or interleaved macros cannot collide with a bare numeric
- * label.
+ * symbol, so nested or interleaved macros cannot collide the way a bare numeric
+ * label would.
  */
 .macro COUNTER_INC byte_off
     mrs x29, tpidr_el1
@@ -297,13 +291,13 @@ _start:
 
     /* TLB + I-cache invalidation: ensure clean translation state before
      * enabling the MMU. Runs with SCTLR.M=0, so this fetch cannot be
-     * misdirected by stale TLB state -- which is exactly why the execve
-     * re-entry path lands here instead of resuming the interrupted svc_handler
-     * frame: after guest_reset recycles the PT pool in place, stale walk-cache
-     * entries can poison any translated fetch, and the only architecturally
-     * safe point to drop them is before MMU-on. IC IALLUIS covers stale I-cache
-     * lines from a pre-exec image that loaded code at the same addresses (no-op
-     * cost at cold boot).
+     * misdirected by stale TLB state, which is exactly why the execve re-entry
+     * path lands here instead of resuming the interrupted svc_handler frame:
+     * after guest_reset recycles the PT pool in place, stale walk-cache entries
+     * can poison any translated fetch, and the only architecturally safe point
+     * to drop them is before MMU-on. IC IALLUIS covers stale I-cache lines from
+     * a pre-exec image that loaded code at the same addresses (no-op cost at
+     * cold boot).
      */
     tlbi vmalle1is
     ic ialluis
@@ -381,17 +375,12 @@ bad_exception:
     /* x5 already holds vector offset from the entry stub */
     hvc #2
 
-/* svc_handler: Synchronous exception dispatcher
+/* svc_handler: synchronous exception dispatcher.
  *
- * On entry from EL0 SVC #0 (or EL1 synchronous):
+ * On entry from EL0 SVC #0 (or an EL1 synchronous exception):
  *   X0-X5  = syscall arguments
  *   X8     = syscall number
- *   X6-X30 = caller state (MUST be preserved per Linux ABI)
- *
- * The Linux syscall ABI guarantees all registers except X0 survive the SVC.
- * Musl's inline syscall wrappers (and GCC/Clang codegen) rely on this: scratch
- * registers X9-X15 are NOT saved by the compiler across SVC calls. The shim
- * must save/restore ALL 31 GPRs.
+ *   X6-X30 = caller state, preserved per the Linux ABI (see the file header)
  *
  * Stack frame: 256 bytes (16 pairs x 16 bytes)
  *   [sp+0]   x0,x1    [sp+16]  x2,x3    [sp+32]  x4,x5
@@ -423,19 +412,16 @@ svc_handler:
     cmp x11, #0
     b.ne restore_and_bad
 
-    /* Identity-class fast path. X8 in [172, 179) is one of getpid (172),
-     * getppid (173), getuid (174), geteuid (175), getgid (176), getegid (177),
-     * or gettid (178). The first six read from the shim-globals cache
-     * (TPIDR_EL1 base, host-published scalar slots starting at offset 8);
-     * gettid reads its per-vCPU tid from CONTEXTIDR_EL1 directly. Layout-wise
-     * the cache has the attention flag at offset 0 (LDAR'd here to enforce the
-     * slow-path gate from Slice B and the --verbose trace gate) and six
-     * identity slots after it.
+    /* Identity-class fast path: X8 in [172, 179), which is getpid (172) through
+     * getegid (177) plus gettid (178). The first six read host-published slots
+     * from the shim-globals cache at TPIDR_EL1, starting at offset 8; gettid
+     * reads its per-vCPU tid straight out of CONTEXTIDR_EL1. The LDAR below
+     * takes attention at offset 0, which is what enforces the signal, cred and
+     * --verbose trace gates.
      *
-     * Saved X8 is at [sp+64] per SAVE_GPRS. Scratch X10..X13 are restored from
-     * the frame by RESTORE_GPRS_KEEP_X0 at the named tail (svc_restore_eret),
-     * so the Linux ABI guarantee (X1..X30 preserved across SVC) is intact even
-     * on the fast path.
+     * Saved X8 is at [sp+64] per SAVE_GPRS. RESTORE_GPRS_KEEP_X0 at
+     * svc_restore_eret restores scratch X10-X13 from the frame, so the ABI
+     * guarantee that SVC preserves X1-X30 holds on this path too.
      */
     ldr x10, [sp, #64]               /* saved X8 (syscall nr) */
     sub x11, x10, #172
@@ -443,6 +429,8 @@ svc_handler:
     b.lo identity_class_fast          /* 172..178 -> identity / gettid */
     cmp x10, #63                       /* SYS_read? */
     b.eq urandom_read_fast
+    cmp x10, #98                       /* SYS_futex? */
+    b.eq futex_wait_fast
     cmp x10, #155                      /* SYS_getpgid? */
     b.eq getpgid_fast
     cmp x10, #156                      /* SYS_getsid? */
@@ -478,7 +466,7 @@ getpgid_fast:
     mrs x12, tpidr_el1
     ldar w13, [x12]
     cbnz w13, attn_bail
-    ldr x0, [x12, #0x1148]            /* SHIM_IDENTITY_OFF_PGID */
+    ldr x0, [x12, #0x1158]            /* SHIM_IDENTITY_OFF_PGID */
     COUNTER_INC CB_PGSID_HIT
     b svc_restore_eret
 
@@ -488,8 +476,115 @@ getsid_fast:
     mrs x12, tpidr_el1
     ldar w13, [x12]
     cbnz w13, attn_bail
-    ldr x0, [x12, #0x1150]            /* SHIM_IDENTITY_OFF_SID */
+    ldr x0, [x12, #0x1160]            /* SHIM_IDENTITY_OFF_SID */
     COUNTER_INC CB_PGSID_HIT
+    b svc_restore_eret
+
+/* futex_wait_fast: serve an untimed FUTEX_WAIT or FUTEX_WAIT_BITSET whose word
+ * already differs from expected. It answers EAGAIN once an EL0 read proves the
+ * caller will not block, and EFAULT when that read faults
+ * (handle_el1_data_abort_recover below). Anything that could need a waiter, and
+ * every other shape, bails to the host.
+ *
+ * The authority this must match is futex_should_block in runtime/futex.c, not
+ * the Linux source: reordering the checks there is what would silently make
+ * this answer wrong. It returns EFAULT for an unresolvable uaddr and EAGAIN for
+ * a moved word, and its four callers reject the timeout, the bitset and the
+ * alignment before reaching it. Every one of those rejections bails below.
+ *
+ * A non-NULL timeout stays on the host even when the word differs, because both
+ * host waiters build the deadline first, so a malformed timespec has to outrank
+ * the moved word.
+ *
+ * The shape decode reads only the saved SVC frame, so it runs before the
+ * attention load. That ordering is what makes CB_ATTN_BAIL count only calls
+ * that were otherwise eligible rather than every guest FUTEX_WAKE. It does not
+ * keep a WAKE off the shared line: the shape bail's COUNTER_INC reads the stats
+ * gate, which shares a cache line with attention at offset 0. That line is
+ * read-mostly (only shim_globals_attn_or writes it), so this is an L1 hit, not
+ * coherence traffic.
+ */
+futex_wait_fast:
+    ldr w14, [sp, #8]                 /* op */
+    and w15, w14, #0x7f               /* FUTEX_CMD_MASK, pinned in futex.c */
+    cmp w15, #0                       /* FUTEX_WAIT */
+    b.eq futex_wait_shape
+    cmp w15, #1                       /* FUTEX_WAKE */
+    b.eq futex_wake_shape
+    cmp w15, #10                      /* FUTEX_WAKE_BITSET */
+    b.eq futex_wakebs_shape
+    cmp w15, #9                       /* FUTEX_WAIT_BITSET */
+    b.ne futex_shape_bail
+    ldr w16, [sp, #40]                /* val3 = bitset */
+    cbz w16, futex_shape_bail         /* zero bitset is EINVAL on the host */
+futex_wait_shape:
+    ldr x14, [sp, #24]                /* timeout */
+    cbnz x14, futex_shape_bail
+    ldr x14, [sp, #0]                 /* uaddr */
+    tst x14, #3
+    b.ne futex_shape_bail
+
+    /* TCR_EL1.TBI0 is set (hvutil.h TCR_EL1_VALUE), so the LDTR below ignores
+     * uaddr[63:56]. The host's software walker does not: gva_resolve_perm
+     * indexes L0 from the raw address, so a tagged pointer fails its bound and
+     * reports EFAULT. Bail on a tag rather than answer EAGAIN for an address
+     * every other futex shape faults on.
+     */
+    tst x14, #0xFF00000000000000
+    b.ne futex_shape_bail
+
+    mrs x12, tpidr_el1
+    ldar w13, [x12]
+    cbnz w13, attn_bail
+
+    /* LDTR, the unprivileged load: at EL1 it applies EL0 permissions in
+     * hardware, so shim_data and every other MEM_PERM_EL1_ONLY page faults here
+     * exactly as it would for the guest. That is the boundary an AT s1e0r probe
+     * drew, in one instruction rather than four, with no page walk, no ISB, and
+     * no window between check and access for a sibling vCPU to unmap into. A
+     * translation or permission fault lands in handle_el1_data_abort_recover
+     * and returns EFAULT, matching what the host answers for an address it
+     * cannot resolve.
+     *
+     * A host-side SIGBUS (the truncated MAP_SHARED overlay HOST_SIGBUS_GUARD
+     * covers) is not a stage-1 fault and does not arrive here. Any FUTEX_WAIT
+     * caller already read this word in EL0 to learn the expected value, so it
+     * hits that case identically.
+     *
+     * Relaxed, not the acquire it replaces: nothing orders a later access
+     * against this load, and the path returns EAGAIN without ever enqueueing,
+     * so it cannot lose a wake. A stale value that still matches bails to the
+     * host, which re-reads under seq_cst. The reverse error, a spurious EAGAIN,
+     * needs a value older than this vCPU already observed in EL0, which
+     * single-address coherence forbids.
+     *
+     * PSTATE.PAN would fault an EL1 unprivileged access to EL0-accessible
+     * memory. SCTLR_RES1 sets SPAN (hvutil.h), so PAN stays clear on exception
+     * entry, which the urandom path's EL1 strb already depends on.
+     *
+     * Two fault classes bypass that recovery tail, neither newly exposed. A
+     * stage-2 fault exits to EL2 rather than these vectors, so guest.c answers
+     * a dangling entry over an unmapped IPA. And because LDTR is an
+     * unprivileged access, an EL0 GDB watchpoint (DBGWCR.PAC) can match it and
+     * report a stop at a shim PC.
+     *
+     * The recovery slot below keeps ELR/SPSR under the outer SVC frame so the
+     * abort handler resumes EL0 at the original post-SVC PC.
+     */
+    mrs x18, elr_el1
+    mrs x19, spsr_el1
+    stp x18, x19, [sp, #-16]!
+.globl futex_load_start
+.globl futex_load_end
+futex_load_start:
+    ldtr w16, [x14]
+futex_load_end:
+    add sp, sp, #16
+    ldr w17, [sp, #16]                /* expected */
+    cmp w16, w17
+    b.eq futex_match_bail             /* caller blocks; host owns the queue */
+    mov x0, #-11                      /* Linux EAGAIN */
+    COUNTER_INC CB_FUTEX_EAGAIN_HIT
     b svc_restore_eret
 
     /* Urandom-read fast path. Serves read(urandom_fd, buf, len) with len in [1,
@@ -531,26 +626,21 @@ urandom_read_fast:
 
     ldr x20, [sp, #8]                /* saved X1 = buf */
 
-    /* Probe the guest buffer for stage-1 EL0-write translations before doing
-     * any EL1 store. PROT_NONE or unmapped pages bail to the slow path here;
-     * the host's sys_read returns -EFAULT.
+    /* Probe the guest buffer for stage-1 EL0-write translations before any EL1
+     * store. A PROT_NONE or unmapped page bails here and the host's sys_read
+     * answers EFAULT.
      *
-     * The probe handles the STATIC case (buffer already unmapped at entry). The
-     * DYNAMIC case where a sibling vCPU munmaps the buffer in the window
-     * between probe and strb is caught later by the EL1 data abort vector
-     * routing into handle_el1_data_abort_recover (which discards the reserved
-     * entropy, releases the lock, and returns -EFAULT to EL0; the ring head is
-     * not rolled back -- the already-published bytes are simply skipped on the
-     * next read). Without that recovery the EL1 strb would fault into BAD_VEC
-     * and halt the VM.
+     * This catches only the static case, where the buffer is already unmapped
+     * on entry. A sibling vCPU that munmaps between probe and strb is caught
+     * instead by handle_el1_data_abort_recover, which drops the reserved
+     * entropy, releases the lock, and returns EFAULT; the ring head is left
+     * advanced, so those bytes are skipped rather than reissued. Without that
+     * recovery the strb would fault into BAD_VEC and halt the VM.
      *
-     * len is in [1, SHIM_URANDOM_INLINE_LIMIT=256]. Probing the first and last
-     * byte covers every page the inline copy can touch: even at the smaller 4
-     * KiB host page size a 256-byte buffer straddles at most one page boundary,
-     * so probe(buf) + probe(buf+len-1) hits both pages. The second probe is
-     * skipped when buf and buf+len-1 fall in the same 4 KiB page -- the
-     * dominant case for small crypto/SSH-handshake reads. Detected via xor +
-     * mask.
+     * len is in [1, 256], so the buffer straddles at most one boundary even at
+     * a 4 KiB page size, and probing the first and last byte covers every page
+     * the copy can touch. The second probe is skipped, via xor and mask, when
+     * both fall in the same 4 KiB page, which is the common small-read case.
      */
     sub x16, x15, #1                 /* len - 1 */
     adds x17, x20, x16               /* last_byte = buf + len - 1 */
@@ -756,6 +846,93 @@ urandom_loop_done:
 attn_bail:
     COUNTER_INC CB_ATTN_BAIL
     b handle_svc_0
+
+/* futex_wake_fast: answer a FUTEX_WAKE that has nobody to wake.
+ *
+ * The whole result of such a call is the count woken, which is zero, so once
+ * EL1 can prove the address has no waiter there is nothing left for the host to
+ * do. The proof is the per-bucket count the wait paths publish into shim_data
+ * (SHIM_FUTEX_WAITERS_OFF); shim_globals_futex_waiters_add states the ordering
+ * that makes a zero reading sound, and it is the reason for the DMB below.
+ *
+ * Measured at 59.8 percent of all futex calls on a contended two-thread glibc
+ * mutex-and-condvar workload, where the wait fast path next door fires not once
+ * because every wait there genuinely blocks.
+ *
+ * No address check beyond alignment. The host resolves nothing for a wake
+ * either: futex_wake matches enqueued waiters by raw uaddr, and the os_sync
+ * top-up returns 0 rather than EFAULT when guest_ptr fails. So an unmapped or
+ * tagged address answers 0 on both sides, and hashing the raw value here is
+ * what keeps the two agreeing.
+ */
+futex_wakebs_shape:
+    ldr w16, [sp, #40]                /* val3 = bitset */
+    cbz w16, futex_shape_bail         /* zero bitset is EINVAL on the host */
+futex_wake_shape:
+    ldr x14, [sp, #0]                 /* uaddr */
+    tst x14, #3
+    b.ne futex_shape_bail             /* unaligned is EINVAL on the host */
+
+    mrs x12, tpidr_el1
+    ldar w13, [x12]
+    cbnz w13, attn_bail
+
+    /* futex_bucket_index from proved/futexhash.h, in registers: multiply the
+     * address shifted past its two dead low bits by the 64-bit mixer, keep bits
+     * 32 and up, and mask to the table. The mask stands in for the header's
+     * remainder because the table size is a power of two, and futex.c pins both
+     * the multiplier and the size so this cannot drift from it.
+     */
+    lsr x15, x14, #2
+    movz x16, #0x7C15
+    movk x16, #0x7F4A, lsl #16
+    movk x16, #0x79B9, lsl #32
+    movk x16, #0x9E37, lsl #48
+    mul x15, x15, x16
+    lsr x15, x15, #32
+    and x15, x15, #1023               /* FUTEX_BUCKETS - 1, pinned in futex.c */
+
+    /* Orders the guest's store to the futex word, made in EL0 before this SVC,
+     * ahead of the count load below. Taking an exception is a context
+     * synchronization event and not a barrier, so without this the load may be
+     * satisfied before the store is visible, and a waiter that published its
+     * count after that store would be missed. That is the one failure this
+     * whole path must not have.
+     */
+    dmb ish
+
+    add x16, x12, #0x1000
+    add x16, x16, #0x168              /* SHIM_FUTEX_WAITERS_OFF, 0x1168 */
+    ldr w17, [x16, x15, lsl #2]
+    cbnz w17, futex_wake_waiter_bail
+
+    mov x0, #0                        /* nothing was parked, so nothing woke */
+    COUNTER_INC CB_FUTEX_WAKE_HIT
+    b svc_restore_eret
+
+futex_wake_waiter_bail:
+    /* The bucket holds a waiter, which may or may not be for this address:
+     * distinct addresses share a bucket. The host settles it.
+     */
+    COUNTER_INC CB_FUTEX_WAKE_WAITER_BAIL
+    b handle_svc_0
+
+futex_shape_bail:
+    /* Not the shape this path serves: another futex command, a zero bitset, a
+     * non-NULL timeout, or an unaligned or tagged uaddr. An unreadable address
+     * is not here: LDTR faults on it and the recovery tail answers EFAULT. One
+     * counter rather than a taxonomy; splitting it further would only subdivide
+     * the answer to "how often is the servable shape seen".
+     */
+    COUNTER_INC CB_FUTEX_SHAPE_BAIL
+    b handle_svc_0
+futex_match_bail:
+    /* The servable shape, but the word still holds the expected value, so the
+     * caller genuinely blocks. Counted apart from the shape bail so the
+     * served-shape rate and the block rate stay separable denominators.
+     */
+    COUNTER_INC CB_FUTEX_MATCH_BAIL
+    b handle_svc_0
 urandom_fd_oor_bail:
     COUNTER_INC CB_URANDOM_FD_OOR
     b handle_svc_0
@@ -774,7 +951,7 @@ urandom_probe_fail_bail:
 urandom_ring_low_bail:
     /* Release the spinlock and clear the exclusive monitor BEFORE the
      * stats-mode counter bump. Otherwise a sibling vCPU waiting on the lock
-     * pays for this vCPU's counter cache-line ping-pong while it spins -- the
+     * pays for this vCPU's counter cache-line ping-pong while it spins: the
      * counter write lands on a line the sibling does not need but the lock
      * holder does not release until after the bump. Bailing through
      * urandom_clrex_slow only clears the monitor and drops the lock; it does no
@@ -826,10 +1003,10 @@ getrandom_fast:
 
     /* Accept flags == 0 and flags == GRND_NONBLOCK (0x1); both behave
      * identically against our arc4random-backed ring (always non- blocking,
-     * always seeded). Any other bit set -- GRND_RANDOM (0x2), GRND_INSECURE
-     * (0x4), the invalid combination of the two, or any future kernel flag --
-     * falls through to sys_getrandom so the host preserves the full Linux
-     * contract (EINVAL on conflict, etc.).
+     * always seeded). Any other bit set (GRND_RANDOM 0x2, GRND_INSECURE 0x4,
+     * the invalid combination of the two, or any future kernel flag) falls
+     * through to sys_getrandom so the host preserves the full Linux contract
+     * (EINVAL on conflict, etc.).
      */
     cmp x16, #1
     b.hi handle_svc_0
@@ -935,11 +1112,10 @@ not_svc:
     cmp x10, #0x3C
     b.eq handle_brk
 
-    /* EC=0x25: Data abort taken without a change in Exception level. The only
-     * legitimate source today is the urandom fast path: a sibling vCPU can
-     * munmap the guest buffer between the AT probe and the EL1 strb, faulting
-     * the store. Recover by returning -EFAULT to the guest instead of halting
-     * the VM (which is what the EL1-from-EL1 default below would do).
+    /* EC=0x25: the urandom store or futex LDTR can fault after a sibling vCPU
+     * revokes the page.
+     *
+     * Return EFAULT rather than halting the VM.
      */
     cmp x10, #0x25
     b.eq handle_el1_data_abort_recover
@@ -953,22 +1129,47 @@ not_svc:
     b handle_el0_fault           /* EL0 (M=0): forward for signal delivery */
 
 /* handle_el1_data_abort_recover: tag a data abort whose faulting PC sits inside
- * the urandom-copy strb region as a recoverable EFAULT.
+ * the futex ldtr or the urandom-copy strb region as a recoverable EFAULT.
  *
  * Layout invariants exploited here:
  *   - SAVE_GPRS allocated 256 bytes for THIS (inner) entry on top of
  *     whatever the outer SVC entry already pushed. Dropping that 256
- *     puts SP at the recovery slot urandom_read_fast pushed before
- *     entering the strb region.
+ *     puts SP at the recovery slot the faulting fast path pushed before
+ *     entering its access (futex_wait_fast before the ldtr,
+ *     urandom_read_fast before the strb region).
  *   - Recovery slot is 16 bytes: [sp+0]=ELR_EL1, [sp+8]=SPSR_EL1.
- *   - The lock at TPIDR_EL1 + 0x10C0 is held by this vCPU at the
- *     time the strb faulted, so release before transferring out.
+ *   - The urandom range holds the lock at TPIDR_EL1 + 0x10C0 at the time the
+ *     strb faults, so that range releases it before transferring out. The
+ *     futex range holds no lock and no exclusive monitor, which is the whole
+ *     difference between the two tails below.
  *
- * If the fault PC is outside the urandom strb ranges this is a genuine shim
- * bug; fall back to restore_and_bad.
+ * If the fault PC is outside both the futex ldtr and the urandom strb ranges
+ * this is a genuine shim bug; fall back to restore_and_bad.
  */
 handle_el1_data_abort_recover:
     mrs x11, elr_el1
+    adr x12, futex_load_start
+    cmp x11, x12
+    b.lo 3f
+    adr x12, futex_load_end
+    cmp x11, x12
+    b.hs 3f
+
+    /* The futex load holds no lock or exclusive monitor. Its recovery slot is
+     * otherwise the same shape as urandom's: discard the nested exception
+     * frame, restore the SVC return state, and report Linux EFAULT. This is the
+     * only way the futex path reports EFAULT, since LDTR takes the EL0
+     * permission fault itself rather than being gated by a probe.
+     */
+    add sp, sp, #256
+    ldp x9, x10, [sp], #16
+    msr elr_el1, x9
+    msr spsr_el1, x10
+    mov x0, #-14
+    COUNTER_INC CB_FUTEX_EFAULT_HIT
+    b svc_restore_eret
+
+3:
     adr x12, urandom_strb_1byte_start
     cmp x11, x12
     b.lo 2f
@@ -1404,15 +1605,13 @@ tlbi_selective:
      * runs single-ASID at EL0, so just shift the VA right by 12. Issue all TLBI
      * ops, then DSB ISH + (conditional) IC IALLU + DSB + ISB.
      *
-     * Defensive: if x10 == 0, skip the loop. The per-vCPU host-side accumulator
-     * (cpu_tlbi_req in core/guest.h) never sets pages == 0 alongside kind ==
-     * TLBI_RANGE, but if a future helper bug or a stray write ever produced the
-     * pair X8=3, X10=0, the subs x12, x12, #1 below would underflow to
-     * 0xFFFFFFFFFFFFFFFF and the b.ne would loop ~2^64 iterations, hanging this
-     * vCPU. Cheap guard.
+     * The x10 == 0 guard is defensive. cpu_tlbi_req (core/guest.h) never pairs
+     * pages == 0 with TLBI_RANGE, but were X8=3, X10=0 ever to arrive, the subs
+     * below would underflow and the loop would run 2^64 times, hanging this
+     * vCPU.
      *
-     * x11 is the I-cache hint on entry but the per-page TLBI operand is also
-     * computed from x9 -- save the hint into x13 before clobbering.
+     * x11 arrives as the I-cache hint and x9 feeds the per-page operand, so
+     * save the hint into x13 before clobbering.
      */
     cbz x10, 1f
     mov x13, x11              /* x13 = saved I-cache hint */
@@ -1458,10 +1657,9 @@ svc_restore_eret:
      *
      * Named alias for the cross-function jump from the identity fast path in
      * svc_handler. A bare 'b 1f' from up there would resolve to the next
-     * forward '1:' -- which sits inside handle_inst_abort -- and silently
-     * re-route the identity result into a W^X toggle. Caught the hard way
-     * during the prior P2 attempt; keep the named symbol to make the intent
-     * explicit.
+     * forward '1:', which sits inside handle_inst_abort, and silently re-route
+     * the identity result into a W^X toggle. Caught the hard way during the
+     * prior P2 attempt; keep the named symbol to make the intent explicit.
      */
     RESTORE_GPRS_KEEP_X0
 

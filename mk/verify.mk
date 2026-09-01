@@ -317,8 +317,8 @@ VERIFY_FDSET_CLAIM := for ANY nfds, fd_set bit, or fd-table slot index
 VERIFY_FDSET_UNPROVED := the poll translation and the result writeback stay test-covered
 
 VERIFY_TIMESPEC_SRC  := src/proved/timespec.h
-VERIFY_TIMESPEC_FCTS := timespec_valid timespec_to_ns_sat timespec_to_poll_ms
-VERIFY_TIMESPEC_MIN_GOALS ?= 35
+VERIFY_TIMESPEC_FCTS := timespec_valid timespec_valid_capped timespec_to_ns_sat timespec_to_poll_ms
+VERIFY_TIMESPEC_MIN_GOALS ?= 45
 VERIFY_TIMESPEC_MODEL := typed
 VERIFY_TIMESPEC_SCAN := src/proved/timespec.h
 VERIFY_TIMESPEC_CLAIM := for ANY timespec a guest can write
@@ -339,6 +339,26 @@ VERIFY_ALIGN_MODEL := typed
 VERIFY_ALIGN_SCAN := src/proved/align.h
 VERIFY_ALIGN_CLAIM := for ANY address, alignment, and search window
 VERIFY_ALIGN_UNPROVED := the region-array walk around them stays test-covered
+
+VERIFY_FUTEXHASH_SRC  := src/proved/futexhash.h
+VERIFY_FUTEXHASH_FCTS := futex_bucket_index
+VERIFY_FUTEXHASH_MIN_GOALS ?= 3
+# typed: the arithmetic takes scalars only, no buffer and no aliasing question,
+# so nothing here needs a model that assumes separation it cannot check.
+VERIFY_FUTEXHASH_MODEL := typed
+VERIFY_FUTEXHASH_SCAN := src/proved/futexhash.h
+VERIFY_FUTEXHASH_CLAIM := for ANY guest futex address and ANY table size
+VERIFY_FUTEXHASH_UNPROVED := the queue walks around it stay test-covered
+
+VERIFY_FUTEXOP_SRC  := src/proved/futexop.h
+VERIFY_FUTEXOP_FCTS := futex_op_sign_extend12 futex_op_shift_arg_ok
+VERIFY_FUTEXOP_MIN_GOALS ?= 6
+# typed: scalar arithmetic on one guest-supplied word, no buffer and no
+# aliasing question.
+VERIFY_FUTEXOP_MODEL := typed
+VERIFY_FUTEXOP_SCAN := src/proved/futexop.h
+VERIFY_FUTEXOP_CLAIM := for ANY guest-supplied val3 word
+VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-covered
 
 VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
 VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop

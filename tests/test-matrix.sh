@@ -643,13 +643,15 @@ test_pipe()
 #
 # This is the full aarch64 unit-test surface: every tests/manifest.txt ("make
 # check") binary except the handful that assert elfuse-internal implementation
-# details with no meaningful counterpart on a real kernel (the EL1 shim
+# details with no meaningful counterpart on a real kernel (most of the EL1 shim
 # fast-path suite -- test-shim-* and test-shim-cred-race, which probe elfuse's
-# own shim_data block and identity cache -- test-mremap-infra, which guards
-# elfuse's guest-IPA infra reserve, and test-oom-proc, documented in its own
-# header). test-mremap-tail-emfile is listed here as an elfuse-lane regression
-# and marked QEMU_SKIP because its host-reserve assertion has no Linux analogue.
-# There is no "core" vs "extended" split here; everything below runs in both
+# own shim_data block and identity cache; test-shim-futex-fast is the exception
+# and does run here, because every assertion in it is plain Linux futex ABI that
+# a real kernel adjudicates (unlike test-mremap-infra, which guards elfuse's
+# guest-IPA infra reserve, and test-oom-proc, documented in its own header).
+# test-mremap-tail-emfile is listed here as an elfuse-lane regression and marked
+# QEMU_SKIP because its host-reserve assertion has no Linux analogue. There is
+# no "core" vs "extended" split here; everything below runs in both
 # elfuse-aarch64 and qemu-aarch64 modes, and genuine, understood divergences
 # from the qemu reference kernel are called out via QEMU_SKIP with a comment
 # rather than silently dropped from this list. The unit lane runs binaries this
@@ -878,7 +880,14 @@ run_unit_tests()
     printf "\nPI futex + EINTR regression\n"
     test_check "$runner" "test-futex-pi" "0 failed" "$bindir/test-futex-pi"
     test_rc "$runner" "test-futex-waitv" 0 "$bindir/test-futex-waitv"
+    test_rc "$runner" "test-futex-wake-op" 0 "$bindir/test-futex-wake-op"
+    test_rc "$runner" "test-futex-wake-nowaiter" 0 \
+        "$bindir/test-futex-wake-nowaiter"
+    test_rc "$runner" "test-futex-requeue-account" 0 \
+        "$bindir/test-futex-requeue-account"
     test_rc "$runner" "test-robust-futex" 0 "$bindir/test-robust-futex"
+    test_check "$runner" "test-shim-futex-fast" "OK" \
+        "$bindir/test-shim-futex-fast"
 
     printf "\nFD table race\n"
     test_rc "$runner" "test-fd-race" 0 "$bindir/test-fd-race"
@@ -1435,8 +1444,21 @@ run_suite()
 # operator with M3+ hardware updates the apple-m3-plus row in place when their
 # observed counts diverge. apple-unknown is the fallback row for SoC strings the
 # detector does not recognize yet.
+#
+# These are floors, not observed totals: a run with every fixture present passes
+# far more (271 on the machine that last raised this row), and the gap is the
+# suites that skip without their fixtures. Raise a row only for a test that runs
+# without fixtures, by the amount it adds.
+#
+# elfuse-aarch64 went 243 to 247 for test-shim-futex-fast, test-futex-wake-op,
+# test-futex-wake-nowaiter and test-futex-requeue-account, all built from
+# tests/, so they run in any checkout. qemu-aarch64 runs all four too and its
+# floor should be 229, but it is left at 225 deliberately: the qemu fixtures are
+# not present on the machine that made this change, so 229 would be a number
+# nobody observed. A floor too low costs nothing; an unobserved one asserts a
+# run that did not happen.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|243|0"
+    "elfuse-aarch64|247|0"
     "qemu-aarch64|225|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"

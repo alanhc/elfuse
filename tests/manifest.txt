@@ -63,6 +63,8 @@ test-shim-data-el1
 test-shim-urandom-smp
 test-shim-urandom-toctou
 test-shim-urandom-wrap
+test-shim-futex-fast
+test-shim-futex-toctou
 
 [section] I/O subsystem tests
 test-eventfd
@@ -152,6 +154,15 @@ test-futex-pi                  # diff=skip
 
 [section] futex_waitv (SYS 449) tests
 test-futex-waitv               # diff=skip
+
+[section] FUTEX_WAKE_OP operand decode
+test-futex-wake-op
+
+[section] FUTEX_WAKE with no waiter
+test-futex-wake-nowaiter
+
+[section] FUTEX_REQUEUE accounting
+test-futex-requeue-account
 
 [section] Robust futex tests
 test-robust-futex
