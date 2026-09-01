@@ -42,7 +42,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
-        test-usb-sysfs-overflow \
+        test-usb-sysfs-overflow test-dir-union-fd-reuse \
         test-sysroot-symlink-target \
         test-sysroot-name-i18n test-sysroot-name-length \
         test-sysroot-name-staged test-sysroot-name-race \
@@ -255,6 +255,7 @@ $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
+$(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
 $(call run-lane,test-fstatat-empty-path,AT_EMPTY_PATH stat by fd under a sysroot)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
@@ -1617,6 +1618,24 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 ## whole model is synthetic here.
 test-usb-sysfs-overflow: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
 	ELFUSE_USB_FIXTURE=overflow $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+
+## A union walk must answer for the directory it pinned, not the fd number
+# The window between pinning the stream and looking the backing up is far too
+# narrow to reach unaided, so ELFUSE_DIR_UNION_BACKING_DELAY_US widens it and
+# the guest closes the walked fd inside it. MARKER is planted in the sysroot's
+# /sys and nowhere in the synthetic tree, so its absence from a listing that
+# reported success is exactly the silent half-listing under test.
+test-dir-union-fd-reuse: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-union-fd-reuse
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker"; \
+	ELFUSE_DIR_UNION_BACKING_DELAY_US=20000 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-union-fd-reuse
+
 
 ## Run the absock derived-name unit test natively on the host
 test-absock-names-host: $(BUILD_DIR)/test-absock-names-host

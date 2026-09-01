@@ -224,7 +224,21 @@ static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
      */
     if (path_prefix_match(path, "/sys", 4) ||
         path_prefix_match(path, "/dev/bus", 8)) {
-        str_copy_trunc(out, path, out_size);
+        /* Refuse a name that does not fit rather than stamp a truncated one.
+         * The stamp is FD_VIRTUAL_PATH_MAX bytes and str_copy_trunc cuts
+         * silently, which for a long spelling ends the stamp mid-component --
+         * and every consumer then acts on that name as if it were whole: the
+         * relative-walk rebase resolves off a directory the guest never named,
+         * and getcwd and /proc/self/fd/N report it. No spelling the synthetic
+         * tree produces reaches the cap today (the longest canonical one is 47
+         * bytes for an interface attribute, and a deep hub chain adds a few),
+         * so this is the guard for the day one does: an unstamped descriptor
+         * loses an identity, a mis-stamped one invents a different one, and
+         * sys_fstatfs already recovers the sysfs answer from the descriptor
+         * itself when the stamp is absent.
+         */
+        if (str_copy_trunc(out, path, out_size) >= out_size)
+            return false;
         return true;
     }
 
@@ -343,6 +357,18 @@ static const char *proc_virtual_dir_path(const char *path,
  */
 typedef struct {
     DIR *dir;
+
+    /* Second stream, over the host/sysroot directory that backs the same guest
+     * name, for the synthetic directories that must extend their backing rather
+     * than replace it (see usb_sysfs_dir_unions_backing). Opened lazily, once,
+     * when the primary stream runs out, so a directory that is never read to
+     * the end never pays for it and a directory that has no backing never opens
+     * one. Guarded by `lock` along with the walk itself.
+     */
+    DIR *overlay;
+    bool overlay_tried; /* the lazy open has run; do not retry */
+    bool on_overlay;    /* the walk has moved to the overlay stream */
+
     pthread_mutex_t lock; /* Serializes the telldir/readdir/seekdir walk in
                            * sys_getdents64. The refcount below only pins the
                            * wrapper's lifetime; two guest threads issuing
@@ -406,6 +432,9 @@ void *dir_stream_open(int host_fd)
     }
 
     ds->dir = dir;
+    ds->overlay = NULL;
+    ds->overlay_tried = false;
+    ds->on_overlay = false;
     pthread_mutex_init(&ds->lock, NULL);
     ds->refcount = 1;
     return ds;
@@ -429,27 +458,47 @@ void dir_stream_ref_locked(void *ds_ptr)
 static void dir_stream_discard(void *ds_ptr)
 {
     dir_stream_t *ds = ds_ptr;
+    if (ds->overlay)
+        closedir(ds->overlay);
     closedir(ds->dir);
     pthread_mutex_destroy(&ds->lock);
     free(ds);
 }
 
 /* Pin fd's directory stream against a concurrent close()/dup2() so
- * sys_getdents64 can safely walk it.
+ * sys_getdents64 can safely walk it, and stamp the walk with the guest path
+ * that slot carried at the moment it was pinned.
+ *
+ * The stamp is copied out here, under the same fd_lock that proved the slot is
+ * this stream's, because it is the only moment at which the fd number and the
+ * stream are known to belong together. Everything the walk needs to know about
+ * the descriptor's identity therefore travels with the pinned stream instead of
+ * being re-read from fd_table[fd] later: a sibling's close()+open() can put a
+ * different file behind that number while this walk still holds the original
+ * stream, and a re-read would then union some other directory's backing into it
+ * -- or, when the number is merely closed, find no stamp at all and end the
+ * listing early with the backing half silently missing and success reported.
+ *
+ * @proc_path_out receives that stamp, empty when the slot carried none.
  *
  * Returns the pinned wrapper, or NULL if fd is not (or no longer) an open
  * FD_DIR. Balance every non-NULL return with dir_stream_release().
  */
-static dir_stream_t *dir_stream_acquire(int fd)
+static dir_stream_t *dir_stream_acquire(int fd,
+                                        char *proc_path_out,
+                                        size_t proc_path_sz)
 {
+    proc_path_out[0] = '\0';
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return NULL;
     pthread_mutex_lock(&fd_lock);
     dir_stream_t *ds = NULL;
     if (fd_table[fd].type == FD_DIR) {
         ds = (dir_stream_t *) fd_table[fd].dir;
-        if (ds)
+        if (ds) {
             ds->refcount++;
+            str_copy_trunc(proc_path_out, fd_table[fd].proc_path, proc_path_sz);
+        }
     }
     pthread_mutex_unlock(&fd_lock);
     return ds;
@@ -473,6 +522,8 @@ void dir_stream_release(void *ds_ptr)
     bool last = --ds->refcount == 0;
     pthread_mutex_unlock(&fd_lock);
     if (last) {
+        if (ds->overlay)
+            closedir(ds->overlay);
         closedir(ds->dir);
         pthread_mutex_destroy(&ds->lock);
         free(ds);
@@ -1967,6 +2018,77 @@ int64_t sys_close_range(unsigned int first,
 
 /* directory operations. */
 
+/* Widen the window between pinning the stream and looking the backing up, off
+ * unless ELFUSE_DIR_UNION_BACKING_DELAY_US is set to a positive microsecond
+ * count.
+ *
+ * The window is real but far too narrow to reach from a test: two threads
+ * hammering close and dup2 on the walked fd produced no cross-listing in 353k
+ * walks. What lives in it is a guest fd number that can be closed, or reopened
+ * onto a different file, while this walk still holds the stream that number
+ * used to name -- and the outcome that has to be pinned is that the walk keeps
+ * answering for the directory it pinned, rather than reading someone else's
+ * backing into it or quietly returning a listing missing its backing half.
+ * tests/test-dir-union-fd-reuse drives it. Read from the environment, with no
+ * effect at all when unset, like the ELFUSE_USB_FIXTURE hook in
+ * src/runtime/usb-sysfs.c.
+ */
+static void dir_backing_window_delay(void)
+{
+    static _Atomic long cached = -1; /* -1 = unread */
+    long v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (v < 0) {
+        const char *env = getenv("ELFUSE_DIR_UNION_BACKING_DELAY_US");
+        long long n = env ? strtoll(env, NULL, 10) : 0;
+        v = (n > 0 && n < 1000000) ? (long) n : 0;
+        atomic_store_explicit(&cached, v, memory_order_relaxed);
+    }
+    if (v > 0)
+        usleep((useconds_t) v);
+}
+
+/* Open the host/sysroot directory that backs the same guest name as @fd, for a
+ * synthetic directory whose listing has to extend its backing instead of
+ * replacing it.
+ *
+ * The backing is found from the descriptor's stamped guest path rather than
+ * remembered at open time, so a dup'd or fork-restored directory fd -- which
+ * gets a fresh stream over the same host descriptor and would otherwise lose
+ * the union -- resolves it the same way the original did.
+ *
+ * @guest_path is that stamp as dir_stream_acquire read it, not as fd_table
+ * holds it now. The distinction is the whole point: the stream this extends was
+ * pinned by fd number and can outlive the slot that number names, so the number
+ * must never be consulted again once the walk owns the stream.
+ *
+ * Returns the stream, or NULL when this directory has no union to do, when the
+ * backing does not exist (no sysroot, or a sysroot with no such directory), or
+ * when it cannot be opened. Every one of those is "nothing to add", so the
+ * caller simply finishes with the entries it already has.
+ */
+static DIR *dir_backing_stream(const char *guest_path)
+{
+    dir_backing_window_delay();
+    if (guest_path[0] != '/')
+        return NULL;
+    if (!usb_sysfs_dir_unions_backing(guest_path))
+        return NULL;
+
+    path_translation_t tx;
+    if (path_translate_at(LINUX_AT_FDCWD, guest_path, PATH_TR_NONE, &tx) < 0)
+        return NULL;
+    if (tx.fuse_path)
+        return NULL;
+
+    int host_fd = open(tx.host_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (host_fd < 0)
+        return NULL;
+    DIR *dir = fdopendir(host_fd);
+    if (!dir)
+        close_keep_errno(host_fd);
+    return dir;
+}
+
 /* getdents64: read directory entries from a guest directory fd. Uses the
  * persistent DIR* stored in fd_table (created by openat).
  */
@@ -1989,10 +2111,10 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     /* Pin the directory stream so a concurrent close()/dup2() cannot free it
      * while this call is still walking it -- see dir_stream_t in fs.c.
      */
-    dir_stream_t *ds = dir_stream_acquire(fd);
+    char walk_path[FD_VIRTUAL_PATH_MAX];
+    dir_stream_t *ds = dir_stream_acquire(fd, walk_path, sizeof(walk_path));
     if (!ds)
         return -LINUX_ENOTDIR;
-    DIR *dir = ds->dir;
 
     /* Serialize the walk against a concurrent getdents64 pinning the same
      * stream -- see the lock field in dir_stream_t.
@@ -2021,20 +2143,51 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
      */
     uint8_t entry_buf[DIRENT64_MAX_RECLEN];
 
-    /* One answer per call, not per entry: which side of the sysroot boundary
+    /* The walk runs over the primary stream and then, for a synthetic directory
+     * that has a backing, over the backing's own stream. `cur` is whichever one
+     * is being read; every telldir/readdir/seekdir below uses it, so a rewind
+     * always rewinds the stream the entry came from.
+     */
+    DIR *cur = ds->on_overlay && ds->overlay ? ds->overlay : ds->dir;
+
+    /* One answer per stream, not per entry: which side of the sysroot boundary
      * the stream reads from is a property of the directory.
      */
-    const bool dir_holds_escapes = path_dirent_dir_holds_escapes(dirfd(dir));
+    bool dir_holds_escapes = path_dirent_dir_holds_escapes(dirfd(cur));
 
     while (1) {
         /* Save position BEFORE readdir so getdents emulation can rewind if the
          * entry does not fit. macOS telldir returns an opaque cookie --
          * arithmetic on it (e.g. telldir()-1) is undefined.
          */
-        long saved_pos = telldir(dir);
-        de = readdir(dir);
-        if (!de)
-            break;
+        long saved_pos = telldir(cur);
+        de = readdir(cur);
+        if (!de) {
+            if (ds->on_overlay || ds->overlay_tried)
+                break;
+            ds->overlay_tried = true;
+            ds->overlay = dir_backing_stream(walk_path);
+            if (!ds->overlay)
+                break;
+            ds->on_overlay = true;
+            cur = ds->overlay;
+            dir_holds_escapes = path_dirent_dir_holds_escapes(dirfd(cur));
+            continue;
+        }
+
+        /* Deduplicate by name with the synthetic side winning, which is also
+         * what makes "." and ".." appear once. Asking the primary directory
+         * itself rather than remembering the names already emitted keeps the
+         * state out of the stream: the overlay is only ever read after the
+         * primary is exhausted, so a name that is in the primary has already
+         * been offered to the guest.
+         */
+        if (ds->on_overlay) {
+            struct stat dup_st;
+            if (fstatat(dirfd(ds->dir), de->d_name, &dup_st,
+                        AT_SYMLINK_NOFOLLOW) == 0)
+                continue;
+        }
 
         char guest_name[NAME_MAX + 1];
         int name_rc = path_translate_dirent_name(
@@ -2077,13 +2230,13 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         if (!dirent_record_bounds(name_len, guest_pos, count, &reclen,
                                   &pad_start)) {
             /* Entry does not fit; rewind so next call gets it */
-            seekdir(dir, saved_pos);
+            seekdir(cur, saved_pos);
             break;
         }
 
         linux_dirent64_t lde;
         lde.d_ino = de->d_ino;
-        lde.d_off = telldir(dir);
+        lde.d_off = telldir(cur);
         lde.d_reclen = (uint16_t) reclen;
         lde.d_type = de->d_type;
 
@@ -2179,6 +2332,44 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
             return linux_errno();
         proc_cwd_set_virtual(tx.guest_path);
         return 0;
+    }
+
+    /* The synthetic /sys and /dev/bus directories are reached by an intercept,
+     * never by the host walk: chdir(tx.host_path) looks for them in the sysroot
+     * or on the host, neither of which carries the tree, so chdir answered
+     * ENOENT for every directory open() and fchdir() both reach -- and reported
+     * ENOENT rather than ENOTDIR for the attributes and device nodes inside it.
+     * Route it through the same open the descriptor path uses so the three
+     * agree, and publish the descriptor's own guest spelling as the virtual
+     * cwd, which is what makes a chdir onto a `subsystem` link land where Linux
+     * lands rather than in the directory the link sits in.
+     *
+     * A name the intercept does not claim falls through to the host chdir
+     * below, unchanged.
+     */
+    if (tx.intercept_path &&
+        (path_prefix_match(tx.intercept_path, "/sys", 4) ||
+         path_prefix_match(tx.intercept_path, "/dev/bus", 8))) {
+        int host_fd =
+            proc_intercept_open(g, tx.intercept_path, LINUX_O_DIRECTORY, 0);
+        if (host_fd >= 0) {
+            char virt_buf[LINUX_PATH_MAX];
+            const char *virt_path = tx.intercept_path;
+            if (usb_sysfs_guest_path_for_fd(host_fd, virt_buf,
+                                            sizeof(virt_buf)) > 0)
+                virt_path = virt_buf;
+            int chdir_rc = fchdir(host_fd);
+            int saved_errno = errno;
+            close_keep_errno(host_fd);
+            if (chdir_rc < 0) {
+                errno = saved_errno;
+                return linux_errno();
+            }
+            proc_cwd_set_virtual(virt_path);
+            return 0;
+        }
+        if (host_fd == -1)
+            return linux_errno();
     }
 
     if (chdir(tx.host_path) < 0)
@@ -2950,13 +3141,27 @@ int64_t sys_faccessat(guest_t *g,
      * mode bits, not just path existence.
      */
     struct stat intercepted_st;
-    if (path_might_use_stat_intercept(tx.intercept_path) &&
-        proc_intercept_stat_at(tx.intercept_path, &intercepted_st,
-                               !(flags & LINUX_AT_SYMLINK_NOFOLLOW)) == 0) {
-        host_fd_ref_close(&dir_ref);
-        if (path_check_intercept_access(&intercepted_st, mode, flags) < 0)
+    if (path_might_use_stat_intercept(tx.intercept_path)) {
+        int intercepted =
+            proc_intercept_stat_at(tx.intercept_path, &intercepted_st,
+                                   !(flags & LINUX_AT_SYMLINK_NOFOLLOW));
+        if (intercepted == 0) {
+            host_fd_ref_close(&dir_ref);
+            if (path_check_intercept_access(&intercepted_st, mode, flags) < 0)
+                return linux_errno();
+            return 0;
+        }
+
+        /* An intercept that claimed the name and then failed is the answer.
+         * Only PROC_NOT_INTERCEPTED means "ask the backing": treating the
+         * failure as one too let access(2) answer OK from the host for a name
+         * whose open and stat both said ENOENT, so the three disagreed about
+         * the same path.
+         */
+        if (intercepted == -1) {
+            host_fd_ref_close(&dir_ref);
             return linux_errno();
-        return 0;
+        }
     }
 
     int mac_flags =
