@@ -80,7 +80,7 @@ INVENTORY = {
         "forbids",
         "The address-wait path plain FUTEX_WAIT takes; its deadline is " "relative.",
     ),
-    "runtime/futex.c::futex_wait": (
+    "runtime/futex.c::futex_wait_inner": (
         "forbids",
         "Relative FUTEX_WAIT has spent part of its timeout; FUTEX_WAIT_BITSET "
         "is absolute and stays restartable.",
@@ -307,7 +307,7 @@ INVENTORY = {
         "restartable",
         "Same shape as sys_wait4: the reap and WNOHANG answers precede this.",
     ),
-    "runtime/futex.c::futex_lock_pi": (
+    "runtime/futex.c::futex_lock_pi_inner": (
         "restartable",
         "The deadline is absolute and futex_unlock_pi zeroes the word rather "
         "than transferring ownership, so a restart re-CASes.",

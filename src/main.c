@@ -311,7 +311,7 @@ int main(int argc, char **argv)
                 "  -h, --help              Show this help and exit\n"
                 "  -V, --version           Show version and exit\n"
                 "  -v, --verbose           Trace each guest syscall\n"
-                "  --timeout N             Per-iteration vCPU run timeout "
+                "  --timeout N             vCPU watchdog period "
                 "(seconds, default 10; 0 disables)\n"
                 "  --sysroot PATH          Resolve absolute guest paths under "
                 "PATH first\n"

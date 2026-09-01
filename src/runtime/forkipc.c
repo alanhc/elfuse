@@ -958,11 +958,10 @@ static void *thread_create_and_run(void *arg)
 
     /* A PTRACE_INTERRUPT that raced this bring-up (arrived before the handle
      * was published) recorded a pending request it could not deliver via
-     * hv_vcpus_exit. Consume it under the same lock and self-kick below so the
-     * first hv_vcpu_run returns CANCELED into the ptrace-stop path.
+     * hv_vcpus_exit. Preserve that owed stop and self-kick below so the first
+     * hv_vcpu_run returns CANCELED into the ptrace-stop path.
      */
     bool ptrace_interrupt = t->ptrace_interrupt_pending;
-    t->ptrace_interrupt_pending = false;
     pthread_mutex_unlock(tlock);
     if (ptrace_interrupt)
         hv_vcpus_exit(&vcpu, 1);
@@ -1339,7 +1338,6 @@ static void *vm_clone_thread_run(void *arg)
      * thread_create_and_run. vm-clone children are the usual ptrace targets.
      */
     bool ptrace_interrupt = t->ptrace_interrupt_pending;
-    t->ptrace_interrupt_pending = false;
     pthread_mutex_unlock(tlock);
     if (ptrace_interrupt)
         hv_vcpus_exit(&vcpu, 1);

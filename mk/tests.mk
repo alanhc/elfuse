@@ -7,7 +7,7 @@
 # src/elfuse-limits.h.
 ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-nofile)
 
-.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox \
+.PHONY: test-hello test-all check check-syscall-coverage check-eintr-contract check-lock-order check-atomics check-skill-refs test-gdbstub test-coreutils test-busybox test-shim-futex-stats test-vcpu-watchdog \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -260,11 +260,13 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage check-eintr-contract ch
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	$(CHECK_SHARED_LANES)
 	$(call run-lane,test-sysroot-name-race,concurrent creation of colliding names)
+	$(call run-lane,test-vcpu-watchdog,vCPU watchdog kills a wedged guest)
 	$(call run-lane,test-sysroot-pathmax,guest paths at the host path ceiling)
 	$(call run-lane,test-sysroot-corpus,frozen on-disk spelling corpus)
 	$(call run-lane,test-sysroot-path-matrix,addressing modes agree across the path matrix)
 	$(call run-lane,test-usage-synopsis,usage synopsis renderings)
 	$(call run-lane,test-shebang-host,shebang parser unit test)
+	$(call run-lane,test-shim-futex-stats,futex EL1 fast path is live)
 	$(call run-lane,test-gva-contracts,proved/gva.h call-site contract checks)
 	$(call run-lane,test-proctitle-host,proctitle argv-tail regression)
 	$(call run-lane,test-proctitle-low-stack,proctitle low-stack regression)
@@ -1297,6 +1299,13 @@ $(BUILD_DIR)/busybox: | $(BUILD_DIR)
 	chmod 0755 "$@"; \
 	rm -rf "$$tmpdir"
 
+## Verify the futex EL1 fast path actually served the calls, via shim counters
+test-shim-futex-stats: $(ELFUSE_BIN) $(TEST_DIR)/test-shim-futex-fast \
+		$(TEST_DIR)/test-futex-wake-nowaiter
+	@bash tests/test-shim-futex-stats.sh $(ELFUSE_BIN) \
+		$(TEST_DIR)/test-shim-futex-fast \
+		$(TEST_DIR)/test-futex-wake-nowaiter
+
 ## Run busybox applet smoke tests
 test-busybox: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
 	@if [ ! -x "$(BUSYBOX_BIN)" ]; then \
@@ -1615,3 +1624,20 @@ test-shebang-host: $(BUILD_DIR)/test-shebang-host
 ## Run the proved/gva.h call-site precondition checks (skips without the flag)
 test-gva-contracts: $(BUILD_DIR)/test-gva-contracts
 	$(BUILD_DIR)/test-gva-contracts
+
+# The two fixtures are prerequisites only where the makefile can build them.
+# A prebuilt tree sets TEST_DEPS empty and points TEST_DIR at binaries it did
+# not compile, so naming them there asks make for files it has no rule to
+# produce and the lane dies before the script runs. The same shape guards
+# BENCH_GUARDRAIL_DEPS above. They stay out of tests/manifest.txt because that
+# file lists tests the matrix runs, and .ci/check-matrix-lists.sh fails on an
+# entry no test_* call registers: these two are fixtures the script drives, not
+# tests of their own.
+VCPU_WATCHDOG_DEPS := $(ELFUSE_BIN)
+ifndef GUEST_TEST_BINARIES
+  VCPU_WATCHDOG_DEPS += $(TEST_DIR)/spin-forever $(TEST_DIR)/test-sleep-long
+endif
+
+## Verify the vCPU watchdog still kills a wedged guest and spares a blocked one
+test-vcpu-watchdog: $(VCPU_WATCHDOG_DEPS)
+	@bash tests/test-vcpu-watchdog.sh $(ELFUSE_BIN) $(TEST_DIR)
