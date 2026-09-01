@@ -283,8 +283,10 @@ VERIFY_FUTEXDEADLINE_MODEL := typed
 VERIFY_FUTEXDEADLINE_SCAN := src/runtime/futex.c src/proved/timespec.h
 VERIFY_FUTEXDEADLINE_CLAIM := for ANY guest deadline and ANY cap the wait \
 paths hand it
-VERIFY_FUTEXDEADLINE_UNPROVED := the wait loops that consume the deadline, and \
-whether their callers honor these preconditions stay test-covered
+VERIFY_FUTEXDEADLINE_UNPROVED := futex_make_deadline, which reads the guest \
+timespec through guest_read_small and so has no body the analyzer can follow, \
+the wait loops that consume the deadline, and whether their callers honor \
+these preconditions stay test-covered
 
 VERIFY_SIGFRAME_SRC  := src/proved/sigframe.h
 VERIFY_SIGFRAME_FCTS := sigframe_base sigframe_fpsimd_vreg_offset
@@ -577,7 +579,7 @@ check-stub-constants:
 # proofs would still discharge, about a different program.
 check-stub-shadow:
 	$(Q)python3 scripts/check-stub-shadow.py --self-test
-	$(Q)python3 scripts/check-stub-shadow.py
+	$(Q)python3 scripts/check-stub-shadow.py --frama-c $(FRAMAC)
 
 verify:
 	+@$(MAKE) --no-print-directory \

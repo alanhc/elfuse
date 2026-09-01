@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import os
 import pathlib
 import re
 import subprocess
@@ -36,10 +37,10 @@ RENAME = re.compile(r"^#define\s+(\w+)\s+__fc_linux_\w+\s*$", re.M)
 INCLUDE_NEXT = re.compile(r"^#include_next\s+<([^>]+)>\s*$", re.M)
 
 
-def modeled_libc():
+def modeled_libc(framac):
     try:
         out = subprocess.run(
-            ["frama-c", "-print-share-path"],
+            [framac, "-print-share-path"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -66,6 +67,12 @@ def shadows():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
+    # mk/verify.mk lets FRAMAC name the binary the proofs run under, and this
+    # gate has to read that one's modeled libc. Probing a bare "frama-c" meant
+    # an override sent the proofs to one installation and this check to another,
+    # or to none: absent, it reports a clean skip, so the rename would go
+    # unchecked with nothing saying so.
+    ap.add_argument("--frama-c", default=os.environ.get("FRAMAC", "frama-c"))
     args = ap.parse_args()
 
     if args.self_test:
@@ -93,7 +100,7 @@ def main():
         print(f"  SHADOW   self-test: {len(cases) + 1} cases, all pass")
         return 0
 
-    libc = modeled_libc()
+    libc = modeled_libc(args.frama_c)
     if libc is None:
         print("  SHADOW   no frama-c; skipping (a run with it checks this)")
         return 0
