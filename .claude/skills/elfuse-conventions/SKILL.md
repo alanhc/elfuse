@@ -44,19 +44,29 @@ gate-protected the way a `src/` path is. Renaming it is a manual sweep.
 
 ## Style
 
-Source comments and commit messages are ASCII only, with no markdown syntax:
-no inline backticks, no non-ASCII arrows. Write code, path, and symbol
-references as plain text (EPOLL_CTL_MOD, tests/foo.c). Markdown files are
-exempt and use normal GitHub Markdown, so do not strip backticks out of a
-`.md` file in its name.
+Source comments and commit messages are ASCII, with no markdown syntax: no
+inline backticks, no non-ASCII arrows. Write code, path, and symbol references
+as plain text (EPOLL_CTL_MOD, tests/foo.c). Markdown files are exempt and use
+normal GitHub Markdown, so do not strip backticks out of a `.md` file in its
+name.
+
+One exception, in source only: a comment diagram may draw with the Box Drawing
+block (U+2500 to U+257F) and the four small triangle arrowheads (U+25B4,
+U+25B8, U+25BE, U+25C2). Eight files already do, and the diagrams are worth
+more than the rule they break. `make check-ascii` fails on every other
+non-ASCII character, so the rest of this is now a gate rather than a habit;
+`scripts/check-ascii.py --self-test` states the classes it catches.
 
 The em dash (U+2014) is banned on every surface, markdown included: comments,
 commit messages, `docs/`, these skill files, PR bodies, and review replies.
 In an otherwise-ASCII tree it is the clearest mark of machine-written prose,
-rejected on sight (PR#209). Write the character as its codepoint, never the
-glyph, so `grep -rnPI '\x{2014}'` stays a clean check; `-P` with the codepoint
-is required, since `grep $'\u2014'` matches nothing and reports a false
-all-clear.
+rejected on sight (PR#209). Two gates catch it: `make check-ascii` over the C
+sources, and `scripts/git-commit-msg.sh`, which requires a printable-ASCII
+commit message and which `scripts/check-commit-log.sh` runs over every commit
+in a PR. `docs/` and PR replies have no gate, so there it is still on the
+writer; write the character as its codepoint rather than the glyph when you
+have to name it, since a literal em dash in a grep pattern matches nothing and
+reports a false all-clear.
 
 A spaced double hyphen is not the way around it, on any of those surfaces.
 It carries the register the em dash carries, so a comment, a commit body, a

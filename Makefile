@@ -196,6 +196,12 @@ $(BUILD_DIR)/test-shebang-host: $(BUILD_DIR)/test-shebang-host.o \
 	@echo "  LD      $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^
 
+## Build the ELF header validation host test (native macOS binary)
+$(BUILD_DIR)/test-elf-headers-host: $(BUILD_DIR)/test-elf-headers-host.o \
+		$(BUILD_DIR)/core/elf.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
 ## Build the teardown live-worker accounting host unit test (native macOS binary)
 # Links the in-tree thread.o so the real thread_destroy_all_vcpus logic runs.
 # It drives only the worker branches (main vCPU passed as not-valid), so no
