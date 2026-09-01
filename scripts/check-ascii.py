@@ -30,14 +30,22 @@ ROOTS = ("src", "tests", "frama-c-stubs")
 SUFFIXES = (".c", ".h", ".S")
 
 
-def tracked_sources():
+def source_files():
+    """Every source under ROOTS, tracked or merely added but not ignored.
+
+    --others --exclude-standard is what check-commentflow.sh uses, and for the
+    same reason: a new file is untracked for as long as it takes to write it,
+    and a style gate that skips it locally only speaks up once the mistake is
+    already committed.
+    """
     out = subprocess.run(
-        ["git", "ls-files", "-z", "--", *ROOTS],
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+         "--", *ROOTS],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
-    return [p for p in out.split("\0") if p.endswith(SUFFIXES)]
+    return sorted({p for p in out.split("\0") if p.endswith(SUFFIXES)})
 
 
 def offenders(text):
@@ -116,7 +124,7 @@ def main():
     if args.self_test:
         return self_test()
 
-    paths = tracked_sources()
+    paths = source_files()
     bad = check(paths)
     if bad:
         print(f"\n{bad} non-ASCII character(s) outside the diagram set")
