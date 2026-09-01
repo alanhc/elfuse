@@ -46,10 +46,22 @@ skip=0
 # watchdog regression.
 require_timeout
 
+# The two guest fixtures are built from tests/ in a source checkout and are
+# simply absent from a prebuilt binary tree, which the makefile cannot compile
+# them into. Absent reads as a suite skip, the same answer require_timeout gives
+# for a missing timeout(1), rather than as a watchdog regression.
+for fixture in spin-forever test-sleep-long; do
+    if [ ! -x "$BINDIR/$fixture" ]; then
+        printf 'vCPU watchdog: %s is not in %s; skipping\n' "$fixture" "$BINDIR"
+        exit 77
+    fi
+done
+
 # 1. A spinning guest is killed, and the message says why. Under timeout,
 # because a broken watchdog means this guest never exits: the lane has to fail,
 # not hang. The cap is well past the two ticks detection needs, so it only fires
 # when the watchdog did not.
+test_host_busy_mark
 start=$(date +%s)
 out="$("$TIMEOUT" $((PERIOD * 5)) "$ELFUSE" --timeout "$PERIOD" \
     "$BINDIR/spin-forever" 2>&1 || true)"
@@ -69,15 +81,24 @@ fi
 # of slack is also thin: the observed time is 4 s of a 6 s bound on an idle
 # host, and this is a make check gate. A busy host turns that slack into a false
 # failure rather than a finding, so the bound stays tight and an overrun is
-# reported as a skip when the load explains it. test_host_is_busy is the same
-# predicate driver.sh and the throughput guardrail use.
+# reported as a skip when the load explains it. The load is sampled at the mark
+# before the timed run and again at the branch, because a host that was loaded
+# during the run and idle by the time the verdict is read would otherwise turn a
+# load artifact into a failure. driver.sh, test-sharun.sh and test-runner.sh use
+# the same pair for the same reason. Strictly above one period, not at or above
+# it. A kill on the first tick is the regression this bound exists to catch, and
+# it lands at exactly PERIOD, so the old "at or above" form could not fail:
+# every kill passes it. Two periods would be the exact expectation, but elapsed
+# is whole seconds from date(1), so a correct run that straddles a second
+# boundary can read one low; strictly-greater separates a first-tick kill from a
+# two-tick one with a full period of margin either side.
 max=$((PERIOD * 3))
-if [ "$elapsed" -ge "$PERIOD" ] && [ "$elapsed" -le "$max" ]; then
+if [ "$elapsed" -gt "$PERIOD" ] && [ "$elapsed" -le "$max" ]; then
     report_pass "killed within three periods"
-elif [ "$elapsed" -gt "$max" ] && test_host_is_busy; then
+elif [ "$elapsed" -gt "$max" ] && test_host_busy_since_mark; then
     report_skip "killed within three periods (${elapsed}s on a loaded host)"
 else
-    report_fail "killed within three periods (${elapsed}s outside [${PERIOD}, ${max}])"
+    report_fail "killed within three periods (${elapsed}s outside (${PERIOD}, ${max}])"
 fi
 
 # 2. A guest blocked in a host syscall for longer than a period survives: the

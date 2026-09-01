@@ -1625,7 +1625,19 @@ test-shebang-host: $(BUILD_DIR)/test-shebang-host
 test-gva-contracts: $(BUILD_DIR)/test-gva-contracts
 	$(BUILD_DIR)/test-gva-contracts
 
+# The two fixtures are prerequisites only where the makefile can build them.
+# A prebuilt tree sets TEST_DEPS empty and points TEST_DIR at binaries it did
+# not compile, so naming them there asks make for files it has no rule to
+# produce and the lane dies before the script runs. The same shape guards
+# BENCH_GUARDRAIL_DEPS above. They stay out of tests/manifest.txt because that
+# file lists tests the matrix runs, and .ci/check-matrix-lists.sh fails on an
+# entry no test_* call registers: these two are fixtures the script drives, not
+# tests of their own.
+VCPU_WATCHDOG_DEPS := $(ELFUSE_BIN)
+ifndef GUEST_TEST_BINARIES
+  VCPU_WATCHDOG_DEPS += $(TEST_DIR)/spin-forever $(TEST_DIR)/test-sleep-long
+endif
+
 ## Verify the vCPU watchdog still kills a wedged guest and spares a blocked one
-test-vcpu-watchdog: $(ELFUSE_BIN) $(TEST_DIR)/spin-forever \
-		$(TEST_DIR)/test-sleep-long
+test-vcpu-watchdog: $(VCPU_WATCHDOG_DEPS)
 	@bash tests/test-vcpu-watchdog.sh $(ELFUSE_BIN) $(TEST_DIR)
