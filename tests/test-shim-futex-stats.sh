@@ -66,6 +66,20 @@ check_positive()
     fi
 }
 
+check_zero()
+{
+    local name value
+    name="$1"
+    value=$(counter "$name" "${2:-$stats}")
+    if [ "$value" = "missing" ]; then
+        report_fail "$name absent from the shim-stats dump"
+    elif [ "$value" -ne 0 ]; then
+        report_fail "$name is $value, expected 0 while the path is off"
+    else
+        report_pass "$name = 0"
+    fi
+}
+
 # Two mismatched untimed waits are served at EL1. The tagged-address and
 # matching-word cases decline on shape, and the matching-word case blocks.
 check_positive FUTEX_EAGAIN_HIT
@@ -76,11 +90,13 @@ check_positive FUTEX_MATCH_BAIL
 # exception frame by hand. The guest's three unresolvable addresses drive it.
 check_positive FUTEX_EFAULT_HIT
 
-# The wake path serves the shape that a real contended workload actually
-# produces, so a dispatch that stops reaching it costs more than the wait path
-# does. Its bail counter moves too, because the guest parks a waiter.
-check_positive FUTEX_WAKE_HIT "$wake_stats"
-check_positive FUTEX_WAKE_WAITER_BAIL "$wake_stats"
+# The wake path is routed to the host for now, so its counters stay at zero: the
+# shim declines both wake shapes until the published census is known never to
+# understate what is parked. See the comment at the dispatch in core/shim.S.
+# Asserting zero rather than deleting the check, so that turning the path back
+# on fails here and the assertion has to be restored with it.
+check_zero FUTEX_WAKE_HIT "$wake_stats"
+check_zero FUTEX_WAKE_WAITER_BAIL "$wake_stats"
 
 report_summary
 if [ "$fail" -ne 0 ]; then

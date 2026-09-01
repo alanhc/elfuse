@@ -554,10 +554,28 @@ futex_wait_fast:
     and w15, w14, #0x7f               /* FUTEX_CMD_MASK, pinned in futex.c */
     cmp w15, #0                       /* FUTEX_WAIT */
     b.eq futex_wait_shape
+
+    /* The wake shapes go to the host, for now. The zero-count answer below is
+     * sound only while the published census never understates what is parked,
+     * and it does: under ELFUSE_CONTRACT_ASSERT, tests/test-signal-in-shim
+     * reaches futex_wake with a bucket whose census reads 0 while a waiter is
+     * parked on it. Measured, the unaccounted waiter is always in the Darwin
+     * address-wait population rather than the bucket chain (chain=0 osync=1),
+     * so a publication path around futex_os_sync_wait is what is missing.
+     *
+     * Serving a wake from a stale zero loses that wakeup, which is the one
+     * error this path is not allowed to make: issue #315 named it as the
+     * difference between costing a round trip and hanging a guest. A wasted HVC
+     * is the safe direction, so take it until the invariant holds.
+     *
+     * The census itself stays. It is what the wake path will read once the
+     * missing publication is found, and the contract assert is what will say
+     * so. Restoring these two branches is the whole of turning it back on.
+     */
     cmp w15, #1                       /* FUTEX_WAKE */
-    b.eq futex_wake_shape
+    b.eq futex_shape_bail
     cmp w15, #10                      /* FUTEX_WAKE_BITSET */
-    b.eq futex_wakebs_shape
+    b.eq futex_shape_bail
     cmp w15, #9                       /* FUTEX_WAIT_BITSET */
     b.ne futex_shape_bail
     ldr w16, [sp, #40]                /* val3 = bitset */
