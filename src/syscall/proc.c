@@ -1920,9 +1920,11 @@ int64_t sys_ptrace(guest_t *g,
          * fast path, and stopping there snapshots shim scratch as the guest's
          * registers (thread_ptrace_stop reads the live set) and discards
          * whatever the tracer writes back, since the shim restores its own
-         * frame over it. The two places that can read the guest's state
-         * honestly consume the flag instead: the HVC #5 epilogue, and the
-         * canceled-exit handler once it has established the vCPU is at EL0.
+         * frame over it. The HVC #5 epilogue consumes the flag and then either
+         * stops right there, on the tails whose live registers are already the
+         * final EL0 set, or asks the shim through X7 to restore the frame and
+         * come back at HVC #13. The canceled-exit handler consumes it once it
+         * has established the vCPU is at EL0.
          *
          * Attention goes up before the kick, the same order
          * shim_globals_raise_attention uses and for the same reason: a fast
@@ -3867,28 +3869,13 @@ static bool vcpu_handle_el0_fault(guest_t *g,
     return sig_ret >= 0;
 }
 
-static void ptrace_attention_owed(thread_entry_t *t, void *opaque)
-{
-    if (t->ptrace_interrupt_pending)
-        *(bool *) opaque = true;
-}
-
-/* Take the ptrace-stop this thread is owed, if any, and inject whatever signal
- * the tracer resumed it with.
- *
- * Both callers reach here only where the guest's registers are the live set:
- * the HVC #5 epilogue, which runs with the syscall frame still architectural,
- * and the canceled-exit handler after it has established EL0. That is the whole
- * point of routing PTRACE_INTERRUPT through a flag rather than acting on the
- * kick where it lands, which can be anywhere inside the shim.
- *
- * Returns false when the tracer resumed with a signal whose delivery failed,
- * which is the caller's cue to stop running.
+/* Consume this thread's owed stop. The pending scan and attention clear share
+ * thread_lock with PTRACE_INTERRUPT so a racing request cannot lose its hint.
  */
-static bool ptrace_take_owed_stop(guest_t *g, hv_vcpu_t vcpu, int *exit_code)
+static bool ptrace_consume_owed_stop(guest_t *g)
 {
     if (!current_thread)
-        return true;
+        return false;
 
     pthread_mutex_t *tlock = thread_get_lock();
     pthread_mutex_lock(tlock);
@@ -3896,28 +3883,39 @@ static bool ptrace_take_owed_stop(guest_t *g, hv_vcpu_t vcpu, int *exit_code)
                 current_thread->ptraced && !current_thread->ptrace_stopped;
     if (owed)
         current_thread->ptrace_interrupt_pending = false;
+    if (owed && !thread_ptrace_interrupt_pending_locked())
+        shim_globals_ptrace_attention(g, false);
     pthread_mutex_unlock(tlock);
 
-    if (!owed)
-        return true;
+    return owed;
+}
 
-    /* Dropped before the stop, not after: thread_ptrace_stop blocks until the
-     * tracer resumes, and holding the hint up for that whole time would make
-     * every other thread's fast paths bail for as long as a human is looking at
-     * a register dump. Keep it raised while another thread still owes a stop.
-     */
-    bool attention_owed = false;
-    thread_for_each(ptrace_attention_owed, &attention_owed);
-    if (!attention_owed)
-        shim_globals_ptrace_attention(g, false);
+/* Set where the syscall epilogue asks the shim for the HVC #13 detour, cleared
+ * where that detour arrives. Per-vCPU like cpu_tlbi_req and for the same
+ * reason: the thread that arms it is the thread that takes the stop.
+ *
+ * The window between the two is the X7 test, the frame restore, and the HVC,
+ * with nothing else reachable in between. A canceled exit can land there, and
+ * the flag has to survive that, which is why it is not cleared per exit; the
+ * canceled handler sees EL1 in CPSR and resumes into the same window. No other
+ * HVC is reachable from the SVC tail, and EL0 cannot issue one at all, so an
+ * unarmed HVC #13 means the shim and this file disagree.
+ */
+static _Thread_local bool cpu_ptrace_stop_armed;
 
+/* Take a consumed ptrace-stop and inject the tracer's resume signal. Every
+ * caller has already consumed the stop, which establishes current_thread.
+ */
+static bool ptrace_take_stop(guest_t *g, hv_vcpu_t vcpu, int *exit_code)
+{
     int cont_sig = thread_ptrace_stop(current_thread, SIGTRAP);
-    if (cont_sig > 0) {
+    if (cont_sig > 0)
         signal_queue(cont_sig);
-        if (signal_deliver(vcpu, g, exit_code) < 0)
-            return false;
-    }
-    return true;
+
+    /* One delivery covers both the injected resume signal and anything that
+     * arrived while the tracee was stopped, so neither caller repeats it.
+     */
+    return !signal_pending() || signal_deliver(vcpu, g, exit_code) >= 0;
 }
 
 /* What a run-loop exit handler tells the loop to do next. VCPU_RESUME means the
@@ -3943,6 +3941,84 @@ typedef enum {
  * signal delivery both skip themselves once something has failed) and a caller
  * flag would not be visible to them.
  */
+
+/* Finish an HVC #5 return: take or defer any owed ptrace-stop, deliver pending
+ * signals, and place the shim's X7 detour request.
+ *
+ * Returns whether the guest keeps running.
+ */
+static bool syscall_return_epilogue(guest_t *g,
+                                    hv_vcpu_t vcpu,
+                                    int ret,
+                                    bool running,
+                                    int *exit_code)
+{
+    /* Whether the shim's tail restores the saved frame is what decides if X7 is
+     * host-only. The vector entry clobbers no GPR below X9, so the live set at
+     * HVC #5 is still the guest's, and only that restore puts a host write to
+     * X7 back. Two tails skip it: X8 == 2, where the host has rebuilt EL0 state
+     * and the live registers are already final, and an execve re-entry, which
+     * goes through the MMU-off _start with no tail at all.
+     *
+     * Only the exec-happened return has to ask the vCPU which of those it is.
+     * Everywhere else tlbi_request_emit_to_vcpu has just written X8 itself and
+     * never writes 2, so the answer is known without the register read.
+     */
+    bool frame_restored = ret != SYSCALL_EXEC_HAPPENED;
+    bool regs_final = false;
+    if (!frame_restored) {
+        uint64_t x8_req = 0;
+        hv_vcpu_get_reg(vcpu, HV_REG_X8, &x8_req);
+        regs_final = x8_req == 2; /* rt_sigreturn, as against execve */
+    }
+
+    /* An execve re-entry leaves the stop owed rather than consuming it: there
+     * is no tail to carry X7, and stopping on the MMU-off bootstrap state would
+     * show the tracer an EL1 PC. Attention stays raised, so the new image's
+     * first syscall takes it.
+     */
+    bool defer_stop = false, stop_taken = false;
+    if (running && (frame_restored || regs_final) &&
+        ptrace_consume_owed_stop(g)) {
+        if (regs_final) {
+            /* Live registers are already the architectural EL0 set, which is
+             * what the detour exists to produce. Stop here instead.
+             */
+            running = ptrace_take_stop(g, vcpu, exit_code);
+            stop_taken = true;
+        } else {
+            defer_stop = true;
+        }
+    }
+
+    /* Deliver pending signals after each syscall. A deferred stop takes its
+     * signal in the HVC #13 handler, once the shim has restored the frame.
+     * signal_deliver is a once-per-epilogue call by its own contract: it walks
+     * past discarded signals to the first the guest can see, and a second call
+     * here would stack a frame on the handler the first one just installed.
+     * ptrace_take_stop has already made that call on the inline path.
+     */
+    if (running && !defer_stop && !stop_taken && signal_pending()) {
+        int sig_ret = signal_deliver(vcpu, g, exit_code);
+        if (sig_ret < 0)
+            running = false; /* Default TERM/CORE disposition */
+        else if (sig_ret > 0)
+            frame_restored = false; /* committed to a handler frame: X8 = 2 */
+    }
+
+    /* X7 asks the shim to restore its SVC frame and enter HVC #13 for this
+     * stop. Written only on the tails that do restore the frame, which put the
+     * guest's own X7 back before the ERET. The flag beside it is what lets the
+     * HVC #13 arm say a stop was actually asked for.
+     */
+    if (frame_restored) {
+        hv_vcpu_set_reg(vcpu, HV_REG_X7, defer_stop);
+        cpu_ptrace_stop_armed = defer_stop;
+    }
+
+    return running;
+}
+
 static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
                                                 hv_vcpu_t vcpu,
                                                 const hv_vcpu_exit_t *vexit,
@@ -4011,22 +4087,7 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
                     (unsigned long long) tblocked, signal_pending());
             }
 
-            /* Take any ptrace-stop owed to this thread. Here rather than where
-             * the PTRACE_INTERRUPT kick landed, because the kick can land at
-             * EL1 in the shim and the guest's registers are only the live set
-             * on this path. Before signal delivery, so a tracer that resumes
-             * with a signal sees it delivered on top of the state it just
-             * inspected.
-             */
-            if (running && !ptrace_take_owed_stop(g, vcpu, exit_code))
-                running = false;
-
-            /* Deliver pending signals after each syscall */
-            if (running && signal_pending()) {
-                int sig_ret = signal_deliver(vcpu, g, exit_code);
-                if (sig_ret < 0)
-                    running = false; /* Default TERM/CORE disposition */
-            }
+            running = syscall_return_epilogue(g, vcpu, ret, running, exit_code);
 
             /* After exec, verify critical registers before resuming vCPU. This
              * closes any gap where signal delivery or other code between
@@ -4109,6 +4170,24 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
             vcpu_handle_sysinstr_trap(vcpu, verbose, prefix);
             break;
         }
+
+        case 13:
+            /* Only the epilogue above arms this. Without the check a detour
+             * nobody asked for would park the thread in thread_ptrace_stop
+             * waiting on a tracer that will never CONT it: a silent hang
+             * instead of a report.
+             */
+            if (!cpu_ptrace_stop_armed) {
+                log_fatal("%s: HVC #13 with no ptrace stop armed", prefix);
+                crash_report(vcpu, g, CRASH_UNEXPECTED_HVC,
+                             "HVC #13 without an armed ptrace stop");
+                *exit_code = 128;
+                running = false;
+                break;
+            }
+            cpu_ptrace_stop_armed = false;
+            running = ptrace_take_stop(g, vcpu, exit_code);
+            break;
 
         case 2: {
             running = vcpu_handle_bad_exception(g, vcpu, prefix, exit_code);
@@ -4300,8 +4379,8 @@ static vcpu_action_t vcpu_handle_canceled_exit(guest_t *g,
      * either HVC #5 or an ERET to EL0, the fast paths test attention on entry,
      * futex_wait_fast re-tests it inside its spin, and both the signal and
      * ptrace kicks raise attention before kicking. So the work lands a
-     * microsecond later at HVC #5, where the epilogue does it on the path built
-     * for it.
+     * microsecond later at HVC #5, which restores the frame before HVC #13
+     * takes the stop.
      */
     uint64_t cur_cpsr = 0;
     hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cur_cpsr);
@@ -4323,7 +4402,7 @@ static vcpu_action_t vcpu_handle_canceled_exit(guest_t *g,
      * brought the vCPU here may not be the one that owes it, and the flag is
      * what says whether anything is owed at all.
      */
-    if (!ptrace_take_owed_stop(g, vcpu, exit_code))
+    if (ptrace_consume_owed_stop(g) && !ptrace_take_stop(g, vcpu, exit_code))
         return VCPU_STOP;
 
     /* rseq preemption abort: mirrors Linux rseq_ip_fixup() on context switch.

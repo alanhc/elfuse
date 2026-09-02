@@ -137,6 +137,25 @@ static void exec_republish_shim_globals_or_die(hv_vcpu_t vcpu,
     shim_globals_rebuild_urandom_bitmap();
     shim_globals_refill_urandom_ring(g);
     shim_globals_recompute_attention(g);
+
+    /* The ptrace lane is not part of the recompute above, which owns only the
+     * signal lane, so shim_globals_init's memset is otherwise the last word on
+     * it. Restate it from the live thread table instead of inheriting a zero.
+     *
+     * No test covers this and none can today, which is worth saying plainly
+     * rather than leaving as an apparent gap: after a successful execve no
+     * tracer is left to observe the lane. thread_exec_de_thread has removed
+     * every CLONE_THREAD sibling, and an execve with a live CLONE_VM child is
+     * refused with ENOSYS well before this point, so the scan can only answer
+     * false and the memset already wrote that. What this buys is that the
+     * post-exec value is stated where the other lanes are stated, instead of
+     * being a consequence of a memset elsewhere continuing to be correct. It
+     * starts carrying weight the moment a tracer can outlive an exec.
+     */
+    pthread_mutex_t *tlock = thread_get_lock();
+    pthread_mutex_lock(tlock);
+    shim_globals_ptrace_attention(g, thread_ptrace_interrupt_pending_locked());
+    pthread_mutex_unlock(tlock);
 }
 
 /* Release the buffers and temporary host-side files that sys_execve allocates
