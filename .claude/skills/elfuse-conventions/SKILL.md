@@ -1,6 +1,6 @@
 ---
 name: elfuse-conventions
-description: elfuse conventions that CONTRIBUTING.md does not carry: the register a comment or commit message is written in, comment brevity, the type and return conventions at the ABI boundary, how shared mutable state is declared and which memory order a site states, PR etiquette, the untracked root working docs, and the rule that a tool checked out for evaluation never becomes a build dependency. Use when drafting a commit message or PR description, adding a new file or a new type, touching an atomic or a lock-free access, or wiring the build to anything a fresh clone would not have.
+description: elfuse conventions outside CONTRIBUTING.md. Use when adding, reviewing, or reducing prose in source comments, docstrings, README.md, or docs/*.md; drafting a commit message, PR description, or review reply; adding a file or type; touching an atomic or lock-free access; handling untracked working docs; or wiring the build to a tool absent from a fresh clone.
 ---
 
 # elfuse conventions
@@ -87,6 +87,10 @@ prompt echo, effort claims, inflation words, coined vocabulary, trailing
 `references/prose-register.md` before writing a comment block, a commit body,
 a PR reply, or a paragraph of `docs/`, and treat it as the one place those
 classes are defined.
+
+When a prose task extends beyond a local sentence, read
+`references/prose-reduction.md` to decide what survives and where it belongs.
+The register reference above still settles how each survivor is written.
 
 Comments and commit messages are third-person: name the subject (the caller,
 this function) or use imperative phrasing.
@@ -269,14 +273,15 @@ block and rewrite what no longer reads cleanly.
 Mechanics: `/* */` only in `.c`, `.h`, and `.S`, no `//`, no Doxygen tags;
 multi-line blocks align on ` * `, close with `*/` on its own line, indented
 to the body; American English; `@name` references a parameter in prose. A
-new file opens with title, copyright, SPDX identifier, a blank `*` line,
-then one prose paragraph on what the module is for (`src/syscall/signal.h`
-is the model). `#` comments in shell, Python, and Make obey the same rules.
-Update or delete a comment in the commit that changes its code: a stale
-comment is worse than none, because it is believed. A comment asserting a
-number or a guarantee is the case that rots silently, so recompute it before
-carrying it into an edit; `elfuse-refactor` reads the same rule from the
-reviewer's side.
+new file follows the surrounding legal-header form. Omit a title or synopsis
+when the filename, module name, primary type, or entry point already states
+it. Keep one short module paragraph only for a stable file-wide constraint
+with no narrower owner. `#` comments in shell, Python, and Make obey the same
+content rules. Update or delete a comment in the commit that changes its code:
+a stale comment is worse than none, because it is believed. A comment
+asserting a number or a guarantee is the case that rots silently, so recompute
+it before carrying it into an edit; `elfuse-refactor` reads the same rule from
+the reviewer's side.
 
 ## docs/
 

@@ -1,6 +1,6 @@
 ---
 name: elfuse-refactor
-description: Judging and cleaning elfuse C code that already works - which Refactoring smells carry weight in a Linux ABI reimplementation, which ones are false alarms in this tree, and what has to stay green before a change counts as behavior-preserving. Use when asked to clean up, simplify, deduplicate, or restructure, when reviewing a diff for maintainability rather than for bugs, or on the symptom alone: an over-long function, the same cleanup block repeated at many failure exits, a helper that returns 0 or -1 and is read with a < 0 test, a comment asserting a number. Not for adding a syscall (elfuse-syscall), for naming and commit style (elfuse-conventions), or for chasing a live failure (elfuse-debug).
+description: Behavior-preserving cleanup of elfuse code, calibrated for C-specific smells and false alarms. Use when simplifying, deduplicating, or restructuring working code; reviewing maintainability; or facing an over-long function, repeated cleanup, a 0/-1 helper used as a boolean, or prose that narrates code or asserts a number. Not for syscall implementation (elfuse-syscall), naming or commit style (elfuse-conventions), or live failures (elfuse-debug).
 ---
 
 # Refactoring elfuse code
@@ -109,15 +109,12 @@ Three cases where "I only moved code" is wrong:
   `src/syscall/abi.h` with a name, and the domain file uses the name.
 - A helper that returns 0 or -1 and is only ever read with `< 0`. That is a
   `bool` wearing an `int`, and `elfuse-conventions` says which is which.
-- A comment that asserts a number or a guarantee. Both rot silently and both
-  read as checked. A comment saying a buffer is "~100KiB" when the type it
-  sizes has since grown, or saying a check "has to be declared in the diff"
-  when `WarningsAsErrors` is empty and the CI job logs rather than gates, is
-  worse than no comment: the next reader trusts it instead of measuring. When
-  a refactor moves a comment, its claims move with it unverified, so recompute
-  the number and re-read the config the sentence describes. This is the same
-  failure `scripts/check-skill-refs.py` exists to catch in the skills, and
-  nothing catches it in `src/`.
+- A comment or docstring that narrates working code or asserts a number or
+  guarantee. Restatements hide rationale, and unchecked claims rot. Recompute
+  the claim, then apply the deletion pass in
+  `.claude/skills/elfuse-conventions/references/prose-reduction.md`. A Python
+  docstring is runtime data, so rule out introspection consumers before
+  deleting it.
 
 ## Smells that are false alarms in this tree
 
