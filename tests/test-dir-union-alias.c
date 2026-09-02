@@ -51,6 +51,13 @@
  * was given a fresh, undrained union state over a primary it also re-read, so
  * the child drained the backing and emitted names the parent still held.
  *
+ * One fork state is not asserted, because this cannot deliver it: a parent that
+ * closes its copy of the fd before the backing has been drained takes the
+ * backing half with it, and the child answers with its primary alone. That row
+ * is measured and printed as an XFAIL carrying both values -- Linux's and this
+ * build's -- rather than left out of the lane; see case_fork_cross_close for
+ * why it is recorded in both directions and what the two rows separate.
+ *
  * Both fixtures are several hundred names wide, and that is load-bearing. An
  * earlier revision of this lane staged three names a side, and scored 22 of 22
  * on a build that loses a whole host block: at three names the whole listing
@@ -81,6 +88,12 @@
 #include "test-harness.h"
 
 int passes = 0, fails = 0;
+
+/* Cases that neither passed nor failed: a measured divergence from Linux this
+ * build knowingly keeps, printed with both values. Counted so the summary says
+ * one is there instead of leaving a row that only reads as absent.
+ */
+static int xfails = 0;
 
 /* The union root: a /sys the USB layer synthesizes and the sysroot also has.
  * Staged several hundred names wide on the sysroot side, so the backing half is
@@ -337,9 +350,21 @@ static bool partial_read(int src, names_t *ns)
  * Written with write(2) rather than stdio because the child leaves through
  * _exit and an unflushed buffer would report an empty listing as a real one.
  */
-static void fork_child_report(int src, int out) __attribute__((noreturn));
-static void fork_child_report(int src, int out)
+static void fork_child_report(int src, int out, int gate)
+    __attribute__((noreturn));
+static void fork_child_report(int src, int out, int gate)
 {
+    /* When a gate is given, the case being walked is one whose state the parent
+     * establishes after the fork, so the child must not read before it is told.
+     * A byte on the gate is that permission; a closed gate (EOF) means the
+     * parent gave up, and the child reads anyway rather than hanging.
+     */
+    if (gate >= 0) {
+        char go;
+        read(gate, &go, 1);
+        close(gate);
+    }
+
     names_t got = {0};
     bool ok = drain(src, &got);
     for (int i = 0; i < got.count; i++) {
@@ -436,7 +461,7 @@ static void case_alias(const char *dir,
         }
         if (child == 0) {
             close(pipefd[0]);
-            fork_child_report(src, pipefd[1]);
+            fork_child_report(src, pipefd[1], -1);
         }
         close(pipefd[1]);
         bool child_ok = fork_collect(pipefd[0], &got);
@@ -528,6 +553,255 @@ static void case_cross_close(const char *dir, const char *what)
     }
 }
 
+/* The one state this cannot deliver whole, recorded rather than asserted.
+ *
+ * A child whose parent closes its copy of the fd before either side has drained
+ * the backing answers with its primary alone: the backing half belongs to the
+ * parent's stream (see dir_stream_open_inherited in src/syscall/internal.h) and
+ * that stream is gone, while the block the parent's own open() read ahead went
+ * with it. Linux keeps position and listing in the open file description, so
+ * the close costs the child nothing and it reads the directory whole.
+ *
+ * It is reported the way tests/usb-sysfs-matrix-vectors.h reports its
+ * escape-syn column: the measured Linux value is carried here as data and
+ * printed as an XFAIL beside what elfuse answers, rather than deleted from the
+ * lane. So a change in either direction shows up as a diff in the lane's output
+ * -- a child that started draining its own backing would move the elfuse number
+ * up, a widening loss would move it down -- while neither counts as a pass nor
+ * turns the lane red. The value elfuse gives today is carried too, and a
+ * departure from it is called out on the same line; nothing else in this lane
+ * holds that side.
+ *
+ * Both rows are load-bearing, because neither number alone separates the three
+ * answers. Measured here by putting each of the other two back at the one site
+ * that chooses between them, dir_stream_open_inherited: with the child allowed
+ * to drain a backing of its own -- what 54cd91e does -- the plain row still
+ * reads 354 and the union row moves to 404; with the child's stream handed back
+ * already at the end of its listing -- what 27ee83a does -- the union row still
+ * reads 0 and the plain row moves to 0. So the pair, plain 354 with union 0, is
+ * this build's answer and neither other's, and the two rows together pin the
+ * middle course between delivering the backing twice and delivering nothing.
+ *
+ * Linux side measured in docker (gcc 14.4, Linux 6.19 aarch64) over this same
+ * sequence on directories staged with this lane's two widths: the child gets
+ * all 403 names of the plain fixture and all 405 of the union's. elfuse side
+ * measured on macOS 15.6, APFS.
+ */
+static void case_fork_cross_close(const char *dir,
+                                  int linux_names,
+                                  int recorded,
+                                  const char *what)
+{
+    TEST(what);
+    names_t ref = {0};
+    if (!reference(dir, &ref)) {
+        FAIL("could not read the reference listing");
+        return;
+    }
+    if (ref.count < MIN_REFERENCE_NAMES) {
+        fprintf(stderr, "  %d names, want at least %d\n", ref.count,
+                MIN_REFERENCE_NAMES);
+        FAIL("the fixture is too narrow to show a lost host block");
+        return;
+    }
+
+    int src = open(dir, O_RDONLY | O_DIRECTORY);
+    if (src < 0) {
+        FAIL("could not open the directory");
+        return;
+    }
+    int pipefd[2], gate[2];
+    if (pipe(pipefd) < 0) {
+        close(src);
+        FAIL("could not open the pipe the child reports over");
+        return;
+    }
+    if (pipe(gate) < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(src);
+        FAIL("could not open the gate the child waits on");
+        return;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        close(gate[0]);
+        close(gate[1]);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(src);
+        FAIL("could not fork");
+        return;
+    }
+    if (child == 0) {
+        close(pipefd[0]);
+        close(gate[1]);
+        fork_child_report(src, pipefd[1], gate[0]);
+    }
+    close(pipefd[1]);
+    close(gate[0]);
+
+    /* The state being measured: the parent's copy is gone before the child has
+     * read anything, and the gate is what makes that an order rather than a
+     * race.
+     */
+    close(src);
+    ssize_t told = write(gate[1], "g", 1);
+    close(gate[1]);
+
+    names_t got = {0};
+    bool child_ok = fork_collect(pipefd[0], &got);
+    int status = 0;
+    waitpid(child, &status, 0);
+    if (told != 1 || !child_ok || got.overflow) {
+        FAIL("the child's walk did not end on a well-formed stream");
+        return;
+    }
+
+    xfails++;
+    printf("XFAIL: Linux %d, elfuse %d%s\n", linux_names, got.count,
+           got.count == recorded ? "" : " -- the recorded value moved");
+    if (got.count != recorded)
+        fprintf(stderr, "  recorded %d, now %d\n", recorded, got.count);
+}
+
+/* Two aliases inside the child, which is the dimension every case above misses:
+ * they all put the second fd on one side of the fork or the other, and this one
+ * carries a pair of aliases across it together.
+ *
+ * The parent opens the directory and dups it, so both descriptors name one open
+ * file description before the fork. The child inherits both. Nothing about
+ * elfuse's fork rebuild makes that pair share a wrapper on its own -- each
+ * inherited descriptor arrives over SCM_RIGHTS on its own, and building a
+ * stream for each gives the child two locks, two DIR* read-ahead buffers and
+ * two positions over one description -- so the child's second alias came back
+ * holding names the first had never delivered, and the first had ended at a
+ * clean 0 before them.
+ *
+ * What is asserted is the alias property, not a count: after the child has
+ * drained the first alias to its end, the second delivers nothing, and no name
+ * arrives twice. Both halves hold on Linux for any pair of fds on one
+ * description, so neither needs measuring; the count the child reaches is the
+ * inherited-stream loss the fork cross-close row already records, and is
+ * deliberately not asserted here.
+ *
+ * The plain fixture only. The union fixture's child answers with nothing at all
+ * (see case_fork_cross_close), so both halves would hold vacuously there.
+ */
+static void case_child_aliases(const char *dir, const char *what)
+{
+    TEST(what);
+    int src = open(dir, O_RDONLY | O_DIRECTORY);
+    if (src < 0) {
+        FAIL("could not open the directory");
+        return;
+    }
+    int alias = dup(src);
+    if (alias < 0) {
+        close(src);
+        FAIL("could not dup the directory fd");
+        return;
+    }
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        close(alias);
+        close(src);
+        FAIL("could not open the pipe the child reports over");
+        return;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        close(alias);
+        close(src);
+        FAIL("could not fork");
+        return;
+    }
+    if (child == 0) {
+        close(pipefd[0]);
+
+        /* First alias to its end, then the second. The marker between them is
+         * what lets the parent tell which side a name came from; a name after
+         * it is a name the first alias's end-of-listing had already denied.
+         */
+        names_t first = {0}, second = {0};
+        bool ok = drain(src, &first);
+        ok = drain(alias, &second) && ok;
+        for (int i = 0; i < first.count; i++)
+            dprintf(pipefd[1], "%s\n", first.name[i]);
+        dprintf(pipefd[1], "#split\n");
+        for (int i = 0; i < second.count; i++)
+            dprintf(pipefd[1], "%s\n", second.name[i]);
+        dprintf(pipefd[1], "%s\n",
+                ok && !first.overflow && !second.overflow ? "#ok" : "#broke");
+        _exit(0);
+    }
+    close(pipefd[1]);
+
+    /* The parent's copies go away: it never reads, and holding them would leave
+     * the child's answer depending on when they closed.
+     */
+    close(alias);
+    close(src);
+
+    names_t first = {0}, second = {0};
+    FILE *f = fdopen(pipefd[0], "r");
+    if (!f) {
+        close(pipefd[0]);
+        FAIL("could not read the child's report");
+        return;
+    }
+    char line[NAME_CAP + 8];
+    bool split = false, verdict = false, spoke = false;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (!strcmp(line, "#split")) {
+            split = true;
+            continue;
+        }
+        if (!strcmp(line, "#ok")) {
+            verdict = true;
+            spoke = true;
+            continue;
+        }
+        if (!strcmp(line, "#broke")) {
+            spoke = true;
+            continue;
+        }
+        names_add(split ? &second : &first, line);
+    }
+    fclose(f);
+    int status = 0;
+    waitpid(child, &status, 0);
+
+    if (!spoke || !verdict || !split || first.overflow || second.overflow) {
+        FAIL("the child's walk over the pair did not end well-formed");
+        return;
+    }
+    if (first.count < MIN_REFERENCE_NAMES) {
+        fprintf(stderr, "  the child's first alias delivered %d names\n",
+                first.count);
+        FAIL("the fixture is too narrow to split at a host block boundary");
+        return;
+    }
+
+    const char *twice = NULL;
+    for (int i = 0; i < second.count && !twice; i++)
+        if (names_count_of(&first, second.name[i]))
+            twice = second.name[i];
+    if (second.count) {
+        fprintf(stderr,
+                "  the first alias ended at 0 with %d names, then the second "
+                "delivered %d more (%s%s)\n",
+                first.count, second.count, second.name[0],
+                twice ? ", and repeated one" : "");
+        FAIL("the child's two aliases split one listing between them");
+    } else {
+        PASS();
+    }
+}
+
 typedef struct {
     route_t route;
     const char *name;
@@ -539,7 +813,10 @@ static const route_desc_t routes[] = {
     {ROUTE_FORK, "fork"},
 };
 
-static void run_dir(const char *dir, const char *kind)
+static void run_dir(const char *dir,
+                    const char *kind,
+                    int linux_names,
+                    int recorded)
 {
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         char what[64];
@@ -551,6 +828,8 @@ static void run_dir(const char *dir, const char *kind)
     char what[64];
     snprintf(what, sizeof(what), "%s cross-close", kind);
     case_cross_close(dir, what);
+    snprintf(what, sizeof(what), "%s fork cross-close", kind);
+    case_fork_cross_close(dir, linux_names, recorded, what);
 }
 
 int main(void)
@@ -558,9 +837,18 @@ int main(void)
     printf(
         "test-dir-union-alias: an alias shares one position and one union\n\n");
 
-    run_dir(PLAIN_DIR, "plain");
-    run_dir(UNION_DIR, "union");
+    /* The two numbers each row carries: what Linux answers, and what this build
+     * answers. Both measured -- see case_fork_cross_close.
+     */
+    run_dir(PLAIN_DIR, "plain", 403, 354);
+    run_dir(UNION_DIR, "union", 405, 0);
+    case_child_aliases(PLAIN_DIR, "plain two aliases inside the child");
 
     SUMMARY("test-dir-union-alias");
+    if (xfails)
+        printf(
+            "%d expected failure%s printed above, neither passed nor "
+            "failed\n",
+            xfails, xfails == 1 ? "" : "s");
     return fails == 0 ? 0 : 1;
 }
