@@ -162,6 +162,90 @@ static void translate_statfs(const struct statfs *mac, linux_statfs_t *lin)
     lin->f_frsize = mac->f_bsize;
 }
 
+/* Stat the descriptor an *at-style call names with AT_EMPTY_PATH and an empty
+ * path.
+ *
+ * The empty path names the descriptor rather than anything beneath it, so it
+ * resolves nothing and must be answered before a resolver ever sees it. A
+ * resolver measures a relative name against dirfd, and the empty path is
+ * relative, so it owes ENOTDIR for a dirfd that is not a directory -- correct
+ * for a name, wrong for the descriptor itself, and glibc has spelled fstat(fd)
+ * as fstatat(fd, "", AT_EMPTY_PATH) since 2.33. sys_fchmodat and sys_fchownat
+ * short-circuit ahead of translation for the same reason.
+ *
+ * The order mirrors sys_fstat, since this answers the same question: the FUSE
+ * shim first, because a FUSE descriptor is answered by the emulation layer
+ * rather than by a host file; then the /proc intercept, which an O_PATH
+ * descriptor needs because its host fd cannot be stat'ed for the emulated
+ * object; then the host.
+ *
+ * sys_fstat calls this rather than keeping a body of its own, since glibc's
+ * spelling makes this the form most fstat() calls arrive in and there is no
+ * second policy worth having. The classification and the descriptor come from
+ * one fd_lock window here, so a sibling thread cannot close and reuse the slot
+ * between the two: answering the /proc intercept for one object and then
+ * stat'ing another is what separate reads allow.
+ *
+ * AT_FDCWD is not handled here -- it names the current directory, which always
+ * has a base path to resolve against, so the caller keeps answering it the way
+ * Linux specifies it.
+ *
+ * Returns 0 on success or a negative Linux errno.
+ */
+static int64_t stat_empty_path_fd(int dirfd, struct stat *mac_st)
+{
+    int frc = fuse_fstat_fd(dirfd, mac_st);
+    if (frc == 0)
+        return 0;
+    if (frc != -LINUX_EBADF)
+        return frc;
+
+    fd_entry_t snap;
+    host_fd_ref_t ref = HOST_FD_REF_INIT;
+    if (thread_is_single_active()) {
+        /* No sibling can mutate the slot, so the pin has nothing to defend
+         * against and the snapshot alone is already consistent -- the rule
+         * fd_block_state states for the same reason. A closed slot, or one
+         * carrying no host descriptor, is the EBADF that fd_to_host would have
+         * reported on this path before.
+         */
+        if (!fd_snapshot(dirfd, &snap) || snap.host_fd < 0)
+            return -LINUX_EBADF;
+        ref.fd = snap.host_fd;
+    } else {
+        /* Pin, not dup: the descriptor has to stay valid across the stat, not
+         * become private, and retiring a dup would drop the guest's record
+         * locks on the file (fcntl(2)).
+         */
+        if (fd_host_ref_acquire(dirfd, &snap, &ref.lifetime) < 0)
+            return linux_errno(); /* EBADF or ENOMEM; the helper picks. */
+        ref.fd = snap.host_fd;
+    }
+
+    int64_t rc = 0;
+    if (snap.type == FD_PATH && snap.proc_path[0] != '\0') {
+        /* The descriptor already names one object: an O_PATH open that followed
+         * refers to the target, one made with O_NOFOLLOW to the link itself, so
+         * the open's flag is what selects here.
+         */
+        bool follow = !(snap.linux_flags & LINUX_O_NOFOLLOW);
+        int intercepted =
+            proc_intercept_stat_at(snap.proc_path, mac_st, follow);
+        if (intercepted == 0)
+            goto done;
+        if (intercepted == -1) {
+            rc = linux_errno();
+            goto done;
+        }
+    }
+    if (fstat(ref.fd, mac_st) < 0)
+        rc = linux_errno();
+
+done:
+    host_fd_ref_close(&ref);
+    return rc;
+}
+
 /* Resolve the directory + path arguments of a *at-style stat operation and fill
  * *mac_st via the appropriate host call (proc intercept where applicable).
  * Shared by sys_newfstatat and sys_statx; the caller copies the result into the
@@ -191,6 +275,10 @@ static int64_t stat_at_path(guest_t *g,
     if (guest_read_path(g, path_gva, short_path, sizeof(short_path), path,
                         sizeof(path), &pathp) < 0)
         return -LINUX_EFAULT;
+
+    if ((flags & LINUX_AT_EMPTY_PATH) && pathp[0] == '\0' &&
+        dirfd != LINUX_AT_FDCWD)
+        return stat_empty_path_fd(dirfd, mac_st);
 
     if (pathp[0] == '/' && fuse_path_matches_mount(pathp)) {
         int frc = fuse_stat_path(pathp, mac_st, flags);
@@ -224,46 +312,15 @@ static int64_t stat_at_path(guest_t *g,
     host_fd_ref_t dir_ref = HOST_FD_REF_INIT;
     if ((flags & LINUX_AT_EMPTY_PATH) && pathp[0] == '\0') {
         /* Linux: AT_EMPTY_PATH with dirfd == AT_FDCWD operates on the current
-         * working directory.
+         * working directory. Every other descriptor was answered by
+         * stat_empty_path_fd above, before anything tried to resolve the empty
+         * path against it.
          */
-        if (dirfd == LINUX_AT_FDCWD) {
-            dir_ref.fd = AT_FDCWD;
-            int mac_flags = translate_at_flags(flags);
-            if (fstatat(AT_FDCWD, ".", mac_st, mac_flags) < 0) {
-                rc = linux_errno();
-                goto done;
-            }
-        } else {
-            /* Pin, not dup: fstatat needs the descriptor to stay valid, not to
-             * be private, and retiring a dup would drop the guest's record
-             * locks on the file (fcntl(2)).
-             */
-            fd_entry_t snap;
-            if (fd_host_ref_acquire(dirfd, &snap, &dir_ref.lifetime) < 0) {
-                /* EBADF or ENOMEM; the helper distinguishes them. */
-                rc = linux_errno();
-                goto done;
-            }
-            dir_ref.fd = snap.host_fd;
-            if (snap.type == FD_PATH && snap.proc_path[0] != '\0') {
-                /* The descriptor already names one object: an O_PATH open that
-                 * followed refers to the target, one made with O_NOFOLLOW to
-                 * the link itself, so the open's flag is what selects here.
-                 */
-                bool follow = !(snap.linux_flags & LINUX_O_NOFOLLOW);
-                int intercepted =
-                    proc_intercept_stat_at(snap.proc_path, mac_st, follow);
-                if (intercepted == 0)
-                    goto done;
-                if (intercepted == -1) {
-                    rc = linux_errno();
-                    goto done;
-                }
-            }
-            if (fstat(dir_ref.fd, mac_st) < 0) {
-                rc = linux_errno();
-                goto done;
-            }
+        dir_ref.fd = AT_FDCWD;
+        int mac_flags = translate_at_flags(flags);
+        if (fstatat(AT_FDCWD, ".", mac_st, mac_flags) < 0) {
+            rc = linux_errno();
+            goto done;
         }
     } else {
         int64_t ref_err = host_dirfd_ref_open(dirfd, &dir_ref);
@@ -305,52 +362,20 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
      * from it.
      */
     struct stat mac_st = {0};
-    int frc = fuse_fstat_fd(fd, &mac_st);
-    if (frc == 0) {
-        if (write_linux_stat(g, stat_gva, &mac_st) < 0)
-            return -LINUX_EFAULT;
-        return 0;
-    }
-    if (frc != -LINUX_EBADF)
-        return frc;
 
-    fd_entry_t snap;
-    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH &&
-        snap.proc_path[0] != '\0') {
-        /* As in stat_at_path's AT_EMPTY_PATH branch: the open already chose
-         * between the link and its target, so replay that choice here.
-         */
-        bool follow = !(snap.linux_flags & LINUX_O_NOFOLLOW);
-        int intercepted =
-            proc_intercept_stat_at(snap.proc_path, &mac_st, follow);
-        if (intercepted == 0) {
-            if (write_linux_stat(g, stat_gva, &mac_st) < 0)
-                return -LINUX_EFAULT;
-            return 0;
-        }
-        if (intercepted == -1)
-            return linux_errno();
+    /* fstat(fd) and fstatat(fd, "", AT_EMPTY_PATH) are the same question --
+     * glibc has spelled the first as the second since 2.33 -- so they are
+     * answered by one body rather than two that can drift.
+     */
+    int64_t rc = stat_empty_path_fd(fd, &mac_st);
+    if (rc < 0) {
+        log_debug("fstat(%d): failed rc=%lld", fd, (long long) rc);
+        return rc;
     }
 
-    host_fd_ref_t host_ref;
-    int64_t ref_err = host_fd_ref_open(fd, &host_ref);
-    if (ref_err < 0) {
-        log_debug("fstat(%d): invalid guest fd", fd);
-        return ref_err;
-    }
-    if (fstat(host_ref.fd, &mac_st) < 0) {
-        log_debug("fstat(%d->%d): host fstat failed errno=%d", fd, host_ref.fd,
-                  errno);
-        host_fd_ref_close(&host_ref);
-        return linux_errno();
-    }
-
-    if (write_linux_stat(g, stat_gva, &mac_st) < 0) {
-        host_fd_ref_close(&host_ref);
+    if (write_linux_stat(g, stat_gva, &mac_st) < 0)
         return -LINUX_EFAULT;
-    }
 
-    host_fd_ref_close(&host_ref);
     return 0;
 }
 

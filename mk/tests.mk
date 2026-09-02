@@ -28,6 +28,7 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-procfs-exec test-sysroot-fd-magiclink \
         test-timeout-disable test-launch-flags \
         test-fuse-alpine \
+        test-fstatat-empty-path \
         test-sysroot-nofollow test-sysroot-chdir test-sysroot-symlink-escape \
         test-sysroot-dotdot test-sysroot-openat2-walk \
         test-sysroot-inotify-names test-sysroot-exec-names \
@@ -249,6 +250,7 @@ $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
+$(call run-lane,test-fstatat-empty-path,AT_EMPTY_PATH stat by fd under a sysroot)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
 $(call run-lane,test-sysroot-name-i18n,non-ASCII guest filenames)
@@ -343,6 +345,17 @@ test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 		printf "$(RED)FAIL$(RESET) rename escaped sysroot to host /tmp\n"; \
 		exit 1; \
 	fi
+
+## AT_EMPTY_PATH names the descriptor rather than a name under it, so it has to
+## be answered before anything resolves against dirfd. Only a sysroot run puts
+## a resolver in front of it, which is why this lane exists next to the matrix
+## registration: without --sysroot the empty path never reaches the code that
+## used to fail it, and the test passes without proving anything.
+test-fstatat-empty-path: $(ELFUSE_BIN) $(BUILD_DIR)/test-fstatat-empty-path
+	@tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$tmpdir/tmp"; \
+	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-fstatat-empty-path
 
 test-sysroot-nofollow: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-nofollow
 	@tmpdir=$$(mktemp -d); \
