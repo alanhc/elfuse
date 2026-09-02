@@ -227,7 +227,7 @@ seven commit-message rules the log is written to.
 Two things settle most review comments before they are written:
 
 ```sh
-make indent        # apply every formatter, comment reflow included
+make indent        # clang-format and comment reflow (FORMAT_SHELL/FORMAT_PY add the rest)
 make check-format  # verify without rewriting
 ```
 
