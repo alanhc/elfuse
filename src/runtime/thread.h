@@ -566,6 +566,10 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
                            int options);
 
 /* Get the thread table mutex (needed for ptrace wait blocking). */
+/*@
+  ensures \valid(\result);
+  assigns \nothing;
+ */
 pthread_mutex_t *thread_get_lock(void);
 
 /* Snapshot every active guest stack range overlapping [start, end), then record
