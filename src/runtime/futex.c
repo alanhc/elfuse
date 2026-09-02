@@ -42,6 +42,7 @@
 #include "debug/log.h"
 #include "proved/futexhash.h"
 #include "proved/futexop.h"
+#include "proved/futexreq.h"
 #include "proved/timespec.h"
 
 /* macOS 14.4+ ships os_sync_{wait_on_address_with_timeout,wake_by_address_any}
@@ -1409,10 +1410,10 @@ static int64_t futex_requeue(guest_t *g,
                              int do_cmp,
                              uint32_t expected)
 {
-    /* Linux refuses these before taking either key. Both arrive as uint32_t, so
-     * the guest's sign survives only as the top bit.
+    /* Linux refuses these before taking either key; proved/futexreq.h carries
+     * why the sign is only visible as the top bit here.
      */
-    if ((int32_t) wake_count < 0 || (int32_t) requeue_count < 0)
+    if (!futex_requeue_counts_valid(wake_count, requeue_count))
         return -LINUX_EINVAL;
 
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
@@ -1452,7 +1453,7 @@ static int64_t futex_requeue(guest_t *g,
      * summed in 64 bits: both halves are guest-supplied and wake-all passes
      * INT_MAX.
      */
-    uint64_t checked = (uint64_t) wake_count + requeue_count;
+    uint64_t checked = futex_requeue_budget(wake_count, requeue_count);
     for (futex_waiter_t *w = b_src->head; w && checked != 0; w = w->next) {
         if (w->uaddr != uaddr)
             continue;
