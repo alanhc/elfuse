@@ -354,6 +354,7 @@ aligned address from the `Rt` register); HVF traps DC ZVA via `HCR_EL2.TDZ=1`.
 | #10 | BRK from EL0 | SIGTRAP delivery / ptrace-stop; GPRs in frame |
 | #11 | EL0 fault | SIGSEGV/SIGILL delivery; GPRs in frame |
 | #12 | EL0 system-instruction trap | cache maintenance logging (DC CVAU, IC IVAU, …) and `MSR TPIDR_EL0` emulation |
+| #13 | Ptrace interrupt | the shim restores the saved SVC frame before this stop, so ptrace snapshots architectural registers |
 
 ### Critical Vector-Entry Rule
 
@@ -790,7 +791,12 @@ In `src/syscall/proc.c`:
 - `PTRACE_SEIZE` -- attach without stopping; sets `ptraced = 1`.
 - `PTRACE_CONT` -- resume the stopped tracee, optionally injecting a signal.
 - `PTRACE_INTERRUPT` -- force the tracee into ptrace-stop via
-  `hv_vcpus_exit()`.
+  `hv_vcpus_exit()`. A stop taken on a syscall return whose tail restores the
+  saved SVC frame goes through HVC #13, so ptrace snapshots the architectural
+  GPR set rather than shim scratch. The tails that rebuild EL0 state instead
+  (`X8 = 2`) already hold that set live, so the host stops on them directly;
+  an `execve` re-entry leaves the stop owed for the new image's first
+  syscall.
 - `PTRACE_GETREGSET` / `PTRACE_SETREGSET` (`NT_PRSTATUS`) -- read or write
   the tracee's register snapshot. Writes are applied on resume.
 

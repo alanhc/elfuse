@@ -30,6 +30,7 @@
  *                          tail preserves X0/X1/X2/X30 so signal_deliver's
  *                          register writes survive.
  *   #12  System instr trap cache maintenance logging (DC CVAU, IC IVAU, ...)
+ *   #13  Ptrace interrupt  GPRs restored from HVC #5's saved SVC frame
  *
  * X8 on return from #5, the post-syscall request:
  *   0  no flush
@@ -41,6 +42,16 @@
  *   4  single-shot TLBI RVAE1IS (FEAT_TLBIRANGE), operand pre-encoded in X9 as
  *      baddr | NUM<<39 | SCALE<<44 | TTL<<37 | ASID<<48 (SCALE, TTL and ASID
  *      are all 0 today)
+ *
+ * X7 on return from #5 is the ptrace-stop request, read on every tail that
+ * restores the saved frame, which is all of them but X8 == 2: non-zero means
+ * take HVC #13 after the restore, so the tracer sees the architectural GPR set
+ * rather than shim scratch. The host leaves X7 alone on the X8 == 2 tail, which
+ * never restores the frame and would carry the flag into EL0 as guest state; it
+ * takes that stop itself, where the live registers are already final. A tail
+ * that skips the X7 test drops a stop the host has already consumed, so new
+ * exits from the dispatch below go through svc_hvc_restore_eret, never straight
+ * to svc_restore_eret.
  *
  * X11 is the I-cache hint, read for X8 in {1, 3, 4}: 1 issues IC IALLU after
  * the TLBI because the change made new content executable, 0 skips it. X8 == 2
@@ -1708,7 +1719,7 @@ handle_svc_0:
     /* Dispatch on X8. Encoded so the common case (X8 == 0, no flush) hits the
      * cbz fast path; the other branches sort by frequency thereafter.
      */
-    cbz x8, 1f
+    cbz x8, svc_hvc_restore_eret
     cmp x8, #1
     b.eq tlbi_full
     cmp x8, #3
@@ -1736,7 +1747,7 @@ tlbi_full:
     dsb ish
 .Ltlbi_full_skip_ic:
     isb
-    b svc_restore_eret
+    b svc_hvc_restore_eret
 
 tlbi_selective:
     /* Selective TLBI VAE1IS loop.
@@ -1755,7 +1766,7 @@ tlbi_selective:
      * x11 arrives as the I-cache hint and x9 feeds the per-page operand, so
      * save the hint into x13 before clobbering.
      */
-    cbz x10, 1f
+    cbz x10, svc_hvc_restore_eret
     mov x13, x11              /* x13 = saved I-cache hint */
     /* TLBI VAE1IS operand: VA[55:12] held in bits [43:0]. ubfx pins the 44-bit
      * width so future LPA2 / TTL / tagged-address support cannot leak VA bits
@@ -1773,7 +1784,7 @@ tlbi_selective:
     dsb ish
 .Ltlbi_sel_skip_ic:
     isb
-    b svc_restore_eret
+    b svc_hvc_restore_eret
 
 tlbi_range_large:
     /* Single-shot TLBI RVAE1IS (FEAT_TLBIRANGE, ARMv8.4+). The host has encoded
@@ -1790,24 +1801,46 @@ tlbi_range_large:
     dsb ish
 .Ltlbi_rvae_skip_ic:
     isb
-    b svc_restore_eret
+    b svc_hvc_restore_eret
 
 svc_restore_eret:
-1:
     /* Restore all guest registers except X0, which now holds the syscall return
      * value. Linux preserves X1-X30, including X8.
      *
-     * Named alias for the cross-function jump from the identity fast path in
-     * svc_handler. A bare 'b 1f' from up there would resolve to the next
-     * forward '1:', which sits inside handle_inst_abort, and silently re-route
-     * the identity result into a W^X toggle. Caught the hard way during the
-     * prior P2 attempt; keep the named symbol to make the intent explicit.
+     * Named target for every jump that lands here, and deliberately without a
+     * numeric label. A bare 'b 1f' from the identity fast path in svc_handler
+     * would resolve to the next forward '1:', which sits inside
+     * handle_inst_abort, and silently re-route the identity result into a W^X
+     * toggle. Caught the hard way during the prior P2 attempt; a numeric label
+     * on this line invites the same accident from the other direction, since a
+     * '1f' anywhere in the SVC tail would reach it and skip the X7 test.
      */
     RESTORE_GPRS_KEEP_X0
 
     /* Return to EL0. X0 now holds the syscall return value, X1-X30 retain their
      * original EL0 values.
      */
+    eret
+
+svc_hvc_restore_eret:
+    cbz x7, svc_restore_eret
+
+    /* Restore the saved SVC frame before stopping, so ptrace snapshots and
+     * restores the architectural GPR set rather than shim scratch.
+     */
+    RESTORE_GPRS_KEEP_X0
+    hvc #13
+
+    /* The frame is gone, so there is no scratch register left to decode an X8
+     * request with. Flush unconditionally: a ptrace-stop has already cost a
+     * tracer round trip, and this is what covers anything the host touched
+     * while the tracee was stopped.
+     */
+    tlbi vmalle1is
+    dsb ish
+    ic iallu
+    dsb ish
+    isb
     eret
 
 exec_drop_frame:

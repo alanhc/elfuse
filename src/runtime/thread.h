@@ -178,9 +178,11 @@ typedef struct thread_entry {
                                        * shim, where the live registers are shim
                                        * scratch and a stop would show the tracer
                                        * those instead of the guest's. Consumed
-                                       * where the state is readable: the HVC #5
-                                       * epilogue, or the canceled-exit handler
-                                       * once it has established EL0. A vCPU
+                                       * in the HVC #5 epilogue, which then
+                                       * either stops in place or routes the
+                                       * stop through HVC #13, or by the
+                                       * canceled-exit handler once it has
+                                       * established EL0. A vCPU
                                        * still in bring-up (!vcpu_valid) cannot
                                        * be kicked at all and self-kicks at
                                        * publish. Under thread_lock.
@@ -364,6 +366,11 @@ uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t);
  * thread table lock during iteration.
  */
 void thread_for_each(void (*fn)(thread_entry_t *t, void *ctx), void *ctx);
+
+/* True when a tracee that can still consume one owes a PTRACE_INTERRUPT stop.
+ * An exited vm-clone is not one of those. Caller holds thread_lock.
+ */
+bool thread_ptrace_interrupt_pending_locked(void);
 
 /* Count active VM-clone threads (is_vm_clone && !vm_exited). Used to detect
  * when the last VM-clone child exits.
@@ -559,6 +566,10 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
                            int options);
 
 /* Get the thread table mutex (needed for ptrace wait blocking). */
+/*@
+  ensures \valid(\result);
+  assigns \nothing;
+ */
 pthread_mutex_t *thread_get_lock(void);
 
 /* Snapshot every active guest stack range overlapping [start, end), then record

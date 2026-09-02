@@ -310,8 +310,7 @@ int shim_globals_install_per_vcpu(hv_vcpu_t vcpu,
 void shim_globals_raise_attention(guest_t *g);
 
 /* Raise or drop the ptrace lane. Separate from the signal lane's
- * raise/recompute pair because nothing recomputes this one: the thread that
- * takes the stop is what drops it.
+ * raise/recompute pair because the thread consuming the stop drops it.
  */
 void shim_globals_ptrace_attention(guest_t *g, bool owed);
 void shim_globals_recompute_attention(guest_t *g);

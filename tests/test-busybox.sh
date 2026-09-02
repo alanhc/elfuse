@@ -260,7 +260,29 @@ run_check find "hello.txt" "$TMPDIR" "-name" "hello.txt"
 
 # Networking
 printf '\n%s── Networking ──%s\n' "$BLUE" "$RESET"
-run_check nslookup "Address" "example.com"
+
+# nslookup queries live DNS, so a host that has momentarily lost its uplink
+# fails it for reasons that say nothing about busybox or about elfuse's socket
+# path. The wget guard below already draws that line; without the same one here
+# a dropped uplink turns make check red with a misleading verdict, which is what
+# it did on a hotspot that came back a minute later.
+#
+# The probe reaches the nameserver the guest will query, over TCP, rather than
+# asking the system resolver. dscacheutil goes through mDNSResponder, which
+# answers from cache, so on a dropped uplink it still returns the record it
+# holds while the guest's live UDP query gets nothing: the probe would pass and
+# the test would fail, which is the case this guard exists to prevent.
+#
+# Reachability of the resolver rather than a full lookup, so a nameserver that
+# is up but answering SERVFAIL still reaches the check and is reported. A
+# resolver that serves UDP but refuses TCP reads as unreachable and skips, which
+# loses coverage rather than inventing a failure.
+nameserver=$(scutil --dns 2> /dev/null | awk '/nameserver\[0\]/ {print $3; exit}')
+if [ -n "$nameserver" ] && nc -z -w 2 "$nameserver" 53 2> /dev/null; then
+    run_check nslookup "Address" "example.com"
+else
+    run_skip nslookup "no reachable nameserver from this host"
+fi
 
 # wget pulls a real document from example.com. In sandboxed CI / corporate
 # networks where outbound HTTP is filtered, this fails with "No route to host"

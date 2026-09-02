@@ -142,3 +142,18 @@ struct fpunchhole {
 #ifndef st_ctimespec
 #define st_ctimespec st_ctim
 #endif
+
+/* unistd.h confstr selector. syscall/proc.c asks for the per-user temp dir when
+ * it composes the process-table path; Frama-C's libc models confstr but not the
+ * Darwin selectors it takes.
+ */
+#define _CS_DARWIN_USER_TEMP_DIR 65537
+
+/* sys/qos.h. syscall/proc.c raises the vCPU threads to the interactive class so
+ * the scheduler does not park them behind background work. The SDK spells these
+ * as enumerators of qos_class_t, which check-stub-constants.py compares by
+ * compiling against the header.
+ */
+typedef unsigned int qos_class_t;
+#define QOS_CLASS_USER_INTERACTIVE 0x21
+int pthread_set_qos_class_self_np(qos_class_t qos_class, int relative_priority);
