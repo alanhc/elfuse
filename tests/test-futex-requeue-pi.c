@@ -17,6 +17,7 @@
  * Syscalls exercised: futex(98), clone(220), gettid(178), exit(93), sched_yield
  */
 
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
@@ -70,6 +71,25 @@ static void set_and_wake(int *addr)
     raw_futex_wake(addr, 1);
 }
 
+/* holder_ready is the one flag two threads wait on, main and the waiter, and it
+ * is set once. Waking a single one of them strands the other for good, because
+ * the flag never returns to zero and no second wake is coming.
+ *
+ * Both readers usually observe the store before they park, which is why the
+ * single wake survived every run on a host with hardware virtualization. Under
+ * qemu's tcg the window between the load in wait_until_set and the FUTEX_WAIT
+ * behind it is wide enough to lose, and the matrix's qemu-aarch64 lane hung
+ * there about one run in three.
+ *
+ * The other three flags keep set_and_wake. Each has exactly one reader, and
+ * leaving them alone is what keeps that readable.
+ */
+static void set_and_wake_all(int *addr)
+{
+    __atomic_store_n(addr, 1, __ATOMIC_RELEASE);
+    raw_futex_wake(addr, INT_MAX);
+}
+
 static void wait_until_set(int *addr)
 {
     while (__atomic_load_n(addr, __ATOMIC_ACQUIRE) == 0)
@@ -82,7 +102,7 @@ static void wait_until_set(int *addr)
 static void holder_fn(void)
 {
     if (futex_lock_pi(&pi_lock) == 0) {
-        set_and_wake(&holder_ready);
+        set_and_wake_all(&holder_ready);
         wait_until_set(&release);
         futex_unlock_pi(&pi_lock);
     } else {
@@ -90,7 +110,7 @@ static void holder_fn(void)
          * whose LOCK_PI is broken is the one this lane exists to catch.
          */
         set_and_wake(&holder_failed);
-        set_and_wake(&holder_ready);
+        set_and_wake_all(&holder_ready);
     }
     raw_exit(0);
 }
