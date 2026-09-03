@@ -2369,9 +2369,10 @@ static int64_t proc_reap_exited_and_unlock(guest_t *g,
     if (status_gva && guest_write_small(g, status_gva, &linux_status,
                                         sizeof(linux_status)) < 0)
         return -LINUX_EFAULT;
-    if (rusage_gva)
+    if (rusage_gva &&
         write_rusage_to_guest(g, rusage_gva,
-                              ru_valid ? &ru : &(struct rusage) {0});
+                              ru_valid ? &ru : &(struct rusage) {0}) < 0)
+        return -LINUX_EFAULT;
     return gpid;
 }
 
