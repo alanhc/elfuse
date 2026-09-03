@@ -164,11 +164,6 @@ uint64_t build_linux_stack(guest_t *g,
             envc++;
     }
 
-/* Bounds-check: Linux returns E2BIG for oversized argument/environment. ARG_MAX
- * on Linux is typically 2MiB; stack setup caps at reasonable stack limits.
- */
-#define MAX_ARGS 131072
-#define MAX_ENVS 131072
 
     /* argc is bounded below as well as above, and the lower bound is the one
      * that matters here: a negative argc makes the (uint64_t) total_entries
@@ -179,7 +174,8 @@ uint64_t build_linux_stack(guest_t *g,
      * discharge the precondition instead of leaving it as an argument about
      * other files.
      */
-    if (argc < 0 || argc > MAX_ARGS || envc > MAX_ENVS)
+    if (argc < 0 || argc > ELFUSE_MAX_ARG_STRINGS ||
+        envc > ELFUSE_MAX_ARG_STRINGS)
         return 0; /* Caller treats 0 as failure */
 
     /* Phase 1: Write strings and random data at the top of the stack. stack

@@ -48,6 +48,7 @@
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
+
 /* Force HVF to commit the sysreg/GPR writes that sys_execve performs after a
  * guest_reset before vcpu_run resumes. HVF defers writes until the next
  * register-touch on the owning thread, and a stale read here is harmless. Use
@@ -338,7 +339,7 @@ static int read_string_array(guest_t *g,
         if (ptr == 0)
             break;
         count++;
-        if (count > 131072)
+        if (count > ELFUSE_MAX_ARG_STRINGS)
             return -2;
     }
 
@@ -363,17 +364,17 @@ static int read_string_array(guest_t *g,
             return -1;
         }
 
-        int rc = guest_read_str(g, ptr, temp_str, 131072);
+        int rc = guest_read_str(g, ptr, temp_str, LINUX_MAX_ARG_STRLEN);
         if (rc < 0) {
             size_t temp_len = strlen(temp_str);
             free(argv);
             free(buf);
-            return (temp_len >= 131072 - 1) ? -2 : -1;
+            return (temp_len >= LINUX_MAX_ARG_STRLEN - 1) ? -2 : -1;
         }
 
         size_t len = (size_t) rc;
 
-        if (*running_bytes + len + 1 > 2048 * 1024) {
+        if (*running_bytes + len + 1 > ELFUSE_MAX_ARG_BYTES) {
             free(argv);
             free(buf);
             return -2;
@@ -1374,7 +1375,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     interp.fd = -1;
 
 
-    char *temp_str = malloc(131072);
+    char *temp_str = malloc(LINUX_MAX_ARG_STRLEN);
     if (!temp_str) {
         err = -LINUX_ENOMEM;
         goto fail;
@@ -1534,7 +1535,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
          * original-argv[1:]]
          */
         int prefix = (has_arg ? 2 : 1) + 1;
-        if (argc + prefix - 1 > 131072) {
+        if (argc + prefix - 1 > ELFUSE_MAX_ARG_STRINGS) {
             err = -LINUX_E2BIG;
             goto fail;
         }
@@ -1565,7 +1566,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         int prefix_end = ni - (argc > 1 ? argc - 1 : 0);
         for (int i = 0; i < prefix_end; i++) {
             size_t len = strlen(new_argv[i]);
-            if (running_bytes + len + 1 > 2048 * 1024) {
+            if (running_bytes + len + 1 > ELFUSE_MAX_ARG_BYTES) {
                 free(new_argv);
                 err = -LINUX_E2BIG;
                 goto fail;

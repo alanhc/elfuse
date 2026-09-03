@@ -27,3 +27,20 @@
  * have to be the same number.
  */
 #define LINUX_MINSIGSTKSZ 5120
+
+/* execve argument limits.
+ *
+ * LINUX_MAX_ARG_STRLEN is the kernel's MAX_ARG_STRLEN, 32 pages on a 4 KiB
+ * kernel. The other two are elfuse's own caps, chosen so a guest cannot drive
+ * an unbounded host allocation; the entry count shares MAX_ARG_STRLEN's value
+ * by coincidence, not by derivation, which is why it is named separately.
+ *
+ * Shared rather than per-file: read_string_array (src/syscall/exec.c) enforces
+ * the count while building the arrays, build_linux_stack (src/core/stack.c)
+ * enforces it again while pushing them, and src/proved/stack.h states the
+ * containment argument for STACK_MAX_WORDS in terms of it. Three copies of the
+ * number let a change to one leave the other two disagreeing in silence.
+ */
+#define LINUX_MAX_ARG_STRLEN 131072
+#define ELFUSE_MAX_ARG_STRINGS 131072
+#define ELFUSE_MAX_ARG_BYTES (2048 * 1024)

@@ -16,10 +16,11 @@
  * header needs nothing but stdint.h, so make verify-stack proves it directly.
  *
  * The descent is already contained today: read_string_array
- * (src/syscall/exec.c) caps combined argv/envp bytes at 2 MiB and the entry
- * count at 131072, against an 8 MiB stack. Routing every step through
- * stack_take makes that containment structural, held by a postcondition here
- * rather than by two caps in another file staying smaller than the stack.
+ * (src/syscall/exec.c) caps combined argv/envp bytes at ELFUSE_MAX_ARG_BYTES
+ * and the entry count at ELFUSE_MAX_ARG_STRINGS, against an 8 MiB stack.
+ * Routing every step through stack_take makes that containment structural, held
+ * by a postcondition here rather than by two caps in another file staying
+ * smaller than the stack.
  */
 
 #pragma once
@@ -42,10 +43,11 @@ _Static_assert(STACK_WORD == sizeof(uint64_t),
 
 /* Ceiling on the structured area, in words. build_linux_stack computes
  * auxv.nwords + 3 + argc + envc, with auxv.nwords bounded by
- * LINUX_STACK_AUXV_WORDS_MAX (48) and argc, envc each capped at 131072 by
- * read_string_array, so the true maximum is 262195. Rounded up to a power of
- * two: the value only has to keep words * STACK_WORD far from overflow, and a
- * loose bound is easier to keep true as the auxv set changes.
+ * LINUX_STACK_AUXV_WORDS_MAX (48) and argc, envc each capped at
+ * ELFUSE_MAX_ARG_STRINGS (131072) by read_string_array, so the true maximum is
+ * 262195. Rounded up to a power of two: the value only has to keep words *
+ * STACK_WORD far from overflow, and a loose bound is easier to keep true as the
+ * auxv set changes.
  */
 #define STACK_MAX_WORDS (1ULL << 20)
 
