@@ -271,6 +271,14 @@ typedef struct {
 #define LINUX_PR_GET_CHILD_SUBREAPER 37
 #define LINUX_PR_CAPBSET_READ 23
 #define LINUX_CAP_LAST_CAP 40
+
+/* _LINUX_CAPABILITY_VERSION_3, the only version elfuse's capget accepts (Linux
+ * still takes the two deprecated ones). A guest asking for another gets this
+ * one written back with EINVAL, which is how Linux tells it which version to
+ * retry with. sc_capset refuses every call with EPERM and never reads the
+ * header, so it has no use for this.
+ */
+#define LINUX_CAPABILITY_VERSION_3 0x20080522
 #define LINUX_PR_SET_VMA 0x53564d41 /* "SVMA" */
 #define LINUX_PR_SET_VMA_ANON_NAME 0
 

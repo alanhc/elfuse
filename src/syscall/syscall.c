@@ -1825,8 +1825,8 @@ static int64_t sc_capget(guest_t *g,
     uint32_t hdr[2];
     if (guest_read_small(g, x0, hdr, sizeof(hdr)) < 0)
         return -LINUX_EFAULT;
-    if (hdr[0] != 0x20080522) {
-        hdr[0] = 0x20080522;
+    if (hdr[0] != LINUX_CAPABILITY_VERSION_3) {
+        hdr[0] = LINUX_CAPABILITY_VERSION_3;
         guest_write_small(g, x0, hdr, sizeof(hdr));
         return -LINUX_EINVAL;
     }
