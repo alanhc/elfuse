@@ -68,19 +68,19 @@ static int parse_int_arg(const char *s, int min, int max, int *out)
 /* Parse one --user id component, stopping at @end. strtoul would take a sign
  * and negate the unsigned result, so "-0" parses as root; an id is digits.
  */
-static int parse_id_component(const char *s, const char **end, uint32_t *out)
+static bool parse_id_component(const char *s, const char **end, uint32_t *out)
 {
     if (*s < '0' || *s > '9')
-        return -1;
+        return false;
     unsigned long long value = 0;
     for (; *s >= '0' && *s <= '9'; s++) {
         value = value * 10 + (unsigned long long) (*s - '0');
         if (value > UINT32_MAX)
-            return -1;
+            return false;
     }
     *end = s;
     *out = (uint32_t) value;
-    return 0;
+    return true;
 }
 
 static int resolve_guest_elf_host_path(const char *elf_guest_path,
@@ -411,15 +411,14 @@ int main(int argc, char **argv)
         } else if (!strcmp(argv[arg_start], "--user") && arg_start + 1 < argc) {
             const char *spec = argv[arg_start + 1], *end;
             uint32_t u, g;
-            if (parse_id_component(spec, &end, &u) < 0) {
+            if (!parse_id_component(spec, &end, &u)) {
                 log_error("invalid --user UID: %s", spec);
                 goto cleanup;
             }
             g = u;
             if (*end == ':') {
                 const char *gend;
-                if (parse_id_component(end + 1, &gend, &g) < 0 ||
-                    *gend != '\0') {
+                if (!parse_id_component(end + 1, &gend, &g) || *gend != '\0') {
                     log_error("invalid --user UID:GID: %s", spec);
                     goto cleanup;
                 }
