@@ -4057,7 +4057,7 @@ static vcpu_action_t vcpu_handle_exception_exit(guest_t *g,
              * crashes tests/test-mmap-sigbus-efault, because the fast paths it
              * re-engages have no answer for a stage-2 fault on a truncated
              * MAP_SHARED overlay: EC=0x24 reaches EL2 and no arm handles it.
-             * The clear stays here until that gap is closed (TODO.md).
+             * The clear stays here until that gap is closed.
              */
             shim_globals_recompute_attention(g);
 
