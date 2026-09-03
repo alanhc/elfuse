@@ -1424,13 +1424,18 @@ static const char *elfuse_self_path(int *len_out)
     return elfuse_self_path_buf;
 }
 
-int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+/* Open the signal-transport file of another elfuse process for append.
+ *
+ * Refuses a host pid that is not (or is no longer) an elfuse process: if it was
+ * recycled onto an unrelated program, a raw SIGUSR2 would terminate it. A
+ * sub-microsecond exit and pid reuse between this check and the kill() the
+ * caller issues still lands the signal on the wrong process.
+ *
+ * Sets errno and returns -1 on every failure, so the callers report it as their
+ * own.
+ */
+static int proc_open_transport(pid_t host_pid)
 {
-    /* Refuse to signal a host pid that is not (or is no longer) an elfuse
-     * process: if it was recycled onto an unrelated program, a raw SIGUSR2
-     * would terminate it. A sub-microsecond exit and pid reuse between this
-     * check and kill() still lands the signal on the wrong process.
-     */
     int our_len;
     const char *our_path = elfuse_self_path(&our_len);
     char tpath[PROC_PIDPATHINFO_MAXSIZE];
@@ -1446,9 +1451,13 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
         errno = ENAMETOOLONG;
         return -1;
     }
+    return open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                0600);
+}
 
-    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
-                  0600);
+int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+{
+    int fd = proc_open_transport(host_pid);
     if (fd < 0)
         return -1;
 
@@ -1613,23 +1622,7 @@ static int proc_send_reparent(pid_t host_pid,
                               int64_t target_guest_pid,
                               int64_t new_ppid)
 {
-    int our_len;
-    const char *our_path = elfuse_self_path(&our_len);
-    char tpath[PROC_PIDPATHINFO_MAXSIZE];
-    int tlen = proc_pidpath(host_pid, tpath, sizeof(tpath));
-    if (our_len <= 0 || tlen != our_len ||
-        memcmp(tpath, our_path, our_len) != 0) {
-        errno = ESRCH;
-        return -1;
-    }
-
-    char path[PATH_MAX];
-    if (!signal_transport_path(path, sizeof(path), host_pid)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
-                  0600);
+    int fd = proc_open_transport(host_pid);
     if (fd < 0)
         return -1;
 
