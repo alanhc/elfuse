@@ -1587,6 +1587,17 @@ static inline uint32_t ip_copyval_clamp(int level,
     return actual_len;
 }
 
+/* How many bytes a getsockopt reply may write into the caller's buffer.
+ *
+ * Not the MIN macro in utils.h: it is a statement expression, which this tree
+ * compiles with -Werror against.
+ */
+static inline uint32_t sockopt_write_len(uint32_t actual_len,
+                                         uint32_t guest_optlen)
+{
+    return actual_len < guest_optlen ? actual_len : guest_optlen;
+}
+
 int64_t sys_getsockopt(guest_t *g,
                        int fd,
                        int level,
@@ -1617,9 +1628,8 @@ int64_t sys_getsockopt(guest_t *g,
             .uid = proc_get_uid(),
             .gid = proc_get_gid(),
         };
-        uint32_t out_len = sizeof(cred);
-        if (guest_optlen < out_len)
-            out_len = guest_optlen;
+        uint32_t out_len =
+            sockopt_write_len((uint32_t) sizeof(cred), guest_optlen);
         if (out_len > 0 && guest_write_small(g, optval_gva, &cred, out_len) < 0)
             return -LINUX_EFAULT;
         uint32_t actual_len = sizeof(cred);
@@ -1656,9 +1666,7 @@ int64_t sys_getsockopt(guest_t *g,
         if (net_socket_cached_int_get(fd, level, optname, &value)) {
             uint32_t actual_len =
                 ip_copyval_clamp(level, guest_optlen, value, sizeof(int));
-            uint32_t write_len = actual_len;
-            if (write_len > guest_optlen)
-                write_len = guest_optlen;
+            uint32_t write_len = sockopt_write_len(actual_len, guest_optlen);
             if (write_len > 0 &&
                 guest_write_small(g, optval_gva, &value, write_len) < 0)
                 return -LINUX_EFAULT;
@@ -1721,9 +1729,7 @@ getsockopt_translated:
 
         actual_len = used_cache ? sizeof(int) : (uint32_t) mac_optlen;
         actual_len = ip_copyval_clamp(level, guest_optlen, value, actual_len);
-        write_len = actual_len;
-        if (write_len > guest_optlen)
-            write_len = guest_optlen;
+        write_len = sockopt_write_len(actual_len, guest_optlen);
         if (write_len > 0 &&
             guest_write_small(g, optval_gva, &value, write_len) < 0) {
             host_fd_ref_close(&host_ref);
@@ -1771,14 +1777,12 @@ getsockopt_translated:
         }
     }
 
-    /* Write option value, truncating to guest buffer size if needed. Write back
-     * actual length (not truncated) per Linux semantics: Linux getsockopt
-     * returns the real option size so the caller can detect truncation and
-     * retry with a larger buffer.
+    /* Write at most the caller's buffer, but report the option's real size:
+     * Linux getsockopt does that so a caller can detect truncation and retry
+     * with a larger buffer. Every write above clamps the same way.
      */
-    uint32_t actual_len = (uint32_t) mac_optlen, write_len = actual_len;
-    if (write_len > guest_optlen)
-        write_len = guest_optlen;
+    uint32_t actual_len = (uint32_t) mac_optlen;
+    uint32_t write_len = sockopt_write_len(actual_len, guest_optlen);
     if (guest_write_small(g, optval_gva, optval, write_len) < 0) {
         host_fd_ref_close(&host_ref);
         return -LINUX_EFAULT;
