@@ -555,9 +555,9 @@ def main():
             SKILL_DIR.glob("*/references/*.md")
         )
 
-    # A routing file is checked the same way, but only when its owner names
-    # it: whether one exists is local to a working copy. It is checked even in
-    # a clone with no skills directory, where its references rot fastest.
+    # A routing file is checked the same way, when named: AGENTS.md is the
+    # tracked one and a working copy may name its own. It is checked even in a
+    # clone with no skills directory, where its references rot fastest.
     for extra in sys.argv[1:]:
         path = pathlib.Path(extra)
         if not path.is_absolute():

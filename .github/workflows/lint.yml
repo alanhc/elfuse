@@ -177,7 +177,7 @@ jobs:
         # current. This found two dead references to a workflow and a makefile
         # that the CI split had already removed.
         if: ${{ !cancelled() }}
-        run: python3 scripts/check-skill-refs.py
+        run: python3 scripts/check-skill-refs.py AGENTS.md
 
       # What follows needs LINT_PKGS, and the three checks that use it read
       # only C sources, the style file, and the .ci scripts that implement
