@@ -11,7 +11,8 @@ from an entry there.
 This skill covers the host side of the boundary: taking guest arguments,
 translating them, and calling macOS. Anything that changes what the guest sees
 when it comes back is `elfuse-guest-abi`, even when the file lives under
-`src/syscall/`.
+`src/syscall/`. The guest chooses every argument a wrapper receives, so the
+rules for handling one it chose badly are `elfuse-security`.
 
 ## The steps
 
