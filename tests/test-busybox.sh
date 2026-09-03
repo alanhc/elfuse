@@ -277,7 +277,12 @@ printf '\n%s── Networking ──%s\n' "$BLUE" "$RESET"
 # is up but answering SERVFAIL still reaches the check and is reported. A
 # resolver that serves UDP but refuses TCP reads as unreachable and skips, which
 # loses coverage rather than inventing a failure.
-nameserver=$(scutil --dns 2> /dev/null | awk '/nameserver\[0\]/ {print $3; exit}')
+#
+# awk reads to EOF rather than exiting on the first match: under pipefail an
+# early exit closes the pipe while scutil is still writing, and the SIGPIPE
+# surfaces as 141 from the assignment, which set -e then treats as a failed run.
+nameserver=$(scutil --dns 2> /dev/null |
+    awk '/nameserver\[0\]/ && !seen {print $3; seen = 1}')
 if [ -n "$nameserver" ] && nc -z -w 2 "$nameserver" 53 2> /dev/null; then
     run_check nslookup "Address" "example.com"
 else
