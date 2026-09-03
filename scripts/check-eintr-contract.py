@@ -209,14 +209,16 @@ INVENTORY = {
     ),
     "syscall/net-msg.c::sys_sendmsg": (
         "restartable",
-        "Both wait sites sit before their send in the EAGAIN retry loop, so "
-        "EINTR means nothing left the socket.",
+        "The wait sits before its send in the EAGAIN retry loop, so EINTR "
+        "means nothing left the socket.",
     ),
-    "syscall/net-msg.c::sys_sendmmsg": (
+    "syscall/net-msg.c::net_send_single_iov": (
         "restartable",
-        "Interrupting message i reports i as the count when i > 0, so the "
-        "restart never re-sends a delivered message; only an interrupt before "
-        "the first send reaches the guest as EINTR.",
+        "Same shape, for the single-iovec fast path both sendmsg and sendmmsg "
+        "take: the wait precedes the send, so EINTR means nothing left the "
+        "socket. sys_sendmmsg forwards this result and carries no wait of its "
+        "own, so it is not listed; its loop reports the delivered count rather "
+        "than the error once a message has gone out.",
     ),
     "syscall/net-msg.c::sys_recvmsg": (
         "restartable",

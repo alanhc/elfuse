@@ -43,13 +43,6 @@
 #include "syscall/io.h"
 #include "syscall/signal.h"
 
-/* Linux MSG_OOB: urgent-data receive, never gated on readiness. */
-#define LINUX_MSG_OOB 0x01
-/* Linux MSG_DONTWAIT: recv/send skip the interruptible wait when set. */
-#define LINUX_MSG_DONTWAIT 0x40
-#define LINUX_MSG_PEEK 0x02
-#define LINUX_MSG_WAITALL 0x100
-
 /* Wait for a blocking socket op (recv/accept/connect/send) to become ready or
  * be interrupted by a guest signal, so a vCPU thread parked in the host call
  * stays reachable by hv_vcpus_exit + the wakeup pipe. No-op for nonblocking fds
@@ -1056,7 +1049,7 @@ int64_t sys_sendto(guest_t *g,
     /* MSG_NOSIGNAL (0x4000): suppress SIGPIPE on EPIPE. macOS has no
      * MSG_NOSIGNAL; elfuse handles it by not queuing SIGPIPE.
      */
-    int suppress_sigpipe = (linux_flags & 0x4000);
+    int suppress_sigpipe = (linux_flags & LINUX_MSG_NOSIGNAL);
 
     /* sendto with a NULL destination is send(); merge both forms. */
     struct sockaddr_storage mac_sa;

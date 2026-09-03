@@ -2504,14 +2504,10 @@ int64_t sys_renameat2(guest_t *g,
         return -LINUX_ENOSYS;
 
     host_fd_ref_t olddir_ref, newdir_ref;
-    int64_t ref_err = host_dirfd_ref_open(olddirfd, &olddir_ref);
+    int64_t ref_err =
+        host_dirfd_ref_open_pair(olddirfd, newdirfd, &olddir_ref, &newdir_ref);
     if (ref_err < 0)
         return ref_err;
-    ref_err = host_dirfd_ref_open(newdirfd, &newdir_ref);
-    if (ref_err < 0) {
-        host_fd_ref_close(&olddir_ref);
-        return ref_err;
-    }
     host_fd_t old_host_dirfd = path_translation_dirfd(&old_tx, &olddir_ref);
     host_fd_t new_host_dirfd = path_translation_dirfd(&new_tx, &newdir_ref);
 
@@ -2835,14 +2831,10 @@ int64_t sys_linkat(guest_t *g,
         return -LINUX_ENOSYS;
 
     host_fd_ref_t olddir_ref, newdir_ref;
-    int64_t ref_err = host_dirfd_ref_open(olddirfd, &olddir_ref);
+    int64_t ref_err =
+        host_dirfd_ref_open_pair(olddirfd, newdirfd, &olddir_ref, &newdir_ref);
     if (ref_err < 0)
         return ref_err;
-    ref_err = host_dirfd_ref_open(newdirfd, &newdir_ref);
-    if (ref_err < 0) {
-        host_fd_ref_close(&olddir_ref);
-        return ref_err;
-    }
     host_fd_t old_host_dirfd = path_translation_dirfd(&old_tx, &olddir_ref);
     host_fd_t new_host_dirfd = path_translation_dirfd(&new_tx, &newdir_ref);
 
