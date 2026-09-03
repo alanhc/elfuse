@@ -2644,7 +2644,14 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         proc_set_ctty(0);
         return 0;
     case LINUX_TIOCGSID: {
-        /* Get session ID of the controlling terminal. */
+        /* Get session ID of the controlling terminal. Linux answers ENOTTY when
+         * the caller has none, rather than reporting the session id of a
+         * terminal it does not hold.
+         */
+        if (!proc_get_ctty()) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_ENOTTY;
+        }
         int32_t val = (int32_t) proc_get_sid();
         host_fd_ref_close(&host_ref);
         if (guest_write_small(g, arg, &val, sizeof(val)) < 0)

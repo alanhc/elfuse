@@ -222,6 +222,12 @@ int64_t proc_sys_getsid(int64_t pid);
 void proc_set_fg_pgrp(int64_t pgrp);
 void proc_set_ctty(int has_ctty);
 
+/* Nonzero while the guest holds a controlling terminal. Consumed by TIOCGSID,
+ * which Linux answers with ENOTTY when there is none, and by the tty_nr and
+ * tpgid fields of /proc/self/stat.
+ */
+int proc_get_ctty(void);
+
 /* Emulated UID/GID accessors. */
 uint32_t proc_get_uid(void);
 uint32_t proc_get_euid(void);
