@@ -29,8 +29,9 @@ that both moves code and changes behavior cannot be reviewed as either.
 
 Measure it first. `references/measuring.md` carries the scans for function
 size, duplication, and nesting, and the traps in reading each. Report a number
-with the command that produced it and a judgment as a judgment; never quote a
-count from a document, this one included.
+with the command that produced it and a judgment as a judgment; `elfuse-verify`
+carries the rest of that rule, this file included among the documents a count
+must not be quoted from.
 
 Prefer deletion, an existing local helper, or a direct rewrite over a new
 abstraction. A parameter every caller gives the same value, a hook with one
