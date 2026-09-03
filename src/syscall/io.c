@@ -2644,11 +2644,19 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         proc_set_ctty(0);
         return 0;
     case LINUX_TIOCGSID: {
-        /* Get session ID of the controlling terminal. Linux answers ENOTTY when
-         * the caller has none, rather than reporting the session id of a
-         * terminal it does not hold.
+        /* Get session ID of the controlling terminal. Linux answers ENOTTY on
+         * two counts, and both are checked here: the fd must be a terminal at
+         * all, which tcgetattr decides the same way every termios case below
+         * does, and the caller must hold a controlling terminal rather than be
+         * told the session id of one it detached from.
+         *
+         * Linux also rejects an fd that is a terminal but not this caller's
+         * controlling one. elfuse records only whether a controlling terminal
+         * is held, not which device it is, so that third case still answers.
+         * Narrowing it needs proc_set_ctty to record the terminal's identity.
          */
-        if (!proc_get_ctty()) {
+        struct termios sid_t;
+        if (tcgetattr(host_fd, &sid_t) < 0 || !proc_get_ctty()) {
             host_fd_ref_close(&host_ref);
             return -LINUX_ENOTTY;
         }
