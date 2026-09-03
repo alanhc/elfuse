@@ -147,8 +147,9 @@ eventfd, timerfd, signalfd). A class check that reads the raw fd number is wrong
 a `dup`.
 
 The lock order is the comment at the top of `internal.h`. Acquire in the order
-it lists, and add a new lock to that comment before using it in a second
-module. Three constraints in it are not derivable from the ordering:
+it lists, and add a new lock to that comment as soon as it exists, whether or
+not a second module uses it. Three constraints in it are not derivable from
+the ordering:
 
 - The per-epoll-instance lock is taken under `fd_lock` by the close hook, but
   taken alone by `epoll_ctl` and `epoll_pwait`. This is the one a summary
