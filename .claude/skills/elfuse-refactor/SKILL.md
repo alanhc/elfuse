@@ -97,10 +97,9 @@ is not enough: the two bodies must represent the same fact.
 
 ## Work in small, evidenced steps
 
-Read `docs/testing.md`, section "Validation Strategy By Change Type", and run
-the selected baseline before a multi-step cleanup. Keep inherited failures
-separate from the change. Stop when the baseline is red in the area being
-changed.
+Run the baseline `elfuse-verify` selects for the area touched before a
+multi-step cleanup. Keep inherited failures separate from the change. Stop
+when the baseline is red in the area being changed.
 
 A failure blamed on the environment earns one reproduction attempt under the
 condition blamed for it before it is written off. "Transient" and "the host was
