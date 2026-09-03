@@ -337,6 +337,22 @@ static inline bool futex_uaddr_is_aligned(uint64_t uaddr)
     return (uaddr & 0x3) == 0;
 }
 
+/* Poll the guest itimer and pending-signal state on behalf of a bucket waiter.
+ * Lock order forbids doing that under the bucket lock (bucket is 7, sig_lock is
+ * 4), so this drops b->lock and retakes it. The caller must re-check
+ * waiter.woken afterward: a wake can land in the window.
+ *
+ * Returns whether a deliverable signal is queued for this thread.
+ */
+static bool futex_poll_signal_relock(futex_bucket_t *b)
+{
+    pthread_mutex_unlock(&b->lock);
+    signal_check_timer_real();
+    bool sig_ready = signal_pending() != 0;
+    pthread_mutex_lock(&b->lock);
+    return sig_ready;
+}
+
 /* Unlink a waiter from its bucket's singly-linked list. Caller must hold
  * b->lock. Silently returns if the waiter is not in the list (already unlinked
  * by a wake/requeue).
@@ -1142,18 +1158,13 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
             if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
                 break;
 
-            /* Mirror the no-timeout branch's itimer/queued-signal re-check
-             * below: without it, a thread parked in a timed FUTEX_WAIT_BITSET
-             * (glibc sem_timedwait, pthread_cond_timedwait, JVM parkNanos) only
-             * observes an expired guest itimer or a deliverable queued signal
-             * once the futex wakes or the full guest deadline elapses. Lock
-             * order requires dropping the bucket lock before touching sig_lock
-             * (4).
+            /* Mirror the no-timeout branch's re-check below: without it, a
+             * thread parked in a timed FUTEX_WAIT_BITSET (glibc sem_timedwait,
+             * pthread_cond_timedwait, JVM parkNanos) only observes an expired
+             * guest itimer or a deliverable queued signal once the futex wakes
+             * or the full guest deadline elapses.
              */
-            pthread_mutex_unlock(&b->lock);
-            signal_check_timer_real();
-            bool sig_ready = signal_pending() != 0;
-            pthread_mutex_lock(&b->lock);
+            bool sig_ready = futex_poll_signal_relock(b);
 
             if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
                 break;
@@ -1177,18 +1188,12 @@ static int64_t futex_wait_inner(unsigned *pub_bucket_out,
             break;
         }
 
-        /* Lock-order: bucket lock(7) outranks sig_lock(4), so signal_pending()
-         * and signal_check_timer() may only be called once the bucket lock has
-         * been released. Drop it, poke the itimers, observe queued signals
-         * under sig_lock (the slow-path confirm avoids the stale-true edge that
-         * the atomic hint can carry after rt_sigprocmask masks the queued
-         * signal), then re-acquire and re-check waiter.woken in case a wake
-         * landed in the window.
+        /* The slow-path confirm inside signal_pending() avoids the stale-true
+         * edge the atomic hint can carry after rt_sigprocmask masks the queued
+         * signal. Re-check waiter.woken below: a wake can land in the window
+         * the poll opens.
          */
-        pthread_mutex_unlock(&b->lock);
-        signal_check_timer_real();
-        bool sig_ready = signal_pending() != 0;
-        pthread_mutex_lock(&b->lock);
+        bool sig_ready = futex_poll_signal_relock(b);
 
         if (atomic_load_explicit(&waiter.woken, memory_order_acquire))
             break;
@@ -1910,13 +1915,8 @@ static int64_t futex_lock_pi_inner(guest_t *g,
                      * thread parked here with a timeout only observes an
                      * expired guest itimer or a deliverable queued signal once
                      * the lock is acquired or the full guest deadline elapses.
-                     * Lock order requires dropping the bucket lock before
-                     * signal_check_timer/signal_pending touch sig_lock (4).
                      */
-                    pthread_mutex_unlock(&b->lock);
-                    signal_check_timer_real();
-                    bool sig_ready = signal_pending() != 0;
-                    pthread_mutex_lock(&b->lock);
+                    bool sig_ready = futex_poll_signal_relock(b);
 
                     if (!atomic_load_explicit(&waiter.woken,
                                               memory_order_acquire) &&
@@ -1963,14 +1963,9 @@ static int64_t futex_lock_pi_inner(guest_t *g,
                 /* Mirror futex_wait's untimed branch: without this, a thread
                  * parked in FUTEX_LOCK_PI with no timeout never observes an
                  * expired guest itimer or a deliverable queued signal until the
-                 * lock is acquired or the owner dies. Lock order requires
-                 * dropping the bucket lock before signal_check_timer/
-                 * signal_pending touch sig_lock (4).
+                 * lock is acquired or the owner dies.
                  */
-                pthread_mutex_unlock(&b->lock);
-                signal_check_timer_real();
-                bool sig_ready = signal_pending() != 0;
-                pthread_mutex_lock(&b->lock);
+                bool sig_ready = futex_poll_signal_relock(b);
 
                 if (!atomic_load_explicit(&waiter.woken,
                                           memory_order_acquire) &&
