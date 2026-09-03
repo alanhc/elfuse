@@ -14,7 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/random.h>
 
 #include "proved/stack.h"
 #include "core/stack.h"
@@ -206,9 +205,14 @@ uint64_t build_linux_stack(guest_t *g,
     if (!stack_take(&str_ptr, stack_floor, 16))
         return 0;
     uint64_t random_ptr = str_ptr;
+
+    /* glibc and musl derive the stack canary and the pointer guard from these
+     * 16 bytes, so they must never be predictable. arc4random_buf returns void
+     * and cannot fail, which leaves no error path to substitute a constant on.
+     * sys.c serves getrandom(2) from it for the same reason.
+     */
     uint8_t random_bytes[16];
-    if (getentropy(random_bytes, 16) != 0)
-        memset(random_bytes, 0x42, 16); /* Fallback: deterministic fill */
+    arc4random_buf(random_bytes, sizeof(random_bytes));
     int str_err = 0;
     str_err |=
         guest_write_small(g, random_ptr, random_bytes, sizeof(random_bytes));
