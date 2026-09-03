@@ -290,14 +290,23 @@ else
 fi
 
 # wget pulls a real document from example.com. In sandboxed CI / corporate
-# networks where outbound HTTP is filtered, this fails with "No route to host"
-# through no fault of busybox itself. Probe TCP reachability from the host first
-# and skip cleanly rather than report a misleading failure. /dev/tcp/host/port
-# is bash-specific; nc -z is more portable here.
-if nc -z -w 2 example.com 80 2> /dev/null; then
+# networks where outbound HTTP is filtered, this fails through no fault of
+# busybox itself, so probe from the host first and skip cleanly rather than
+# report a misleading failure.
+#
+# The probe fetches the document rather than testing TCP reachability, because a
+# captive portal or transparent proxy accepts the connection and answers with
+# its own page: a port probe passes while the guest sees content that never came
+# from example.com, the same trap the nameserver guard above avoids by not
+# asking a cache. It matches "Example Domain" where the guest check greps the
+# bare "Example", so a portal page carrying that word cannot arm a check the
+# guest then fails on different content. Measured on a network whose middlebox
+# answers port 80 with a 307 to a subscriber redirect.
+if host_page=$(curl -fsS --max-time 10 http://example.com/ 2> /dev/null) &&
+    printf '%s' "$host_page" | grep -q 'Example Domain'; then
     run_check wget "Example" "-q" "-O" "-" "http://example.com/"
 else
-    run_skip wget "external http unreachable from this host"
+    run_skip wget "no unintercepted http to example.com from this host"
 fi
 run_skip ping "needs raw socket / setuid"
 run_nc_http_check
