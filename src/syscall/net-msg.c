@@ -920,7 +920,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                             scm_hfds[scm_nfds] = host_recv_fd;
                             scm_nfds++;
                         }
-                        if (flags & 0x40000000)
+                        if (flags & LINUX_MSG_CMSG_CLOEXEC)
                             fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
                     }
                 }
@@ -1039,7 +1039,6 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
 }
 
 #define LINUX_MMSGHDR_SIZE 64
-#define LINUX_MSG_WAITFORONE 0x10000
 
 static inline int write_linux_mmsghdr_len(guest_t *g,
                                           uint64_t hdr_gva,

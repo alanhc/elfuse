@@ -54,10 +54,6 @@
 #include "utils.h"
 #include <poll.h>
 
-#ifndef LINUX_MSG_DONTWAIT
-#define LINUX_MSG_DONTWAIT 0x40
-#endif
-
 static void netlink_close(int guest_fd);
 
 /* Linux netlink message structures. These structures are defined manually to
