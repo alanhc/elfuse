@@ -1106,10 +1106,11 @@ startup_ok:
      * how pthread_join works in musl: the joining thread does FUTEX_WAIT on
      * this address until it becomes 0.
      *
-     * Drain any deferred munmap of this thread's stack before waking the
-     * joiner: the parent may reuse the freed VA as soon as it returns from
-     * pthread_join, and reuse must not race with the deferred unmap.
+     * Drain deferred stack munmaps before the store, not merely before the
+     * wake: a joiner polling the tid never reaches FUTEX_WAIT, so ordering the
+     * drain against the wake alone lets it reuse the VA while still mapped.
      */
+    mem_cleanup_deferred_stack_unmaps(g, t);
     bool wake_ctid = false;
     if (t->clear_child_tid != 0) {
         uint32_t zero = 0;
@@ -1124,7 +1125,6 @@ startup_ok:
                 (unsigned long long) t->clear_child_tid);
         }
     }
-    mem_cleanup_deferred_stack_unmaps(g, t);
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 
@@ -1392,10 +1392,10 @@ static void *vm_clone_thread_run(void *arg)
     int wait_status = 0;
     int exit_code = vcpu_run_loop(vcpu, vexit, g, verbose, 0, &wait_status);
 
-    /* CLONE_CHILD_CLEARTID cleanup. Same ordering as thread_entry: drain
-     * deferred stack munmaps before waking the joiner so the parent does not
-     * reuse the VA before it is released.
+    /* CLONE_CHILD_CLEARTID cleanup. Same ordering as thread_entry: drain before
+     * the store, so a joiner that never blocks cannot reuse the VA early.
      */
+    mem_cleanup_deferred_stack_unmaps(g, t);
     bool wake_ctid = false;
     if (t->clear_child_tid != 0) {
         uint32_t zero = 0;
@@ -1410,7 +1410,6 @@ static void *vm_clone_thread_run(void *arg)
                 (unsigned long long) t->clear_child_tid);
         }
     }
-    mem_cleanup_deferred_stack_unmaps(g, t);
     if (wake_ctid)
         futex_wake_one(g, t->clear_child_tid);
 
