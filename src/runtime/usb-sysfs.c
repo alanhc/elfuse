@@ -1616,6 +1616,19 @@ int usb_sysfs_guest_path_for_fd(int host_fd, char *out, size_t outsz)
     return rc;
 }
 
+/* What an intercept entry point returns for a path the USB tree does not own:
+ * PROC_NOT_INTERCEPTED normally, or -1 with errno set when the path was ours in
+ * shape but malformed. Stated once so the three entry points cannot drift.
+ */
+static int usb_not_intercepted(int cerr)
+{
+    if (cerr) {
+        errno = cerr;
+        return -1;
+    }
+    return PROC_NOT_INTERCEPTED;
+}
+
 int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
 {
     int bus = 0, dev = 0, cerr = 0;
@@ -1623,13 +1636,8 @@ int usb_sysfs_intercept_open(const char *path, int linux_flags, int mode)
     char norm[LINUX_PATH_MAX];
     usb_path_kind_t kind = classify_and_normalize(path, &bus, &dev, &sfx, norm,
                                                   sizeof(norm), &cerr);
-    if (kind == USB_PATH_NONE) {
-        if (cerr) {
-            errno = cerr;
-            return -1;
-        }
-        return PROC_NOT_INTERCEPTED;
-    }
+    if (kind == USB_PATH_NONE)
+        return usb_not_intercepted(cerr);
 
     pthread_mutex_lock(&usb_lock);
     int rc = -1;
@@ -1802,13 +1810,8 @@ int usb_sysfs_intercept_stat(const char *path, struct stat *st, bool follow)
     char norm[LINUX_PATH_MAX];
     usb_path_kind_t kind = classify_and_normalize(path, &bus, &dev, &sfx, norm,
                                                   sizeof(norm), &cerr);
-    if (kind == USB_PATH_NONE) {
-        if (cerr) {
-            errno = cerr;
-            return -1;
-        }
-        return PROC_NOT_INTERCEPTED;
-    }
+    if (kind == USB_PATH_NONE)
+        return usb_not_intercepted(cerr);
 
     pthread_mutex_lock(&usb_lock);
     int rc = -1;
@@ -1921,13 +1924,8 @@ int usb_sysfs_intercept_readlink(const char *path, char *buf, size_t bufsiz)
     char norm[LINUX_PATH_MAX];
     usb_path_kind_t kind = classify_and_normalize(path, &bus, &dev, &sfx, norm,
                                                   sizeof(norm), &cerr);
-    if (kind == USB_PATH_NONE) {
-        if (cerr) {
-            errno = cerr;
-            return -1;
-        }
-        return PROC_NOT_INTERCEPTED;
-    }
+    if (kind == USB_PATH_NONE)
+        return usb_not_intercepted(cerr);
 
     if (kind == USB_PATH_SYS) {
         /* The scratch tree holds real symlinks for `subsystem` entries;
