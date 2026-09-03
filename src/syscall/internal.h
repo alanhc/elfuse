@@ -943,6 +943,24 @@ static inline int64_t host_dirfd_ref_open(guest_fd_t dirfd, host_fd_ref_t *ref)
     return host_fd_ref_open(dirfd, ref);
 }
 
+/* Open both dirfd references a two-path *at() call needs, releasing the first
+ * if the second fails so no caller has to spell that rollback again. On success
+ * both refs are the caller's to close.
+ */
+static inline int64_t host_dirfd_ref_open_pair(guest_fd_t olddirfd,
+                                               guest_fd_t newdirfd,
+                                               host_fd_ref_t *old_ref,
+                                               host_fd_ref_t *new_ref)
+{
+    int64_t err = host_dirfd_ref_open(olddirfd, old_ref);
+    if (err < 0)
+        return err;
+    err = host_dirfd_ref_open(newdirfd, new_ref);
+    if (err < 0)
+        host_fd_ref_close(old_ref);
+    return err;
+}
+
 /* The transfer classification carried by an entry already in hand. Callers that
  * snapshot and dup in one window get their state from here rather than looking
  * the slot up again, which is what makes the two describe the same object.
