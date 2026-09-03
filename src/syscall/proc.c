@@ -2304,6 +2304,77 @@ static void proc_deferred_reap_poll(void)
     pthread_mutex_unlock(&pid_lock);
 }
 
+/* Publish a wait4 report to the guest and release the slot.
+ *
+ * Returns the guest pid, or -LINUX_EFAULT when the guest buffers cannot be
+ * written. The slot is deactivated on every path, since another thread may have
+ * reaped it in the meantime.
+ */
+static int64_t proc_publish_wait_report(guest_t *g,
+                                        pid_t host_pid,
+                                        int64_t gpid,
+                                        int status,
+                                        const struct rusage *ru,
+                                        uint64_t status_gva,
+                                        uint64_t rusage_gva)
+{
+    if (WIFEXITED(status) || WIFSIGNALED(status))
+        status = lifecycle_guest_terminal_status(gpid, status);
+
+    /* Credit CPU only on a terminal report, and re-test after the translation
+     * above rather than reusing its result. mac_options may carry
+     * WUNTRACED/WCONTINUED, and a stop or continue report is a snapshot of a
+     * still-running child: crediting it here would count the same child again
+     * at each of its stop, continue, and final exit reports.
+     */
+    if (WIFEXITED(status) || WIFSIGNALED(status))
+        proc_children_cpu_add(ru);
+
+    /* Short-circuit order matters: a failed status write skips the rusage
+     * write, as the two separate exits it replaces did. Child already reaped
+     * either way, so the slot is released before reporting EFAULT, which is
+     * what Linux returns here.
+     */
+    int32_t linux_status = status;
+    int64_t rc = gpid;
+    if ((status_gva && guest_write_small(g, status_gva, &linux_status,
+                                         sizeof(linux_status)) < 0) ||
+        (rusage_gva && write_rusage_to_guest(g, rusage_gva, ru) < 0))
+        rc = -LINUX_EFAULT;
+    proc_deactivate_slot_if_matches(host_pid, gpid);
+    return rc;
+}
+
+/* Reap an entry already marked exited: account it, free the slot, and publish
+ * status and rusage to the guest. The caller holds pid_lock; this releases it
+ * before touching guest memory and never reacquires it, so every caller returns
+ * straight after.
+ *
+ * Returns the guest pid, or a negative Linux errno when the guest buffers
+ * cannot be written.
+ */
+static int64_t proc_reap_exited_and_unlock(guest_t *g,
+                                           proc_entry_t *entry,
+                                           uint64_t status_gva,
+                                           uint64_t rusage_gva)
+{
+    int64_t gpid = entry->guest_pid;
+    int32_t linux_status = entry->exit_status;
+    struct rusage ru = entry->rusage;
+    bool ru_valid = entry->rusage_valid;
+    proc_account_entry_locked(entry);
+    entry->active = false;
+    pthread_mutex_unlock(&pid_lock);
+    lifecycle_consume(gpid);
+    if (status_gva && guest_write_small(g, status_gva, &linux_status,
+                                        sizeof(linux_status)) < 0)
+        return -LINUX_EFAULT;
+    if (rusage_gva)
+        write_rusage_to_guest(g, rusage_gva,
+                              ru_valid ? &ru : &(struct rusage) {0});
+    return gpid;
+}
+
 int64_t sys_wait4(guest_t *g,
                   int pid,
                   uint64_t status_gva,
@@ -2361,23 +2432,8 @@ int64_t sys_wait4(guest_t *g,
                 found_any_child = true;
                 if (proc_table[i].exited) {
                     /* Already reaped (from CLONE_VFORK wait) */
-                    int64_t gpid = proc_table[i].guest_pid;
-                    int32_t linux_status = proc_table[i].exit_status;
-                    struct rusage ru = proc_table[i].rusage;
-                    bool ru_valid = proc_table[i].rusage_valid;
-                    proc_account_entry_locked(&proc_table[i]);
-                    proc_table[i].active = false;
-                    pthread_mutex_unlock(&pid_lock);
-                    lifecycle_consume(gpid);
-                    if (status_gva &&
-                        guest_write_small(g, status_gva, &linux_status,
-                                          sizeof(linux_status)) < 0)
-                        return -LINUX_EFAULT;
-                    if (rusage_gva)
-                        write_rusage_to_guest(
-                            g, rusage_gva,
-                            ru_valid ? &ru : &(struct rusage) {0});
-                    return gpid;
+                    return proc_reap_exited_and_unlock(g, &proc_table[i],
+                                                       status_gva, rusage_gva);
                 }
 
                 if (!proc_table[i].host_waitable) {
@@ -2405,34 +2461,8 @@ int64_t sys_wait4(guest_t *g,
                 pid_t ret =
                     wait4(host_pid, &status, mac_options | WNOHANG, &ru);
                 if (ret > 0) {
-                    if (WIFEXITED(status) || WIFSIGNALED(status))
-                        status = lifecycle_guest_terminal_status(gpid, status);
-
-                    /* Credit CPU only on a terminal report. mac_options may
-                     * carry WUNTRACED/WCONTINUED, and a stop/continue report is
-                     * a snapshot of a still-running child: crediting it here
-                     * would double- or triple-count the same child across its
-                     * stop, continue, and final exit reports.
-                     */
-                    if (WIFEXITED(status) || WIFSIGNALED(status))
-                        proc_children_cpu_add(&ru);
-                    if (status_gva) {
-                        int32_t linux_status = status;
-                        if (guest_write_small(g, status_gva, &linux_status,
-                                              sizeof(linux_status)) < 0) {
-                            /* Child already reaped. Match Linux: return EFAULT
-                             */
-                            proc_deactivate_slot_if_matches(host_pid, gpid);
-                            return -LINUX_EFAULT;
-                        }
-                    }
-                    if (rusage_gva &&
-                        write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                        proc_deactivate_slot_if_matches(host_pid, gpid);
-                        return -LINUX_EFAULT;
-                    }
-                    proc_deactivate_slot_if_matches(host_pid, gpid);
-                    return gpid;
+                    return proc_publish_wait_report(
+                        g, host_pid, gpid, status, &ru, status_gva, rusage_gva);
                 }
                 /* ret == 0 (not exited) or ret < 0 (error): try next */
                 pthread_mutex_lock(&pid_lock);
@@ -2488,22 +2518,8 @@ int64_t sys_wait4(guest_t *g,
     for (size_t i = 0; i < proc_table_capacity; i++) {
         if (proc_table[i].active && proc_table[i].guest_pid == pid) {
             if (proc_table[i].exited) {
-                int64_t gpid = proc_table[i].guest_pid;
-                int32_t linux_status = proc_table[i].exit_status;
-                struct rusage ru = proc_table[i].rusage;
-                bool ru_valid = proc_table[i].rusage_valid;
-                proc_account_entry_locked(&proc_table[i]);
-                proc_table[i].active = false;
-                pthread_mutex_unlock(&pid_lock);
-                lifecycle_consume(gpid);
-                if (status_gva &&
-                    guest_write_small(g, status_gva, &linux_status,
-                                      sizeof(linux_status)) < 0)
-                    return -LINUX_EFAULT;
-                if (rusage_gva)
-                    write_rusage_to_guest(
-                        g, rusage_gva, ru_valid ? &ru : &(struct rusage) {0});
-                return gpid;
+                return proc_reap_exited_and_unlock(g, &proc_table[i],
+                                                   status_gva, rusage_gva);
             }
 
             if (!proc_table[i].host_waitable) {
@@ -2552,27 +2568,8 @@ int64_t sys_wait4(guest_t *g,
                 }
             }
             if (ret > 0) {
-                if (WIFEXITED(status) || WIFSIGNALED(status))
-                    status = lifecycle_guest_terminal_status(gpid, status);
-                /* Same terminal-report gate as the P_ALL branch above. */
-                if (WIFEXITED(status) || WIFSIGNALED(status))
-                    proc_children_cpu_add(&ru);
-                if (status_gva) {
-                    int32_t linux_status = status;
-                    if (guest_write_small(g, status_gva, &linux_status,
-                                          sizeof(linux_status)) < 0) {
-                        proc_deactivate_slot_if_matches(host_pid, gpid);
-                        return -LINUX_EFAULT;
-                    }
-                }
-                if (rusage_gva &&
-                    write_rusage_to_guest(g, rusage_gva, &ru) < 0) {
-                    proc_deactivate_slot_if_matches(host_pid, gpid);
-                    return -LINUX_EFAULT;
-                }
-                /* Re-validate slot: another thread may have reaped it */
-                proc_deactivate_slot_if_matches(host_pid, gpid);
-                return gpid;
+                return proc_publish_wait_report(g, host_pid, gpid, status, &ru,
+                                                status_gva, rusage_gva);
             } else if (ret == 0) {
                 return 0; /* WNOHANG */
             }
