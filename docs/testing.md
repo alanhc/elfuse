@@ -436,6 +436,56 @@ Example:
 bash tests/driver.sh -f test-proc
 ```
 
+## Fault Injection And Recorded Rows
+
+Three failures the directory and identity lanes have to pin cannot be provoked
+from a test: a `malloc` coming back NULL part-way through a backing listing, a
+`readdir` that fails part-way through a directory elfuse itself materialized,
+and a slot replaced inside a window that is sub-microsecond wide unaided. Each
+has an environment hook, read once and with no effect at all when unset:
+
+| Variable | Effect | Driven by |
+|----------|--------|-----------|
+| `ELFUSE_DIR_BACKING_FAULT=N` | the union drain fails with `ENOMEM` once it has buffered N names | `test-dir-backing-drain-error` |
+| `ELFUSE_DIR_PRIMARY_READ_FAULT=N` | `readdir` on the synthetic stream fails with `EIO` after N entries | `test-dir-primary-read-error` |
+| `ELFUSE_DIR_UNION_BACKING_DELAY_US=N` | widens the window between pinning a directory stream and looking its backing up | `test-dir-union-fd-reuse` |
+| `ELFUSE_FD_IDENTITY_WINDOW_US=N` | widens the window between reading a descriptor's stamp and pinning its host fd | `test-fstatfs-fd-identity` |
+
+`ELFUSE_USB_FIXTURE` is the same shape pointing at enumeration rather than
+failure: it stands a deterministic synthetic USB tree up in place of whatever
+IOKit reports, so the lanes below have devices to walk on any host.
+`ELFUSE_USB_FIXTURE=overflow` stands up 129 address-less devices on one bus for
+the `devnum` cap.
+
+The lanes these drive:
+
+| Lane | Property |
+|------|----------|
+| `test-usb-sysfs-matrix` | every entry point against every class of name `/sys` and `/dev/bus` can hold |
+| `test-getdents64-small-buf` | a buffer that cannot take the next entry reports rather than ending, and the entry it could not take comes back |
+| `test-dir-backing-drain-error` | a union listing that lost its backing half is reported, not ended |
+| `test-dir-primary-read-error` | the same on the synthetic half |
+| `test-dir-union-fd-reuse` | a walk answers for the directory it pinned, not for the fd number |
+| `test-dir-union-alias` | every route to a second fd on one description shares one position and one union state |
+| `test-dir-fd-budget-union` | a union directory fd costs one host descriptor, like a plain one |
+| `test-fstatfs-fd-identity` | `fstatfs` answers for the descriptor it pinned, not for the fd number |
+
+Two lanes carry rows that are recorded rather than asserted, and print as
+`XFAIL`. An `XFAIL` row is a measured Linux value the build knowingly does not
+meet: it is neither a pass nor a failure, it does not turn the lane red, and the
+value elfuse gives today is carried beside it so that a departure from either
+number shows up as a diff in the lane's output. The alternative -- deleting the
+row -- is what lets a known divergence become an unknown one.
+
+`test-usb-sysfs-matrix` records its `escape-syn` column that way: a `..` chain
+walking through the synthetic subtree and back out cannot be resolved here,
+because the host walk has to traverse a `/sys/bus/usb` that exists only inside
+the layer. `test-dir-union-alias` records its fork cross-close rows: a child
+whose parent closes its copy of the fd before the backing has been drained
+answers with its primary alone, because the backing half belongs to a stream
+that has gone. Both rows are load-bearing in pairs -- neither number alone
+separates the answers the site could give -- so both are printed.
+
 ## Validation Strategy By Change Type
 
 Suggested minimum validation:

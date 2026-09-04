@@ -1043,6 +1043,136 @@ that string on Linux and shows nothing here.
 Related implementation: `src/runtime/procemu.c`, `src/syscall/path.c`,
 `src/syscall/fs.c`, `src/syscall/proc-state.c`, `src/runtime/usb-sysfs.c`.
 
+### Ownership Of `/sys` And `/dev/bus` Names
+
+The layer synthesizes exactly one subtree on each side, `/sys/bus/usb` and
+`/dev/bus/usb`, on top of a `/sys` and a `/dev/bus` that a sysroot supplies.
+Which of the two answers a name is one decision, taken once in
+`classify_and_normalize`, and every entry point -- `open`, `stat`, `lstat`,
+`readlink`, `access`, `getdents64`, `statfs`, `chdir` -- answers from it.
+An entry point that re-derives the decision is how four regressions arrived,
+each one a shadow: the layer claiming a name it does not serve and reporting
+`ENOENT` for a file the sysroot really has.
+
+The classes and who answers them:
+
+| Class | Path | Answered by |
+|-------|------|-------------|
+| `USB_PATH_SYS` | `/sys[/suffix]` | the layer, if the folded suffix resolves in the scratch tree; otherwise the backing, unless the suffix is under `bus/usb`, where an absence is authoritative |
+| `USB_PATH_DEV_BUS` | `/dev/bus` | both: a union listing, synthetic `usb` plus the backing's names |
+| `USB_PATH_DEV_USB` | `/dev/bus/usb` | the layer |
+| `USB_PATH_DEV_BUSNUM` | `/dev/bus/usb/BBB` | the layer |
+| `USB_PATH_DEV_NODE` | `/dev/bus/usb/BBB/DDD` | the layer |
+| `USB_PATH_DEV_NODE_SUB` | a node used as a directory | the layer (`ENOTDIR` once the node exists) |
+| `USB_PATH_DEV_ABSENT` | under `/dev/bus/usb`, no such device | the layer, `ENOENT` |
+| `USB_PATH_DEV_FOREIGN` | under `/dev/bus`, a bus we do not model | the backing |
+| `USB_PATH_NONE` | anything else, and a name that folds above its root | the backing |
+
+Only `PROC_NOT_INTERCEPTED` means "ask the backing". A name the layer claims
+and then fails to serve is an answer, not a fall-through: taking the failure
+for one let `access(2)`, and then `statfs(2)`, answer from the backing while
+`open` and `stat` reported `ENOENT` for the same path.
+
+`.` and `..` are folded lexically before ownership is decided, on both halves.
+The fold is the ours/not-ours gate and nothing else -- the served path is built
+by `usb_sys_resolve_suffix`, which resolves symlinks and applies each `..` to
+what the previous component resolved to, the way the kernel does, so
+`<dev>/subsystem/..` names `/sys/bus`. Deciding ownership on the guest's
+spelling instead splits the two halves apart in both directions:
+`/dev/bus/usb/../other/f` reads as a malformed device number and is claimed,
+and `/dev/bus/other/../usb/001/002` reads as a foreign bus and is disowned.
+A suffix that folds away above its own root leaves as `USB_PATH_NONE`.
+
+### Filesystem Identity Of A Descriptor
+
+Two questions have one answer here: what `statfs` reports for a name, and what
+`fstatfs` reports for a descriptor opened by that name. systemd's `sd-device`
+gates every enumerated syspath on `fstatfs(fd) == SYSFS_MAGIC` and libusb gates
+on `statfs("/sys")`, so a build where the two disagree is one where a device
+enumerates through one library and not the other.
+
+The rules:
+
+- `/sys`, whichever side served it, reports `SYSFS_MAGIC` (`0x62656572`). That
+  covers the scratch-dir backed names, where the host `fstatfs` would leak the
+  `/tmp` filesystem's magic, and the ones that fell through to a sysroot's own
+  `/sys`, where it would leak the sysroot's.
+- `/dev/bus` reports devtmpfs, on both entry points.
+- `..` is folded and a relative name is resolved against the cwd before either
+  entry point decides, so the two cannot be handed different spellings of one
+  object.
+
+A descriptor's identity comes from the virtual path stamped on its slot when
+this layer served the open, and from the descriptor's own host path mapped back
+through the sysroot when there is no stamp -- a fall-through open stamps
+nothing, which is exactly the case that used to make `statfs("/sys/class")`
+report `SYSFS_MAGIC` while `fstatfs` on the fd it had just opened reported the
+sysroot's filesystem.
+
+`fstat` answers from the stamp for `O_PATH` descriptors and for `/sys` and
+`/dev/bus` names, because the object behind a `/dev/bus/usb/BBB/DDD` node is a
+placeholder file: libusb `fstat`s the node it just opened and refuses anything
+that is not a character device, so the descriptor has to report the character
+device the path side described. `/proc` stays `O_PATH`-only there: its
+descriptors are real host files whose contents are the answer, and stamping
+their type would misdescribe the object the guest is reading.
+
+The stamp and the descriptor are read in one `fd_lock` window
+(`host_fd_ref_open_entry`). They are two facts about one open file description,
+and read separately a close and reopen between them gives the stamp of one and
+the descriptor of another.
+
+### Union Directory Listings
+
+A directory that exists on both sides -- `/sys`, `/dev/bus` -- lists the union.
+`sys_getdents64` walks the synthetic (primary) stream first and then the names
+drained out of the backing; the drain opens the backing directory and closes it
+before returning, so elfuse keeps its promise of one host descriptor per guest
+fd and a union directory costs no more than a plain one.
+
+What the guest is told when part of the listing cannot be delivered is the
+contract that matters, because the failure mode is silent: a listing that lost
+a name and still ends at `0` is an end-of-directory the guest cannot tell from
+a real one, and having read it, it never asks again.
+
+- A failure that costs the stream names it can never produce again -- a drain
+  that failed part-way, a primary `readdir` that stopped -- is recorded in
+  `listing_errno`. It is sticky: every later call on that fd fails the same
+  way. Linux has no case that re-delivers an error on a directory stream, so
+  there is no shape to copy; clearing it would put the next call back on the
+  silent path, and the stream has nothing truthful left to return.
+- Linux's two-part shape is followed for reporting one: a call that has already
+  written entries returns their count and leaves the error for the next call; a
+  call that has written nothing returns `-1` with the errno.
+- A buffer too small to hold one entry is `EINVAL`, not `0`. Measured on Linux
+  over a directory holding a twelve-byte name: `getdents64` with 8- and
+  16-byte buffers returns `EINVAL` immediately, and with 24 bytes it delivers
+  the names that fit and then reports.
+- No exit from the walk may consume an entry without putting it back. The
+  entry-does-not-fit path and the guest-write fault path both rewind the
+  primary with `seekdir`; the backing side rewinds by not advancing its cursor.
+- A host name too long for Linux `NAME_MAX` is skipped, and the rest of the
+  stream is delivered. This is an elfuse compatibility policy with no Linux
+  counterpart: Linux enforces `NAME_MAX` at the filesystem layer, so no
+  oversize entry ever reaches `getdents64` there. macOS APFS accepts them, and
+  aborting the stream truncated `ls` / `find` listings against APFS trees.
+
+`dir_stream_t` is the wrapper around the `DIR*`. It is refcounted and carries
+its own lock, so an in-flight `getdents64` pins it against a sibling's
+`close()`; `dup`, `dup2` and `F_DUPFD` share one wrapper rather than opening a
+second, which is what makes two guest fds on one open file description share
+one position and one union state. A forked child's inherited fds share one
+wrapper per inherited open file description for the same reason. The wrapper
+owns the descriptor it was opened on -- only `closedir()` gives it back -- so
+an alias names the descriptor the shared wrapper holds and the redundant one is
+closed.
+
+A stream built for an inherited descriptor has `backing_private` set: the
+primary is shared with the parent through the description and must be read, and
+the backing belongs to whichever stream first ran out of primary and must not
+be drained twice. `docs/testing.md` records the one state this cannot deliver
+whole.
+
 ### Limits Of The IOKit Mapping
 
 This tree enumerates devices; the pieces that follow open them and

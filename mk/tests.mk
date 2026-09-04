@@ -42,7 +42,12 @@ ELFUSE_HOST_NOFILE_MIN ?= $(shell bash "$(CURDIR)/tests/test-config.sh" --host-n
         test-sysroot-name-relative \
         test-nosysroot-literal-names test-sysroot-outside-names \
         test-sysroot-root test-usb-sysfs test-usb-sysfs-sysroot \
-        test-usb-sysfs-overflow \
+        test-usb-sysfs-matrix \
+        test-usb-sysfs-overflow test-dir-fd-budget-union \
+        test-dir-backing-drain-error test-dir-union-fd-reuse \
+        test-fstatfs-fd-identity \
+        test-dir-union-alias test-dir-primary-read-error \
+        test-getdents64-small-buf \
         test-sysroot-symlink-target \
         test-sysroot-name-i18n test-sysroot-name-length \
         test-sysroot-name-staged test-sysroot-name-race \
@@ -254,7 +259,15 @@ $(call run-host-unit,test-usb-desc-host,USB descriptor blob walk unit test)
 $(call run-host-unit,test-elf-headers-host,ELF header validation unit test)
 $(call run-lane,test-usb-sysfs,synthetic USB tree contract)
 $(call run-lane,test-usb-sysfs-sysroot,synthetic USB /sys sharing a populated sysroot)
+$(call run-lane,test-usb-sysfs-matrix,every /sys and /dev/bus entry point against every path class)
 $(call run-lane,test-usb-sysfs-overflow,per-bus devnum cap under 127-device overflow)
+$(call run-lane,test-dir-fd-budget-union,a union directory fd costs one host descriptor)
+$(call run-lane,test-dir-backing-drain-error,a lost union listing is reported not truncated)
+$(call run-lane,test-dir-union-fd-reuse,a union walk answers for the directory it pinned)
+$(call run-lane,test-fstatfs-fd-identity,fstatfs answers for the descriptor it pinned)
+$(call run-lane,test-dir-union-alias,a dup shares one listing position and one union)
+$(call run-lane,test-dir-primary-read-error,a failed synthetic read is reported not ended)
+$(call run-lane,test-getdents64-small-buf,a getdents64 buffer too small for one entry)
 $(call run-lane,test-fstatat-empty-path,AT_EMPTY_PATH stat by fd under a sysroot)
 $(call run-lane,test-sysroot-name-unique,one on-disk name per guest name)
 $(call run-lane,test-sysroot-name-relative,relative and dirfd-relative names)
@@ -1065,6 +1078,18 @@ test-getdents64-overlong: $(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-overlong
 	done; \
 	$(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-overlong "$$tmpdir/fixture"
 
+## Verify a getdents64 buffer too small for one entry reports EINVAL
+test-getdents64-small-buf: $(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-small-buf
+	@$(SYSROOT_SCRATCH); \
+	mkdir -p "$$tmpdir/fixture" "$$tmpdir/wide"; \
+	: > "$$tmpdir/fixture/aaaaaaaaaaaa"; \
+	: > "$$tmpdir/fixture/bb"; \
+	i=0; while [ $$i -lt 96 ]; do \
+		printf '' > "$$tmpdir/wide/name-that-is-fairly-long-$$i"; \
+		i=$$((i + 1)); \
+	done; \
+	$(ELFUSE_BIN) $(BUILD_DIR)/test-getdents64-small-buf "$$tmpdir/fixture" "$$tmpdir/wide" 96
+
 test-sysroot-create-paths: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-create-paths
 	@set -e; \
 	tmpdir=$$(mktemp -d); \
@@ -1612,11 +1637,181 @@ test-usb-sysfs-sysroot: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-sysroot
 	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
 		$(TEST_DIR)/test-usb-sysfs-sysroot
 
+## Every entry point that can name something under /sys or /dev/bus, against
+## every class of name those trees can hold. The layer synthesizes one subtree
+## on each side and the rest belongs to the sysroot, so the sysroot has to carry
+## the other side of each column: a /sys skeleton, a foreign /dev/bus, an /etc
+## file for the '..' chain that leaves the tree, and one name planted inside
+## /dev/bus/usb, which the layer owns and the backing must not reach into.
+## Nothing is planted under the sysroot's /sys/bus: a Linux rootfs image carries
+## an empty /sys, and its not having a `bus` is the shape the escape-syn column
+## records. Expected values are the
+## ones recorded on Linux; see tests/usb-sysfs-matrix-vectors.h.
+test-usb-sysfs-matrix: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-matrix
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net/eth0" \
+		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
+		"$$sysroot/sys/devices/system/node" \
+		"$$sysroot/sys/fs/cgroup" \
+		"$$sysroot/sys/bus/pci/devices" \
+		"$$sysroot/dev/bus/other" "$$sysroot/dev/bus/usb/099" \
+		"$$sysroot/etc"; \
+	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
+	printf 'always [madvise] never\n' \
+		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
+	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	: > "$$sysroot/sys/fs/cgroup/g"; \
+	: > "$$sysroot/dev/bus/other/f"; \
+	: > "$$sysroot/dev/bus/usb/099/001"; \
+	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-usb-sysfs-matrix
+
 ## The devnum cap needs more than 127 address-less devices on one bus, which
 ## the overflow fixture injects through the real fallback path. No sysroot: the
 ## whole model is synthetic here.
 test-usb-sysfs-overflow: $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
 	ELFUSE_USB_FIXTURE=overflow $(ELFUSE_BIN) $(TEST_DIR)/test-usb-sysfs-overflow
+
+## fstatfs answers for the descriptor it pinned, not for the fd number
+# The identity is decided from the slot's stamp and from the descriptor itself,
+# and those used to be two lookups with a window between them. The window is far
+# too narrow to reach unaided, so ELFUSE_FD_IDENTITY_WINDOW_US widens it and the
+# test swaps the slot inside it. The sysroot carries both sides the test needs:
+# a plain file, and a /sys directory this layer does not synthesize, so the
+# descriptor falls through to the sysroot and still has to answer sysfs.
+test-fstatfs-fd-identity: $(ELFUSE_BIN) $(TEST_DIR)/test-fstatfs-fd-identity
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" "$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" "$$sysroot/etc"; \
+	printf 'elfuse\n' > "$$sysroot/etc/hostname"; \
+	ELFUSE_FD_IDENTITY_WINDOW_US=120000 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-fstatfs-fd-identity /etc/hostname /sys/kernel
+## A union directory fd must cost one host descriptor, like a plain one
+# The measurement only means something with the host limit at exactly what
+# elfuse asks for -- the same squeeze tests/manifest.txt puts on
+# test-dir-fd-budget -- and only if /sys really is a union here, which needs a
+# sysroot that carries one. The skeleton is the same shape the other /sys lanes
+# stage, plus a marker directory the synthetic tree has no name for: the test
+# refuses to pass without seeing it, so the lane cannot go quietly vacuous if
+# the sysroot ever stops being planted.
+test-dir-fd-budget-union: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-fd-budget-union
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net/eth0" \
+		"$$sysroot/sys/kernel/mm/transparent_hugepage" \
+		"$$sysroot/sys/devices/system/node" \
+		"$$sysroot/sys/elfuse-union-marker"; \
+	printf '02:42:ac:11:00:02\n' > "$$sysroot/sys/class/net/eth0/address"; \
+	printf 'always [madvise] never\n' \
+		> "$$sysroot/sys/kernel/mm/transparent_hugepage/enabled"; \
+	printf '0-3\n' > "$$sysroot/sys/devices/system/node/online"; \
+	ulimit -n $(ELFUSE_HOST_NOFILE_MIN); \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-fd-budget-union
+
+## A union listing that cannot be delivered whole must be reported
+# Three runs over one staged sysroot, because the thing under test is what the
+# guest is told and each answer needs its own conditions. The drain-failure run
+# needs a failure that will not happen by itself -- a malloc coming back NULL
+# part-way through the backing -- so ELFUSE_DIR_BACKING_FAULT drives it after
+# two names, against a backing that has more than two to give. The unreadable
+# run needs no hook: chmod 000 on the sysroot's /sys makes the drain's own open
+# fail. The no-fault run is the control, and it is also what keeps the other
+# two honest: it refuses to pass unless the marker directory -- present in the
+# sysroot and nowhere in the synthetic tree -- comes back in the listing, so
+# the lane cannot go quietly vacuous if /sys ever stops being a union here.
+# chmod 000 outlives the scratch trap on some filesystems, so the mode goes
+# back before the shell exits.
+test-dir-backing-drain-error: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-backing-drain-error
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	trap 'chmod -R u+rwX "$$tmpdir" 2>/dev/null; rm -rf "$$tmpdir"' EXIT; \
+	mkdir -p "$$sysroot/sys/class/net" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker" \
+		"$$sysroot/sys/extra-one" "$$sysroot/sys/extra-two"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-backing-drain-error complete; \
+	ELFUSE_DIR_BACKING_FAULT=2 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-backing-drain-error fault; \
+	chmod 000 "$$sysroot/sys"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-backing-drain-error unreadable
+
+## A dup'd directory fd must share one listing position and one union state
+# Both directories the lane walks are staged several hundred names wide, and
+# that width is the lane. macOS reads one host block ahead when it opens a
+# directory, so a three-name fixture -- what this staged before -- fits inside
+# that block: a stream that never reads its primary loses nothing, and the loss
+# only becomes visible once the listing outruns the block. Measured over this
+# staging, an unread fork on the 403-name plain directory: 403 names across the
+# pair when the sharing is right, 340 when the child skips its primary. The
+# union side is staged wide for the mirror-image reason -- a backing delivered a
+# second time is 809 names where 405 are wanted. 400 a side is several times the
+# block and costs one mkdir.
+test-dir-union-alias: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-union-alias
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" "$$sysroot/sys/class/tty" \
+		"$$sysroot/sys/class/block" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker" \
+		"$$sysroot/plain-alias"; \
+	i=0; wide=""; \
+	while [ $$i -lt 403 ]; do \
+		wide="$$wide $$sysroot/plain-alias/plain-w$$i"; \
+		i=$$((i + 1)); \
+	done; \
+	i=0; \
+	while [ $$i -lt 400 ]; do \
+		wide="$$wide $$sysroot/sys/union-w$$i"; \
+		i=$$((i + 1)); \
+	done; \
+	mkdir -p $$wide; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-union-alias
+
+## A synthetic listing that failed part-way must be reported, not ended
+# Two runs over one staged sysroot: the control proves the union works at all,
+# and the fault run drives a readdir failure on the primary after one entry,
+# which is a failure that cannot happen by itself on a tree elfuse owns.
+test-dir-primary-read-error: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-primary-read-error
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker"; \
+	ELFUSE_USB_FIXTURE=1 $(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-primary-read-error complete; \
+	ELFUSE_DIR_PRIMARY_READ_FAULT=1 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-primary-read-error fault
+
+## A union walk must answer for the directory it pinned, not the fd number
+# The window between pinning the stream and looking the backing up is far too
+# narrow to reach unaided, so ELFUSE_DIR_UNION_BACKING_DELAY_US widens it and
+# the guest closes the walked fd inside it. MARKER is planted in the sysroot's
+# /sys and nowhere in the synthetic tree, so its absence from a listing that
+# reported success is exactly the silent half-listing under test.
+test-dir-union-fd-reuse: $(ELFUSE_BIN) $(TEST_DIR)/test-dir-union-fd-reuse
+	@$(SYSROOT_SCRATCH); \
+	sysroot="$$tmpdir/sysroot"; \
+	mkdir -p "$$sysroot/sys/class/net" \
+		"$$sysroot/sys/kernel" \
+		"$$sysroot/sys/devices" \
+		"$$sysroot/sys/elfuse-union-marker"; \
+	ELFUSE_DIR_UNION_BACKING_DELAY_US=20000 ELFUSE_USB_FIXTURE=1 \
+		$(ELFUSE_BIN) --sysroot "$$sysroot" \
+		$(TEST_DIR)/test-dir-union-fd-reuse
+
 
 ## Run the absock derived-name unit test natively on the host
 test-absock-names-host: $(BUILD_DIR)/test-absock-names-host
